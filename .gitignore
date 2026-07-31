@@ -40,10 +40,7 @@ id_ed25519.*
 *.sqlite-*
 *.wal
 *.shm
-.butler2/
-.butler/
-.butler-issue-summary/
-.tmux-butler-uploads/
+.mando/
 .deploy-backups/
 
 # Logs, temporary files, and backups

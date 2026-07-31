@@ -83,7 +83,7 @@ export interface SshConnConfig {
   host: string;
   port: number;
   username: string;
-  /** 私钥文件绝对路径（控制面本地 ~/.butler2/keys/<keyRef>，0600，不进 DB） */
+  /** 私钥文件绝对路径（控制面本地 ~/.mando/keys/<keyRef>，0600，不进 DB） */
   privateKeyPath: string;
   /** 首次重连退避基数（ms），指数递增至 maxBackoffMs；默认 1000 */
   baseBackoffMs?: number;

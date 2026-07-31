@@ -40,7 +40,7 @@ const CODEX_UPDATED_OUT = `╭─ OpenAI Codex (v0.144.6) ─╮
 
 /** 注入被 bash 当命令跑掉的现场（本 issue 要根治的症状） */
 const BASH_AFTER_INJECT = `-bash: 请继续执行子任务: command not found
-[root@VM-0-6-opencloudos tmux-butler]#`;
+[root@VM-0-6-opencloudos mando]#`;
 
 /** 空闲 bash */
 const BASH_IDLE = `[root@VM-0-6-opencloudos livetest]#

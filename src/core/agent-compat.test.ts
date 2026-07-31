@@ -15,7 +15,7 @@ let dir: string;
 const driver = new LocalDriver();
 
 beforeAll(async () => {
-  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'butler2-compat-'));
+  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-compat-'));
 });
 afterAll(async () => {
   await fsp.rm(dir, { recursive: true, force: true });
@@ -66,7 +66,7 @@ describe('ensureMandoIssueSkill', () => {
     const cl = await fsp.readFile(clPath, 'utf8');
     expect(cl).toBe(await fsp.readFile(cxPath, 'utf8'));
     expect(cl).toContain('name: mando-issue');
-    expect(cl).toContain('.butler/modules/INDEX.md');
+    expect(cl).toContain('.mando/modules/INDEX.md');
     expect(await ensureMandoIssueSkill(driver, { claudeHome, codexHome })).toHaveLength(0);
 
     await fsp.writeFile(clPath, '# 人工版本');
@@ -87,7 +87,7 @@ describe('ensureModuleGuideBlocks', () => {
       const text = await fsp.readFile(path.join(cwd, name), 'utf8');
       expect(text).toContain(`# 人工 ${name === 'AGENTS.md' ? 'AGENTS' : 'CLAUDE'}`);
       expect(text.match(/mando:module-guide:start/g)).toHaveLength(1);
-      expect(text).toContain('.butler/modules/INDEX.md');
+      expect(text).toContain('.mando/modules/INDEX.md');
     }
   });
 

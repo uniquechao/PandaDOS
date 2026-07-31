@@ -18,7 +18,7 @@ import { migrate } from '../../core/migrate';
 import { imageReadHint } from '../../core/uploads';
 import { LocalDriver } from '../../executor/local';
 import { KEY_WHITELIST, type PtyChannel } from '../../executor/driver';
-import { startServer, type ButlerServer } from '../server';
+import { startServer, type MandoServer } from '../server';
 
 // ---------- 假 Driver（tmux/PTY 面 stub，文件/git 面真 LocalDriver） ----------
 
@@ -98,7 +98,7 @@ afterEach(async () => {
 });
 
 interface Ctx {
-  server: ButlerServer;
+  server: MandoServer;
   base: string;
   wsBase: string;
   dir: string;
@@ -111,9 +111,9 @@ interface Ctx {
 }
 
 async function boot(): Promise<Ctx> {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'butler2-ws-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-ws-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
-  const dbPath = path.join(dir, 'butler.db');
+  const dbPath = path.join(dir, 'mando.db');
   const claudeDir = path.join(dir, 'home', '.claude', 'projects');
   await fsp.mkdir(claudeDir, { recursive: true });
 
@@ -317,7 +317,7 @@ describe('WS 鉴权矩阵（/ws/term /ws/chat 同一套 upgrade 前鉴权）', (
     expect(await get(`/ws/chat/${t.pid}`, t.bobToken)).toBe(403);
 
     // 关联 bob 为项目成员（成员 API 尚未接线，WAL 下另开连接直接写库）
-    const db = openDb(path.join(t.dir, 'butler.db'));
+    const db = openDb(path.join(t.dir, 'mando.db'));
     const bobId = db.query<{ id: number }, []>("SELECT id FROM users WHERE username = 'bob'").get()!.id;
     db.query('INSERT INTO project_members (project_id, user_id, created_ts) VALUES (?, ?, 0)').run(
       t.pid,
@@ -655,26 +655,26 @@ describe('WS chat：baseline → msg 增量 → selection → stale → 注入',
       type: 'text',
       text: '看这个',
       images: [
-        '.tmux-butler-uploads/x/a.png', // 合法
+        '.mando/uploads/x/a.png', // 合法
         'evil.png', // 非上传目录 → 丢
-        '.tmux-butler-uploads/../secret', // 越界 → 丢
+        '.mando/uploads/../secret', // 越界 → 丢
       ],
     });
     await waitFor(() => t.driver.sent.length === 1);
     const inj1 = t.driver.sent[0]!.text;
     expect(inj1).toContain('请先用 Read'); // imageReadHint 提示
-    expect(inj1).toContain(`${cwd}/.tmux-butler-uploads/x/a.png`); // 合法图 → 执行机绝对路径
+    expect(inj1).toContain(`${cwd}/.mando/uploads/x/a.png`); // 合法图 → 执行机绝对路径
     expect(inj1).not.toContain('evil.png');
     expect(inj1).not.toContain('secret');
     expect(inj1).toContain('看这个'); // 用户文本保留
     expect(inj1.indexOf('请先用 Read')).toBeLessThan(inj1.indexOf('看这个')); // 提示在前、文本在后
 
     // 只发图（文本空但有图）：仍注入（纯提示 + 路径）
-    c.send({ type: 'text', text: '', images: ['.tmux-butler-uploads/y/b.png'] });
+    c.send({ type: 'text', text: '', images: ['.mando/uploads/y/b.png'] });
     await waitFor(() => t.driver.sent.length === 2);
     const inj2 = t.driver.sent[1]!.text;
     expect(inj2).toContain('请先用 Read');
-    expect(inj2).toContain(`${cwd}/.tmux-butler-uploads/y/b.png`);
+    expect(inj2).toContain(`${cwd}/.mando/uploads/y/b.png`);
 
     // 纯空帧（无文本无图）→ bad_frame，不注入
     c.send({ type: 'text', text: '   ' });
@@ -687,7 +687,7 @@ describe('WS chat：baseline → msg 增量 → selection → stale → 注入',
     const t = await chatCtx();
     // 覆盖 chatCtx 默认 jsonl：一条 assistant（非 user，应原样）+ 一条带图 user（应富化）
     const combined = injected(
-      ['/x/.tmux-butler-uploads/aa/a.png', '/x/.tmux-butler-uploads/bb/b.jpg'],
+      ['/x/.mando/uploads/aa/a.png', '/x/.mando/uploads/bb/b.jpg'],
       '看这两张',
     );
     await fsp.writeFile(t.jsonl, asst('欢迎') + user(combined));
@@ -701,16 +701,16 @@ describe('WS chat：baseline → msg 增量 → selection → stale → 注入',
     expect(m0.images).toBeUndefined();
     // 带图 user：images = cwd 相对路径数组、正文剥掉 AI 向提示
     expect(m1.role).toBe('user');
-    expect(m1.images).toEqual(['.tmux-butler-uploads/aa/a.png', '.tmux-butler-uploads/bb/b.jpg']);
+    expect(m1.images).toEqual(['.mando/uploads/aa/a.png', '.mando/uploads/bb/b.jpg']);
     expect(m1.text).toBe('看这两张');
     expect(m1.text).not.toContain('请先用 Read');
 
     // tail 增量：再来一条纯图 user（无正文）→ msg 帧同样富化、正文为空串
-    await fsp.appendFile(t.jsonl, user(injected(['/x/.tmux-butler-uploads/cc/c.webp'])));
+    await fsp.appendFile(t.jsonl, user(injected(['/x/.mando/uploads/cc/c.webp'])));
     const inc = await c.next();
     expect(inc.type).toBe('msg');
     expect(inc.m.role).toBe('user');
-    expect(inc.m.images).toEqual(['.tmux-butler-uploads/cc/c.webp']);
+    expect(inc.m.images).toEqual(['.mando/uploads/cc/c.webp']);
     expect(inc.m.text).toBe('');
 
     // 无图 user → 原样透传（不挂 images、正文不动）
@@ -1040,9 +1040,9 @@ if (!tmuxOk || !scriptOk) {
 
 describe.if(tmuxOk && scriptOk)('WS term 集成（真 tmux attach）', () => {
   test('对真 tmux 会话 attach：收到终端字节流', async () => {
-    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'butler2-ws-real-'));
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-ws-real-'));
     cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
-    const dbPath = path.join(dir, 'butler.db');
+    const dbPath = path.join(dir, 'mando.db');
     const claudeDir = path.join(dir, 'claude');
     const db0 = openDb(dbPath);
     migrate(db0);

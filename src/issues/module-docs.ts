@@ -1,5 +1,5 @@
 /**
- * issues/module-docs —— `.butler/modules` 的版本化模块知识与 issue 过程页。
+ * issues/module-docs —— `.mando/modules` 的版本化模块知识与 issue 过程页。
  *
  * 数据库拥有调度事实；这里拥有可进 git 的长期认知。系统只改显式 managed block，
  * MODULE.md 的人工/agent 正文永不整文件重写。
@@ -7,7 +7,7 @@
 import type { ProjectModule } from '../core/types';
 import type { ExecutorDriver } from '../executor/driver';
 
-const ROOT_REL = '.butler/modules';
+const ROOT_REL = '.mando/modules';
 const DECODER = new TextDecoder();
 
 type DocDriver = Pick<
@@ -134,7 +134,7 @@ export class ModuleDocs {
   }
 
   /**
-   * slug 改名的文档侧迁移：`.butler/modules/<旧slug>/` 整目录搬到 `<新slug>/`，
+   * slug 改名的文档侧迁移：`.mando/modules/<旧slug>/` 整目录搬到 `<新slug>/`，
    * 并把新 MODULE.md 的 meta slug 改写成新值（否则 ensureModule 身份校验必炸）。
    * Driver 无 move 原语（加接口要同步 4 处），目录只有少量 md——递归复制 + 删旧实现。
    * 迁移前校验 MODULE.md 身份（module_id 必须对上）；旧目录不存在则视为无档可迁（直接返回）。

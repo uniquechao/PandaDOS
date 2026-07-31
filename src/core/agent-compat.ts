@@ -28,18 +28,18 @@ export interface CompatHomes {
   codexHome?: string;
 }
 
-const GEN_MARK = 'tmux-butler 自动生成';
+const GEN_MARK = 'mando 自动生成';
 const MODULE_GUIDE_START = '<!-- mando:module-guide:start -->';
 const MODULE_GUIDE_END = '<!-- mando:module-guide:end -->';
 
 export const MANDO_ISSUE_SKILL = `---
 name: mando-issue
-description: Use whenever working on an issue or module in a repository containing .butler/modules/INDEX.md, or when a prompt provides a Mando module or issue process-page path.
+description: Use whenever working on an issue or module in a repository containing .mando/modules/INDEX.md, or when a prompt provides a Mando module or issue process-page path.
 ---
 
 # Mando Issue 模块记忆（${GEN_MARK}）
 
-1. 从当前工作目录向上定位项目根目录，先读 \`.butler/modules/INDEX.md\`。
+1. 从当前工作目录向上定位项目根目录，先读 \`.mando/modules/INDEX.md\`。
 2. 读取当前模块的 \`MODULE.md\`，再读 prompt 指定的 issue 过程页。
 3. 实施中只记录关键设计、决策、文件和测试，不写逐条终端流水。
 4. 完成前更新 issue 过程页；只有长期仍有效的知识才提炼回 \`MODULE.md\`。
@@ -49,7 +49,7 @@ description: Use whenever working on an issue or module in a repository containi
 const MODULE_GUIDE_BLOCK = `${MODULE_GUIDE_START}
 ## Mando issue 模块记忆
 
-处理 issue 或修改代码前，先读取 \`.butler/modules/INDEX.md\`，再读取当前模块的
+处理 issue 或修改代码前，先读取 \`.mando/modules/INDEX.md\`，再读取当前模块的
 \`MODULE.md\` 和当前 issue 过程页。遵循全局技能 \`mando-issue\`：实施中维护过程页，
 完成时只把长期有效的知识提炼回模块文档，不记录逐条终端流水。
 ${MODULE_GUIDE_END}`;

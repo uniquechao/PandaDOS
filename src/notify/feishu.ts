@@ -110,7 +110,7 @@ export const CARD_REJECT_NOTE = '飞书卡片一键拒绝（详细意见待网�
 
 /** 绑定验证的测试消息文案 */
 export const BIND_TEST_TEXT =
-  '✅ Mando AI（曼拓）绑定验证：收到本条消息说明 openid 可达，绑定已生效。';
+  '✅ MandoAI（曼拓）绑定验证：收到本条消息说明 openid 可达，绑定已生效。';
 
 /**
  * 卡点决定转发（issue-engine decideGate 骨架签名的结构化镜像；

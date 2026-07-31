@@ -13,7 +13,7 @@
  *   9. 优雅停机：engine.stop(await 在途 tick) → progress.stopAll → flushAll → router.stop →
  *      feishu.stop → driver.close ×N → server/db（M1：引擎先停，driver/db 最后关）
  *
- * 配置来源统一 env BUTLER2_*：PORT(8802) / BIND(127.0.0.1) / DB(~/.butler2/butler.db) /
+ * 配置来源统一 env MANDO_*：PORT(8802) / BIND(127.0.0.1) / DB(~/.mando/mando.db) /
  * FEISHU_APP_ID+FEISHU_APP_SECRET / LLM_*（agents/llm.ts）/ PERSONA_FILE（agents/pm.ts）。
  */
 import type { Database } from 'bun:sqlite';
@@ -68,13 +68,13 @@ import { createWsHandlers, handleWsUpgrade, type WsData, type WsDeps } from './w
 // ---------- 选项 / 返回 ----------
 
 export interface ServerOptions {
-  /** 监听端口；缺省 env BUTLER2_PORT，再缺省 8802。传 0 = 随机端口（测试用） */
+  /** 监听端口；缺省 env MANDO_PORT，再缺省 8802。传 0 = 随机端口（测试用） */
   port?: number;
-  /** 绑定地址；缺省 env BUTLER2_BIND，再缺省 127.0.0.1（生产走 nginx 反代） */
+  /** 绑定地址；缺省 env MANDO_BIND，再缺省 127.0.0.1（生产走 nginx 反代） */
   bind?: string;
-  /** DB 路径；缺省 env BUTLER2_DB，再缺省 ~/.butler2/butler.db */
+  /** DB 路径；缺省 env MANDO_DB，再缺省 ~/.mando/mando.db */
   dbPath?: string;
-  /** 首启 admin 明文 token 的落盘文件（0600）；缺省 env BUTLER2_ADMIN_TOKEN_FILE，再缺省 ~/.butler2/admin-token */
+  /** 首启 admin 明文 token 的落盘文件（0600）；缺省 env MANDO_ADMIN_TOKEN_FILE，再缺省 ~/.mando/admin-token */
   adminTokenFile?: string;
   /** 静态目录（build-ui 产物）；缺省根目录 public */
   publicDir?: string;
@@ -87,12 +87,12 @@ export interface ServerOptions {
   /** 飞书配置：undefined = 读 env；null = 明确禁用 */
   feishu?: FeishuConfig | null;
   /**
-   * 是否启动飞书 WS 长连通道（通知/卡片）；缺省 env BUTLER2_FEISHU_CHANNEL !== 'off'。
+   * 是否启动飞书 WS 长连通道（通知/卡片）；缺省 env MANDO_FEISHU_CHANNEL !== 'off'。
    * false = 只启用扫码登录/绑定（OAuth 纯 HTTP）——同一 app 已被其他服务建长连时
    * 再连会分走事件推送，此开关让扫码与通道解耦。
    */
   feishuChannel?: boolean;
-  /** 对外基址（OAuth 回调用，如 https://x.y.z）；缺省 env BUTLER2_PUBLIC_URL，再缺省按请求推导 */
+  /** 对外基址（OAuth 回调用，如 https://x.y.z）；缺省 env MANDO_PUBLIC_URL，再缺省按请求推导 */
   publicUrl?: string;
   /** 引擎调参（测试缩短 tick 等） */
   engineConfig?: Partial<EngineConfig>;
@@ -106,7 +106,7 @@ export interface ServerOptions {
   progressThrottleSeconds?: number;
 }
 
-export interface ButlerServer {
+export interface MandoServer {
   port: number;
   db: Database;
   migrations: MigrationStatus;
@@ -155,16 +155,16 @@ export function agentHomesOf(claudeProjectsDir: string): { claudeHome: string; c
   return m ? { claudeHome: `${m[1]}/.claude`, codexHome: `${m[1]}/.codex` } : undefined;
 }
 
-/** env 读飞书配置：BUTLER2_FEISHU_APP_ID + BUTLER2_FEISHU_APP_SECRET 齐全才启用 */
+/** env 读飞书配置：MANDO_FEISHU_APP_ID + MANDO_FEISHU_APP_SECRET 齐全才启用 */
 export function feishuConfigFromEnv(): FeishuConfig | null {
-  const appId = process.env.BUTLER2_FEISHU_APP_ID ?? '';
-  const appSecret = process.env.BUTLER2_FEISHU_APP_SECRET ?? '';
+  const appId = process.env.MANDO_FEISHU_APP_ID ?? '';
+  const appSecret = process.env.MANDO_FEISHU_APP_SECRET ?? '';
   return appId && appSecret ? { appId, appSecret } : null;
 }
 
 // ---------- 装配 ----------
 
-export async function startServer(opts: ServerOptions = {}): Promise<ButlerServer> {
+export async function startServer(opts: ServerOptions = {}): Promise<MandoServer> {
   // ---- 1. DB + 迁移链（顺序固定；各自幂等，记入同一 schema_migrations） ----
   const db = openDb(opts.dbPath ?? defaultDbPath());
   migrate(db);
@@ -183,20 +183,20 @@ export async function startServer(opts: ServerOptions = {}): Promise<ButlerServe
   if (boot) {
     const f =
       opts.adminTokenFile ??
-      process.env.BUTLER2_ADMIN_TOKEN_FILE ??
-      join(homedir(), '.butler2', 'admin-token');
+      process.env.MANDO_ADMIN_TOKEN_FILE ??
+      join(homedir(), '.mando', 'admin-token');
     mkdirSync(dirname(f), { recursive: true });
     writeFileSync(f, `${boot.token}\n`, { mode: 0o600 });
     chmodSync(f, 0o600); // 文件已存在时 writeFileSync 的 mode 不生效，补一刀
     // 明文 token 仅此一次输出 stdout + 0600 文件；严禁进任何日志（v1 前科）
     process.stdout.write(
-      `[butler2] 首启已创建 admin 用户（username=admin）。token 仅显示这一次（已写入 ${f}，0600）：\n${boot.token}\n`,
+      `[mando] 首启已创建 admin 用户（username=admin）。token 仅显示这一次（已写入 ${f}，0600）：\n${boot.token}\n`,
     );
   }
 
   // ---- 3. executors 表 → Driver 池 ----
   const drivers = new Map<number, ExecutorDriver>();
-  const keysDir = join(homedir(), '.butler2', 'keys');
+  const keysDir = join(homedir(), '.mando', 'keys');
   const buildDriver = (ex: Executor): ExecutorDriver => {
     if (opts.driverFactory) return opts.driverFactory(ex);
     const isLocal = (ex.host === '127.0.0.1' || ex.host === 'localhost') && !ex.keyRef;
@@ -228,7 +228,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<ButlerServe
     if (!d) return;
     drivers.delete(id);
     void Promise.resolve((d as { close?: () => Promise<void> | void }).close?.()).catch((e) =>
-      console.error('[butler2] 旧 executor driver 关闭失败:', e),
+      console.error('[mando] 旧 executor driver 关闭失败:', e),
     );
   };
 
@@ -307,10 +307,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<ButlerServe
   // 仅在能从执行机 claude_dir 推出真实家目录时装；推不出（退化/测试装配）跳过，免污染兜底 homedir。
   if (derivedHomes) {
     void ensureArtifactSkill(primaryDriver, derivedHomes).catch((e) =>
-      console.error('[butler2] 内置技能 artifacts-to-cwd 安装失败（best-effort）:', e),
+      console.error('[mando] 内置技能 artifacts-to-cwd 安装失败（best-effort）:', e),
     );
     void ensureMandoIssueSkill(primaryDriver, derivedHomes).catch((e) =>
-      console.error('[butler2] 内置技能 mando-issue 安装失败（best-effort）:', e),
+      console.error('[mando] 内置技能 mando-issue 安装失败（best-effort）:', e),
     );
   }
 
@@ -368,14 +368,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<ButlerServe
       const answer = await pmFor(project).answerQuestion(user.id, q);
       await feishu.sendText({ userId: user.id, address: openid }, answer);
     } catch (e) {
-      console.error('[butler2] 飞书入站处理失败:', e);
+      console.error('[mando] 飞书入站处理失败:', e);
     }
   };
 
   const feishuCfg = opts.feishu !== undefined ? opts.feishu : feishuConfigFromEnv();
   // 扫码登录/绑定只依赖 app 凭据（纯 HTTP），与 WS 长连通道解耦
   const feishuOauth: FeishuOauthPort | null = feishuCfg ? new FeishuOauthClient(feishuCfg) : null;
-  const channelOn = opts.feishuChannel ?? process.env.BUTLER2_FEISHU_CHANNEL !== 'off';
+  const channelOn = opts.feishuChannel ?? process.env.MANDO_FEISHU_CHANNEL !== 'off';
   if (feishuCfg && channelOn) {
     const ch = new FeishuChannel(feishuCfg, {
       db,
@@ -385,14 +385,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<ButlerServe
       onSelection: (requestId, idx, openid) =>
         void approvals
           .consumeFromCard(requestId, idx, openid)
-          .catch((e) => console.error('[butler2] 选择卡回调处理失败:', e)),
+          .catch((e) => console.error('[mando] 选择卡回调处理失败:', e)),
     });
     try {
       await ch.start();
       notify.register(ch);
       feishu = ch;
     } catch (e) {
-      console.error('[butler2] 飞书通道启动失败（本次不注册，通知静默跳过）:', e);
+      console.error('[mando] 飞书通道启动失败（本次不注册，通知静默跳过）:', e);
     }
   }
 
@@ -450,7 +450,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<ButlerServe
   let engineRunning = true;
 
   // ---- 8. 路由聚合 + 静态 + healthz ----
-  const publicUrl = opts.publicUrl ?? process.env.BUTLER2_PUBLIC_URL;
+  const publicUrl = opts.publicUrl ?? process.env.MANDO_PUBLIC_URL;
   const dispatch = createApiDispatcher({
     db,
     users,
@@ -558,7 +558,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<ButlerServe
         }
       }
     } catch (e) {
-      console.error('[butler2] executor status 同步失败:', e);
+      console.error('[mando] executor status 同步失败:', e);
     }
   };
   syncExecutorStatus();
@@ -583,8 +583,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<ButlerServe
   };
 
   const server = Bun.serve<WsData>({
-    hostname: opts.bind ?? process.env.BUTLER2_BIND ?? '127.0.0.1',
-    port: opts.port ?? Number(process.env.BUTLER2_PORT ?? 8802),
+    hostname: opts.bind ?? process.env.MANDO_BIND ?? '127.0.0.1',
+    port: opts.port ?? Number(process.env.MANDO_PORT ?? 8802),
     async fetch(req, srv): Promise<Response | undefined> {
       const url = new URL(req.url);
 
@@ -652,10 +652,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<ButlerServe
 if (import.meta.main) {
   const s = await startServer();
   console.log(
-    `butler2 listening on :${s.port}（迁移 latest=${s.migrations.latest}，执行机 ${s.drivers.size} 台，飞书=${s.feishuEnabled ? 'on' : 'off'}）`,
+    `mando listening on :${s.port}（迁移 latest=${s.migrations.latest}，执行机 ${s.drivers.size} 台，飞书=${s.feishuEnabled ? 'on' : 'off'}）`,
   );
   const shutdown = async (sig: string): Promise<void> => {
-    console.log(`[butler2] 收到 ${sig}，优雅停机…`);
+    console.log(`[mando] 收到 ${sig}，优雅停机…`);
     await s.stop();
     process.exit(0);
   };

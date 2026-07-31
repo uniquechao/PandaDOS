@@ -764,7 +764,7 @@ function CreateProjectModal({
             <input
               value={workBranch}
               onInput={(e) => setWorkBranch(e.currentTarget.value)}
-              placeholder="任务都在你当前所在的分支上干活，butler 不新建/不切/不合并分支（分支与 MR 你自己在 GitLab 管理）；此项仅当读不到当前分支时兜底用"
+              placeholder="任务都在你当前所在的分支上干活，mando 不新建/不切/不合并分支（分支与 MR 你自己在 GitLab 管理）；此项仅当读不到当前分支时兜底用"
             />
           </label>
         )}

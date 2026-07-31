@@ -9,7 +9,7 @@ let dir: string;
 const driver = new LocalDriver();
 
 beforeAll(async () => {
-  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'butler2-jsonl-'));
+  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-jsonl-'));
 });
 afterAll(async () => {
   await fsp.rm(dir, { recursive: true, force: true });

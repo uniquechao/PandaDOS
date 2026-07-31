@@ -59,9 +59,9 @@ export interface LlmClient {
 /**
  * LLM provider 配置形状（唯一真相）：
  * - DB：llm_config 表单行（id=1，040_pm_agent.sql；admin 可改，saveLlmConfig）
- * - 环境变量（DB 未保存对应字段时兜底）：BUTLER2_LLM_BASE_URL / BUTLER2_LLM_MODEL /
- *   BUTLER2_LLM_API_KEY / BUTLER2_LLM_TEMPERATURE / BUTLER2_LLM_TIMEOUT_MS /
- *   BUTLER2_LLM_RETRIES / BUTLER2_LLM_MAX_CONCURRENT
+ * - 环境变量（DB 未保存对应字段时兜底）：MANDO_LLM_BASE_URL / MANDO_LLM_MODEL /
+ *   MANDO_LLM_API_KEY / MANDO_LLM_TEMPERATURE / MANDO_LLM_TIMEOUT_MS /
+ *   MANDO_LLM_RETRIES / MANDO_LLM_MAX_CONCURRENT
  */
 export interface LlmConfig {
   baseUrl: string;
@@ -125,15 +125,15 @@ export function loadLlmConfig(db?: Database): LlmConfig {
   }
   const e = process.env;
   return {
-    baseUrl: row.base_url ?? e.BUTLER2_LLM_BASE_URL ?? DEFAULT_LLM_CONFIG.baseUrl,
-    model: row.model ?? e.BUTLER2_LLM_MODEL ?? DEFAULT_LLM_CONFIG.model,
-    apiKey: row.api_key ?? e.BUTLER2_LLM_API_KEY ?? DEFAULT_LLM_CONFIG.apiKey,
-    temperature: row.temperature ?? envNum(e.BUTLER2_LLM_TEMPERATURE) ?? DEFAULT_LLM_CONFIG.temperature,
-    timeoutMs: row.timeout_ms ?? envNum(e.BUTLER2_LLM_TIMEOUT_MS) ?? DEFAULT_LLM_CONFIG.timeoutMs,
-    retries: row.retries ?? envNum(e.BUTLER2_LLM_RETRIES) ?? DEFAULT_LLM_CONFIG.retries,
+    baseUrl: row.base_url ?? e.MANDO_LLM_BASE_URL ?? DEFAULT_LLM_CONFIG.baseUrl,
+    model: row.model ?? e.MANDO_LLM_MODEL ?? DEFAULT_LLM_CONFIG.model,
+    apiKey: row.api_key ?? e.MANDO_LLM_API_KEY ?? DEFAULT_LLM_CONFIG.apiKey,
+    temperature: row.temperature ?? envNum(e.MANDO_LLM_TEMPERATURE) ?? DEFAULT_LLM_CONFIG.temperature,
+    timeoutMs: row.timeout_ms ?? envNum(e.MANDO_LLM_TIMEOUT_MS) ?? DEFAULT_LLM_CONFIG.timeoutMs,
+    retries: row.retries ?? envNum(e.MANDO_LLM_RETRIES) ?? DEFAULT_LLM_CONFIG.retries,
     backoffMs: DEFAULT_LLM_CONFIG.backoffMs,
     maxConcurrent:
-      row.max_concurrent ?? envNum(e.BUTLER2_LLM_MAX_CONCURRENT) ?? DEFAULT_LLM_CONFIG.maxConcurrent,
+      row.max_concurrent ?? envNum(e.MANDO_LLM_MAX_CONCURRENT) ?? DEFAULT_LLM_CONFIG.maxConcurrent,
   };
 }
 

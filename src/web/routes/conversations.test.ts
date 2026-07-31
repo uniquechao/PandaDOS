@@ -42,7 +42,7 @@ class FakeConvDriver implements ConvDriver {
     this.sent.push({ session, text });
   }
   async statPath() {
-    return { size: 1, isDirectory: true }; // cwd 视为已存在，跳过 .butler-keep 物化
+    return { size: 1, isDirectory: true }; // cwd 视为已存在，跳过 .mando/keep 物化
   }
   async readFileRange() {
     return { data: new Uint8Array(), size: 0 };

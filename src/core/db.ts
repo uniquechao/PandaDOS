@@ -1,16 +1,16 @@
 /**
  * core/db —— bun:sqlite 封装。
- * 职责：打开单文件 DB（默认 ~/.butler2/butler.db），统一 PRAGMA（WAL / 外键 / busy_timeout）。
+ * 职责：打开单文件 DB（默认 ~/.mando/mando.db），统一 PRAGMA（WAL / 外键 / busy_timeout）。
  */
 import { Database } from 'bun:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 
-export const DEFAULT_DB_PATH = join(homedir(), '.butler2', 'butler.db');
+export const DEFAULT_DB_PATH = join(homedir(), '.mando', 'mando.db');
 
 export function defaultDbPath(): string {
-  return process.env.BUTLER2_DB ?? DEFAULT_DB_PATH;
+  return process.env.MANDO_DB ?? DEFAULT_DB_PATH;
 }
 
 /**

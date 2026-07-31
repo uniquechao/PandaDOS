@@ -2,7 +2,7 @@
  * components/ImageLightbox —— 全屏图片灯箱（可复用）。
  *
  * 给定 pid + 项目内相对路径，用 GET /api/projects/:pid/fs/raw?path= 内联渲染 <img>
- * （该端点按扩展名给 image/*，截图落在项目 cwd 内的 .tmux-butler-uploads/ 下，直接可服务，
+ * （该端点按扩展名给 image/*，截图落在项目 cwd 内的 .mando/uploads/ 下，直接可服务，
  * 子任务 1 已核实后端无需改动）。
  *
  * 交互：✕ / 点背景（图片以外的空白）/ Esc 关闭；顶栏带下载链接（走 fs/download 强制附件）。
@@ -22,7 +22,7 @@ export function ImageLightbox({
   onClose,
 }: {
   pid: number;
-  /** 项目 cwd 相对路径（如 .tmux-butler-uploads/<子目录>/<名>） */
+  /** 项目 cwd 相对路径（如 .mando/uploads/<子目录>/<名>） */
   path: string;
   onClose: () => void;
 }) {

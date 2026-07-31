@@ -111,7 +111,7 @@ export interface ConversationManagerOpts {
   /** 执行机上的 ~/.codex/config.toml（codex trust_level 预置；缺省跳过，兜底=启动参数直接 bypass） */
   codexConfigFile?: string;
   /**
-   * codex 启动附加参数。默认 bypass 审批+沙箱：butler 无人守屏全自动驱动，codex 的
+   * codex 启动附加参数。默认 bypass 审批+沙箱：mando 无人守屏全自动驱动，codex 的
    * 审批弹窗不走 CC 菜单协议（screen.ts 检不到），滞留即卡死——与 claude 侧
    * 「PM 自动过菜单」对齐的等效选择。
    */
@@ -449,7 +449,7 @@ export class ConversationManager {
     // 确保项目 cwd 在执行机上存在（writeFile 会建父目录；已存在则跳过，不污染项目目录）
     const cwdStat = await this.driver.statPath(cwd).catch(() => null);
     if (!cwdStat) {
-      await this.driver.writeFile(`${cwd.replace(/\/+$/, '')}/.butler-keep`, '');
+      await this.driver.writeFile(`${cwd.replace(/\/+$/, '')}/.mando/keep`, '');
     }
 
     const cmd = await this.buildCommand(c);

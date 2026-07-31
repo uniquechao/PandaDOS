@@ -360,10 +360,10 @@ describe('本地兜底分级（issue #91，LLM 不可用时）', () => {
       'Bash command\nrm -rf node_modules',
       'Bash command\ngit push --force origin main',
       'Bash command\ngit reset --hard HEAD~3',
-      'Bash command\nsqlite3 butler.db "DROP TABLE issues;"',
-      'Bash command\nsystemctl restart butler2',
+      'Bash command\nsqlite3 mando.db "DROP TABLE issues;"',
+      'Bash command\nsystemctl restart mando',
       'Bash command\nsudo chown -R root /etc',
-      'Edit file\n/root/.butler2/env\nUpdate BUTLER2_LLM_API_KEY',
+      'Edit file\n/root/.mando/env\nUpdate MANDO_LLM_API_KEY',
       'Bash command\n./deploy.sh prod',
     ];
     for (const context of danger) {
@@ -467,8 +467,8 @@ describe('自动批准档位（issue #108）', () => {
       'rm -rf node_modules',
       'git push --force origin main',
       'git reset --hard HEAD~3',
-      'sqlite3 butler.db "DROP TABLE issues;"',
-      'systemctl restart butler2',
+      'sqlite3 mando.db "DROP TABLE issues;"',
+      'systemctl restart mando',
       './deploy.sh prod',
     ];
     for (const cmd of danger) {
@@ -479,7 +479,7 @@ describe('自动批准档位（issue #108）', () => {
     // 改生产密钥这类非 Bash 弹窗同样拦住
     const env = await decideApproval(
       llm,
-      { context: 'Edit file\n/root/.butler2/env\nUpdate BUTLER2_LLM_API_KEY', options: CC },
+      { context: 'Edit file\n/root/.mando/env\nUpdate MANDO_LLM_API_KEY', options: CC },
       {},
       'auto',
     );

@@ -205,13 +205,13 @@ describe('并发信号量（评审 5.3#8：全局限流）', () => {
 
 describe('配置读取（形状见 llm.ts LlmConfig 注释）', () => {
   const ENV_KEYS = [
-    'BUTLER2_LLM_BASE_URL',
-    'BUTLER2_LLM_MODEL',
-    'BUTLER2_LLM_API_KEY',
-    'BUTLER2_LLM_TEMPERATURE',
-    'BUTLER2_LLM_TIMEOUT_MS',
-    'BUTLER2_LLM_RETRIES',
-    'BUTLER2_LLM_MAX_CONCURRENT',
+    'MANDO_LLM_BASE_URL',
+    'MANDO_LLM_MODEL',
+    'MANDO_LLM_API_KEY',
+    'MANDO_LLM_TEMPERATURE',
+    'MANDO_LLM_TIMEOUT_MS',
+    'MANDO_LLM_RETRIES',
+    'MANDO_LLM_MAX_CONCURRENT',
   ];
   const saved = new Map<string, string | undefined>();
   for (const k of ENV_KEYS) saved.set(k, process.env[k]);
@@ -242,9 +242,9 @@ describe('配置读取（形状见 llm.ts LlmConfig 注释）', () => {
     const db = openDb(':memory:');
     migratePmAgent(db);
     saveLlmConfig(db, { model: 'db-model', apiKey: 'db-key', temperature: 0.7 });
-    process.env.BUTLER2_LLM_BASE_URL = 'https://env.example/v1';
-    process.env.BUTLER2_LLM_MODEL = 'env-model';
-    process.env.BUTLER2_LLM_API_KEY = 'env-key';
+    process.env.MANDO_LLM_BASE_URL = 'https://env.example/v1';
+    process.env.MANDO_LLM_MODEL = 'env-model';
+    process.env.MANDO_LLM_API_KEY = 'env-key';
     let c = loadLlmConfig(db);
     expect(c.baseUrl).toBe('https://env.example/v1');
     expect(c.model).toBe('db-model');
@@ -262,7 +262,7 @@ describe('配置读取（形状见 llm.ts LlmConfig 注释）', () => {
 
   test('数据库空字符串是明确清空，不被环境变量复活', () => {
     clearEnv();
-    process.env.BUTLER2_LLM_API_KEY = 'env-key';
+    process.env.MANDO_LLM_API_KEY = 'env-key';
     const db = openDb(':memory:');
     migratePmAgent(db);
     saveLlmConfig(db, { baseUrl: 'https://db.example/v1', model: 'db-model', apiKey: '' });

@@ -282,7 +282,7 @@ export type EngineClarifyResult =
 // ---------- 执行结果总结（文件哨兵；与 clarify-runner/agent-summary 同理，抓屏必误命中） ----------
 
 /** 总结 scratch 根目录名（挂在项目 cwd 下；子目录按 issueId 隔离） */
-export const RESULT_SUMMARY_SCRATCH_BASE = '.butler-issue-summary';
+export const RESULT_SUMMARY_SCRATCH_BASE = '.mando/tmp/result';
 
 /** 给 cwd + issueId 算出总结 scratch 各绝对路径 */
 export function resultSummaryPaths(cwd: string, issueId: number): {
@@ -709,7 +709,7 @@ export class IssueStore {
   /**
    * 悬空创建时澄清（重启恢复扫描的判据）：最后一条 clarify_started 之后无终态事件
    * —— clarify_done / clarify_discarded / error@where=clarify。分析链与轮询 runner
-   * 是进程内存态，butler2 重启即蒸发，只留下这种「有头无尾」的事件形状。
+   * 是进程内存态，mando 重启即蒸发，只留下这种「有头无尾」的事件形状。
    * 不看 issue 状态（pending 重跑还是补收口由引擎分流）；只扫 active 项目。
    */
   listDanglingClarify(): EngineIssue[] {
@@ -2255,7 +2255,7 @@ export class IssueEngine {
    * 重启恢复扫描（start() 一次性）：悬空分析按状态分流——仍 pending 的重新
    * scheduleClarify 全新重跑（runner 步骤 0 自清残留会话与 scratch，天然幂等）；
    * 已开跑/完结的补不回也无意义，只补记 clarify_discarded 收口事件，并清掉
-   * 本该由 runner finally 清理的残留 clr-<id> 会话与 .butler-clarify/<id>。
+   * 本该由 runner finally 清理的残留 clr-<id> 会话与 .mando/tmp/clarify/<id>。
    */
   private async recoverClarify(): Promise<void> {
     if (!this.deps.clarify) return;

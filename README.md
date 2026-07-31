@@ -1,4 +1,4 @@
-# Mando AI — Issue-driven coding agent orchestration
+# MandoAI — Issue-driven coding agent orchestration
 
 **Your self-hosted control plane for Claude Code and Codex. Turn issues into queued, observable,
 approval-aware coding workflows—from any browser.**
@@ -8,14 +8,14 @@ approval-aware coding workflows—from any browser.**
 [Quick Start](#quick-start) · [Highlights](#highlights) · [Architecture](#architecture) ·
 [Deployment](#deployment) · [Security](#security)
 
-Mando AI connects your issue queue, coding-agent CLIs, tmux sessions, and a browser workspace. It
+MandoAI connects your issue queue, coding-agent CLIs, tmux sessions, and a browser workspace. It
 coordinates clarification, execution, approvals, progress, notifications, and recovery while the
 actual code changes remain in the hands of Claude Code or Codex on machines you control.
 
-Mando AI is not an AI model. It is the orchestration and observability layer between your team and
+MandoAI is not an AI model. It is the orchestration and observability layer between your team and
 the coding agents you already use.
 
-![Mando AI workspace overview](docs/images/mando-workspace-overview.png)
+![MandoAI workspace overview](docs/images/mando-workspace-overview.png)
 
 > The workspace, users, issues, branches, and project names shown above are sanitized demo data.
 
@@ -40,8 +40,8 @@ bun run start
 
 Open `http://127.0.0.1:8802`.
 
-On first start, Mando AI creates the administrator account. Its one-time token is printed once and
-written to `~/.butler2/admin-token` with `0600` permissions. Keep it private.
+On first start, MandoAI creates the administrator account. Its one-time token is printed once and
+written to `~/.mando/admin-token` with `0600` permissions. Keep it private.
 
 For reverse proxies, environment variables, SSH executors, and production service setup, see the
 [deployment guide](DEPLOY.md).
@@ -67,7 +67,7 @@ For reverse proxies, environment variables, SSH executors, and production servic
 User / Browser / Notifications
               │
               ▼
-     Mando AI control plane
+     MandoAI control plane
               │
               ├── Issues, queue, and clarification
               ├── Approvals, progress, and recovery
@@ -80,12 +80,12 @@ User / Browser / Notifications
       tmux → Claude Code / Codex
 ```
 
-Each issue is a traceable unit of work. Mando AI keeps the queue and state machine moving, pauses
+Each issue is a traceable unit of work. MandoAI keeps the queue and state machine moving, pauses
 when a decision is needed, and exposes the agent's real session instead of hiding it behind a chat
 transcript. Projects can run independently; work sharing one repository is serialized to reduce
 conflicting edits.
 
-![Mando AI issue workflow](docs/images/mando-issue-workflow.png)
+![MandoAI issue workflow](docs/images/mando-issue-workflow.png)
 
 > Issue state, progress, agent, target branch, approvals, and execution summary stay together.
 
@@ -114,15 +114,15 @@ The main stack is Bun, TypeScript, SQLite, Preact, Vite, tmux, xterm.js, and ssh
 
 ## Deployment
 
-Mando AI binds to `127.0.0.1:8802` by default. Keep that loopback default for local use. For remote
+MandoAI binds to `127.0.0.1:8802` by default. Keep that loopback default for local use. For remote
 access, place it behind a trusted reverse proxy that provides TLS and authentication.
 
-Configuration uses `BUTLER2_*` environment variables. The complete reference, systemd example,
+Configuration uses `MANDO_*` environment variables. The complete reference, systemd example,
 reverse-proxy configuration, and SSH executor setup are in [DEPLOY.md](DEPLOY.md).
 
 ## Security
 
-Mando AI can expose terminals, files, Git operations, and coding-agent sessions. Treat access to the
+MandoAI can expose terminals, files, Git operations, and coding-agent sessions. Treat access to the
 web interface as access to a remote shell.
 
 - Do not expose the service directly to the public internet.
@@ -146,4 +146,4 @@ preserve the documented dependency boundaries, and include validation appropriat
 
 ## License
 
-Mando AI is licensed under the [Apache License 2.0](LICENSE).
+MandoAI is licensed under the [Apache License 2.0](LICENSE).

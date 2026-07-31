@@ -143,7 +143,7 @@ async function setup(opts: {
   modulesFor?: EngineDeps['modulesFor'];
   onNotify?: (event: EngineNotifyEvent) => void | Promise<void>;
 } = {}) {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'butler2-engine-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-engine-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
 
   const db = openDb(':memory:');
@@ -847,7 +847,7 @@ describe('正式模块绑定', () => {
         },
         async createIssuePage(module, issue) {
           pages.push(`${module.slug}#${issue.id}`);
-          return `.butler/modules/${module.slug}/issues/${issue.id}-x.md`;
+          return `.mando/modules/${module.slug}/issues/${issue.id}-x.md`;
         },
         async refreshIssueIndex() {},
       },
@@ -940,7 +940,7 @@ describe('正式模块绑定', () => {
         async ensureModule() {},
         async refreshIndex() {},
         async createIssuePage(module, issue) {
-          return `.butler/modules/${module.slug}/issues/${issue.id}-x.md`;
+          return `.mando/modules/${module.slug}/issues/${issue.id}-x.md`;
         },
         async refreshIssueIndex() {},
         async renameDir(module, newSlug) {
@@ -1173,18 +1173,18 @@ describe('ISSUE_BLOCKED 哨兵 / clarifying / 手动旁路封死', () => {
     const s = await setup();
     const issue = await s.engine.createIssue(
       s.projectId,
-      { title: '带图任务', imagesJson: JSON.stringify(['.tmux-butler-uploads/a/1.png']) },
+      { title: '带图任务', imagesJson: JSON.stringify(['.mando/uploads/a/1.png']) },
       false,
     );
-    expect(JSON.parse(s.engine.store.get(issue.id)!.imagesJson!)).toEqual(['.tmux-butler-uploads/a/1.png']);
+    expect(JSON.parse(s.engine.store.get(issue.id)!.imagesJson!)).toEqual(['.mando/uploads/a/1.png']);
 
     // 覆盖为新的一组
     s.engine.store.patchMeta(issue.id, {
-      imagesJson: JSON.stringify(['.tmux-butler-uploads/b/2.png', '.tmux-butler-uploads/b/3.png']),
+      imagesJson: JSON.stringify(['.mando/uploads/b/2.png', '.mando/uploads/b/3.png']),
     });
     expect(JSON.parse(s.engine.store.get(issue.id)!.imagesJson!)).toEqual([
-      '.tmux-butler-uploads/b/2.png',
-      '.tmux-butler-uploads/b/3.png',
+      '.mando/uploads/b/2.png',
+      '.mando/uploads/b/3.png',
     ]);
 
     // 清空：null → images_json 置空
@@ -4235,7 +4235,7 @@ describe('start() 恢复扫描：被重启打断的创建时澄清', () => {
     st.logEvent(c.id, 'clarify_done', { questions: 0 });
     // A 的中断残留现场：clr 会话还挂着 + scratch 没清（runner finally 没机会跑）
     s.driver.tmuxSessions.add(`clr-${a.id}`);
-    const aScratch = path.join(s.repo, '.butler-clarify', String(a.id));
+    const aScratch = path.join(s.repo, '.mando/tmp/clarify', String(a.id));
     await fsp.mkdir(aScratch, { recursive: true });
     await fsp.writeFile(path.join(aScratch, 'task.md'), 'x');
 

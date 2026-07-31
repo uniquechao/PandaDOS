@@ -66,7 +66,7 @@ async function initRepo(dir: string): Promise<void> {
 }
 
 async function setup(opts?: { llm?: LlmClient }) {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'butler2-git-route-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-git-route-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
 
   const db = openDb(':memory:');
@@ -773,7 +773,7 @@ const issueRefStub = (projectId: number, issueId: number): IssueGitRef | null =>
 };
 
 async function setupIssue() {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'butler2-issgit-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-issgit-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
   const db = openDb(':memory:');
   migrate(db);
@@ -992,7 +992,7 @@ async function initSharedRepo(dir: string): Promise<{
 }
 
 async function setupShared() {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'butler2-sharedgit-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-sharedgit-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
   const db = openDb(':memory:');
   migrate(db);

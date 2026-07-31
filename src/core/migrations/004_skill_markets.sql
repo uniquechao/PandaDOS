@@ -1,7 +1,7 @@
 -- 004_skill_markets: 技能市场（多市场源注册 + DeepSeek 富化缓存）
 --
 -- skill_markets: 一行 = 一个技能市场（git 仓库，内含若干「目录 + SKILL.md」技能）。
---   控制面浅克隆到 ~/.butler2/skill-markets/<name>，扫描出技能清单供浏览/安装。
+--   控制面浅克隆到 ~/.mando/skill-markets/<name>，扫描出技能清单供浏览/安装。
 --   admin 可增删；内置 4 个源（seed 见文末，claude/codex 通用的 agentskills 格式）。
 -- skill_i18n: DeepSeek 富化缓存（中文描述/标签/推荐），键 = <market>/<rel>，
 --   desc_hash = 源描述指纹（描述变了才重译，绝不重复烧 token —— v1 market-cache.json 平移进 DB）。

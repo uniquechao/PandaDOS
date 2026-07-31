@@ -1,6 +1,6 @@
-# Mando AI 架构
+# MandoAI 架构
 
-本文说明 Mando AI 当前的运行模型，以及项目、issue、对话、tmux 和执行代理之间的关系。
+本文说明 MandoAI 当前的运行模型，以及项目、issue、对话、tmux 和执行代理之间的关系。
 
 ## 核心关系
 
@@ -125,7 +125,7 @@ pending → planning → implementing → testing → done
 
 ## 数据与安全
 
-默认运行数据位于 `~/.butler2/`，包括 SQLite、管理员 token、SSH key 引用和缓存。
+默认运行数据位于 `~/.mando/`，包括 SQLite、管理员 token、SSH key 引用和缓存。
 这些数据不属于源码仓库。
 
 安全部署应遵循：

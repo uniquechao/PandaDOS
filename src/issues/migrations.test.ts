@@ -20,7 +20,7 @@ afterEach(async () => {
 
 /** 把 issues/migrations 里编号落在 [from, to] 的迁移复制到临时目录并执行 */
 async function applyRange(db: ReturnType<typeof openDb>, from: number, to: number): Promise<void> {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'butler2-mig-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-mig-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
   for (const f of await fsp.readdir(ISSUE_ENGINE_MIGRATIONS_DIR)) {
     const id = Number.parseInt(f, 10);

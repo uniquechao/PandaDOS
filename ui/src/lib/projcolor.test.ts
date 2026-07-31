@@ -6,7 +6,7 @@ import { projAvatar, projColor, projInitial } from './projcolor';
 
 describe('projInitial', () => {
   test('拉丁字母 → 大写首字母', () => {
-    expect(projInitial('tmux-butler')).toBe('T');
+    expect(projInitial('mando')).toBe('M');
     expect(projInitial('anthology')).toBe('A');
   });
   test('前导空格忽略', () => {
@@ -29,7 +29,7 @@ describe('projColor', () => {
     expect(projColor('anthology')).toEqual(projColor('anthology'));
   });
   test('不同种子一般不同色相', () => {
-    expect(projColor('anthology')).not.toEqual(projColor('tmux-butler'));
+    expect(projColor('anthology')).not.toEqual(projColor('mando'));
   });
   test('输出是合法 hsl 三元组', () => {
     const c = projColor('yubin');
@@ -41,8 +41,8 @@ describe('projColor', () => {
 
 describe('projAvatar', () => {
   test('合成 首字母 + 配色，且与分件一致', () => {
-    const a = projAvatar({ name: 'tmux-butler' });
-    expect(a.initial).toBe('T');
-    expect({ bg: a.bg, fg: a.fg, ring: a.ring }).toEqual(projColor('tmux-butler'));
+    const a = projAvatar({ name: 'mando' });
+    expect(a.initial).toBe('M');
+    expect({ bg: a.bg, fg: a.fg, ring: a.ring }).toEqual(projColor('mando'));
   });
 });

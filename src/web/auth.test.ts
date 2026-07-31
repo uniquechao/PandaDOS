@@ -22,7 +22,7 @@ describe('tokenFromReq', () => {
     expect(tokenFromReq(req({ cookie: `other=1; ${COOKIE}=abc123; x=2` }))).toBe('abc123');
   });
 
-  test('左锚定：不吃 evil_butler_token 后缀同名 cookie', () => {
+  test('左锚定：不吃 evil_mando_token 后缀同名 cookie', () => {
     expect(tokenFromReq(req({ cookie: `evil_${COOKIE}=steal` }))).toBeNull();
   });
 

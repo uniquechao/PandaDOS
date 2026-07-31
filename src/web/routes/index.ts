@@ -85,7 +85,7 @@ export interface ApiDeps {
   sessions: SessionStore;
   /** 飞书 OAuth 客户端（未配置 app 凭据传 null → 扫码接口 503/按钮不显示） */
   feishuOauth: FeishuOauthPort | null;
-  /** 对外基址（BUTLER2_PUBLIC_URL；缺省按请求 Host 推导 OAuth 回调地址） */
+  /** 对外基址（MANDO_PUBLIC_URL；缺省按请求 Host 推导 OAuth 回调地址） */
   publicUrl?: string | undefined;
   /** 通知钩子：建项目自动订阅属主（NotifyRouter 结构兼容） */
   notify?: { ensureOwnerSubscription(projectId: number, ownerUserId: number): unknown };

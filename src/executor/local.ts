@@ -105,8 +105,8 @@ export function ptySpawnEnv(
 }
 
 const EXPECT_PTY_PROGRAM = [
-  'set stty_init "rows $env(BUTLER_PTY_ROWS) columns $env(BUTLER_PTY_COLS)"',
-  'spawn -noecho /bin/sh -c $env(BUTLER_PTY_COMMAND)',
+  'set stty_init "rows $env(MANDO_PTY_ROWS) columns $env(MANDO_PTY_COLS)"',
+  'spawn -noecho /bin/sh -c $env(MANDO_PTY_COMMAND)',
   'interact',
 ].join('; ');
 
@@ -125,9 +125,9 @@ export function ptySpawnSpec(
         command: '/usr/bin/expect',
         args: ['-c', EXPECT_PTY_PROGRAM],
         extraEnv: {
-          BUTLER_PTY_COMMAND: inner,
-          BUTLER_PTY_COLS: String(cols),
-          BUTLER_PTY_ROWS: String(rows),
+          MANDO_PTY_COMMAND: inner,
+          MANDO_PTY_COLS: String(cols),
+          MANDO_PTY_ROWS: String(rows),
         },
       }
     : {
@@ -353,7 +353,7 @@ export class LocalDriver implements ExecutorDriver {
   async openPty(cmd: string, cols: number, rows: number): Promise<PtyChannel> {
     const c = Number.isFinite(cols) ? Math.max(1, Math.trunc(cols)) : 80;
     const r = Number.isFinite(rows) ? Math.max(1, Math.trunc(rows)) : 24;
-    const dir = await fsp.mkdtemp(join(tmpdir(), 'butler2-pty-'));
+    const dir = await fsp.mkdtemp(join(tmpdir(), 'mando-pty-'));
     const ttyFile = join(dir, 'tty');
     const inner = `stty cols ${c} rows ${r} 2>/dev/null; tty > ${ttyFile} 2>/dev/null; exec ${cmd}`;
     const spec = ptySpawnSpec(inner, c, r);

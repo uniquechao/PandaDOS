@@ -51,7 +51,7 @@ async function setup(opts: {
   modules?: boolean;
   organize?: EngineDeps['organize'];
 } = {}) {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'butler2-routes-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-routes-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
   const db = openDb(':memory:');
   migrate(db);
@@ -434,7 +434,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     expect(calls[2]!.title).toBe('B2');
 
     // 截图变（加图）→ 重析
-    const img = '.tmux-butler-uploads/x/shot.png';
+    const img = '.mando/uploads/x/shot.png';
     await j(s.dispatch(req('PATCH', `/api/projects/1/issues/${iid}`, s.alice.token, { images: [img] })));
     await s.engine.waitClarify();
     expect(calls.length).toBe(4);
@@ -694,20 +694,20 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
         req('POST', '/api/projects/1/issues', s.alice.token, {
           title: 'B',
           images: [
-            '.tmux-butler-uploads/abc/a.png', // 合法：上传目录内
+            '.mando/uploads/abc/a.png', // 合法：上传目录内
             7, // 非字符串
             '', // 空串
             'b.png', // 不在上传目录
-            '.tmux-butler-uploads/../secret', // 越界
+            '.mando/uploads/../secret', // 越界
             '/etc/passwd', // 绝对路径伪造
-            './.tmux-butler-uploads/def/b.png', // 合法：./ 前缀归一
+            './.mando/uploads/def/b.png', // 合法：./ 前缀归一
           ],
         }),
       ),
     );
     expect(JSON.parse(created.body.issue.imagesJson)).toEqual([
-      '.tmux-butler-uploads/abc/a.png',
-      './.tmux-butler-uploads/def/b.png',
+      '.mando/uploads/abc/a.png',
+      './.mando/uploads/def/b.png',
     ]);
   });
 
@@ -941,27 +941,27 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
       s.dispatch(
         req('PATCH', `/api/projects/1/issues/${iid}`, s.alice.token, {
           images: [
-            '.tmux-butler-uploads/abc/a.png',
+            '.mando/uploads/abc/a.png',
             7, // 非字符串
             'x.png', // 不在上传目录
-            '.tmux-butler-uploads/../secret', // 越界
-            './.tmux-butler-uploads/def/b.png', // ./ 前缀归一
+            '.mando/uploads/../secret', // 越界
+            './.mando/uploads/def/b.png', // ./ 前缀归一
           ],
         }),
       ),
     );
     expect(p1.status).toBe(200);
     expect(JSON.parse(p1.body.issue.imagesJson)).toEqual([
-      '.tmux-butler-uploads/abc/a.png',
-      './.tmux-butler-uploads/def/b.png',
+      '.mando/uploads/abc/a.png',
+      './.mando/uploads/def/b.png',
     ]);
 
     // 不带 images 的 PATCH：旧图原样保留（缺省不碰）
     const p2 = await j(s.dispatch(req('PATCH', `/api/projects/1/issues/${iid}`, s.alice.token, { title: 'B2' })));
     expect(p2.status).toBe(200);
     expect(JSON.parse(p2.body.issue.imagesJson)).toEqual([
-      '.tmux-butler-uploads/abc/a.png',
-      './.tmux-butler-uploads/def/b.png',
+      '.mando/uploads/abc/a.png',
+      './.mando/uploads/def/b.png',
     ]);
 
     // 清图：images: [] → images_json 置 null

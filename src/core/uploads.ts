@@ -3,7 +3,7 @@
  *
  * 纯函数（净化白名单 / 路径校验 / 随机子目录 / Read 提示后缀）原样平移；
  * 副作用（落盘 / git exclude）改经 Driver 落到执行机——控制面不碰业务文件（spec §2 边界）。
- * 截图落在项目 cwd 下 .tmux-butler-uploads/<随机子目录>/<文件名>，
+ * 截图落在项目 cwd 下 .mando/uploads/<随机子目录>/<文件名>，
  * 这样跑在该项目里的 Claude Code 用 Read 工具读它不会触发越权权限弹窗。
  *
  * 契约备忘：
@@ -19,7 +19,7 @@ import path from 'node:path';
 export const ALLOWED_IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp']);
 
 /** 截图存放目录（位于项目 cwd 下，点开头不干扰常规文件列表） */
-export const UPLOAD_DIR = '.tmux-butler-uploads';
+export const UPLOAD_DIR = '.mando/uploads';
 
 /**
  * 净化上传图片的文件名：去掉路径分量、危险字符、前导点，限长；
@@ -189,7 +189,7 @@ export interface SavedUpload {
 }
 
 /**
- * 把一张截图经 Driver 落到执行机：<cwd>/.tmux-butler-uploads/<随机子目录>/<净化名>，
+ * 把一张截图经 Driver 落到执行机：<cwd>/.mando/uploads/<随机子目录>/<净化名>，
  * 并尽力把上传目录加进 git exclude。文件名不过白名单则抛错（路由层先用 safeImageName 拦 415）。
  */
 export async function saveUploadImage(

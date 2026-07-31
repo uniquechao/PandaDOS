@@ -45,7 +45,7 @@ function makeApp(oauth: FeishuOauthPort | null, opts: { publicUrl?: string } = {
 }
 
 function get(path: string, headers: Record<string, string> = {}): Request {
-  return new Request(`http://butler.test${path}`, { headers });
+  return new Request(`http://mando.test${path}`, { headers });
 }
 
 /** 从 302 Location 提取 state 参数 */
@@ -69,7 +69,7 @@ describe('GET /api/feishu/oauth/start（登录流）', () => {
     expect(r.status).toBe(302);
     const loc = new URL(r.headers.get('location')!);
     expect(loc.hostname).toBe('feishu.example');
-    expect(loc.searchParams.get('redirect_uri')).toBe(`http://butler.test${OAUTH_CALLBACK_PATH}`);
+    expect(loc.searchParams.get('redirect_uri')).toBe(`http://mando.test${OAUTH_CALLBACK_PATH}`);
     expect(loc.searchParams.get('state')).toMatch(/^[0-9a-f]{48}$/);
   });
 

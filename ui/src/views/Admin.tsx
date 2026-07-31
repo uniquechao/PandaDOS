@@ -654,7 +654,7 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
     ['host', 'host（留空 = 本机执行机）', '10.0.0.2'],
     ['port', 'SSH 端口', '22'],
     ['sshUser', 'SSH 用户（本机执行机可留空）', 'root'],
-    ['keyRef', '私钥路径或引用名（引用名从 ~/.butler2/keys/ 读取；本机留空）', '/Users/you/.ssh/id_ed25519'],
+    ['keyRef', '私钥路径或引用名（引用名从 ~/.mando/keys/ 读取；本机留空）', '/Users/you/.ssh/id_ed25519'],
   ];
 
   const detect = async (): Promise<void> => {

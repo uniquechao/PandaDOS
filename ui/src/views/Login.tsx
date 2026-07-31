@@ -38,7 +38,7 @@ export function LoginView({ onLogin, initErr = '' }: { onLogin: () => void; init
   return (
     <div class="login">
       <form class="login-card" onSubmit={submit}>
-        <img class="logo-mark" src="/logo-mark.png" alt="Mando AI" />
+        <img class="logo-mark" src="/logo-mark.png" alt="MandoAI" />
         <h1>
           Mando<span class="brand-ai">AI</span>
         </h1>

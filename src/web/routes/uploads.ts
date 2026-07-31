@@ -2,7 +2,7 @@
  * web/routes/uploads —— 任务截图上传（子任务10；v1 web.ts /api/issue-image 平移改造）。
  *
  * POST /api/projects/:projectId/upload：multipart（file 字段），≤5MB，仅白名单图片类型
- * （png/jpg/jpeg/gif/webp）。落盘经 Driver.writeFile 到项目 cwd/.tmux-butler-uploads/<随机子目录>/，
+ * （png/jpg/jpeg/gif/webp）。落盘经 Driver.writeFile 到项目 cwd/.mando/uploads/<随机子目录>/，
  * git exclude 经 Driver 读写（core/uploads.ts）。
  *
  * 返回 { ok, path: rel, abs, name, size }（与 v1 响应形状一致）：

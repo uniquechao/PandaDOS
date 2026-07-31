@@ -203,7 +203,7 @@ afterEach(async () => {
 
 describe('引擎 Wave3 钩子', () => {
   async function engineSetup() {
-    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'butler2-hooks-'));
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-hooks-'));
     cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
     const db = openDb(':memory:');
     migrate(db);

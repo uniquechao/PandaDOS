@@ -1,4 +1,4 @@
-# Mando AI（曼拓）— Issue 驱动的编程代理编排平台
+# MandoAI（曼拓）— Issue 驱动的编程代理编排平台
 
 **面向 Claude Code 与 Codex 的自托管控制面。把 Issue 转化为可排队、可观察、可审批的
 编程工作流，并通过任意浏览器参与。**
@@ -8,13 +8,13 @@
 [快速开始](#快速开始) · [核心特色](#核心特色) · [技术架构](#技术架构) ·
 [部署](#部署) · [安全](#安全)
 
-Mando AI 把 Issue 队列、编程代理 CLI、tmux 会话和浏览器工作台连接起来。它负责协调
+MandoAI 把 Issue 队列、编程代理 CLI、tmux 会话和浏览器工作台连接起来。它负责协调
 澄清、执行、审批、进度、通知和故障恢复，实际代码修改仍由运行在自有机器上的
 Claude Code 或 Codex 完成。
 
-Mando AI 不是 AI 模型。它是团队与现有编程代理之间的编排和可观察层。
+MandoAI 不是 AI 模型。它是团队与现有编程代理之间的编排和可观察层。
 
-![Mando AI 工作台概览](docs/images/mando-workspace-overview.png)
+![MandoAI 工作台概览](docs/images/mando-workspace-overview.png)
 
 > 上图中的工作区、用户、Issue、分支和项目名称均为经过脱敏的演示数据。
 
@@ -39,8 +39,8 @@ bun run start
 
 打开 `http://127.0.0.1:8802`。
 
-首次启动时，Mando AI 会创建管理员账号。仅显示一次的 token 会同时写入
-`~/.butler2/admin-token`，文件权限为 `0600`。请妥善保管。
+首次启动时，MandoAI 会创建管理员账号。仅显示一次的 token 会同时写入
+`~/.mando/admin-token`，文件权限为 `0600`。请妥善保管。
 
 反向代理、环境变量、SSH 执行机和生产服务配置见[部署指南](DEPLOY.md)。
 
@@ -65,7 +65,7 @@ bun run start
 用户 / 浏览器 / 通知
           │
           ▼
-   Mando AI 控制面
+   MandoAI 控制面
           │
           ├── Issue、队列与澄清
           ├── 审批、进度与故障恢复
@@ -78,11 +78,11 @@ bun run start
   tmux → Claude Code / Codex
 ```
 
-每条 Issue 都是可追踪的工作单元。Mando AI 持续推进队列和状态机，在需要决策时暂停，
+每条 Issue 都是可追踪的工作单元。MandoAI 持续推进队列和状态机，在需要决策时暂停，
 并直接呈现代理的真实会话，而不是把执行过程隐藏在聊天记录后面。不同项目可以独立运行；
 共享同一仓库的工作会串行执行，以降低并发修改冲突。
 
-![Mando AI Issue 执行流程](docs/images/mando-issue-workflow.png)
+![MandoAI Issue 执行流程](docs/images/mando-issue-workflow.png)
 
 > Issue 状态、进度、代理、目标分支、审批记录和执行总结集中在同一页面。
 
@@ -111,15 +111,15 @@ web / notify
 
 ## 部署
 
-Mando AI 默认监听 `127.0.0.1:8802`。本机使用时应保留回环地址默认值；需要远程访问时，
+MandoAI 默认监听 `127.0.0.1:8802`。本机使用时应保留回环地址默认值；需要远程访问时，
 请通过可信反向代理提供 TLS 和身份认证。
 
-配置使用 `BUTLER2_*` 环境变量。完整变量说明、systemd 示例、反向代理配置和 SSH 执行机
+配置使用 `MANDO_*` 环境变量。完整变量说明、systemd 示例、反向代理配置和 SSH 执行机
 设置见 [DEPLOY.md](DEPLOY.md)。
 
 ## 安全
 
-Mando AI 可以提供终端、文件、Git 操作和编程代理会话。应把 Web 界面的访问权限视为
+MandoAI 可以提供终端、文件、Git 操作和编程代理会话。应把 Web 界面的访问权限视为
 远程 shell 权限。
 
 - 不要把服务直接暴露到公网。
@@ -142,4 +142,4 @@ bun run build-ui
 
 ## 许可证
 
-Mando AI 采用 [Apache License 2.0](LICENSE)。
+MandoAI 采用 [Apache License 2.0](LICENSE)。

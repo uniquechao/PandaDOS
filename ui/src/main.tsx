@@ -1,5 +1,5 @@
 /**
- * Mando AI（曼拓）v2 前端壳（spec §9）：
+ * MandoAI（曼拓）v2 前端壳（spec §9）：
  * 登录（POST /api/login → GET /api/me）→ hash 路由分发到
  * 项目列表 / 看板 / issue 详情 / 对话 / 终端 / 我的设定 / admin。
  * 401（cookie 失效）任意请求触发全局回登录页。
@@ -491,8 +491,8 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
         <i class="dc1" /><i class="dc2" /><i class="dc3" /><i class="dc4" /><i class="dc5" />
       </div>
       <aside class={'sidebar' + (collapsed ? ' collapsed' : '')}>
-        <div class="brand" title="Mando AI" onClick={() => nav('/')}>
-          <img class="brand-logo" src="/logo-mark.png" alt="Mando AI" />
+        <div class="brand" title="MandoAI" onClick={() => nav('/')}>
+          <img class="brand-logo" src="/logo-mark.png" alt="MandoAI" />
           <span class="brand-tx">
             Mando<span class="brand-ai">AI</span>
           </span>

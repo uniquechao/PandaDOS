@@ -146,7 +146,7 @@ export function discoverLocalExecutorDefaults(
   const home = options.homeDir ?? homedir();
   const pathExists = options.pathExists ?? existsSync;
   const commandExists = options.commandExists ?? ((agent: AgentKind) => Bun.which(agent) !== null);
-  const envRoot = options.envWorkspaceRoot ?? process.env.BUTLER2_WORKSPACE_ROOT;
+  const envRoot = options.envWorkspaceRoot ?? process.env.MANDO_WORKSPACE_ROOT;
   const candidates = [
     ...(envRoot && isAbsolute(envRoot) ? [envRoot] : []),
     join(home, 'user_space', 'users'),

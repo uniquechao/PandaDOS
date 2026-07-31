@@ -39,7 +39,7 @@ export interface Executor {
   host: string;
   port: number;
   sshUser: string;
-  /** 控制面私钥绝对路径，或 ~/.butler2/keys/ 下的引用名；私钥内容不进 DB */
+  /** 控制面私钥绝对路径，或 ~/.mando/keys/ 下的引用名；私钥内容不进 DB */
   keyRef: string;
   workspaceRoot: string;
   claudeDir: string;

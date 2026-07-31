@@ -39,7 +39,7 @@ function tableNames(db: Database): string[] {
 }
 
 describe('migrate', () => {
-  const tmpDb = join(tmpdir(), `butler2-migrate-test-${process.pid}-${Date.now()}.db`);
+  const tmpDb = join(tmpdir(), `mando-migrate-test-${process.pid}-${Date.now()}.db`);
 
   afterEach(() => {
     for (const suffix of ['', '-wal', '-shm']) rmSync(tmpDb + suffix, { force: true });

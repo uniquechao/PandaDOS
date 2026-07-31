@@ -1,15 +1,15 @@
-# Mando AI Public README Redesign
+# MandoAI Public README Redesign
 
 ## Objective
 
 Redesign the public repository introduction using the product-led information architecture of the
-OpenClaw README as a reference, without copying its wording or presenting unsupported Mando AI
+OpenClaw README as a reference, without copying its wording or presenting unsupported MandoAI
 capabilities.
 
 The primary README will be English. A complete Simplified Chinese version will be provided in
 `README.zh-CN.md`. Both documents will share the same structure and link to each other.
 
-The primary success criterion is that a first-time visitor can understand what Mando AI does and
+The primary success criterion is that a first-time visitor can understand what MandoAI does and
 reach a working self-hosted instance with minimal scrolling.
 
 ## Audience and positioning
@@ -19,14 +19,14 @@ want a self-hosted control plane for queueing, observing, and approving agent wo
 
 Proposed title:
 
-> Mando AI — Issue-driven coding agent orchestration
+> MandoAI — Issue-driven coding agent orchestration
 
 Proposed lead:
 
 > Your self-hosted control plane for Claude Code and Codex. Turn issues into queued, observable,
 > approval-aware coding workflows—from any browser.
 
-The introduction must state that Mando AI is not an AI model. It sits between users and coding-agent
+The introduction must state that MandoAI is not an AI model. It sits between users and coding-agent
 CLIs to coordinate issues, sessions, approvals, notifications, recovery, files, terminals, and Git.
 
 ## Information architecture
@@ -101,7 +101,7 @@ The operating model will be shown as a compact text diagram:
 ```text
 User / Browser / Notifications
               ↓
-     Mando AI control plane
+     MandoAI control plane
               ↓
 Issues · approvals · sessions · files · Git
               ↓

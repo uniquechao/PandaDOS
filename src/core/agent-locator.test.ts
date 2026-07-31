@@ -14,7 +14,7 @@ let dir: string;
 const driver = new LocalDriver();
 
 beforeAll(async () => {
-  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'butler2-agentloc-'));
+  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-agentloc-'));
 });
 afterAll(async () => {
   await fsp.rm(dir, { recursive: true, force: true });

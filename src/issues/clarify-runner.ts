@@ -11,7 +11,7 @@
  * capture-pane 会回显我们敲进去的内容，抓屏必误命中）。菜单（信任/权限弹窗）自动过
  * （detectSelection + 肯定项），codex 更新弹窗选 Skip——逻辑与 agent-summary 一致。
  *
- * scratch 按 issue 隔离（.butler-clarify/<issueId>/）：同项目多条 issue 并发分析互不踩；
+ * scratch 按 issue 隔离（.mando/tmp/clarify/<issueId>/）：同项目多条 issue 并发分析互不踩；
  * 清理只删本 issue 子目录，不动兄弟。
  */
 import { DEFAULT_CODEX_ARGS } from '../core/conversations';
@@ -28,7 +28,7 @@ import type { AgentKind, IssueCategory } from '../core/types';
 export type ClarifyDriver = SummaryDriver;
 
 /** scratch 根目录名（挂在项目 cwd 下；子目录按 issueId 隔离） */
-export const CLARIFY_SCRATCH_BASE = '.butler-clarify';
+export const CLARIFY_SCRATCH_BASE = '.mando/tmp/clarify';
 
 /** 反馈读取上限（防超大文件；store 落库另有 8000 截断） */
 const MAX_FEEDBACK_BYTES = 32 * 1024;

@@ -63,7 +63,7 @@ class RecDriver implements ConvDriver {
 
 let dir: string;
 beforeAll(async () => {
-  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'butler2-conv-'));
+  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-conv-'));
 });
 afterAll(async () => {
   await fsp.rm(dir, { recursive: true, force: true });
@@ -125,7 +125,7 @@ describe('ConversationManager', () => {
     expect(driver.sent).toHaveLength(1);
     expect(driver.sent[0]).toEqual({ session: 'cc-1', text: `claude --session-id ${c.id}` });
     expect(convs.currentConv(1)).toBe(c.id);
-    // cwd 不存在 → 模块指南先物化 cwd；无需再写 .butler-keep
+    // cwd 不存在 → 模块指南先物化 cwd；无需再写 .mando/keep
     expect(await fsp.readFile(path.join(cwd, 'AGENTS.md'), 'utf8')).toContain('mando-issue');
   });
 
@@ -531,7 +531,7 @@ describe('ConversationManager codex 代理', () => {
     const mandoClaude = await fsp.readFile(path.join(claudeHome, 'skills/mando-issue/SKILL.md'), 'utf8');
     const mandoCodex = await fsp.readFile(path.join(codexHome, 'skills/mando-issue/SKILL.md'), 'utf8');
     expect(mandoClaude).toBe(mandoCodex);
-    expect(mandoClaude).toContain('.butler/modules/INDEX.md');
+    expect(mandoClaude).toContain('.mando/modules/INDEX.md');
     expect(await fsp.readFile(path.join(cwd, 'AGENTS.md'), 'utf8')).toContain('mando-issue');
     expect(await fsp.readFile(path.join(cwd, 'CLAUDE.md'), 'utf8')).toContain('@AGENTS.md');
 

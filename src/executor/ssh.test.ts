@@ -583,7 +583,7 @@ describe('SshDriver 集成（localhost 回环）', () => {
     '全接口回环：文件读写/短读循环/目录/建会话/注入/capture/git/pty/杀会话',
     async () => {
       const rand = Math.random().toString(36).slice(2, 8);
-      const tmp = `/tmp/butler2-sshdrv-${rand}`;
+      const tmp = `/tmp/mando-sshdrv-${rand}`;
       const session = `bt2-sshdrv-${rand}`;
       const driver = new SshDriver({
         host: 'localhost',

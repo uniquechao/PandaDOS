@@ -183,7 +183,7 @@ describe('用户 CRUD', () => {
 
   test('建用户经 Driver 在执行机 workspace_root 下建出 u<id> 目录', async () => {
     const { db, dispatch, admin } = makeApp();
-    const root = mkdtempSync(join(tmpdir(), 'butler2-admin-ws-'));
+    const root = mkdtempSync(join(tmpdir(), 'mando-admin-ws-'));
     db.query(
       `INSERT INTO executors (name, host, ssh_user, key_ref, workspace_root, claude_dir)
        VALUES ('e1', 'h', 'root', 'k', ?, '/c')`,

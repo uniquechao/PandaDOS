@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the public landing README with an English, product-led introduction and add a structurally equivalent Simplified Chinese README that helps visitors self-host Mando AI quickly.
+**Goal:** Replace the public landing README with an English, product-led introduction and add a structurally equivalent Simplified Chinese README that helps visitors self-host MandoAI quickly.
 
 **Architecture:** Keep all product positioning, installation, feature, architecture, deployment, and security information in two parallel Markdown files. Reuse the existing sanitized screenshots and existing repository documentation; do not add runtime code, dependencies, hosted-demo claims, or private identifiers.
 
