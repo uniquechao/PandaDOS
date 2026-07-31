@@ -176,6 +176,9 @@ class FakeDriver extends LocalDriver {
   tmuxSessions = new Set<string>();
   sent: Array<{ session: string; text: string }> = [];
   pane = '';
+  override async findExecutable(agent: 'claude' | 'codex') {
+    return `/test/bin/${agent}`;
+  }
   override async listSessions() {
     return [...this.tmuxSessions].map((name) => ({ name, createdTs: 0, attached: false }));
   }

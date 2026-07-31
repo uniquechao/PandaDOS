@@ -164,7 +164,7 @@ describe('系统本机执行机引导', () => {
     db2.close();
   });
 
-  test('自动发现按候选顺序选择 workspace，并按命令/状态目录勾选 Agent', () => {
+  test('自动发现按候选顺序选择 workspace，只有可执行命令才能启用 Agent', () => {
     const existing = new Set([
       '/home/me/workspace',
       '/home/me/projects',
@@ -182,12 +182,12 @@ describe('系统本机执行机引导', () => {
       claudeDir: '/home/me/.claude/projects',
       codexDir: '/home/me/.codex/sessions',
       supportsClaude: true,
-      supportsCodex: true,
+      supportsCodex: false,
       checkedTs: 789,
     });
   });
 
-  test('未检测到 Agent 时兼容预选 Claude；无候选 workspace 回落 ~/workspace', () => {
+  test('未检测到 Agent 时不虚构 Claude 能力；无候选 workspace 回落 ~/workspace', () => {
     expect(
       discoverLocalExecutorDefaults({
         homeDir: '/Users/me',
@@ -197,7 +197,7 @@ describe('系统本机执行机引导', () => {
       }),
     ).toMatchObject({
       workspaceRoot: '/Users/me/workspace',
-      supportsClaude: true,
+      supportsClaude: false,
       supportsCodex: false,
     });
   });

@@ -1,5 +1,5 @@
 /**
- * /api/greeting 路由测试：需登录（user 级）、正常返回 LLM 文案、LLM 失败回退静态兜底。
+ * /api/greeting 路由测试：需登录（user 级）、登录后返回固定欢迎语。
  * LLM 为结构替身，不碰真实 驱动大模型。
  */
 import { describe, expect, test } from 'bun:test';
@@ -9,7 +9,7 @@ import { UserStore } from '../../core/users';
 import type { LlmClient, LlmMessage, LlmResult } from '../../agents/llm';
 import { COOKIE } from '../auth';
 import { authDepsFromDb, createDispatcher } from '../middleware';
-import { GREETING_FALLBACK, greetingRoutes } from './greeting';
+import { GREETING_TEXT, greetingRoutes } from './greeting';
 
 function fakeLlm(
   respond: (messages: LlmMessage[]) => string,
@@ -44,31 +44,12 @@ describe('/api/greeting', () => {
     expect(r!.status).toBe(401);
   });
 
-  test('登录后返回 LLM 生成的欢迎语', async () => {
+  test('登录后返回固定 hello，且不调用 LLM', async () => {
     const llm = fakeLlm(() => '欢迎回来，愿今天顺利');
     const { dispatch, alice } = makeApp(llm);
     const r = await dispatch(getReq(alice.token));
     expect(r!.status).toBe(200);
-    expect(((await r!.json()) as { text: string }).text).toBe('欢迎回来，愿今天顺利');
-  });
-
-  test('同用户同天二次调用命中缓存：LLM 只调 1 次', async () => {
-    const llm = fakeLlm(() => '欢迎回来');
-    const { dispatch, alice } = makeApp(llm);
-    await dispatch(getReq(alice.token));
-    await dispatch(getReq(alice.token));
-    expect(llm.calls).toBe(1);
-  });
-
-  test('LLM 失败 → 200 且回退静态兜底文案', async () => {
-    const llm: LlmClient = {
-      async chat() {
-        throw new Error('llm 502');
-      },
-    };
-    const { dispatch, alice } = makeApp(llm);
-    const r = await dispatch(getReq(alice.token));
-    expect(r!.status).toBe(200);
-    expect(((await r!.json()) as { text: string }).text).toBe(GREETING_FALLBACK);
+    expect(((await r!.json()) as { text: string }).text).toBe(GREETING_TEXT);
+    expect(llm.calls).toBe(0);
   });
 });

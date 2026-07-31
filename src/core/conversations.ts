@@ -29,6 +29,8 @@ import type { AgentKind, AutoApproveLevel, Conversation, ProjectKind } from './t
 // ---------- Driver 最小接口（与 ExecutorDriver 结构兼容） ----------
 
 export interface ConvDriver {
+  /** 只探测受支持的 Agent 命令；启动必须使用返回的实际路径，找不到则拒绝创建 tmux。 */
+  findExecutable(agent: AgentKind): Promise<string | null>;
   /** command = tmux `#{pane_current_command}`（判「代理还在不在跑」的主证据，缺省则退化成只看屏） */
   listSessions(): Promise<Array<{ name: string; command?: string }>>;
   createSession(name: string, cwd: string): Promise<void>;
@@ -136,6 +138,18 @@ export const DEFAULT_CODEX_ARGS = '--dangerously-bypass-approvals-and-sandbox';
  * `-c` 每次启动都保证生效、零文件结构风险。全局选项须在子命令之前（`codex -c ... resume <sid>`，实测可解析）。
  */
 export const CODEX_NO_UPDATE_FLAG = '-c check_for_update_on_startup=false';
+
+export class AgentExecutableNotFoundError extends Error {
+  constructor(readonly agent: AgentKind) {
+    super(`执行机 PATH 中找不到 ${agent === 'claude' ? 'Claude' : 'Codex'} 可执行文件`);
+    this.name = 'AgentExecutableNotFoundError';
+  }
+}
+
+/** Agent 路径来自受限 findExecutable，但仍须安全嵌入 tmux 里的交互 shell 命令。 */
+function quoteShellWord(word: string): string {
+  return /^[A-Za-z0-9_./-]+$/.test(word) ? word : `'${word.replaceAll("'", "'\\''")}'`;
+}
 
 export class ConversationManager {
   constructor(
@@ -385,12 +399,15 @@ export class ConversationManager {
 
   /** 按对话 agent 组装启动命令；codex fresh/resume 一律重盖 launch_ts 锚点并清 path 缓存（会话发现/重定位用） */
   private async buildCommand(c: Conversation): Promise<string> {
+    const executable = await this.driver.findExecutable(c.agent);
+    if (!executable) throw new AgentExecutableNotFoundError(c.agent);
+    const command = quoteShellWord(executable);
     if (c.agent !== 'codex') {
       // 清掉 reclaim 期间可能绑上的手动会话覆盖（agent_jsonl_path）：重启后 pane 里
       // 跑的是 --resume/--session-id 的原生会话，覆盖不清会让引擎继续 tail 死文件
       this.db.query('UPDATE conversations SET agent_jsonl_path = NULL WHERE id = ?').run(c.id);
       const exists = (await this.locator.locate(c.id)) !== null;
-      return exists ? `claude --resume ${c.id}` : `claude --session-id ${c.id}`;
+      return exists ? `${command} --resume ${c.id}` : `${command} --session-id ${c.id}`;
     }
     const args = this.opts.codexArgs ?? DEFAULT_CODEX_ARGS;
     const row = this.db
@@ -405,9 +422,9 @@ export class ConversationManager {
     this.db
       .query('UPDATE conversations SET agent_launch_ts = ?, agent_jsonl_path = NULL WHERE id = ?')
       .run(Date.now(), c.id);
-    if (sid) return `codex ${CODEX_NO_UPDATE_FLAG} resume ${sid} ${args}`.trim();
+    if (sid) return `${command} ${CODEX_NO_UPDATE_FLAG} resume ${sid} ${args}`.trim();
     // fresh：codex 无 --session-id，启动后靠 agent-locator 按 launch_ts+cwd 发现真实会话
-    return `codex ${CODEX_NO_UPDATE_FLAG} ${args}`.trim();
+    return `${command} ${CODEX_NO_UPDATE_FLAG} ${args}`.trim();
   }
 
   /**

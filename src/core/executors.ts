@@ -156,13 +156,13 @@ export function discoverLocalExecutorDefaults(
   const workspaceRoot = candidates.find(pathExists) ?? join(home, 'workspace');
   const claudeState = join(home, '.claude');
   const codexState = join(home, '.codex');
-  const detectedClaude = commandExists('claude') || pathExists(claudeState);
-  const detectedCodex = commandExists('codex') || pathExists(codexState);
+  const detectedClaude = commandExists('claude');
+  const detectedCodex = commandExists('codex');
   return {
     workspaceRoot,
     claudeDir: join(claudeState, 'projects'),
     codexDir: join(codexState, 'sessions'),
-    supportsClaude: detectedClaude || !detectedCodex,
+    supportsClaude: detectedClaude,
     supportsCodex: detectedCodex,
     checkedTs: (options.now ?? Date.now)(),
   };

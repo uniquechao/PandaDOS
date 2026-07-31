@@ -58,6 +58,9 @@ class FakeDriver extends LocalDriver {
   pane = '';
   ptys: Array<{ cmd: string; cols: number; rows: number; pty: FakePty }> = [];
   resizes: Array<{ session: string; size: { cols: number; rows: number } | null }> = [];
+  override async findExecutable(agent: 'claude' | 'codex') {
+    return `/test/bin/${agent}`;
+  }
   override async listSessions() {
     return [...this.sessions].map((name) => ({ name, createdTs: 0, attached: false }));
   }
@@ -972,9 +975,11 @@ describe('WS chat ?conv= chat 独立对话：自身会话 + 恒可注入（无�
     expect(err.msg).toContain('codex'); // 文案带 agent 名
 
     // 用户文本没被打进 shell；随后触发的自愈重启会发 codex 启动命令（非用户文本）
-    await waitFor(() => t.driver.sent.some((s) => s.text.startsWith('codex ')));
+    await waitFor(() => t.driver.sent.some((s) => s.text.startsWith('/test/bin/codex ')));
     expect(t.driver.sent.some((s) => s.text === '生成一张图')).toBe(false);
-    expect(t.driver.sent.find((s) => s.text.startsWith('codex '))!.session).toBe(`chat-${convC}`);
+    expect(t.driver.sent.find((s) => s.text.startsWith('/test/bin/codex '))!.session).toBe(
+      `chat-${convC}`,
+    );
 
     c.close();
     await c.closed;

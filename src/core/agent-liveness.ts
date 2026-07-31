@@ -48,14 +48,17 @@ const SHELL_COMMANDS: ReadonlySet<string> = new Set([
 const AGENT_COMMANDS: ReadonlySet<string> = new Set(['claude', 'codex', 'node', 'bun', 'deno', 'npx']);
 
 /**
- * 末条非空行像 shell 提示符（`#` root / `$` 普通用户 / `%` zsh 收尾，可带尾随空格）。
- * 两家代理的窗格底部都是状态栏或 `❯`/`›` 输入行，不以这些字符收尾，故不会误判。
+ * 末条非空行像 shell 提示符（`#` root / `$` 普通用户 / `%` zsh，或 macOS Starship
+ * 的「cwd/git 状态 + 空格 + `❯`」收尾，可带尾随空格）。Claude 的 composer 是独立一行
+ * `❯`，不把它当 shell；Starship 命中后也只触发进一步核对 pane_current_command。
  * 全空白 → false（无从判定，按「没退回 shell」处理，绝不据此重启）。
  */
 export function shellPromptTail(pane: string): boolean {
   const lines = pane.split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i]!.trim()) return /[#$%]\s*$/.test(lines[i]!);
+    if (lines[i]!.trim()) {
+      return /[#$%]\s*$/.test(lines[i]!) || /\S.*\s❯\s*$/.test(lines[i]!);
+    }
   }
   return false;
 }

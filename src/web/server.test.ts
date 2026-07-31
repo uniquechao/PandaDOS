@@ -17,6 +17,9 @@ import { executorStatusOf, startServer, trustFileOf, type ButlerServer } from '.
 class FakeDriver extends LocalDriver {
   sessions = new Set<string>();
   sent: Array<{ session: string; text: string }> = [];
+  override async findExecutable(agent: 'claude' | 'codex') {
+    return `/test/bin/${agent}`;
+  }
   override async listSessions() {
     return [...this.sessions].map((name) => ({ name, createdTs: 0, attached: false }));
   }

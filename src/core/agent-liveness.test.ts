@@ -46,6 +46,10 @@ const BASH_AFTER_INJECT = `-bash: 请继续执行子任务: command not found
 const BASH_IDLE = `[root@VM-0-6-opencloudos livetest]#
 `;
 
+/** macOS zsh + Starship：`❯` 前面有 cwd/git 状态；不能和 Claude 的独立 composer 光标混为一谈。 */
+const MAC_STARSHIP_IDLE =
+  '~/Documents/codes/tmux_kits on codex/v2-root-cleanup ⇡3 ✗5 ?4 ❯';
+
 describe('shellPromptTail', () => {
   test('末条非空行以 # / $ / % 收尾 → true（尾随空白/空行要回溯）', () => {
     expect(shellPromptTail(BASH_IDLE)).toBe(true);
@@ -59,6 +63,11 @@ describe('shellPromptTail', () => {
   test('代理 TUI 底部（输入行/状态栏）不以 #/$/% 收尾 → false', () => {
     expect(shellPromptTail(CLAUDE_LIVE)).toBe(false);
     expect(shellPromptTail(CODEX_LIVE)).toBe(false);
+  });
+
+  test('macOS Starship 的 cwd/git + ❯ 是 shell；Claude 独立 ❯ composer 不是', () => {
+    expect(shellPromptTail(MAC_STARSHIP_IDLE)).toBe(true);
+    expect(shellPromptTail('❯ ')).toBe(false);
   });
 
   test('全空白 → false（无从判定，绝不据此重启）', () => {
@@ -120,6 +129,7 @@ describe('judgeAgentLiveness：有 pane_current_command（主判）', () => {
     expect(judgeAgentLiveness({ agent: 'claude', paneCommand: 'bash', pane: CLAUDE_EXITED })).toBe('shell');
     expect(judgeAgentLiveness({ agent: 'claude', paneCommand: 'bash', pane: BASH_AFTER_INJECT })).toBe('shell');
     expect(judgeAgentLiveness({ agent: 'codex', paneCommand: 'bash', pane: CODEX_UPDATED_OUT })).toBe('shell');
+    expect(judgeAgentLiveness({ agent: 'claude', paneCommand: 'zsh', pane: MAC_STARSHIP_IDLE })).toBe('shell');
   });
 
   test('前台是 bash 但屏没给（抓屏失败）→ 仍判 shell（主判够硬）', () => {
@@ -201,6 +211,7 @@ describe('shouldProbeLiveness（健康路径零额外 tmux 调用）', () => {
     expect(shouldProbeLiveness('claude', BASH_IDLE)).toBe(true);
     expect(shouldProbeLiveness('codex', CODEX_UPDATED_OUT)).toBe(true);
     expect(shouldProbeLiveness('claude', '')).toBe(true);
+    expect(shouldProbeLiveness('claude', MAC_STARSHIP_IDLE)).toBe(true);
     // 代理 UI 在、但末行是提示符（可能刚退出）→ 也要探
     expect(shouldProbeLiveness('claude', `${CLAUDE_LIVE}\n[root@VM p]#`)).toBe(true);
   });

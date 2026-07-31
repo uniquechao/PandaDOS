@@ -21,6 +21,7 @@
  */
 import type { Database } from 'bun:sqlite';
 import { join } from 'node:path';
+import { AgentExecutableNotFoundError } from '../core/conversations';
 import { migrate, type MigrationStatus } from '../core/migrate';
 import { parseAutoApproveLevel } from '../core/types';
 import type {
@@ -3884,6 +3885,9 @@ export class IssueEngine {
         where: 'agentRestart',
         error: String(e).slice(0, 200),
       });
+      if (e instanceof AgentExecutableNotFoundError) {
+        await this.applyEvent(issue.id, 'block', { note: e.message });
+      }
     }
   }
 
@@ -3981,6 +3985,9 @@ export class IssueEngine {
           where: 'reactivate',
           error: String(e).slice(0, 200),
         });
+        if (e instanceof AgentExecutableNotFoundError) {
+          await this.applyEvent(issue.id, 'block', { note: e.message });
+        }
         return;
       }
     } else if (current !== convId) {
@@ -4021,6 +4028,9 @@ export class IssueEngine {
         this.store.logEvent(issue.id, 'session_recovered', { session });
       } catch (e) {
         this.store.logEvent(issue.id, 'error', { where: 'recover', error: String(e).slice(0, 200) });
+        if (e instanceof AgentExecutableNotFoundError) {
+          await this.applyEvent(issue.id, 'block', { note: e.message });
+        }
       }
       return; // 本 tick 到此为止：让新会话启动，下轮再驱动
     }

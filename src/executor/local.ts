@@ -84,6 +84,26 @@ export interface PtySpawnSpec {
   extraEnv: NodeJS.ProcessEnv;
 }
 
+/**
+ * launchd 启动的 macOS 服务通常没有 locale；tmux 会把这种客户端视为非 UTF-8，
+ * attach 输出中的中文等宽字符因而被替换成 `_`。只在完全没有有效 locale 时兜底，
+ * 不覆盖部署环境显式提供的 LC_ALL / LC_CTYPE / LANG。
+ */
+export function ptySpawnEnv(
+  extraEnv: NodeJS.ProcessEnv,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  const hasLocale = [baseEnv.LC_ALL, baseEnv.LC_CTYPE, baseEnv.LANG, extraEnv.LC_ALL, extraEnv.LC_CTYPE, extraEnv.LANG]
+    .some((value) => typeof value === 'string' && value.trim().length > 0);
+  return {
+    ...baseEnv,
+    ...(platform === 'darwin' && !hasLocale ? { LANG: 'en_US.UTF-8' } : {}),
+    TERM: 'xterm-256color',
+    ...extraEnv,
+  };
+}
+
 const EXPECT_PTY_PROGRAM = [
   'set stty_init "rows $env(BUTLER_PTY_ROWS) columns $env(BUTLER_PTY_COLS)"',
   'spawn -noecho /bin/sh -c $env(BUTLER_PTY_COMMAND)',
@@ -338,7 +358,7 @@ export class LocalDriver implements ExecutorDriver {
     const inner = `stty cols ${c} rows ${r} 2>/dev/null; tty > ${ttyFile} 2>/dev/null; exec ${cmd}`;
     const spec = ptySpawnSpec(inner, c, r);
     const child = spawn(spec.command, spec.args, {
-      env: { ...process.env, TERM: 'xterm-256color', ...spec.extraEnv },
+      env: ptySpawnEnv(spec.extraEnv),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 

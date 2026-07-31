@@ -13,10 +13,17 @@ class RecDriver implements ConvDriver {
   sessions = new Set<string>();
   sent: Array<{ session: string; text: string }> = [];
   killed: string[] = [];
+  executables = new Map([
+    ['claude', 'claude'],
+    ['codex', 'codex'],
+  ]);
   /** capturePane 返回值（测试按需设置：模拟 codex 在跑 / 退回 shell / 更新弹窗） */
   paneText = '';
   /** 每会话的 #{pane_current_command}（不设 = 老实现/解析失败，判活退化成只看屏） */
   commands = new Map<string, string>();
+  async findExecutable(agent: 'claude' | 'codex') {
+    return this.executables.get(agent) ?? null;
+  }
   async listSessions() {
     return [...this.sessions].map((name) => {
       const command = this.commands.get(name);
@@ -120,6 +127,29 @@ describe('ConversationManager', () => {
     expect(convs.currentConv(1)).toBe(c.id);
     // cwd 不存在 → 模块指南先物化 cwd；无需再写 .butler-keep
     expect(await fsp.readFile(path.join(cwd, 'AGENTS.md'), 'utf8')).toContain('mando-issue');
+  });
+
+  test('Agent 命令不存在时激活立即失败，不创建 tmux 或把后续 prompt 留给 shell', async () => {
+    const { convs, driver } = setup();
+    const c = convs.create(1, 'missing claude');
+    driver.executables.delete('claude');
+
+    await expect(convs.activate(c.id)).rejects.toThrow('找不到 Claude 可执行文件');
+    expect(driver.sessions.size).toBe(0);
+    expect(driver.sent).toEqual([]);
+    expect(convs.currentConv(1)).toBeUndefined();
+  });
+
+  test('启动使用探测到的绝对路径，并安全引用带空格的路径', async () => {
+    const { convs, driver } = setup();
+    const c = convs.create(1, 'absolute claude');
+    driver.executables.set('claude', "/Applications/Claude's App/claude");
+
+    await convs.activate(c.id);
+
+    expect(driver.sent[0]!.text).toBe(
+      `'/Applications/Claude'\\''s App/claude' --session-id ${c.id}`,
+    );
   });
 
   test('重复 activate 同对话且 tmux 活着 → 幂等短路（不 kill 不重发）', async () => {

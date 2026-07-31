@@ -22,6 +22,9 @@ class FakeConvDriver implements ConvDriver {
   killed: string[] = [];
   /** capturePane 返回值（默认空串：codexExitedToShell/isCodexUpdatePrompt 均判否 → 健康短路） */
   paneText = '';
+  async findExecutable(agent: 'claude' | 'codex') {
+    return agent;
+  }
   async listSessions() {
     return [...this.sessions].map((name) => ({ name }));
   }

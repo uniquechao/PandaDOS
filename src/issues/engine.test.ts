@@ -37,11 +37,18 @@ class FakeDriver extends LocalDriver {
   tmuxSessions = new Set<string>();
   sent: Array<{ session: string; text: string }> = [];
   keys: Array<{ session: string; key: string }> = [];
+  executables = new Map([
+    ['claude', 'claude'],
+    ['codex', 'codex'],
+  ]);
   pane = '';
   /** 每会话的 #{pane_current_command}（不设 = 老实现/解析失败，判活退化成只看屏） */
   paneCommands = new Map<string, string>();
   /** listSessions 调用次数（issue #97：健康路径必须零额外 tmux 调用） */
   listCalls = 0;
+  override async findExecutable(agent: 'claude' | 'codex') {
+    return this.executables.get(agent) ?? null;
+  }
   override async listSessions() {
     this.listCalls++;
     return [...this.tmuxSessions].map((name) => {
@@ -1631,6 +1638,46 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
     expect(recoverErrors()).toBe(1);
   });
 
+  test('会话已消失且 Agent CLI 不存在：立即 blocked，不留在 driving 态反复恢复', async () => {
+    const s = await setup();
+    const { engine } = s;
+    const issue = await engine.createIssue(s.projectId, { title: '缺会话且 Claude 未安装' });
+    await s.bindJsonl(issue.id);
+    engine.store.setSubtasks(issue.id, ['a']);
+    await engine.applyEvent(issue.id, 'plan_ready');
+    await engine.applyEvent(issue.id, 'plan_approved');
+    await engine.tick();
+
+    s.driver.tmuxSessions.clear();
+    s.driver.executables.delete('claude');
+    const sentBefore = s.driver.sent.length;
+    await engine.tick();
+
+    expect(engine.store.get(issue.id)!.status).toBe('blocked');
+    expect(s.driver.sent.length).toBe(sentBefore);
+    expect(
+      engine.store
+        .listEvents(issue.id)
+        .some((event) => event.kind === 'transition' && (event.dataJson ?? '').includes('找不到 Claude 可执行文件')),
+    ).toBe(true);
+  });
+
+  test('激活绑定丢失且 Agent CLI 不存在：立即 blocked，不静默冻结', async () => {
+    const s = await setup();
+    const { engine } = s;
+    const issue = await engine.createIssue(s.projectId, { title: '激活绑定丢失且 Claude 未安装' });
+    await s.bindJsonl(issue.id);
+    s.driver.tmuxSessions.clear();
+    s.driver.executables.delete('claude');
+    s.db.query('DELETE FROM project_active_conv WHERE project_id = ?').run(s.projectId);
+    const sentBefore = s.driver.sent.length;
+
+    await engine.tick();
+
+    expect(engine.store.get(issue.id)!.status).toBe('blocked');
+    expect(s.driver.sent.length).toBe(sentBefore);
+  });
+
   // ---- issue #97：注入前的代理存活门禁 ----
 
   /** 驱动中的 issue：kickoff 已发，静默到该催办的时刻——此后每 tick 都会想注入点什么 */
@@ -1884,6 +1931,26 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
     ).toBe(1);
     expect(s.driver.sent.length).toBe(sentBefore); // 死会话零注入
     expect(engine.store.countEvents(issueId, 'nudged')).toBe(0);
+  });
+
+  test('Agent CLI 已不存在时重启立即 blocked，不在 shell 中循环注入或空等三轮', async () => {
+    const { s, issueId, session } = await drivingIssue('Claude 未安装');
+    const { engine, clock } = s;
+    s.driver.executables.delete('claude');
+    s.driver.pane = 'zsh: command not found: claude\n~/repo ❯';
+    s.driver.paneCommands.set(session, 'zsh');
+    clock.advance(181_000);
+    const sentBefore = s.driver.sent.length;
+
+    await engine.tick();
+
+    expect(engine.store.get(issueId)!.status).toBe('blocked');
+    expect(s.driver.sent.length).toBe(sentBefore);
+    expect(
+      engine.store
+        .listEvents(issueId)
+        .some((event) => event.kind === 'transition' && (event.dataJson ?? '').includes('找不到 Claude 可执行文件')),
+    ).toBe(true);
   });
 
   test('planning 判 done 死循环出口：前两次注入重输出指令并允许再催，第三次转 blocked', async () => {

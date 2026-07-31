@@ -18,7 +18,7 @@ import {
   TMUX_WIN_COLS,
   TMUX_WIN_ROWS,
 } from './driver';
-import { LocalDriver, ptySpawnSpec, runCommand, sttyResizeArgs } from './local';
+import { LocalDriver, ptySpawnEnv, ptySpawnSpec, runCommand, sttyResizeArgs } from './local';
 
 describe('I5 本地命令超时', () => {
   test('findExecutable 只从 PATH 探测固定 Agent 命令', async () => {
@@ -132,6 +132,41 @@ describe('LocalDriver.listSessions', () => {
 });
 
 describe('本地 PTY 跨平台命令参数', () => {
+  test('macOS launchd 无 locale 时补 UTF-8，已有 locale 配置不被覆盖', () => {
+    expect(ptySpawnEnv({ BUTLER_PTY_COMMAND: 'echo ok' }, { PATH: '/bin' }, 'darwin')).toEqual({
+      PATH: '/bin',
+      LANG: 'en_US.UTF-8',
+      TERM: 'xterm-256color',
+      BUTLER_PTY_COMMAND: 'echo ok',
+    });
+
+    expect(
+      ptySpawnEnv(
+        { BUTLER_PTY_COMMAND: 'echo ok' },
+        { LANG: 'zh_CN.UTF-8', LC_CTYPE: 'UTF-8', TERM: 'screen-256color' },
+        'darwin',
+      ),
+    ).toEqual({
+      LANG: 'zh_CN.UTF-8',
+      LC_CTYPE: 'UTF-8',
+      TERM: 'xterm-256color',
+      BUTLER_PTY_COMMAND: 'echo ok',
+    });
+
+    expect(ptySpawnEnv({}, { LC_ALL: 'C', PATH: '/usr/bin' }, 'darwin')).toEqual({
+      LC_ALL: 'C',
+      PATH: '/usr/bin',
+      TERM: 'xterm-256color',
+    });
+  });
+
+  test('非 macOS 不自行注入 locale', () => {
+    expect(ptySpawnEnv({}, { PATH: '/bin' }, 'linux')).toEqual({
+      PATH: '/bin',
+      TERM: 'xterm-256color',
+    });
+  });
+
   test('Linux 使用 util-linux script，macOS 使用 expect 从 pipe 创建 PTY', () => {
     expect(ptySpawnSpec('echo ok', 100, 40, 'linux')).toEqual({
       command: 'script',
