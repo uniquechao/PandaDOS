@@ -1,0 +1,314 @@
+/**
+ * 项目模块管理面板（Modal，Board 头部「模块」入口）：
+ * - 智能整理：手动触发（可选 claude/codex），执行代理在独立会话扫全部历史 issue + 代码库，
+ *   产出整理方案（合并 / 改 slug / 新建模块 / 挪 issue）；面板轮询进度，方案逐项「执行」
+ *   （服务端按当前事实重校验 + 防重放），或「忽略本批」（localStorage 同批不再提示）。
+ * - 模块列表：显示名 · slug · 代理 · 来源 · issue 数；行内改名（PATCH displayName）、
+ *   归档（PATCH status=archived，有未完结 issue 服务端会拒绝并给中文原因）。
+ */
+import { useEffect, useState } from 'preact/hooks';
+import { api, ApiError } from '../lib/api';
+import type { AgentKind, Issue, ProjectModule } from '../lib/types';
+import {
+  actionKindLabel,
+  actionLabel,
+  dismissOrganizeSuggestion,
+  readOrganizeDismissedTs,
+  visibleSuggestion,
+  type OrganizeStatus,
+} from '../lib/organize';
+import { Modal } from './Modal';
+import { toast } from '../lib/toast';
+import { reconcileAgent } from './AgentPicker';
+
+const ORG_POLL_MS = 4000;
+
+export function ModulesPanel({
+  pid,
+  issues,
+  supportedAgents,
+  onChanged,
+  onClose,
+}: {
+  pid: number;
+  issues: Issue[];
+  supportedAgents: AgentKind[];
+  /** 合并/归档/整理改变了 issue 归属或模块列表后回调（Board 刷新列表用） */
+  onChanged: () => void;
+  onClose: () => void;
+}) {
+  const [modules, setModules] = useState<ProjectModule[] | null>(null);
+  const [org, setOrg] = useState<OrganizeStatus | null>(null);
+  const [orgAgent, setOrgAgent] = useState<AgentKind>('claude');
+  const [dismissed, setDismissed] = useState<number | null>(() => readOrganizeDismissedTs(pid));
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editName, setEditName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [applying, setApplying] = useState<number | null>(null);
+  const [err, setErr] = useState('');
+
+  const load = (): void => {
+    api<{ modules: ProjectModule[] }>(`/api/projects/${pid}/modules`)
+      .then((r) => setModules(r.modules))
+      .catch((e: Error) => setErr(e.message));
+    void loadOrg();
+  };
+  const loadOrg = (): Promise<void> =>
+    api<OrganizeStatus>(`/api/projects/${pid}/modules/organize`)
+      .then(setOrg)
+      .catch(() => {});
+  useEffect(load, [pid]);
+  useEffect(() => {
+    const next = reconcileAgent(orgAgent, supportedAgents);
+    if (next) setOrgAgent(next);
+  }, [supportedAgents]);
+
+  // 分析在途时轮询（面板开着才轮；归还后最后再拉一次拿方案）
+  useEffect(() => {
+    if (!org?.running) return;
+    const t = window.setInterval(() => void loadOrg(), ORG_POLL_MS);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [org?.running, pid]);
+
+  const sugg = visibleSuggestion(org, dismissed);
+  const issueCount = (moduleId: number): number => issues.filter((i) => i.moduleId === moduleId).length;
+
+  const startOrganize = async (): Promise<void> => {
+    if (busy || org?.running) return;
+    setBusy(true);
+    try {
+      await api(`/api/projects/${pid}/modules/organize`, 'POST', { agent: orgAgent });
+      toast.info(`已开始分析（${orgAgent}）：扫描全部 issue 与代码库，可能要几分钟`);
+      await loadOrg();
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const applyAction = async (index: number): Promise<void> => {
+    if (applying !== null) return;
+    setApplying(index);
+    try {
+      const r = await api<{ ok: boolean; summary: string }>(
+        `/api/projects/${pid}/modules/organize/apply`,
+        'POST',
+        { index },
+      );
+      toast.success(r.summary);
+      load();
+      onChanged();
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : String(e));
+      void loadOrg(); // 失败也刷新（可能已被别处执行）
+    } finally {
+      setApplying(null);
+    }
+  };
+
+  const ignore = (): void => {
+    const ts = org?.suggestion?.ts ?? Date.now();
+    dismissOrganizeSuggestion(pid, ts);
+    setDismissed(ts);
+    toast.info('本批方案已忽略；再次点「智能整理」可重新分析');
+  };
+
+  const saveRename = async (m: ProjectModule): Promise<void> => {
+    const name = editName.trim();
+    if (!name || busy) return;
+    setBusy(true);
+    try {
+      await api(`/api/projects/${pid}/modules/${m.id}`, 'PATCH', { displayName: name });
+      toast.success('已改名');
+      setEditingId(null);
+      load();
+      onChanged();
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const archive = async (m: ProjectModule): Promise<void> => {
+    if (busy) return;
+    if (!confirm(`归档模块「${m.displayName}」？归档后不再出现在选择器与自动归类里（档案保留）。`)) return;
+    setBusy(true);
+    try {
+      await api(`/api/projects/${pid}/modules/${m.id}`, 'PATCH', { status: 'archived' });
+      toast.success('已归档');
+      load();
+      onChanged();
+    } catch (e) {
+      // 典型拒绝：模块还有未完结 issue → 提示先合并/处理
+      toast.error(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const changeAgent = async (m: ProjectModule, agent: AgentKind): Promise<void> => {
+    if (busy || agent === m.agent) return;
+    setBusy(true);
+    try {
+      await api(`/api/projects/${pid}/modules/${m.id}`, 'PATCH', { agent });
+      toast.success(`模块已切换为 ${agent}`);
+      load();
+      onChanged();
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title="项目模块" wide onClose={onClose}>
+      <div class="formcol">
+        <div class="org-bar">
+          <span class="org-title">✨ 智能整理</span>
+          <span class="org-hint" title="执行代理在独立会话里扫描全部 issue 与代码库，产出整理方案，逐项确认后执行">
+            扫全部 issue，建议合并 / 改名 / 新建 / 挪
+          </span>
+          <select
+            value={orgAgent}
+            disabled={org?.running || busy}
+            onChange={(e) => setOrgAgent(e.currentTarget.value as AgentKind)}
+          >
+            {supportedAgents.map((a) => (
+              <option key={a} value={a}>{a === 'claude' ? 'Claude Code' : 'Codex'}</option>
+            ))}
+          </select>
+          <button
+            class="btn sm primary"
+            disabled={busy || !!org?.running || supportedAgents.length === 0}
+            onClick={() => void startOrganize()}
+          >
+            {org?.running ? '分析中…' : '开始分析'}
+          </button>
+        </div>
+        {org?.running && (
+          <div class="org-note run">
+            <span class="spinner sm" />
+            代理正在扫描 issue 与代码库，结果会出现在这里…
+          </div>
+        )}
+        {!org?.running && org?.failed && (
+          <div class="org-note fail">
+            上次分析失败（{org.failed.reason}
+            {org.failed.error ? `：${org.failed.error}` : ''}），可重新触发
+          </div>
+        )}
+
+        {sugg && (
+          <div class="org-card">
+            <div class="org-hd">
+              <span class="org-hd-t">整理方案</span>
+              <span class="org-hd-meta">
+                {sugg.agent} · {sugg.actions.filter((a) => !a.applied).length}/{sugg.actions.length} 项待确认
+              </span>
+              {sugg.actions.some((a) => !a.applied) && (
+                <button class="org-ignore" disabled={applying !== null} onClick={ignore}>
+                  忽略本批
+                </button>
+              )}
+            </div>
+            {sugg.actions.map((a, i) => (
+              <div class={`org-item${a.applied ? ' done' : ''}`} key={i}>
+                <span class={`badge ${a.kind === 'merge' ? 'b-ai' : 'b-gray'}`}>{actionKindLabel(a.kind)}</span>
+                <div class="org-item-tx">
+                  <div class="org-label">{actionLabel(a)}</div>
+                  {a.reason && <div class="org-reason">{a.reason}</div>}
+                </div>
+                {a.applied ? (
+                  <span class="org-applied">✓ 已执行</span>
+                ) : (
+                  <button class="org-apply" disabled={applying !== null} onClick={() => void applyAction(i)}>
+                    {applying === i ? '执行中…' : '执行'}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {modules === null ? (
+          <div class="mut">加载中…</div>
+        ) : modules.length === 0 ? (
+          <div class="empty">还没有模块；建 issue 时会自动归类生成。</div>
+        ) : (
+          <div class="mlist">
+            {modules.map((m) => (
+              <div class="mrow" key={m.id}>
+                {editingId === m.id ? (
+                  <>
+                    <input
+                      class="mrow-edit"
+                      value={editName}
+                      onInput={(e) => setEditName(e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') void saveRename(m);
+                      }}
+                    />
+                    <button class="mrow-act save" disabled={busy || !editName.trim()} onClick={() => void saveRename(m)}>
+                      保存
+                    </button>
+                    <button class="mrow-act" disabled={busy} onClick={() => setEditingId(null)}>
+                      取消
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <span class="mrow-main">
+                      <span class="mrow-name">{m.displayName}</span>
+                      <span class="mrow-slug">{m.slug}</span>
+                    </span>
+                    <span class="mrow-src" title="模块来源">
+                      {m.source === 'legacy' ? '迁移' : m.source === 'manual' ? '手动' : '自动'}
+                    </span>
+                    <select
+                      class="mrow-agent"
+                      value={m.agent}
+                      disabled={busy}
+                      title="模块固定 Agent"
+                      onChange={(e) => void changeAgent(m, e.currentTarget.value as AgentKind)}
+                    >
+                      {!supportedAgents.includes(m.agent) && <option value={m.agent}>{m.agent}（不可用）</option>}
+                      {supportedAgents.map((a) => <option key={a} value={a}>{a}</option>)}
+                    </select>
+                    <span class="badge b-gray" title="关联 issue 数">
+                      {issueCount(m.id)} issue
+                    </span>
+                    <span class="mrow-acts">
+                      <button
+                        class="mrow-act"
+                        disabled={busy}
+                        onClick={() => {
+                          setEditingId(m.id);
+                          setEditName(m.displayName);
+                        }}
+                      >
+                        改名
+                      </button>
+                      <button class="mrow-act danger" disabled={busy} onClick={() => void archive(m)}>
+                        归档
+                      </button>
+                    </span>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {err && <div class="err">{err}</div>}
+      </div>
+      <div class="mbtns">
+        <button class="btn" onClick={onClose}>
+          关闭
+        </button>
+      </div>
+    </Modal>
+  );
+}

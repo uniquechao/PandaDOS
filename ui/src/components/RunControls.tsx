@@ -1,0 +1,47 @@
+/**
+ * 运行操作栏——执行现场「对话」模式顶部的常驻控制条（仅 issue 驱动中显示，见 ChatPane）。
+ *  - 重试：让 AI 重试刚才失败的步骤（注入提示；可用性/文案在 subtask 7 细化）；
+ *  - 终止：取消整个 issue（父层带二次确认）。
+ * 纯展示：动作全由父层回调注入。
+ */
+import type { ComponentChildren } from 'preact';
+
+export function RunControls({
+  leading,
+  onRetry,
+  retryLabel,
+  retryEnabled,
+  retryHint,
+  onTerminate,
+  busy,
+}: {
+  /** 行首内联插槽（如「对话/原生」切换钮）：与运行操作钮合并为同一行 */
+  leading?: ComponentChildren;
+  onRetry: () => void;
+  /** 重试按钮文案（随状态变化，如「重试」/「解除阻塞重跑」） */
+  retryLabel: string;
+  /** 重试是否可点（无失败步骤时禁用） */
+  retryEnabled: boolean;
+  /** 重试按钮悬浮说明 */
+  retryHint?: string;
+  onTerminate: () => void;
+  busy?: boolean;
+}) {
+  return (
+    <div class="runctl">
+      {leading}
+      <span class="rc-label">运行中</span>
+      <button
+        class="rc-btn"
+        disabled={!retryEnabled}
+        title={retryHint ?? ''}
+        onClick={() => retryEnabled && onRetry()}
+      >
+        ↻ {retryLabel}
+      </button>
+      <button class="rc-btn danger" disabled={busy} title="取消整个 issue" onClick={onTerminate}>
+        ■ 终止
+      </button>
+    </div>
+  );
+}

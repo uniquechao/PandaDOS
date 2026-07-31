@@ -1,0 +1,70 @@
+# Dependencies and build output
+node_modules/
+public/
+dist/
+coverage/
+.turbo/
+.vite/
+
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+*.local
+
+# Credentials, tokens, and certificates
+admin-token
+*admin-token*
+credentials.json
+credentials.*.json
+secrets.json
+secrets.*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+.npmrc.local
+.netrc
+
+# Databases and runtime state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.wal
+*.shm
+.butler2/
+.butler/
+.butler-issue-summary/
+.tmux-butler-uploads/
+.deploy-backups/
+
+# Logs, temporary files, and backups
+*.log
+*.pid
+*.tmp
+*.temp
+*.bak
+*.backup
+*.swp
+*.swo
+*~
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Test and tool caches
+.cache/
+.nyc_output/
+playwright-report/
+test-results/
