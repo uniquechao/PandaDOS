@@ -15,7 +15,7 @@ actual code changes remain in the hands of Claude Code or Codex on machines you 
 MandoAI is not an AI model. It is the orchestration and observability layer between your team and
 the coding agents you already use.
 
-![MandoAI workspace overview](docs/images/mando-workspace-overview.png)
+![MandoAI workspace overview](docs/images/mando-workspace-overview-en.png)
 
 > The workspace, users, issues, branches, and project names shown above are sanitized demo data.
 
@@ -91,7 +91,7 @@ when a decision is needed, and exposes the agent's real session instead of hidin
 transcript. Projects can run independently; work sharing one repository is serialized to reduce
 conflicting edits.
 
-![MandoAI issue workflow](docs/images/mando-issue-workflow.png)
+![MandoAI issue workflow](docs/images/mando-issue-workflow-en.png)
 
 > Issue state, progress, agent, target branch, approvals, and execution summary stay together.
 
