@@ -44,11 +44,11 @@ describe('isSummaryRunning', () => {
 
 describe('summaryBtnLabel', () => {
   test('busy 或 running → 生成中…；否则 更新简介', () => {
-    expect(summaryBtnLabel('idle', false)).toBe('更新简介');
-    expect(summaryBtnLabel('idle', true)).toBe('生成中…');
-    expect(summaryBtnLabel('running', false)).toBe('生成中…');
-    expect(summaryBtnLabel('done', false)).toBe('更新简介');
-    expect(summaryBtnLabel(undefined, false)).toBe('更新简介');
+    expect(summaryBtnLabel('idle', false)).toBe('Update summary');
+    expect(summaryBtnLabel('idle', true)).toBe('Generating…');
+    expect(summaryBtnLabel('running', false)).toBe('Generating…');
+    expect(summaryBtnLabel('done', false)).toBe('Update summary');
+    expect(summaryBtnLabel(undefined, false)).toBe('Update summary');
   });
 });
 
@@ -63,10 +63,10 @@ describe('MEMORY_MODELS / memoryBtnLabel（更新记忆）', () => {
   });
 
   test('memoryBtnLabel：busy/running → 更新中…；否则 🧠 更新记忆', () => {
-    expect(memoryBtnLabel('idle', false)).toBe('🧠 更新记忆');
-    expect(memoryBtnLabel('idle', true)).toBe('更新中…');
-    expect(memoryBtnLabel('running', false)).toBe('更新中…');
-    expect(memoryBtnLabel(undefined, false)).toBe('🧠 更新记忆');
+    expect(memoryBtnLabel('idle', false)).toBe('🧠 Update memory');
+    expect(memoryBtnLabel('idle', true)).toBe('Updating…');
+    expect(memoryBtnLabel('running', false)).toBe('Updating…');
+    expect(memoryBtnLabel(undefined, false)).toBe('🧠 Update memory');
   });
 });
 

@@ -27,7 +27,7 @@ describe('FileViewer 结构约束', () => {
     expect(source).toContain('<textarea');
     expect(source).toContain("'PUT'");
     expect(source).toContain('edit.content !== edit.orig'); // 脏标记
-    expect(source).toContain('已保存');
+    expect(source).toContain("t('ui.saved')");
   });
 
   test('二进制/超大 415/413 → 回落下载提示', () => {

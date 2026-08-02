@@ -12,6 +12,7 @@
 import type { RefObject } from 'preact';
 import { useRef, useState } from 'preact/hooks';
 import type { ColSizes } from '../lib/colsize';
+import { tr } from '../i18n/runtime';
 
 export function Splitter({
   containerRef,
@@ -64,8 +65,8 @@ export function Splitter({
       class={`gsplit${active ? ' on' : ''}`}
       role="separator"
       aria-orientation="vertical"
-      aria-label={label ?? '拖拽调整列宽'}
-      title="拖拽调整列宽 · 双击复位"
+      aria-label={label ?? tr('ui.dragColumns')}
+      title={tr('ui.dragColumnsReset')}
       onPointerDown={(e) => {
         e.preventDefault();
         dragging.current = true;

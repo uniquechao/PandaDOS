@@ -55,7 +55,8 @@ describe('analyzeProgress（v1 analyze 平移）', () => {
     const a = await analyzeProgress(llm, { label: 'proj', prev: '', activity: '助手说：done', systemPrefix: 'P' });
     expect(a).toEqual({ push: true, status: 'milestone', needsReply: false, headline: '测试全过' });
     const call = llm.calls[0]!;
-    expect(call.messages[0]!.content).toBe(`P\n\n${ANALYZE_SYS}`);
+    expect(call.messages[0]!.content).toStartWith(`P\n\n${ANALYZE_SYS}`);
+    expect(call.messages[0]!.content).toContain('zh-Hans');
     expect(call.messages[1]!.content).toContain('会话 @proj');
     expect(call.messages[1]!.content).toContain('此前进度：(无)');
     expect(call.opts?.jsonMode).toBe(true);

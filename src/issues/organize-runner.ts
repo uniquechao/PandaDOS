@@ -25,6 +25,8 @@ import {
 import { detectSelection } from '../core/screen';
 import { readDriverText } from '../core/skills';
 import type { AgentKind } from '../core/types';
+import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
+import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/language';
 import { normalizeModuleSlug } from './modules';
 
 /** runner 需要的 Driver 子集 = clarify-runner 同款（tmux + 受限文件） */
@@ -149,8 +151,22 @@ export function buildOrganizeTaskMd(input: {
  * 组装注入给代理的提示词（单段：sendKeys 会把换行转空格、截断 2000，故简明成段；
  * 模块/issue 清单不进提示词——写在 task.md 里让代理自己读，绕开注入预算）。
  */
-export function buildOrganizePrompt(agent: AgentKind, projectId: number): string {
+export function buildOrganizePrompt(
+  agent: AgentKind,
+  projectId: number,
+  locale: SupportedLocale = 'zh-Hans',
+): string {
   const rel = `${ORGANIZE_SCRATCH_BASE}/${projectId}`;
+  if (promptLanguage(locale) === 'en') {
+    return [
+      `Perform a read-only project module organization analysis. Do not change code or files outside ${rel}/.`,
+      `(1) Read ${rel}/task.md and inspect the repository to understand module responsibilities.`,
+      `(2) Write ${rel}/plan.json as {"actions":[...]}. Allowed actions are "merge", "rename", "create", and "move" using the exact schema documented in task.md. Use semantic lowercase 2-4 word hyphenated English slugs. Keep module boundaries broad and stable, preserve user-authored issue text, prefer conservative no-op decisions, and give every action a concise reason in the selected output language.`,
+      `(3) As the final step, create ${rel}/done containing ok.`,
+      agent === 'codex' ? 'Proceed without requesting approval.' : '',
+      outputLanguageInstruction(locale),
+    ].filter(Boolean).join(' ');
+  }
   return [
     `你在为项目做「模块整理分析」，这是只读分析，除 ${rel}/ 下的产物文件外不要改动任何文件、不要写代码。请严格按顺序完成：`,
     `(1) 读取文件 ${rel}/task.md（当前全部模块与全部历史 issue 清单），并浏览项目代码库理解各部分职责；`,
@@ -162,6 +178,7 @@ export function buildOrganizePrompt(agent: AgentKind, projectId: number): string
     `要求：slug 用 2-4 个小写英文单词连字符拼接，语义必须与显示名对应（如「Git 页面」→ git-pages），严禁无意义编号；显示名保持中文可读；合并选保留方时优先 issue 多、名称更能概括职责的一方；宁可保守不动，也不要为整齐而硬拆硬并；每个动作都要给简短中文 reason；没有值得做的就给空 actions；`,
     `(3) 全部完成后，最后创建标记文件 ${rel}/done（内容写 ok 即可）——这一步必须最后做。`,
     agent === 'codex' ? '（无需请求审批，直接执行。）' : '',
+    outputLanguageInstruction(locale),
   ]
     .filter(Boolean)
     .join(' ');
@@ -289,6 +306,7 @@ export interface RunOrganizeInput {
   goal?: string | null;
   modules: OrganizeModuleInfo[];
   issues: OrganizeIssueInfo[];
+  locale?: SupportedLocale;
 }
 
 export interface OrganizeRunOptions {
@@ -402,7 +420,7 @@ export class OrganizeRunner {
       await this.waitReady(session, o.readyDelayMs, o.pollIntervalMs);
 
       // 4) 注入任务提示词
-      await this.driver.sendKeys(session, buildOrganizePrompt(input.agent, input.projectId));
+      await this.driver.sendKeys(session, buildOrganizePrompt(input.agent, input.projectId, input.locale));
 
       // 5) 轮询 done 标记
       const done = await this.pollUntilDone(session, p.done, o.timeoutMs, o.pollIntervalMs);

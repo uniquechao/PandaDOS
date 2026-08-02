@@ -20,6 +20,7 @@ import {
 import { Modal } from './Modal';
 import { toast } from '../lib/toast';
 import { reconcileAgent } from './AgentPicker';
+import { useI18n } from '../i18n/provider';
 
 const ORG_POLL_MS = 4000;
 
@@ -37,6 +38,7 @@ export function ModulesPanel({
   onChanged: () => void;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   const [modules, setModules] = useState<ProjectModule[] | null>(null);
   const [org, setOrg] = useState<OrganizeStatus | null>(null);
   const [orgAgent, setOrgAgent] = useState<AgentKind>('claude');
@@ -79,7 +81,7 @@ export function ModulesPanel({
     setBusy(true);
     try {
       await api(`/api/projects/${pid}/modules/organize`, 'POST', { agent: orgAgent });
-      toast.info(`已开始分析（${orgAgent}）：扫描全部 issue 与代码库，可能要几分钟`);
+      toast.info(t('ui.analysisStarted', { agent: orgAgent }));
       await loadOrg();
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : String(e));
@@ -112,7 +114,7 @@ export function ModulesPanel({
     const ts = org?.suggestion?.ts ?? Date.now();
     dismissOrganizeSuggestion(pid, ts);
     setDismissed(ts);
-    toast.info('本批方案已忽略；再次点「智能整理」可重新分析');
+    toast.info(t('ui.batchIgnored'));
   };
 
   const saveRename = async (m: ProjectModule): Promise<void> => {
@@ -121,7 +123,7 @@ export function ModulesPanel({
     setBusy(true);
     try {
       await api(`/api/projects/${pid}/modules/${m.id}`, 'PATCH', { displayName: name });
-      toast.success('已改名');
+      toast.success(t('ui.renamed'));
       setEditingId(null);
       load();
       onChanged();
@@ -134,11 +136,11 @@ export function ModulesPanel({
 
   const archive = async (m: ProjectModule): Promise<void> => {
     if (busy) return;
-    if (!confirm(`归档模块「${m.displayName}」？归档后不再出现在选择器与自动归类里（档案保留）。`)) return;
+    if (!confirm(t('ui.archiveModuleConfirm', { name: m.displayName }))) return;
     setBusy(true);
     try {
       await api(`/api/projects/${pid}/modules/${m.id}`, 'PATCH', { status: 'archived' });
-      toast.success('已归档');
+      toast.success(t('ui.archived'));
       load();
       onChanged();
     } catch (e) {
@@ -154,7 +156,7 @@ export function ModulesPanel({
     setBusy(true);
     try {
       await api(`/api/projects/${pid}/modules/${m.id}`, 'PATCH', { agent });
-      toast.success(`模块已切换为 ${agent}`);
+      toast.success(t('ui.moduleAgentChanged', { agent }));
       load();
       onChanged();
     } catch (e) {
@@ -165,12 +167,12 @@ export function ModulesPanel({
   };
 
   return (
-    <Modal title="项目模块" wide onClose={onClose}>
+    <Modal title={t('ui.projectModules')} wide onClose={onClose}>
       <div class="formcol">
         <div class="org-bar">
-          <span class="org-title">✨ 智能整理</span>
-          <span class="org-hint" title="执行代理在独立会话里扫描全部 issue 与代码库，产出整理方案，逐项确认后执行">
-            扫全部 issue，建议合并 / 改名 / 新建 / 挪
+          <span class="org-title">✨ {t('ui.smartOrganize')}</span>
+          <span class="org-hint" title={t('ui.smartOrganizeHint')}>
+            {t('ui.smartOrganizeHint')}
           </span>
           <select
             value={orgAgent}
@@ -186,32 +188,31 @@ export function ModulesPanel({
             disabled={busy || !!org?.running || supportedAgents.length === 0}
             onClick={() => void startOrganize()}
           >
-            {org?.running ? '分析中…' : '开始分析'}
+            {org?.running ? t('ui.analyzing') : t('ui.startAnalysis')}
           </button>
         </div>
         {org?.running && (
           <div class="org-note run">
             <span class="spinner sm" />
-            代理正在扫描 issue 与代码库，结果会出现在这里…
+            {t('ui.agentScanning')}
           </div>
         )}
         {!org?.running && org?.failed && (
           <div class="org-note fail">
-            上次分析失败（{org.failed.reason}
-            {org.failed.error ? `：${org.failed.error}` : ''}），可重新触发
+            {t('ui.lastAnalysisFailed', { reason: org.failed.reason, error: org.failed.error ? `: ${org.failed.error}` : '' })}
           </div>
         )}
 
         {sugg && (
           <div class="org-card">
             <div class="org-hd">
-              <span class="org-hd-t">整理方案</span>
+              <span class="org-hd-t">{t('ui.organizePlan')}</span>
               <span class="org-hd-meta">
-                {sugg.agent} · {sugg.actions.filter((a) => !a.applied).length}/{sugg.actions.length} 项待确认
+                {sugg.agent} · {t('ui.awaitingActionCount', { pending: sugg.actions.filter((a) => !a.applied).length, total: sugg.actions.length })}
               </span>
               {sugg.actions.some((a) => !a.applied) && (
                 <button class="org-ignore" disabled={applying !== null} onClick={ignore}>
-                  忽略本批
+                  {t('ui.ignoreBatch')}
                 </button>
               )}
             </div>
@@ -223,10 +224,10 @@ export function ModulesPanel({
                   {a.reason && <div class="org-reason">{a.reason}</div>}
                 </div>
                 {a.applied ? (
-                  <span class="org-applied">✓ 已执行</span>
+                  <span class="org-applied">✓ {t('ui.executed')}</span>
                 ) : (
                   <button class="org-apply" disabled={applying !== null} onClick={() => void applyAction(i)}>
-                    {applying === i ? '执行中…' : '执行'}
+                    {applying === i ? t('ui.executing') : t('ui.execute')}
                   </button>
                 )}
               </div>
@@ -235,9 +236,9 @@ export function ModulesPanel({
         )}
 
         {modules === null ? (
-          <div class="mut">加载中…</div>
+          <div class="mut">{t('ui.loading')}</div>
         ) : modules.length === 0 ? (
-          <div class="empty">还没有模块；建 issue 时会自动归类生成。</div>
+          <div class="empty">{t('ui.noModules')}</div>
         ) : (
           <div class="mlist">
             {modules.map((m) => (
@@ -253,10 +254,10 @@ export function ModulesPanel({
                       }}
                     />
                     <button class="mrow-act save" disabled={busy || !editName.trim()} onClick={() => void saveRename(m)}>
-                      保存
+                      {t('ui.save')}
                     </button>
                     <button class="mrow-act" disabled={busy} onClick={() => setEditingId(null)}>
-                      取消
+                      {t('ui.cancel')}
                     </button>
                   </>
                 ) : (
@@ -265,20 +266,20 @@ export function ModulesPanel({
                       <span class="mrow-name">{m.displayName}</span>
                       <span class="mrow-slug">{m.slug}</span>
                     </span>
-                    <span class="mrow-src" title="模块来源">
-                      {m.source === 'legacy' ? '迁移' : m.source === 'manual' ? '手动' : '自动'}
+                    <span class="mrow-src" title={t('ui.moduleSource')}>
+                      {m.source === 'legacy' ? t('ui.migrated') : m.source === 'manual' ? t('ui.manual') : t('ui.automatic')}
                     </span>
                     <select
                       class="mrow-agent"
                       value={m.agent}
                       disabled={busy}
-                      title="模块固定 Agent"
+                      title={t('ui.moduleAgent')}
                       onChange={(e) => void changeAgent(m, e.currentTarget.value as AgentKind)}
                     >
-                      {!supportedAgents.includes(m.agent) && <option value={m.agent}>{m.agent}（不可用）</option>}
+                      {!supportedAgents.includes(m.agent) && <option value={m.agent}>{m.agent} ({t('ui.unavailable')})</option>}
                       {supportedAgents.map((a) => <option key={a} value={a}>{a}</option>)}
                     </select>
-                    <span class="badge b-gray" title="关联 issue 数">
+                    <span class="badge b-gray" title={t('ui.relatedIssueCount')}>
                       {issueCount(m.id)} issue
                     </span>
                     <span class="mrow-acts">
@@ -290,10 +291,10 @@ export function ModulesPanel({
                           setEditName(m.displayName);
                         }}
                       >
-                        改名
+                        {t('ui.rename')}
                       </button>
                       <button class="mrow-act danger" disabled={busy} onClick={() => void archive(m)}>
-                        归档
+                        {t('ui.archive')}
                       </button>
                     </span>
                   </>
@@ -306,7 +307,7 @@ export function ModulesPanel({
       </div>
       <div class="mbtns">
         <button class="btn" onClick={onClose}>
-          关闭
+          {t('action.close')}
         </button>
       </div>
     </Modal>

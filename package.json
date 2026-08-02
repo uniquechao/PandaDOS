@@ -1,18 +1,20 @@
 {
   "name": "mando",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "start": "bun run src/web/server.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "build-ui": "vite build ui"
+    "build-ui": "vite build ui",
+    "check-i18n": "bun test shared/i18n/catalogs.test.ts shared/i18n/guard.test.ts shared/i18n/locales.test.ts shared/i18n/formatter.test.ts"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.68.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
+    "intl-messageformat": "^11.2.13",
     "preact": "^10.24.0",
     "ssh2": "^1.16.0"
   },

@@ -22,6 +22,8 @@ import type { AgentKind } from './types';
 import type { ExecutorDriver } from '../executor/driver';
 import { detectSelection, isCodexUpdatePrompt } from './screen';
 import { readDriverText } from './skills';
+import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
+import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/language';
 
 // isCodexUpdatePrompt 已迁至 core/screen（中立、无循环依赖），此处再导出保持既有引用（clarify-runner/测试）不变
 export { isCodexUpdatePrompt };
@@ -96,7 +98,23 @@ export function buildSummaryPrompt(
   agent: AgentKind,
   projectName?: string,
   target: SummaryTarget = 'readme',
+  locale: SupportedLocale = 'zh-Hans',
 ): string {
+  if (promptLanguage(locale) === 'en') {
+    const who = projectName ? `project "${projectName}"` : 'this project';
+    const targetFile = target === 'memory' ? memoryFileFor(agent) : 'README.md';
+    const artifact = target === 'memory' ? 'project memory overview' : 'project understanding summary';
+    return [
+      `Update ${target === 'memory' ? 'project memory' : 'project documentation'} for ${who}. Perform only these steps in order:`,
+      `(1) Read ${REL_HISTORY} and inspect the repository structure, important source/configuration, conventions, current state, and key decisions.`,
+      `(2) Incrementally update or create root ${targetFile} so it accurately preserves durable project context; do not remove still-valid content.`,
+      `(3) Write a user-facing ${artifact} to ${REL_UNDERSTANDING}, using plain text or light Markdown and at most 600 words.`,
+      `(4) As the final step, create ${REL_DONE} containing ok.`,
+      `Do not modify unrelated code.`,
+      agent === 'codex' ? 'Proceed without requesting approval.' : '',
+      outputLanguageInstruction(locale),
+    ].filter(Boolean).join(' ');
+  }
   const who = projectName ? `项目「${projectName}」` : '本项目';
   if (target === 'memory') {
     const memFile = memoryFileFor(agent);
@@ -108,6 +126,7 @@ export function buildSummaryPrompt(
       `(4) 全部完成后，最后创建标记文件 ${REL_DONE}（内容写 ok 即可）——这一步必须最后做。`,
       `不要改动与记忆无关的代码。`,
       agent === 'codex' ? '（无需请求审批，直接执行。）' : '',
+      outputLanguageInstruction(locale),
     ]
       .filter(Boolean)
       .join(' ');
@@ -120,6 +139,7 @@ export function buildSummaryPrompt(
     `(4) 全部完成后，最后创建标记文件 ${REL_DONE}（内容写 ok 即可）——这一步必须最后做。`,
     `不要改动与总结无关的代码。`,
     agent === 'codex' ? '（无需请求审批，直接执行。）' : '',
+    outputLanguageInstruction(locale),
   ]
     .filter(Boolean)
     .join(' ');
@@ -142,6 +162,7 @@ export interface RunSummaryInput {
   projectName?: string;
   /** 产物目标（缺省 'readme'）：'memory' = 更新项目记忆文件 CLAUDE.md/AGENTS.md 而非 README.md */
   target?: SummaryTarget;
+  locale?: SupportedLocale;
 }
 
 export interface SummaryRunOptions {
@@ -276,7 +297,7 @@ export class AgentSummaryRunner {
       // 4) 注入任务提示词（按 target 选更新 README 还是项目记忆文件）
       await this.driver.sendKeys(
         session,
-        buildSummaryPrompt(input.agent, input.projectName, input.target ?? 'readme'),
+        buildSummaryPrompt(input.agent, input.projectName, input.target ?? 'readme', input.locale),
       );
 
       // 5) 轮询 done 标记

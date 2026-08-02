@@ -73,6 +73,7 @@ import {
   issueGitBranchPayload,
   type IssueGitBranchValue,
 } from '../lib/issuegitbranch';
+import { tr } from '../i18n/runtime';
 
 const POLL_MS = 5000;
 
@@ -123,7 +124,7 @@ export function IssueWorkbench({
         // 网络错误 / 5xx（可能只是临时）——保持轮询，显示原始错误。
         if (e instanceof ApiError && (e.status === 404 || e.status === 403)) {
           stopPoll();
-          setErr('该 issue 不存在或不属于本项目');
+          setErr(tr('issue.notFound'));
         } else {
           setErr(e.message);
         }
@@ -179,9 +180,9 @@ export function IssueWorkbench({
       const ev = events[i]!;
       if (ev.kind !== 'transition') continue;
       const d = tryJson<{ to?: string; note?: string }>(ev.dataJson);
-      if (d?.to === 'blocked') return d.note ?? '（未记录原因）';
+      if (d?.to === 'blocked') return d.note ?? tr('issue.noReason');
     }
-    return '（未记录原因）';
+    return tr('issue.noReason');
   }, [issue, events]);
 
   /** 弹窗自动批复记录（issue #91）：events 已在手，纯本地归约，不额外请求 */
@@ -217,7 +218,7 @@ export function IssueWorkbench({
   /** 复活重跑（#93）：二次确认必须点破「立刻开跑」——想改需求得先改完再点，落 pending 就没窗口了 */
   const reopen = (): void => {
     const plan = retryPlan('cancelled', false);
-    if (!confirm(`重新运行这个 issue？\n\n${plan.hint}。`)) return;
+    if (!confirm(tr('issue.runAgainConfirm', { hint: plan.hint }))) return;
     void post(`/api/projects/${pid}/issues/${iid}/reopen`);
   };
 
@@ -228,7 +229,7 @@ export function IssueWorkbench({
   const reject = (): void => {
     if (!waitingGate) return;
     if (!note.trim()) {
-      setActErr('打回必须带意见');
+      setActErr(tr('issue.rejectionRequired'));
       return;
     }
     void post(`/api/projects/${pid}/gates/${waitingGate.id}/reject`, { note: note.trim() });
@@ -238,7 +239,7 @@ export function IssueWorkbench({
   };
 
   const remove = (): void => {
-    if (!confirm(`删除 issue #${iid}？`)) return;
+    if (!confirm(tr('issue.deleteConfirm', { id: iid }))) return;
     void act(async () => {
       await api(`/api/projects/${pid}/issues/${iid}`, 'DELETE');
       nav(`/p/${pid}`);
@@ -275,18 +276,18 @@ export function IssueWorkbench({
       // 取消不是死路（#93）：改完需求可以就地复活重跑，不用重开一条丢掉历史与模块绑定
       <div class="ro-note reopen-bar">
         <span class="reopen-txt">
-          🚫 已取消 —— 改完需求可以重新运行
-          <span class="mut small"> 回到「待办」后会立即排队开跑</span>
+          🚫 {tr('issue.cancelledCanRerun')}
+          <span class="mut small"> {tr('issue.queueImmediately')}</span>
         </span>
         <button class="btn sm" disabled={busy} onClick={() => setEditing(true)}>
-          ✏️ 编辑
+          ✏️ {tr('issue.editAction')}
         </button>
         <button class="btn sm primary" disabled={busy} onClick={reopen}>
-          ▶ 重新运行
+          ▶ {tr('issue.runAgain')}
         </button>
       </div>
     ) : (
-      <div class="ro-note">✅ 已完成 —— 历史回看</div>
+      <div class="ro-note">✅ {tr('issue.completedHistory')}</div>
     )
   ) : needGateBar ? (
     <GateBar
@@ -302,7 +303,7 @@ export function IssueWorkbench({
       onRetry={retryGate}
       onStart={() => void post(`/api/projects/${pid}/issues/${iid}/start`)}
       onCancel={() => {
-        if (confirm('取消这个 issue？')) void post(`/api/projects/${pid}/issues/${iid}/cancel`);
+        if (confirm(tr('issue.cancelConfirm'))) void post(`/api/projects/${pid}/issues/${iid}/cancel`);
       }}
       onUnblock={() => void post(`/api/projects/${pid}/issues/${iid}/unblock`)}
     />
@@ -354,7 +355,7 @@ export function IssueWorkbench({
           <span class="btitle id-title">{issue ? issue.title : `issue #${iid}`}</span>
           {issue && (
             <>
-              {issue.pinnedTs != null && issue.status === 'pending' && <span class="badge b-amber">📌 置顶</span>}
+              {issue.pinnedTs != null && issue.status === 'pending' && <span class="badge b-amber">📌 {tr('issue.pinned')}</span>}
               <CatBadge cat={issue.category} />
               <StatusBadge status={issue.status} awaitingClarify={issue.awaitingClarify} />
               {issue.waitingInput && <WaitingBadge />}
@@ -364,11 +365,11 @@ export function IssueWorkbench({
                 </span>
               )}
               {issue.module && <span class="badge b-gray">{issue.module}</span>}
-              {issue.implMode === 'team' && <span class="badge b-purple">团队</span>}
+              {issue.implMode === 'team' && <span class="badge b-purple">{tr('issue.team')}</span>}
               {issue.agent === 'codex' && <span class="badge b-ai">codex</span>}
               <ModelBadge model={model} />
               {issue.branch && <span class="badge b-gray mono">⎇ {issue.branch}</span>}
-              <span class="mut small id-creator">创建者：{issue.createdByName || '—'}</span>
+              <span class="mut small id-creator">{tr('issue.creator', { name: issue.createdByName || '—' })}</span>
             </>
           )}
           <div class="id-acts">
@@ -377,30 +378,30 @@ export function IssueWorkbench({
                 class="btn sm danger ghost"
                 disabled={busy}
                 onClick={() => {
-                  if (confirm('取消这个 issue？')) void post(`/api/projects/${pid}/issues/${iid}/cancel`);
+                  if (confirm(tr('issue.cancelConfirm'))) void post(`/api/projects/${pid}/issues/${iid}/cancel`);
                 }}
               >
-                取消
+                {tr('issue.cancel')}
               </button>
             )}
             {issue && issue.status === 'pending' && (
               <button
                 class={`btn sm${issue.pinnedTs != null ? ' primary' : ''}`}
                 disabled={busy}
-                title="置顶后在待办队列中优先调度"
+                title={tr('issue.pinHint')}
                 onClick={() => void post(`/api/projects/${pid}/issues/${iid}/pin`, { pinned: issue.pinnedTs == null })}
               >
-                {issue.pinnedTs != null ? '📌 取消置顶' : '📌 置顶'}
+                {issue.pinnedTs != null ? `📌 ${tr('board.unpin')}` : `📌 ${tr('issue.pinned')}`}
               </button>
             )}
             {issue && issue.status === 'pending' && (
               <button class="btn sm" disabled={busy} onClick={() => setEditing(true)}>
-                编辑
+                {tr('issue.edit')}
               </button>
             )}
             {issue && ['pending', 'done', 'blocked', 'cancelled'].includes(issue.status) && (
               <button class="btn sm danger ghost" onClick={remove}>
-                删除
+                {tr('issue.delete')}
               </button>
             )}
           </div>
@@ -415,13 +416,13 @@ export function IssueWorkbench({
       <div class="id-tabs wb-tabs">
         <div class="seg wb-tabseg">
           <button class={`seg-btn${tab === 'detail' ? ' on' : ''}`} onClick={() => setTab('detail')}>
-            详情
+            {tr('issue.detailsTab')}
           </button>
           <button class={`seg-btn${tab === 'exec' ? ' on' : ''}`} onClick={() => setTab('exec')}>
-            执行
+            {tr('issue.executionTab')}
           </button>
           <button class={`seg-btn${tab === 'changes' ? ' on' : ''}`} onClick={() => setTab('changes')}>
-            改动{changesN > 0 ? `·${changesN}` : ''}
+            {tr('issue.changesTab')}{changesN > 0 ? `·${changesN}` : ''}
           </button>
         </div>
       </div>
@@ -451,7 +452,7 @@ export function IssueWorkbench({
             busy={busy}
             onAutoApprove={changeAutoApprove}
             onTerminate={() => {
-              if (confirm('终止并取消这个 issue？')) void post(`/api/projects/${pid}/issues/${iid}/cancel`);
+              if (confirm(tr('issue.terminateConfirm'))) void post(`/api/projects/${pid}/issues/${iid}/cancel`);
             }}
             onUnblock={() => void post(`/api/projects/${pid}/issues/${iid}/unblock`)}
           />
@@ -568,32 +569,32 @@ function EditIssueModal({
   };
 
   return (
-    <Modal title={`编辑 issue #${issue.id}`} onClose={onClose}>
+    <Modal title={tr('issue.editTitle', { id: issue.id })} onClose={onClose}>
       <div class="formcol">
         <label class="field">
-          标题
-          <input value={title} onInput={(e) => setTitle(e.currentTarget.value)} placeholder="要做什么？" />
+          {tr('issue.titleField')}
+          <input value={title} onInput={(e) => setTitle(e.currentTarget.value)} placeholder={tr('board.whatToDo')} />
         </label>
         <label class="field">
-          详情（可选）
+          {tr('issue.bodyField')}
           <textarea
             rows={4}
             value={body}
             onInput={(e) => setBody(e.currentTarget.value)}
-            placeholder="背景 / 验收标准 / 复现步骤…"
+            placeholder={tr('board.issueBodyPlaceholder')}
           />
         </label>
         <div class="row">
           <label class="field grow">
-            类别
+            {tr('issue.categoryField')}
             <select value={category} onChange={(e) => setCategory(e.currentTarget.value as IssueCategory)}>
-              <option value="task">任务</option>
-              <option value="design">设计</option>
+              <option value="task">{tr('status.categoryTask')}</option>
+              <option value="design">{tr('status.categoryDesign')}</option>
               <option value="debug">DEBUG</option>
             </select>
           </label>
           <label class="field grow">
-            模块（可选）
+            {tr('issue.moduleField')}
             <ModuleSelect
               modules={modules}
               value={module}
@@ -602,12 +603,12 @@ function EditIssueModal({
                 const picked = modules.find((m) => m.slug === value.trim() || m.displayName === value.trim());
                 if (picked) setAgent(picked.agent);
               }}
-              placeholder="选择或输入项目模块"
+              placeholder={tr('board.autoModule')}
             />
           </label>
         </div>
         <label class="field">
-          执行代理
+          {tr('issue.agentField')}
           <select
             value={selectedModule?.agent ?? agent}
             disabled={!canChangeAgent}
@@ -619,10 +620,10 @@ function EditIssueModal({
           </select>
           {!canChangeAgent && (
             <span class="mut small">
-              {selectedModule ? `该模块固定使用 ${selectedModule.agent}` : '已绑对话，不能换代理'}
+              {selectedModule ? tr('board.moduleAgent', { agent: selectedModule.agent }) : tr('issue.conversationAgentLocked')}
             </span>
           )}
-          {agentUnavailable && <span class="err small">该模块/Agent 未在项目执行机上启用</span>}
+          {agentUnavailable && <span class="err small">{tr('board.agentUnavailable')}</span>}
         </label>
         <IssueGitBranchFields
           pid={pid}
@@ -632,7 +633,7 @@ function EditIssueModal({
         />
         <label class="chkrow">
           <input type="checkbox" checked={team} onChange={(e) => setTeam(e.currentTarget.checked)} />
-          团队模式（子任务并行，默认串行）
+          {tr('issue.teamMode')}
         </label>
         {existing.length > 0 && (
           <div class="id-imgs">
@@ -652,7 +653,7 @@ function EditIssueModal({
       </div>
       <div class="mbtns">
         <button class="btn" onClick={onClose}>
-          取消
+          {tr('ui.cancel')}
         </button>
         <button
           class="btn primary"
@@ -660,12 +661,12 @@ function EditIssueModal({
           onClick={submit}
         >
           {busy
-            ? '保存中…'
+            ? tr('ui.saving')
             : gitBranchLoading
-              ? '读取分支中…'
+              ? tr('board.readingBranches')
               : uploading
-                ? '图片上传中…'
-                : '保存'}
+                ? tr('ui.imageUploading')
+                : tr('ui.save')}
         </button>
       </div>
     </Modal>
@@ -715,13 +716,13 @@ function useIssueGit(
 function pushBadge(p: IssuePushState): { text: string; cls: string } {
   switch (p.state) {
     case 'pushed':
-      return { text: '已推送', cls: 'b-green' };
+      return { text: tr('issue.pushed'), cls: 'b-green' };
     case 'ahead':
-      return { text: `领先 origin ${p.n} 条未推送`, cls: 'b-amber' };
+      return { text: tr('issue.aheadOrigin', { count: p.n }), cls: 'b-amber' };
     case 'unpushed':
-      return { text: '未推送到 origin', cls: 'b-amber' };
+      return { text: tr('issue.notPushed'), cls: 'b-amber' };
     default:
-      return { text: '未配置远程', cls: 'b-gray' };
+      return { text: tr('issue.noRemote'), cls: 'b-gray' };
   }
 }
 
@@ -732,16 +733,16 @@ function IssueGitStatus({ info }: { info: IssueGitInfo }) {
   const totals = sumFiles(info.files);
   return (
     <>
-      <span class="mut small">{info.ahead} 条提交</span>
+      <span class="mut small">{tr('issue.commitCount', { count: info.ahead })}</span>
       {pb && <span class={`badge ${pb.cls}`}>{pb.text}</span>}
       {info.files.length > 0 && (
         <span class="mut small">
-          {info.files.length} 个文件{' '}
+          {tr('issue.fileCount', { count: info.files.length })}{' '}
           {(totals.adds > 0 || totals.dels > 0) && <PlusMinus adds={totals.adds} dels={totals.dels} />}
         </span>
       )}
-      {info.worktree !== undefined && wtN > 0 && <span class="mut small">工作区 {wtN} 个文件未提交</span>}
-      {info.source === 'snapshot' && <span class="badge b-gray">分支已清理，按完成时快照展示</span>}
+      {info.worktree !== undefined && wtN > 0 && <span class="mut small">{tr('issue.uncommittedFiles', { count: wtN })}</span>}
+      {info.source === 'snapshot' && <span class="badge b-gray">{tr('issue.snapshot')}</span>}
     </>
   );
 }
@@ -754,14 +755,14 @@ function IssueGitHead({ info, onRefresh }: { info: IssueGitInfo; onRefresh: () =
       {/* 固定/共享分支：改动是本 issue 自己的提交（自起点 sha 起），而非整条分支相对 base */}
       {info.startSha ? (
         <span class="mut small">
-          自 <span class="mono">{info.startSha.slice(0, 7)}</span> 起
+          {tr('issue.sinceCommit', { sha: info.startSha.slice(0, 7) })}
         </span>
       ) : (
         <span class="mut small">→ {info.base}</span>
       )}
       <IssueGitStatus info={info} />
       <button class="linkbtn" style={{ marginLeft: 'auto' }} onClick={onRefresh}>
-        ↻ 刷新
+        ↻ {tr('ui.refresh')}
       </button>
     </div>
   );
@@ -802,7 +803,7 @@ function DetailTab({
       {issue.resultSummary && (
         <div class="id-agentblock">
           <div class="h2" style={{ margin: '2px 0 4px' }}>
-            📋 执行总结{issue.status === 'blocked' ? '（受阻时进展）' : ''}
+            📋 {tr('issue.executionSummary')}{issue.status === 'blocked' ? tr('issue.blockedProgress') : ''}
           </div>
           <div class="gate-box">{issue.resultSummary}</div>
         </div>
@@ -810,12 +811,12 @@ function DetailTab({
       {(issue.clarifyFeedback || analyzing) && (
         <div class="id-agentblock">
           <div class="h2" style={{ margin: '2px 0 4px' }}>
-            🤖 代理反馈（最新分析）
+            🤖 {tr('issue.agentFeedback')}
           </div>
           {analyzing && (
             <div class="mut small" style={{ margin: '0 0 4px' }}>
-              🔄 代理正在重新分析…
-              {issue.clarifyFeedback ? '（完成后自动更新，下方为上一轮反馈）' : '（完成后自动显示）'}
+              🔄 {tr('issue.agentReanalyzingInline')}
+              {issue.clarifyFeedback ? tr('issue.autoAfterDone') : tr('issue.showAfterDone')}
             </div>
           )}
           {issue.clarifyFeedback && <div class="gate-box">{issue.clarifyFeedback}</div>}
@@ -824,7 +825,7 @@ function DetailTab({
       {subs.length > 0 && (
         <div class="plan">
           <div class="h2" style={{ margin: '2px 0 4px' }}>
-            计划（{doneN}/{subs.length}）
+            {tr('issue.planProgress', { done: doneN, total: subs.length })}
           </div>
           {/* 与执行顶栏进度链同一状态源/同一套配色（#104）：done/cur/blocked/cancelled 圆点齐平 */}
           {execProgressState(subs, issue.subIndex, issue.status).steps.map((s) => (
@@ -849,11 +850,11 @@ function ApprovalLog({ rows }: { rows: ApprovalLogRow[] }) {
   return (
     <div class="id-agentblock">
       <div class="h2" style={{ margin: '2px 0 4px' }}>
-        🤖 弹窗自动批复（最近 {rows.length} 次）
+        🤖 {tr('issue.approvalLog', { count: rows.length })}
       </div>
       {rows.map((r) => (
         <div key={r.id} class="apv-i">
-          <span class={`apv-tag${r.auto ? ' auto' : ' esc'}`}>{r.auto ? '自动' : '交人工'}</span>
+          <span class={`apv-tag${r.auto ? ' auto' : ' esc'}`}>{r.auto ? tr('issue.automatic') : tr('issue.escalated')}</span>
           {r.ruleLabel && <span class="apv-rule">{r.ruleLabel}</span>}
           <span class="apv-detail">{r.detail}</span>
           <span class="mut small apv-ts">{timeAgo(r.ts)}</span>
@@ -902,7 +903,7 @@ function ExecTab({
         level={issue.autoApprove ?? 'medium'}
         onChange={onAutoApprove}
         disabled={aaLocked}
-        disabledHint={`${issue.status === 'done' ? '已完成' : '已取消'}的 issue 不会再有弹窗，档位不可改`}
+        disabledHint={tr('issue.approvalLocked')}
       />
       <ExecProgress subs={subs} subIndex={issue.subIndex} status={issue.status} />
     </>
@@ -930,7 +931,7 @@ function ExecTab({
             <div class="fullcol">
               <div class="runctl">{seg}</div>
               <div class="empty" style={{ flex: 1 }}>
-                （对话尚未创建——启动后这里就是执行现场）
+                {tr('issue.noConversation')}
               </div>
               {gateBar}
             </div>
@@ -946,12 +947,12 @@ function ExecTab({
 type TermPaneComp = typeof import('../components/TermPane').TermPane;
 
 function nativeUnavailableReason(issue: Issue): string | null {
-  if (!issue.convId) return '该 issue 尚未启动，没有可接管的原生执行会话。';
+  if (!issue.convId) return tr('issue.nativeNotStarted');
   if (issue.status === 'done' || issue.status === 'cancelled' || issue.status === 'blocked') {
-    return '该 issue 已结束，原生执行会话不可接管。';
+    return tr('issue.nativeEnded');
   }
   if (!['planning', 'implementing', 'testing'].includes(issue.status)) {
-    return '该 issue 当前不在代理执行阶段，原生执行会话不可接管。';
+    return tr('issue.nativeInactive');
   }
   return null;
 }
@@ -972,7 +973,7 @@ function ExecNative({ pid, issue, seg }: { pid: number; issue: Issue; seg: JSX.E
       <div class="runctl">
         {seg}
         <span class="rc-status mut small">
-          {unavailable ? '不可接管' : st === 'open' ? '🟢 已连接' : st === 'connecting' ? '连接中…' : st === 'exit' ? '已结束' : '已断开'}
+          {unavailable ? tr('issue.nativeUnavailable') : st === 'open' ? `🟢 ${tr('ui.connected')}` : st === 'connecting' ? tr('ui.connecting') : st === 'exit' ? tr('view.ended') : tr('ui.disconnected')}
         </span>
       </div>
       <div class="wb-term-body">
@@ -983,10 +984,10 @@ function ExecNative({ pid, issue, seg }: { pid: number; issue: Issue; seg: JSX.E
             pid={pid}
             target={{ kind: 'issue', issueId: issue.id }}
             onStatus={setSt}
-            closedMessage="当前执行会话不可接管：它可能已让位，或其共享会话已被其他 issue 复用。"
+            closedMessage={tr('issue.nativeSessionUnavailable')}
           />
         ) : (
-          <div class="empty">载入原生会话…</div>
+          <div class="empty">{tr('issue.loadingNative')}</div>
         )}
       </div>
     </div>
@@ -1069,7 +1070,7 @@ function IssueChangesTab({
 
   if (err) return <div class="empty">{err}</div>;
   if (!info) return <Loading />;
-  if (info.ok === false) return <div class="empty">{info.error ?? '加载失败'}</div>;
+  if (info.ok === false) return <div class="empty">{info.error ?? tr('ui.loadFailed')}</div>;
 
   // 窄屏钻入态：点提交/文件 → 全屏展开（返回回列表）；宽屏走右栏，不进这两个分支
   if (!wide && sha) {
@@ -1079,7 +1080,7 @@ function IssueChangesTab({
           <button class="back" onClick={() => setSha(null)}>
             ‹
           </button>
-          <span class="mut small">返回改动</span>
+          <span class="mut small">{tr('issue.backChanges')}</span>
         </div>
         <div class="wb-commitpanel">
           <CommitPanel key={sha} pid={pid} sha={sha} onJump={setSha} />
@@ -1098,7 +1099,7 @@ function IssueChangesTab({
           </button>
           <StatusChip code={s.leaf.code} />
           <PathText path={s.leaf.path} oldPath={s.leaf.oldPath} />
-          {s.kind === 'wt' && <span class="mut small">未提交</span>}
+          {s.kind === 'wt' && <span class="mut small">{tr('issue.uncommitted')}</span>}
         </div>
         <DiffBody d={fd.diff} error={fd.err} />
       </div>
@@ -1114,19 +1115,19 @@ function IssueChangesTab({
     <>
       {wtLeaves.length > 0 && (
         <>
-          <div class="wb-sect">⏳ 进行中 · 未提交（完成时自动 commit）</div>
+          <div class="wb-sect">⏳ {tr('issue.runningUncommitted')}</div>
           <ChangeTree leaves={wtLeaves} selKey={fd.file?.leaf.key} onOpen={(l) => openLeaf('wt', l)} />
         </>
       )}
       {rangeLeaves.length > 0 && (
         <>
-          <div class="wb-sect">✅ 已提交</div>
+          <div class="wb-sect">✅ {tr('issue.committed')}</div>
           <ChangeTree leaves={rangeLeaves} selKey={fd.file?.leaf.key} onOpen={(l) => openLeaf('range', l)} />
         </>
       )}
       {info.commits.length > 0 && (
         <>
-          <div class="wb-sect">🧾 提交记录 · {info.commits.length}</div>
+          <div class="wb-sect">🧾 {tr('issue.commitHistory', { count: info.commits.length })}</div>
           <div class="wb-commits">
             {info.commits.map((c) => (
               <button
@@ -1151,10 +1152,10 @@ function IssueChangesTab({
       {!hasAny && (
         <div class="empty">
           {active
-            ? '执行中，暂无改动——代理的改动会先出现在这里（未提交区），完成时自动提交。'
+            ? tr('issue.noChangesRunning')
             : !info.exists
-              ? '该 issue 尚未产生改动（未启动或未落分支）。'
-              : `已并入 ${info.base}，本分支无独立改动。`}
+              ? tr('issue.noChanges')
+              : tr('issue.mergedNoChanges', { base: info.base })}
         </div>
       )}
     </>
@@ -1184,7 +1185,7 @@ function IssueChangesTab({
             {lists}
           </div>
         </div>
-        <ListSplitter containerRef={splitRef} list={treeW} label="改动树栏宽" />
+        <ListSplitter containerRef={splitRef} list={treeW} label={tr('issue.changeTreeWidth')} />
         <div class="wb-main">
           {sha ? (
             <div class="wb-commitpanel">
@@ -1195,15 +1196,15 @@ function IssueChangesTab({
               <div class="wb-sub-hd">
                 <StatusChip code={fd.file.leaf.code} />
                 <PathText path={fd.file.leaf.path} oldPath={fd.file.leaf.oldPath} />
-                {fd.file.kind === 'wt' && <span class="mut small">未提交</span>}
-                <button class="gs-x" title="收起 diff" onClick={fd.close}>
+                {fd.file.kind === 'wt' && <span class="mut small">{tr('issue.uncommitted')}</span>}
+                <button class="gs-x" title={tr('issue.collapseDiff')} onClick={fd.close}>
                   ✕
                 </button>
               </div>
               <DiffBody d={fd.diff} error={fd.err} />
             </div>
           ) : (
-            <div class="gd-empty">← 点选文件看 diff，点选提交看详情</div>
+            <div class="gd-empty">← {tr('issue.chooseChange')}</div>
           )}
         </div>
       </div>
@@ -1234,37 +1235,37 @@ function GateBar(props: {
   if (st === 'plan_review' || st === 'merge_review') {
     return (
       <div class="gatebar">
-        <div class="gate-hd">⚠ {st === 'plan_review' ? '计划待你确认' : '合并前待你 review'}</div>
+        <div class="gate-hd">⚠ {st === 'plan_review' ? tr('issue.planReview') : tr('issue.mergeReview')}</div>
         {gate ? (
           <>
             {st === 'plan_review' ? <PlanGateBody gate={gate} /> : <MergeGateBody gate={gate} />}
             <textarea
               rows={2}
               value={note}
-              placeholder="意见（打回时必填，会带回给 Claude）"
+              placeholder={tr('issue.feedbackPlaceholder')}
               onInput={(e) => setNote(e.currentTarget.value)}
             />
             <div class="gate-row">
               <button class="btn danger" disabled={busy} onClick={props.onReject}>
-                打回（带意见）
+                {tr('issue.rejectWithFeedback')}
               </button>
               <button class="btn danger ghost" disabled={busy} onClick={props.onCancel}>
-                取消任务
+                {tr('issue.cancelTask')}
               </button>
               <button class="btn ok" disabled={busy} onClick={props.onApprove}>
-                {st === 'plan_review' ? '✓ 同意计划' : '✓ 同意合并'}
+                {st === 'plan_review' ? `✓ ${tr('issue.approvePlan')}` : `✓ ${tr('issue.approveMerge')}`}
               </button>
             </div>
           </>
         ) : (
           <>
-            <div class="err">卡点创建失败或被中断，可重新生成评审，也可以取消任务。</div>
+            <div class="err">{tr('issue.gateFailed')}</div>
             <div class="gate-row">
               <button class="btn" disabled={busy} onClick={props.onRetry}>
-                重新生成评审
+                {tr('issue.regenerateReview')}
               </button>
               <button class="btn danger" disabled={busy} onClick={props.onCancel}>
-                取消任务
+                {tr('issue.cancelTask')}
               </button>
             </div>
           </>
@@ -1278,16 +1279,16 @@ function GateBar(props: {
     return (
       <div class="gatebar">
         <div class="gate-hd" style={{ color: '#dc2626' }}>
-          ⛔ 受阻
+          ⛔ {tr('issue.blocked')}
         </div>
         <div class="block-box">{props.blockedReason}</div>
         {actErr && <div class="err">{actErr}</div>}
         <div class="gate-row">
           <button class="btn" disabled={busy} onClick={props.onCancel}>
-            取消 issue
+            {tr('issue.cancelIssue')}
           </button>
           <button class="btn ok" disabled={busy} onClick={props.onUnblock}>
-            解除阻塞重跑
+            {tr('issue.unblockRerun')}
           </button>
         </div>
       </div>
@@ -1298,11 +1299,11 @@ function GateBar(props: {
     // 澄清问答已上移到顶部常驻面板（ClarifyPanel）；这里只留取消入口（clarifying 为存量兼容态）
     return (
       <div class="gatebar">
-        <div class="gate-hd">❓ 需要你澄清需求（在上方澄清面板回答）</div>
+        <div class="gate-hd">❓ {tr('issue.clarifyAbove')}</div>
         {actErr && <div class="err">{actErr}</div>}
         <div class="gate-row">
           <button class="btn" disabled={busy} onClick={props.onCancel}>
-            取消
+            {tr('ui.cancel')}
           </button>
         </div>
       </div>
@@ -1316,7 +1317,7 @@ function GateBar(props: {
         {actErr && <div class="err">{actErr}</div>}
         <div class="gate-row">
           <button class="btn primary" disabled={busy} onClick={props.onStart}>
-            ▶ 启动
+            ▶ {tr('issue.start')}
           </button>
         </div>
       </div>
@@ -1336,19 +1337,19 @@ function ClarifyBar(props: { awaiting: boolean; analyzing: boolean; count: numbe
   return (
     <button
       class={`clarify-bar${props.awaiting ? ' awaiting' : ''}`}
-      title={props.awaiting ? '代理已暂停，等你回答后自动继续' : '点开查看并回答'}
+      title={props.awaiting ? tr('issue.agentPaused') : tr('issue.openToAnswer')}
       onClick={props.onOpen}
     >
       <span class="clarify-bar-t">
         {props.awaiting
-          ? '⏳ 等待你澄清 —— 代理已暂停'
+          ? `⏳ ${tr('status.awaitingClarify')} — ${tr('issue.agentPaused')}`
           : analyzingOnly
-            ? '🔄 代理正在重新分析…'
-            : '❓ 有待确认的问题'}
-        {props.count > 0 && <span class="badge b-amber">{props.count} 个问题</span>}
+            ? `🔄 ${tr('issue.agentReanalyzing')}`
+            : `❓ ${tr('issue.questionsPending')}`}
+        {props.count > 0 && <span class="badge b-amber">{tr('issue.questionCount', { count: props.count })}</span>}
       </span>
       <span class="clarify-bar-go">
-        {analyzingOnly ? '详情 ›' : props.awaiting ? '立即回答 ›' : '点击回答 ›'}
+        {analyzingOnly ? tr('issue.detailsLink') : props.awaiting ? tr('issue.answerNow') : tr('issue.answer')}
       </span>
     </button>
   );
@@ -1383,19 +1384,19 @@ function ClarifyPanel(props: {
   // 只在「分析中且无可回答的问题」时收起输入框——有问题在身仍可边分析边答
   const analyzingOnly = props.analyzing && !hasQ && !props.awaiting;
   return (
-    <Modal title="澄清" onClose={props.onClose}>
+    <Modal title={tr('issue.clarification')} onClose={props.onClose}>
       <div class="clarify-hd">
         {props.awaiting
-          ? '⏳ 等待你澄清 —— 代理已暂停，回答后自动继续'
+          ? `⏳ ${tr('status.awaitingClarify')} — ${tr('issue.agentPaused')}`
           : analyzingOnly
-            ? '🔄 代理正在重新分析…'
-            : '❓ 有待确认的问题 —— 回答会发给代理（不回也不影响排队）'}
+            ? `🔄 ${tr('issue.agentReanalyzing')}`
+            : `❓ ${tr('issue.questionsOptional')}`}
       </div>
       <div class="clarify-ctx">
         <div class="clarify-ctx-t">「{props.title}」</div>
         {props.body?.trim() && (
           <details class="clarify-ctx-b">
-            <summary>原始需求（含历轮补充）</summary>
+            <summary>{tr('issue.originalRequest')}</summary>
             <pre>{props.body}</pre>
           </details>
         )}
@@ -1409,16 +1410,16 @@ function ClarifyPanel(props: {
           ))}
         </ol>
       ) : analyzingOnly ? (
-        <div class="mut small">你的补充已并入需求，代理正在重新分析——稍后更新反馈，可能再有新问题。</div>
+        <div class="mut small">{tr('issue.reanalyzingHelp')}</div>
       ) : (
-        <div class="mut small">代理在等你确认，具体见「执行 › 对话」。</div>
+        <div class="mut small">{tr('issue.agentWaitingExecution')}</div>
       )}
       {!analyzingOnly && (
         <>
           <textarea
             rows={4}
             value={answer}
-            placeholder="在这里回答…（可逐条回答，回车换行）"
+            placeholder={tr('issue.answerPlaceholder')}
             onInput={(e) => setAnswer(e.currentTarget.value)}
           />
           <div class="clarify-row">
@@ -1430,7 +1431,7 @@ function ClarifyPanel(props: {
                 setAnswer('');
               }}
             >
-              提交澄清答复
+              {tr('issue.submitClarification')}
             </button>
           </div>
         </>
@@ -1446,8 +1447,8 @@ function PlanGateBody({ gate }: { gate: Gate }) {
     <div class="gate-box">
       {subtasks.length > 0
         ? subtasks.map((s, i) => `${i + 1}. ${s}`).join('\n')
-        : '（计划为空——直接看「详情」tab 的计划区）'}
-      {p?.implMode === 'team' ? '\n\n模式：团队并行' : ''}
+        : tr('issue.emptyPlan')}
+      {p?.implMode === 'team' ? `\n\n${tr('issue.teamParallel')}` : ''}
     </div>
   );
 }
@@ -1455,19 +1456,19 @@ function PlanGateBody({ gate }: { gate: Gate }) {
 function MergeGateBody({ gate }: { gate: Gate }) {
   const [showDiff, setShowDiff] = useState(false);
   const p = tryJson<MergeGatePayload>(gate.payloadJson);
-  if (!p) return <div class="mut small">（无 diff 数据）</div>;
+  if (!p) return <div class="mut small">{tr('issue.noDiffData')}</div>;
   return (
     <div class="diffwrap">
       <pre class="diffstat">
         {`⎇ ${p.branch ?? '?'} → ${p.base ?? 'main'}\n`}
-        {p.gitError ? `git 出错：${p.gitError}\n` : ''}
-        {p.stat ?? '（无 stat）'}
+        {p.gitError ? `${tr('issue.gitError', { error: p.gitError })}\n` : ''}
+        {p.stat ?? tr('issue.noStat')}
       </pre>
       {showDiff ? (
         <DiffView diff={p.diff ?? ''} truncated={p.diffTruncated === true} />
       ) : (
         <button class="linkbtn" style={{ padding: '9px' }} onClick={() => setShowDiff(true)}>
-          展开完整 diff{p.diffTruncated ? '（已截断）' : ''} ▾
+          {tr('issue.fullDiff')}{p.diffTruncated ? ` (${tr('issue.truncated')})` : ''} ▾
         </button>
       )}
     </div>
@@ -1494,7 +1495,7 @@ function DiffView({ diff, truncated }: { diff: string; truncated: boolean }) {
           </div>
         );
       })}
-      {truncated && <div class="ln hunk">…diff 已截断（完整 diff 请在终端看）…</div>}
+      {truncated && <div class="ln hunk">…{tr('issue.diffTruncated')}…</div>}
     </pre>
   );
 }

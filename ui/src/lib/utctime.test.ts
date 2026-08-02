@@ -1,12 +1,12 @@
-import { describe, expect, test } from 'bun:test';
+import { beforeAll, describe, expect, test } from 'bun:test';
+import { enCatalog } from '../../../shared/i18n/catalogs/en';
+import { createI18n } from '../../../shared/i18n/formatter';
+import { setRuntimeI18n } from '../i18n/runtime';
 import { localizeUtcTimes, nextUtcOccurrence } from './utctime';
 
-/** 用同一套 Date API 算出期望的本地「HH:MM」，让断言不依赖跑测试的机器时区 */
-function localHm(atMs: number): string {
-  const d = new Date(atMs);
-  const p = (n: number): string => (n < 10 ? `0${n}` : String(n));
-  return `${p(d.getHours())}:${p(d.getMinutes())}`;
-}
+beforeAll(() => {
+  setRuntimeI18n(createI18n({ locale: 'en', timeZone: 'Asia/Shanghai', catalog: enCatalog }));
+});
 
 const REF = Date.parse('2026-07-29T05:12:53.000Z'); // 参照时刻（消息行 ts）
 
@@ -26,34 +26,29 @@ describe('nextUtcOccurrence（≥ 参照时刻的最近一次 UTC 墙上时间�
 describe('localizeUtcTimes（正文里的 UTC 时间点补本地时间，issue #116）', () => {
   test('额度提示现场：6:50am (UTC) 就地补本地时间且保留原文', () => {
     const out = localizeUtcTimes("You've hit your session limit · resets 6:50am (UTC)", REF);
-    const hm = localHm(Date.parse('2026-07-29T06:50:00.000Z'));
-    expect(out).toBe(`You've hit your session limit · resets 6:50am (UTC → 本地 ${hm})`);
+    expect(out).toBe("You've hit your session limit · resets 6:50am (UTC → local time 2:50 PM)");
   });
 
   test('整点 5pm / 24 小时制 06:50 / GMT 同样认', () => {
     const pm = localizeUtcTimes('resets 5pm (UTC)', REF);
-    expect(pm).toContain(`本地 ${localHm(Date.parse('2026-07-29T17:00:00.000Z'))}`);
+    expect(pm).toContain('local time tomorrow 1:00 AM');
     const h24 = localizeUtcTimes('resets 06:50 (UTC)', REF);
-    expect(h24).toContain(`本地 ${localHm(Date.parse('2026-07-29T06:50:00.000Z'))}`);
-    expect(localizeUtcTimes('resets 6:50am (GMT)', REF)).toContain('本地 ');
+    expect(h24).toContain('local time 2:50 PM');
+    expect(localizeUtcTimes('resets 6:50am (GMT)', REF)).toContain('local time ');
   });
 
   test('12 点边界：12am=0 点、12pm=正午', () => {
     // 12am 是次日 0 点：本地可能带「明天」前缀，故只钉时分
-    expect(localizeUtcTimes('at 12am (UTC)', REF)).toContain(localHm(Date.parse('2026-07-30T00:00:00.000Z')));
+    expect(localizeUtcTimes('at 12am (UTC)', REF)).toContain('8:00 AM');
     expect(localizeUtcTimes('at 12pm (UTC)', REF)).toContain(
-      `本地 ${localHm(Date.parse('2026-07-29T12:00:00.000Z'))}`,
+      'local time 8:00 PM',
     );
   });
 
   test('跨日：本地落到别的日历日时把日子标出来', () => {
     // 参照 UTC 05:12，目标 UTC 次日 04:00 —— 任何时区下本地都不可能还是同一天
     const out = localizeUtcTimes('resets 4am (UTC)', REF);
-    const at = Date.parse('2026-07-30T04:00:00.000Z');
-    const sameLocalDay = new Date(at).toDateString() === new Date(REF).toDateString();
-    expect(sameLocalDay).toBe(false);
-    expect(out).toMatch(/本地 (明天|\d{1,2}-\d{1,2}) \d{2}:\d{2}/);
-    expect(out).toContain(localHm(at));
+    expect(out).toContain('local time tomorrow 12:00 PM');
   });
 
   test('无匹配 / 含糊写法 / 越界一律原样返回', () => {
@@ -66,7 +61,7 @@ describe('localizeUtcTimes（正文里的 UTC 时间点补本地时间，issue #
 
   test('一段里多个时间点各自换算', () => {
     const out = localizeUtcTimes('限额 6:50am (UTC) 恢复，维护窗口 5pm (UTC)', REF);
-    expect(out).toContain(`6:50am (UTC → 本地 ${localHm(Date.parse('2026-07-29T06:50:00.000Z'))})`);
-    expect(out).toContain(`5pm (UTC → 本地 ${localHm(Date.parse('2026-07-29T17:00:00.000Z'))})`);
+    expect(out).toContain('6:50am (UTC → local time 2:50 PM)');
+    expect(out).toContain('5pm (UTC → local time tomorrow 1:00 AM)');
   });
 });

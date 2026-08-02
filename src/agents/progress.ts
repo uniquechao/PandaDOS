@@ -17,6 +17,8 @@
  */
 import type { Database } from 'bun:sqlite';
 import type { LlmClient } from './llm';
+import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
+import { outputLanguageInstruction, promptLanguage } from './prompts/language';
 
 // ---------- 事件状态分类（v1 cards.ts isEventStatus 语义平移，与 ANALYZE_SYS 的 schema 配套） ----------
 
@@ -44,6 +46,10 @@ export const ANALYZE_SYS = `# 任务：判断要不要打扰主人，并分类
 · push=false（进行中的单步动作）：'正在读/查看/分析 X'、'调用了某工具'、'正在写/改代码'、'正在跑测试'。
 · push=true（值得打扰）：阶段/任务完成、测试通过或失败、报错、被卡住、**需要主人决策或回话**。
 needsReply=true 当 CC 在问主人或在等主人输入/批准。只输出 JSON。`;
+export const ANALYZE_SYS_EN = `# Task: decide whether to notify the user and classify the event
+Analyze the latest Claude Code activity and return JSON only:
+{"push": bool, "status": "milestone|waiting|error|done|working", "needsReply": bool, "headline": "one concise conversational sentence"}
+Prefer missing an update over creating noise. push=false for routine reading, analysis, editing, tool calls, or tests in progress. push=true for meaningful milestones, completion, test success/failure, errors, blockers, or user decisions. needsReply=true when the agent asks or waits for user input or approval.`;
 
 // ---------- 事件渲染（v1 fmtEvent 平移，输入改 core/jsonl 的 ChatMessage 形状） ----------
 
@@ -57,16 +63,17 @@ export interface ProgressEventLike {
 }
 
 /** 一条 jsonl 消息 → 喂 LLM 的活动行（thinking 等未知角色渲染为空 = 过滤） */
-export function fmtChatEvent(m: ProgressEventLike): string {
+export function fmtChatEvent(m: ProgressEventLike, locale: SupportedLocale = 'zh-Hans'): string {
+  const zh = promptLanguage(locale) === 'zh';
   switch (m.role) {
     case 'assistant':
-      return `助手说：${m.text ?? ''}`;
+      return zh ? `助手说：${m.text ?? ''}` : `Assistant: ${m.text ?? ''}`;
     case 'tool_use':
-      return `调用工具 ${m.tool ?? ''}（${m.input ?? ''}）`;
+      return zh ? `调用工具 ${m.tool ?? ''}（${m.input ?? ''}）` : `Tool call ${m.tool ?? ''} (${m.input ?? ''})`;
     case 'tool_result':
-      return `工具结果${m.isError ? '(报错)' : ''}：${m.result ?? ''}`;
+      return zh ? `工具结果${m.isError ? '(报错)' : ''}：${m.result ?? ''}` : `Tool result${m.isError ? ' (error)' : ''}: ${m.result ?? ''}`;
     case 'user':
-      return `用户输入：${m.text ?? ''}`;
+      return zh ? `用户输入：${m.text ?? ''}` : `User input: ${m.text ?? ''}`;
     default:
       return '';
   }
@@ -81,15 +88,20 @@ export function fmtChatEvent(m: ProgressEventLike): string {
  */
 export async function analyzeProgress(
   llm: LlmClient,
-  opts: { label: string; prev: string; activity: string; systemPrefix?: string },
+  opts: { label: string; prev: string; activity: string; systemPrefix?: string; locale?: SupportedLocale },
 ): Promise<ProgressAnalysis> {
-  const sys = (opts.systemPrefix ? `${opts.systemPrefix}\n\n` : '') + ANALYZE_SYS;
+  const locale = opts.locale ?? 'zh-Hans'; // compatibility for direct callers; product paths pass locale
+  const sys = (opts.systemPrefix ? `${opts.systemPrefix}\n\n` : '') +
+    (promptLanguage(locale) === 'zh' ? ANALYZE_SYS : ANALYZE_SYS_EN) +
+    `\n${outputLanguageInstruction(locale)}`;
   const r = await llm.chat(
     [
       { role: 'system', content: sys },
       {
         role: 'user',
-        content: `会话 @${opts.label}\n此前进度：${opts.prev || '(无)'}\n\n最新活动：\n${opts.activity}`,
+        content: promptLanguage(locale) === 'zh'
+          ? `会话 @${opts.label}\n此前进度：${opts.prev || '(无)'}\n\n最新活动：\n${opts.activity}`
+          : `Session @${opts.label}\nPrevious progress: ${opts.prev || '(none)'}\n\nLatest activity:\n${opts.activity}`,
       },
     ],
     { jsonMode: true },
@@ -164,6 +176,7 @@ export interface ProgressReporterOpts {
   maxChars?: number;
   /** PM systemPrompt 前缀（惰性取，persona/memory 可能在运行中被改） */
   systemPrefix?: () => string;
+  locale?: SupportedLocale;
 }
 
 export const DEFAULT_THROTTLE_SECONDS = 30;
@@ -231,7 +244,7 @@ export class ProgressReporter {
     this.buffer = [];
     try {
       const maxChars = this.opts.maxChars ?? DEFAULT_MAX_CHARS;
-      const activity = events.map(fmtChatEvent).filter(Boolean).join('\n').slice(-maxChars); // 保尾（M18）
+      const activity = events.map((event) => fmtChatEvent(event, this.opts.locale)).filter(Boolean).join('\n').slice(-maxChars); // 保尾（M18）
       if (!activity) return null;
       let a: ProgressAnalysis;
       try {
@@ -240,6 +253,7 @@ export class ProgressReporter {
           prev: this.summary.get(),
           activity,
           systemPrefix: this.opts.systemPrefix?.(),
+          locale: this.opts.locale,
         });
       } catch {
         this.buffer = events.concat(this.buffer); // 失败回插（H14）

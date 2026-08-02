@@ -24,11 +24,12 @@ import { SessionStore } from '../core/sessions';
 import type { User } from '../core/types';
 import type { UserStore } from '../core/users';
 import { resolveUser, type SessionLookup } from './auth';
+import { apiError, normalizeErrorPayload } from './errors';
 
 // ---------- 通用 JSON 响应（与 server.ts 同风格） ----------
 
 export function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
+  return new Response(JSON.stringify(normalizeErrorPayload(body, status)), {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8' },
   });
@@ -140,36 +141,36 @@ export async function runRoute(
     auth !== 'project-owner' &&
     auth !== 'project-access'
   ) {
-    return json({ ok: false, error: '路由未声明鉴权级别，默认拒绝' }, 403);
+    return json(apiError('auth.route_undeclared', 'This route is unavailable.', 403), 403);
   }
 
   const user = resolveUser(req, deps.users, deps.sessions);
 
   if (auth !== 'public') {
-    if (!user) return json({ ok: false, error: '未登录' }, 401);
+    if (!user) return json(apiError('auth.required', 'Sign in to continue.', 401), 401);
 
     if (auth === 'admin' && user.role !== 'admin') {
-      return json({ ok: false, error: '需要 admin' }, 403);
+      return json(apiError('auth.admin_required', 'Administrator access is required.', 403), 403);
     }
 
     if (auth === 'project-owner' || auth === 'project-access') {
       const raw = params.projectId ?? url.searchParams.get('projectId') ?? '';
       const pid = Number(raw);
       if (!raw || !Number.isInteger(pid) || pid <= 0) {
-        return json({ ok: false, error: '缺 projectId' }, 400);
+        return json(apiError('project.required', 'A project ID is required.', 400), 400);
       }
       const owner = deps.getProjectOwner(pid);
       if (owner === undefined) {
         // 不存在：admin 见 404，普通用户统一 403（不泄露项目是否存在）
         return user.role === 'admin'
-          ? json({ ok: false, error: '项目不存在' }, 404)
-          : json({ ok: false, error: '无权限' }, 403);
+          ? json(apiError('project.not_found', 'The project does not exist.', 404), 404)
+          : json(apiError('auth.forbidden', 'You do not have permission to do this.', 403), 403);
       }
       if (user.role !== 'admin') {
         // project-owner 只认属主；project-access 放宽到属主 ∨ 成员
         const allowed =
           auth === 'project-owner' ? owner === user.id : deps.hasProjectAccess(pid, user.id);
-        if (!allowed) return json({ ok: false, error: '无权限' }, 403);
+        if (!allowed) return json(apiError('auth.forbidden', 'You do not have permission to do this.', 403), 403);
       }
     }
   }

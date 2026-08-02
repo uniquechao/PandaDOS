@@ -1,86 +1,33 @@
-# MandoAI 部署指南
+# Deployment and Operations
 
-本文说明当前版本的安装、配置和安全部署方式。示例使用专用系统账号 `mando`、
-安装目录 `/srv/mando` 和公开示例域名 `mando.example.com`。
+[简体中文](DEPLOY.zh-CN.md)
 
-## 运行条件
+This guide covers the current MandoAI V2 system. Run all project commands from the repository root.
 
-控制面需要：
+## Requirements
 
-- Bun、Git、tmux；
-- 可写的运行目录 `~/.mando/`；
-- OpenAI-compatible API（可选，用于 PM 判断、总结和问答）；
-- 飞书应用凭据（可选，用于登录与通知）。
+The control plane needs Bun, Git, tmux, a writable `~/.mando/`, and optionally an OpenAI-compatible driver model and Feishu credentials. Each executor needs tmux, Git, and an authenticated Claude Code or Codex installation. Executors may be local or reached over SSH.
 
-执行机需要：
-
-- Git 和 tmux；
-- 已安装并登录 Claude Code 或 Codex；
-- 本机访问，或从控制面可达的 SSH 服务。
-
-## 安装
+## Install and start
 
 ```bash
-git clone https://example.com/your-org/mando.git /srv/mando
-cd /srv/mando
 bun install --frozen-lockfile
+bun run check-i18n
 bun run typecheck
 bun test
 bun run build-ui
-```
-
-启动服务：
-
-```bash
 bun run start
 ```
 
-默认监听地址是 `127.0.0.1:8802`。首次启动会创建管理员账号，并把一次性明文
-token 写入 `~/.mando/admin-token`，权限为 `0600`。
-
-健康检查：
+The default endpoint is `127.0.0.1:8802`; health checks use:
 
 ```bash
 curl --fail http://127.0.0.1:8802/healthz
 ```
 
-## 环境变量
+The first start creates the admin user and writes its one-time token to `~/.mando/admin-token` with mode `0600`. Keep the service bound to loopback and expose it through nginx or Caddy with TLS, authentication, and WebSocket forwarding.
 
-建议把部署变量写入权限为 `0600`、且位于仓库外的环境文件：
-
-```dotenv
-MANDO_BIND=127.0.0.1
-MANDO_PORT=8802
-MANDO_DB=/var/lib/mando/mando.db
-MANDO_ADMIN_TOKEN_FILE=/var/lib/mando/admin-token
-
-MANDO_LLM_BASE_URL=
-MANDO_LLM_MODEL=
-MANDO_LLM_API_KEY=
-
-MANDO_FEISHU_APP_ID=
-MANDO_FEISHU_APP_SECRET=
-MANDO_FEISHU_CHANNEL=off
-MANDO_PUBLIC_URL=https://mando.example.com
-```
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `MANDO_BIND` | `127.0.0.1` | HTTP 绑定地址 |
-| `MANDO_PORT` | `8802` | HTTP 端口 |
-| `MANDO_DB` | `~/.mando/mando.db` | SQLite 数据库 |
-| `MANDO_ADMIN_TOKEN_FILE` | `~/.mando/admin-token` | 管理员 token 文件 |
-| `MANDO_LLM_BASE_URL` | 空 | OpenAI-compatible API 地址 |
-| `MANDO_LLM_MODEL` | 空 | 驱动模型名称 |
-| `MANDO_LLM_API_KEY` | 空 | 驱动模型密钥 |
-| `MANDO_FEISHU_APP_ID` | 空 | 飞书应用 ID |
-| `MANDO_FEISHU_APP_SECRET` | 空 | 飞书应用密钥 |
-| `MANDO_FEISHU_CHANNEL` | `on` | 设为 `off` 可关闭飞书长连接 |
-| `MANDO_PUBLIC_URL` | 按请求推导 | OAuth 对外基址 |
-
-## systemd
-
-创建 `/etc/systemd/system/mando.service`：
+## systemd example
 
 ```ini
 [Unit]
@@ -90,10 +37,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=mando
+User=root
 WorkingDirectory=/srv/mando
-EnvironmentFile=-/etc/mando/env
-ExecStart=/home/mando/.bun/bin/bun run start
+EnvironmentFile=-/root/.mando/env
+ExecStart=/root/.bun/bin/bun run start
 Restart=always
 RestartSec=3
 KillMode=process
@@ -103,77 +50,42 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 ```
 
-启用服务：
+`KillMode=process` avoids killing agent processes running inside tmux when the control plane restarts. Apply changes with `systemctl daemon-reload`; backend changes require `systemctl restart mando`, while UI-only changes need only `bun run build-ui`.
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now mando
-sudo systemctl status mando
-```
+## Executors
 
-后端代码更新后需要重启服务；只更新前端时重新运行 `bun run build-ui` 即可。
+A host of `127.0.0.1` or `localhost` with no `keyRef` uses `LocalDriver`. SSH private keys belong in `~/.mando/keys/<keyRef>` with mode `0600`; verify SSH host keys and agent login state manually before registration. The current scheduler selects the executor with the smallest id as the primary executor.
 
-## 执行机
-
-### 本机执行机
-
-本机执行机使用 `LocalDriver`，无需 SSH 密钥。示例配置：
+Example registration body for `POST /api/admin/executors`:
 
 ```json
 {
   "name": "local",
   "host": "127.0.0.1",
   "port": 22,
-  "sshUser": "mando",
+  "sshUser": "root",
   "keyRef": null,
-  "workspaceRoot": "/srv/mando-workspaces",
-  "claudeDir": "/home/mando/.claude/projects",
-  "codexDir": "/home/mando/.codex/sessions"
+  "workspaceRoot": "/root/workspace",
+  "claudeDir": "/root/.claude/projects"
 }
 ```
 
-### SSH 执行机
+## Environment variables
 
-把私钥保存在控制面的 `~/.mando/keys/`，设置为 `0600`，不要写入数据库或仓库。
-首次登记前先手动确认主机指纹和代理登录状态：
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MANDO_BIND` | `127.0.0.1` | HTTP bind address |
+| `MANDO_PORT` | `8802` | HTTP port |
+| `MANDO_DB` | `~/.mando/mando.db` | SQLite database |
+| `MANDO_ADMIN_TOKEN_FILE` | `~/.mando/admin-token` | Admin token file |
+| `MANDO_LLM_BASE_URL` | unset | Driver-model fallback endpoint |
+| `MANDO_LLM_MODEL` | unset | Driver-model fallback name |
+| `MANDO_LLM_API_KEY` | unset | Driver-model credential |
+| `MANDO_FEISHU_APP_ID` | unset | Feishu application id |
+| `MANDO_FEISHU_APP_SECRET` | unset | Feishu application secret |
+| `MANDO_FEISHU_CHANNEL` | `on` | Set `off` to disable the event connection |
+| `MANDO_PUBLIC_URL` | inferred | Public OAuth base URL |
 
-```bash
-chmod 600 ~/.mando/keys/example_ed25519
-ssh -i ~/.mando/keys/example_ed25519 developer@executor.example.com 'tmux -V'
-```
+## Operations
 
-登记时使用示例字段对应的真实部署值，并为执行机账号配置最小必要权限。
-
-## 反向代理
-
-服务应保持回环绑定，由 nginx、Caddy 或等效代理提供 TLS、强认证和 WebSocket 转发。
-不要把 `8802` 端口直接暴露到公网。
-
-反向代理至少需要：
-
-- 转发普通 HTTP 请求；
-- 支持 WebSocket upgrade；
-- 保留 `Host` 和 `X-Forwarded-Proto`；
-- 限制请求体大小和访问来源；
-- 使用有效 TLS 证书。
-
-## 运维与备份
-
-部署前运行：
-
-```bash
-bun run typecheck
-bun test
-bun run build-ui
-```
-
-日常检查：
-
-```bash
-sudo systemctl status mando
-sudo journalctl -u mando -f
-curl --fail http://127.0.0.1:8802/healthz
-```
-
-SQLite 使用 WAL 模式。备份应采用 SQLite 在线备份能力或同时处理数据库与 WAL 文件，
-并在隔离环境验证恢复流程。不要在 issue 正在执行时重启控制面。
+Use `journalctl -u mando -f`, `systemctl status mando`, and the health endpoint for routine checks. Avoid restarting while an issue is running. Diagnose production databases read-only; use SQLite online backup or another WAL-aware method for consistent backups.

@@ -1,11 +1,12 @@
-/** 载入指示：动画 spinner + 骨架屏。替代裸「载入中…」文字，给出更专业的等待反馈。 */
+/** 载入指示：动画 spinner + 骨架屏。 */
+import { tr } from '../i18n/runtime';
 
 export function Spinner({ size = 'md' }: { size?: 'sm' | 'md' | 'lg' }) {
-  return <span class={`spinner${size === 'md' ? '' : ' ' + size}`} role="status" aria-label="载入中" />;
+  return <span class={`spinner${size === 'md' ? '' : ' ' + size}`} role="status" aria-label={tr('ui.loading')} />;
 }
 
 /** 居中一行「转圈 + 文案」，用于列表/页面首屏载入 */
-export function Loading({ text = '载入中…' }: { text?: string }) {
+export function Loading({ text = tr('ui.loading') }: { text?: string }) {
   return (
     <div class="loadrow">
       <Spinner />

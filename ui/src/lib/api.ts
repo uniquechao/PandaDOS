@@ -15,13 +15,85 @@ import type {
   ProjectMember,
   UploadResult,
 } from './types';
+import type { MessageKey, MessageValues } from '../../../shared/i18n/messages';
+import { tr } from '../i18n/runtime';
+
+export interface ApiErrorDescriptor {
+  code: string;
+  params: Record<string, unknown>;
+  fallback: string;
+  details?: unknown;
+}
+
+const ERROR_MESSAGE_KEYS: Readonly<Record<string, MessageKey>> = {
+  'auth.invalid_credentials': 'errors.auth.invalid_credentials',
+  'auth.required': 'errors.auth.required',
+  'auth.admin_required': 'errors.auth.admin_required',
+  'auth.forbidden': 'errors.auth.forbidden',
+  'auth.route_undeclared': 'errors.auth.route_undeclared',
+  'project.required': 'errors.project.required',
+  'project.not_found': 'errors.project.not_found',
+  'legacy.error': 'errors.legacy.error',
+  'network.unreachable': 'errors.network.unreachable',
+  'http.unexpected_response': 'errors.http.unexpected_response',
+};
 
 export class ApiError extends Error {
-  status: number;
-  constructor(message: string, status: number) {
+  readonly status: number;
+  readonly code: string;
+  readonly params: Record<string, unknown>;
+  readonly fallback: string;
+  readonly details?: unknown;
+
+  constructor(error: ApiErrorDescriptor, status: number, message = error.fallback) {
     super(message);
     this.status = status;
+    this.code = error.code;
+    this.params = error.params;
+    this.fallback = error.fallback;
+    this.details = error.details;
   }
+}
+
+type Translator = (key: MessageKey, values?: MessageValues) => string;
+
+export function localizeApiError(error: ApiError, t: Translator): string {
+  const key = ERROR_MESSAGE_KEYS[error.code];
+  const summary = key ? t(key, error.params) : error.fallback;
+  if (error.code !== 'legacy.error') return summary;
+  const detail = typeof error.details === 'string' ? error.details.trim() : '';
+  return detail ? `${summary} — ${detail}` : summary;
+}
+
+function descriptorFromBody(body: unknown, status: number): ApiErrorDescriptor {
+  if (typeof body === 'object' && body !== null) {
+    const raw = (body as { error?: unknown }).error;
+    if (typeof raw === 'object' && raw !== null) {
+      const value = raw as Partial<ApiErrorDescriptor>;
+      if (typeof value.code === 'string' && typeof value.fallback === 'string') {
+        return {
+          code: value.code,
+          params: typeof value.params === 'object' && value.params !== null ? value.params : {},
+          fallback: value.fallback,
+          ...(value.details === undefined ? {} : { details: value.details }),
+        };
+      }
+    }
+    if (typeof raw === 'string') {
+      return { code: 'legacy.error', params: {}, fallback: raw };
+    }
+  }
+  return {
+    code: 'http.unexpected_response',
+    params: { status },
+    fallback: `The server returned an unexpected response (HTTP ${status}).`,
+  };
+}
+
+function localizedError(error: ApiErrorDescriptor, status: number): ApiError {
+  const value = new ApiError(error, status);
+  value.message = localizeApiError(value, tr);
+  return value;
 }
 
 let onUnauthorized: (() => void) | null = null;
@@ -49,12 +121,17 @@ export async function api<T>(
   let r: Response;
   try {
     r = await fetch(path, init);
-  } catch {
-    throw new ApiError('网络错误', 0);
+  } catch (cause) {
+    throw localizedError({
+      code: 'network.unreachable',
+      params: {},
+      fallback: 'Could not reach the server. Check your connection and try again.',
+      details: cause instanceof Error ? cause.message : undefined,
+    }, 0);
   }
   if (r.status === 401 && !opts.silent401) onUnauthorized?.();
-  const j = (await r.json().catch(() => null)) as { error?: string } | null;
-  if (!r.ok) throw new ApiError(j?.error ?? `HTTP ${r.status}`, r.status);
+  const j = await r.json().catch(() => null) as unknown;
+  if (!r.ok) throw localizedError(descriptorFromBody(j, r.status), r.status);
   return j as T;
 }
 
@@ -74,13 +151,19 @@ export async function uploadImage(projectId: number, file: File): Promise<Upload
   let r: Response;
   try {
     r = await fetch(`/api/projects/${projectId}/upload`, { method: 'POST', body: fd });
-  } catch {
-    throw new ApiError('网络错误', 0);
+  } catch (cause) {
+    throw localizedError({
+      code: 'network.unreachable', params: {},
+      fallback: 'Could not reach the server. Check your connection and try again.',
+      details: cause instanceof Error ? cause.message : undefined,
+    }, 0);
   }
   if (r.status === 401) onUnauthorized?.();
-  const j = (await r.json().catch(() => null)) as (UploadResult & { error?: string }) | null;
-  if (!r.ok || !j?.ok) throw new ApiError(j?.error ?? `上传失败(HTTP ${r.status})`, r.status);
-  return j;
+  const j = await r.json().catch(() => null) as unknown;
+  if (!r.ok || typeof j !== 'object' || j === null || !(j as UploadResult).ok) {
+    throw localizedError(descriptorFromBody(j, r.status), r.status);
+  }
+  return j as UploadResult;
 }
 
 // ---------- 项目成员（关联多用户） ----------

@@ -11,24 +11,7 @@ import type { JSX } from 'preact';
 import { createPortal } from 'preact/compat';
 import { useEffect, useState } from 'preact/hooks';
 import type { AutoApproveLevel } from '../lib/types';
-
-const LEVELS: Array<{ level: AutoApproveLevel; label: string; desc: string }> = [
-  {
-    level: 'cautious',
-    label: '谨慎',
-    desc: '只自动点「信任此目录」和 CLI 标了（推荐）的项，其余都等你点',
-  },
-  {
-    level: 'medium',
-    label: '中等',
-    desc: '安全可逆的自动批（跑测试/改文件/commit/普通 push…），危险不可逆的等你点',
-  },
-  {
-    level: 'auto',
-    label: '全自动',
-    desc: '除删数据/强推改历史/部署上线/改生产密钥/关机重启外，一律自动同意',
-  },
-];
+import { useI18n } from '../i18n/provider';
 
 /** 归一档位：认不出来（老后端没下发这个字段/脏值）时落到 medium，保证收起态一定显示出一档 */
 function normalize(v: unknown): AutoApproveLevel {
@@ -55,8 +38,14 @@ export function AutoApproveSwitch({
   /** 置灰原因（写进 title，别让人点不动还不知道为什么） */
   disabledHint?: string;
 }): JSX.Element {
+  const { t } = useI18n();
+  const levels: Array<{ level: AutoApproveLevel; label: string; desc: string }> = [
+    { level: 'cautious', label: t('ui.cautious'), desc: t('ui.cautiousDesc') },
+    { level: 'medium', label: t('ui.medium'), desc: t('ui.mediumDesc') },
+    { level: 'auto', label: t('ui.automatic'), desc: t('ui.automaticDesc') },
+  ];
   const cur = normalize(level);
-  const curMeta = LEVELS.find((l) => l.level === cur);
+  const curMeta = levels.find((l) => l.level === cur);
   const hint = curMeta ? `${curMeta.label}：${curMeta.desc}` : '';
   // 菜单锚点（fixed 视口坐标；null = 收起）
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
@@ -98,11 +87,11 @@ export function AutoApproveSwitch({
 
   return (
     <span class="aa-pick">
-      <span class="aa-pick-t mut">批准</span>
+      <span class="aa-pick-t mut">{t('ui.approval')}</span>
       <button
         class="aa-btn"
         disabled={disabled}
-        title={disabled ? (disabledHint ?? '当前状态不能改自动批准档位') : hint}
+        title={disabled ? (disabledHint ?? t('ui.approvalUnavailable')) : hint}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={toggle}
@@ -115,11 +104,11 @@ export function AutoApproveSwitch({
           <div
             class="aa-menu"
             role="menu"
-            aria-label="自动批准档位"
+            aria-label={t('ui.autoApprovalLevel')}
             style={{ left: `${menu.x}px`, top: `${menu.y}px` }}
             onClick={(e) => e.stopPropagation()}
           >
-            {LEVELS.map((l) => (
+            {levels.map((l) => (
               <button
                 key={l.level}
                 class={`aa-item${l.level === cur ? ' on' : ''}`}

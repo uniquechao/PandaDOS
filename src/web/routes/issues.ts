@@ -177,7 +177,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
       method: 'POST',
       path: '/api/projects/:projectId/modules/organize',
       auth: 'project-access',
-      handler: async ({ req, params }) => {
+      handler: async ({ req, params, user }) => {
         const pid = num(params.projectId);
         if (!pid) return json({ ok: false, error: '缺 projectId' }, 400);
         const b = await readBody(req);
@@ -185,7 +185,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
           b.agent === 'codex' ? 'codex' : b.agent === 'claude' ? 'claude' : undefined;
         const denied = unsupported(pid, agent ?? 'claude');
         if (denied) return denied;
-        const r = engine.organizeModules(pid, agent);
+        const r = engine.organizeModules(pid, agent, user?.id);
         if (!r.ok) return json(r, r.error.includes('进行中') ? 409 : 400);
         return json({ ok: true });
       },

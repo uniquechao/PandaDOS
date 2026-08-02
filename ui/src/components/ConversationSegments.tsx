@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import { groupConversationMessages } from '../lib/conversationSegments';
-import { STATUS_LABEL, type ChatMessage, type ConversationSegment } from '../lib/types';
+import { type ChatMessage, type ConversationSegment } from '../lib/types';
+import { issueStatusLabel } from '../lib/labels';
+import { tr } from '../i18n/runtime';
 import { RunStream } from './runstream';
 
 export function ConversationSegments({
@@ -47,8 +49,8 @@ export function ConversationSegments({
             <button class="conv-segment-line" onClick={() => !current && toggle(group.key)}>
               <span class="conv-segment-rule" />
               <span class="conv-segment-title">{label}</span>
-              {segment && <span class="conv-segment-status">{STATUS_LABEL[segment.status]}</span>}
-              {!current && <span class="conv-segment-toggle">{open ? '收起' : `展开 · ${group.msgs.length}`}</span>}
+              {segment && <span class="conv-segment-status">{issueStatusLabel(segment.status)}</span>}
+              {!current && <span class="conv-segment-toggle">{open ? tr('ui.collapse') : tr('ui.expandCount', { count: group.msgs.length })}</span>}
               <span class="conv-segment-rule" />
             </button>
             {open && (
@@ -56,14 +58,14 @@ export function ConversationSegments({
                 {group.msgs.length ? (
                   <RunStream msgs={group.msgs} pid={pid} onOpenImage={onOpenImage} />
                 ) : (
-                  <div class="conv-segment-empty">当前 Issue 尚无对话消息</div>
+                  <div class="conv-segment-empty">{tr('ui.issueNoMessages')}</div>
                 )}
               </div>
             )}
             {open && segment && segment.endTs !== null && (
               <div class="conv-segment-end">
                 <span />
-                Issue #{segment.issueId} · {STATUS_LABEL[segment.status]}
+                Issue #{segment.issueId} · {issueStatusLabel(segment.status)}
                 <span />
               </div>
             )}

@@ -53,6 +53,11 @@ export interface ModuleDocsPort {
     status: string;
     docPath: string;
   }>): Promise<void>;
+  recordResultSummary?(
+    module: ProjectModule,
+    issue: { id: number; title: string; body: string | null; status: string; agent: AgentKind; createdTs: number },
+    summary: string,
+  ): Promise<void>;
 }
 
 export interface ModuleMergeInput {
@@ -359,6 +364,16 @@ export class ModuleManager {
         docPath: moduleIssueRelPath(module.slug, i.id, i.title),
       }));
     await this.deps.docs.refreshIssueIndex(module, items);
+    this.store.touch(module.id);
+  }
+
+  async recordResultSummary(
+    module: ProjectModule,
+    issue: { id: number; title: string; body: string | null; status: string; agent: AgentKind; createdTs: number },
+    summary: string,
+  ): Promise<void> {
+    if (!this.deps.docs.recordResultSummary) return;
+    await this.deps.docs.recordResultSummary(module, issue, summary);
     this.store.touch(module.id);
   }
 

@@ -34,6 +34,7 @@ the coding agents you already use.
 git clone https://github.com/uniquechao/MandoAI.git
 cd MandoAI
 bun install --frozen-lockfile
+bun run check-i18n
 bun run build-ui
 bun run start
 ```
@@ -60,6 +61,11 @@ For reverse proxies, environment variables, SSH executors, and production servic
   machines through a shared executor boundary.
 - **Team-ready projects** — Organize work by project and module, add members, maintain summaries,
   subscribe to notifications, and run independent projects in parallel.
+- **Global localization** — Use English by default or switch among ten UI languages. Browser locale
+  and IANA timezone are detected initially, while account preferences remain user-controlled.
+- **Localized AI and notifications** — Clarifications, summaries, approvals, notifications, and
+  cards follow each recipient's language without altering issues, code, terminal output, Git data,
+  or existing chat history.
 
 ## How it works
 
@@ -108,9 +114,10 @@ web / notify
 | `src/notify/` | Subscriptions, aggregation, and notification channels |
 | `src/web/` | HTTP API, WebSocket, terminal bridge, and service composition |
 | `ui/` | Preact and Vite browser interface |
+| `shared/i18n/` | Typed catalogs, ICU formatting, locale matching, and timezone formatting |
 
 The main stack is Bun, TypeScript, SQLite, Preact, Vite, tmux, xterm.js, and ssh2. Read the
-[architecture overview](docs/architecture.md) for the runtime model and module boundaries.
+[execution model](docs/execution-model.md) for the runtime architecture and module boundaries.
 
 ## Deployment
 
@@ -136,6 +143,7 @@ web interface as access to a remote shell.
 ## Development
 
 ```bash
+bun run check-i18n
 bun run typecheck
 bun test
 bun run build-ui

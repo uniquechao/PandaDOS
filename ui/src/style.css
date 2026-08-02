@@ -608,35 +608,129 @@ label.field { display: flex; flex-direction: column; gap: 5px; font-size: 13px; 
 .skel-card { background: var(--card); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 12px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 9px; box-shadow: var(--sh-1); }
 .skel-line { height: 12px; }
 
-/* ── 登录（自带圆点缀的暖色大堂） ── */
+/* ── 登录（暖色国际化大堂） ── */
 .login {
-  height: 100%; display: flex; align-items: center; justify-content: center; padding: 20px;
+  height: 100%; display: flex; align-items: center; justify-content: center; padding: 82px 24px 34px;
   position: relative; overflow: hidden;
-  background: radial-gradient(1100px 520px at 12% -8%, rgba(255, 197, 66, 0.4), transparent 62%),
-    radial-gradient(900px 620px at 108% 112%, rgba(255, 166, 30, 0.3), transparent 60%), var(--bg);
+  background: radial-gradient(900px 480px at 4% 0%, rgba(255, 190, 75, 0.22), transparent 68%),
+    radial-gradient(820px 560px at 100% 100%, rgba(255, 173, 40, 0.18), transparent 66%), #fbf8f2;
 }
-.login::before {
-  content: ''; position: absolute; width: 130px; height: 130px; border-radius: 50%;
-  border: 3px solid rgba(245, 158, 11, 0.3); left: 8%; bottom: 12%;
-  box-shadow: 0 0 42px rgba(245, 158, 11, 0.1);
-  will-change: transform, opacity;
-  animation: login-orbit-ring 10s ease-in-out infinite;
+.login-art { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+.login-art i { position: absolute; display: block; will-change: transform, opacity; }
+.login-glow { width: 420px; height: 250px; border-radius: 50%; filter: blur(22px); opacity: 0.44; }
+.login-glow-tl { left: -130px; top: -95px; background: rgba(255, 187, 74, 0.36); animation: login-drift-a 14s ease-in-out infinite; }
+.login-glow-br { right: -150px; bottom: -100px; background: rgba(255, 174, 48, 0.3); animation: login-drift-b 17s ease-in-out -5s infinite; }
+.login-ring { border: 2px solid rgba(239, 166, 62, 0.3); border-radius: 50%; }
+.login-ring-left { width: 270px; height: 270px; left: -95px; bottom: -90px; animation: login-float-ring 13s ease-in-out infinite; }
+.login-ring-right { width: 210px; height: 210px; right: 5%; top: 17%; animation: login-float-ring 16s ease-in-out -6s infinite reverse; }
+.login-dots { width: 190px; height: 140px; opacity: 0.32; background: radial-gradient(circle, rgba(255, 255, 255, 0.95) 2px, transparent 2.4px) 0 0 / 16px 16px; }
+.login-dots-tl { left: 10px; top: 8px; -webkit-mask-image: linear-gradient(135deg, #000 18%, transparent 86%); mask-image: linear-gradient(135deg, #000 18%, transparent 86%); animation: login-drift-b 18s ease-in-out -3s infinite; }
+.login-dots-br { right: 16px; bottom: 10px; -webkit-mask-image: linear-gradient(315deg, #000 18%, transparent 86%); mask-image: linear-gradient(315deg, #000 18%, transparent 86%); animation: login-drift-a 19s ease-in-out -8s infinite reverse; }
+.login-spark { color: rgba(250, 174, 64, 0.5); font-style: normal; line-height: 1; }
+.login-spark-top { left: 18%; top: 16%; font-size: 28px; animation: login-spark-float 9s ease-in-out infinite; }
+.login-spark-side { right: 15.5%; top: 34%; font-size: 37px; animation: login-spark-float 11s ease-in-out -4s infinite reverse; }
+.login-card {
+  position: relative; z-index: 1; width: 100%; max-width: 430px;
+  background: rgba(255, 253, 248, 0.88); border: 1px solid rgba(182, 136, 56, 0.2); border-radius: 30px;
+  padding: 38px 34px 34px; display: flex; flex-direction: column; gap: 15px;
+  box-shadow: 0 26px 64px rgba(102, 76, 30, 0.14), 0 3px 12px rgba(102, 76, 30, 0.06);
+  backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
+  animation: sheet-rise var(--dur-3) var(--ease-out) both;
 }
-.login::after {
-  content: ''; position: absolute; width: 42px; height: 42px; border-radius: 50%;
-  background: rgba(255, 166, 30, 0.35); right: 12%; top: 16%;
-  box-shadow: 0 0 32px rgba(255, 166, 30, 0.2);
-  will-change: transform, opacity;
-  animation: login-orbit-dot 8s ease-in-out -2.6s infinite;
-}
-.login-card { position: relative; z-index: 1; width: 100%; max-width: 360px; background: var(--card); border: 1px solid var(--line); border-radius: 28px; padding: 28px 24px; display: flex; flex-direction: column; gap: 12px; box-shadow: var(--sh-3); animation: sheet-rise var(--dur-3) var(--ease-out) both; }
-.login-card h1 { margin: 0; font-size: 21px; text-align: center; letter-spacing: -0.01em; }
+.login-card h1 { margin: 0; font-size: 30px; line-height: 1.08; text-align: center; letter-spacing: -0.035em; }
 .logo-mark {
-  width: 76px; height: 76px; border-radius: 20px; margin: 0 auto 2px;
+  width: 84px; height: 84px; border-radius: 22px; margin: 0 auto 3px;
   display: block; object-fit: cover;
-  box-shadow: 0 8px 22px rgba(245, 158, 11, 0.35);
+  box-shadow: 0 12px 30px rgba(223, 143, 23, 0.2);
 }
-.login-sub { margin: -4px 0 6px; text-align: center; color: var(--mut); font-size: 13px; }
+.login-sub { max-width: 340px; margin: -4px auto 0; text-align: center; color: #756653; font-size: 15px; line-height: 1.35; }
+.login-divider { display: flex; align-items: center; gap: 12px; color: rgba(250, 168, 48, 0.48); margin: 3px 0 2px; }
+.login-divider::before, .login-divider::after { content: ''; height: 1px; flex: 1; background: rgba(199, 156, 84, 0.24); }
+.login-divider span { font-size: 21px; line-height: 1; animation: login-spark-pulse 4.8s ease-in-out infinite; }
+.login-card > .field { gap: 7px; color: #584a3b; font-size: 15px; }
+.login-input { position: relative; display: block; }
+.login-input input { width: 100%; min-height: 56px; padding: 10px 14px 10px 61px; border-radius: 15px; border-color: rgba(229, 158, 58, 0.48); background: rgba(255, 255, 255, 0.5); box-shadow: inset 0 1px 2px rgba(110, 78, 27, 0.025); }
+.login-input input:focus { background: rgba(255, 255, 255, 0.78); }
+.login-input-icon { position: absolute; z-index: 1; left: 11px; top: 50%; width: 36px; height: 36px; transform: translateY(-50%); border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #c98a31; background: rgba(255, 184, 77, 0.16); pointer-events: none; }
+.login-input-icon svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.login-submit { min-height: 60px; margin-top: 3px; border-radius: 15px; gap: 10px; font-size: 17px; font-weight: 750; box-shadow: 0 10px 24px rgba(232, 148, 20, 0.28); }
+.login-submit-icon { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.login-locale { position: absolute; z-index: 2; top: calc(16px + env(safe-area-inset-top)); right: 16px; }
+.locale-select { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+.locale-select-control { position: relative; display: block; }
+.locale-select select { min-height: 40px; min-width: 180px; background: #fff; }
+.locale-select.compact { position: relative; display: block; }
+.locale-select.compact .locale-select-control {
+  display: flex; align-items: center; gap: 8px; min-width: 132px; height: 42px; padding: 0 12px;
+  border: 1px solid rgba(158, 118, 42, 0.24); border-radius: var(--r-pill);
+  background: rgba(255, 253, 248, 0.8); box-shadow: var(--sh-1);
+  color: var(--fg); cursor: pointer; font: inherit;
+  backdrop-filter: var(--mat-blur); -webkit-backdrop-filter: var(--mat-blur);
+  transition: background var(--dur-2) var(--ease), border-color var(--dur-2) var(--ease), box-shadow var(--dur-2) var(--ease), transform var(--dur-1) var(--ease);
+}
+.locale-select.compact .locale-select-control:focus-visible { border-color: var(--accent); border-radius: var(--r-pill); box-shadow: var(--ring), var(--sh-1); }
+.locale-select.compact .locale-select-control:disabled { opacity: 0.62; cursor: wait; }
+.locale-select-globe, .locale-select-chevron {
+  flex-shrink: 0; pointer-events: none; fill: none; stroke: currentColor;
+  stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round;
+}
+.locale-select-globe { width: 17px; height: 17px; color: var(--accent-2); }
+.locale-select-current { flex: 1; min-width: 0; text-align: left; white-space: nowrap; font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+.locale-select-chevron { width: 15px; height: 15px; color: var(--mut); transition: transform var(--dur-2) var(--ease); }
+.locale-select-chevron.open { transform: rotate(180deg); }
+@media (hover: hover) {
+  .locale-select.compact .locale-select-control:hover:not(:disabled) { background: rgba(255, 253, 248, 0.96); border-color: var(--line-2); box-shadow: var(--sh-2); }
+}
+.locale-select.compact .locale-select-control:active:not(:disabled) { transform: scale(0.98); }
+.locale-select-menu {
+  position: absolute; z-index: 50; top: calc(100% + 8px); right: 0;
+  width: min(220px, calc(100vw - 20px)); max-height: min(390px, calc(100vh - 80px));
+  overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 2px;
+  background: rgba(255, 253, 248, 0.97); border: 1px solid var(--line-2); border-radius: var(--r-lg);
+  box-shadow: 0 16px 44px rgba(92, 70, 24, 0.2), 0 2px 8px rgba(92, 70, 24, 0.08);
+  backdrop-filter: var(--mat-blur); -webkit-backdrop-filter: var(--mat-blur);
+  transform-origin: top right; animation: menu-pop var(--dur-2) var(--ease-out) both;
+}
+.locale-select-option {
+  display: flex; align-items: center; gap: 9px; width: 100%; min-height: 38px; padding: 7px 10px;
+  border: 0; border-radius: 10px; background: transparent; color: var(--fg);
+  font: inherit; font-size: 14.5px; text-align: left; cursor: pointer;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+.locale-select-check {
+  flex: 0 0 16px; width: 16px; height: 16px; fill: none; stroke: transparent;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+}
+.locale-select-option.on { background: var(--accent-weak); color: #7a4a00; font-weight: 650; }
+.locale-select-option.on .locale-select-check { stroke: var(--accent-2); }
+.locale-select-option:focus-visible { border-radius: 10px; box-shadow: inset 0 0 0 2px rgba(255, 179, 38, 0.55); }
+@media (hover: hover) { .locale-select-option:hover { background: var(--fill-2); } }
+.locale-select-option:active { background: var(--accent-weak); }
+.timezone-field .row { align-items: center; }
+.timezone-field input { min-width: 0; }
+.locale-preview { padding-top: 2px; }
+@media (max-width: 479px) {
+  .login { padding: 72px 14px 20px; }
+  .login-card { padding: 27px 20px 24px; border-radius: 24px; gap: 12px; }
+  .login-card h1 { font-size: 25px; }
+  .logo-mark { width: 70px; height: 70px; border-radius: 18px; }
+  .login-sub { font-size: 13.5px; }
+  .login-input input { min-height: 52px; }
+  .login-submit { min-height: 54px; }
+  .login-ring-right { right: -100px; }
+  .login-dots { opacity: 0.22; }
+  .login-locale { top: calc(10px + env(safe-area-inset-top)); right: 10px; }
+  .locale-select.compact .locale-select-control { min-width: 124px; height: 40px; }
+  .locale-select-current { font-size: 13.5px; }
+}
+@media (max-height: 700px) and (min-width: 480px) {
+  .login { padding-top: 66px; }
+  .login-card { padding-top: 25px; padding-bottom: 25px; gap: 10px; }
+  .logo-mark { width: 68px; height: 68px; border-radius: 18px; }
+  .login-card h1 { font-size: 25px; }
+  .login-input input { min-height: 50px; }
+  .login-submit { min-height: 52px; }
+}
 
 /* ── 项目列表 ── */
 /* 首页头部条：标题 + 搜索 + 状态筛选 + 导入/新建（窄屏自动换行） */
@@ -1469,16 +1563,29 @@ body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-sel
 @keyframes card-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 @keyframes bubble-in { from { opacity: 0; transform: translateY(6px) scale(0.98); } to { opacity: 1; transform: none; } }
 @keyframes sheet-rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
-/* 登录大堂光晕：两枚圆错峰缓慢漂浮，轻微缩放/呼吸，不干扰表单。 */
-@keyframes login-orbit-ring {
-  0%, 100% { opacity: 0.7; transform: translate3d(0, 0, 0) scale(1); }
-  35% { opacity: 1; transform: translate3d(18px, -14px, 0) scale(1.06); }
-  70% { opacity: 0.78; transform: translate3d(-8px, -24px, 0) scale(0.96); }
+/* 登录大堂装饰：光晕、圆环、点阵与星芒分别错峰漂浮，表单本身保持稳定。 */
+@keyframes login-drift-a {
+  0%, 100% { opacity: 0.38; transform: translate3d(0, 0, 0) rotate(0deg); }
+  48% { opacity: 0.52; transform: translate3d(22px, 15px, 0) rotate(2deg); }
+  76% { opacity: 0.42; transform: translate3d(7px, -10px, 0) rotate(-1deg); }
 }
-@keyframes login-orbit-dot {
-  0%, 100% { opacity: 0.72; transform: translate3d(0, 0, 0) scale(1); }
-  40% { opacity: 1; transform: translate3d(-20px, 18px, 0) scale(1.12); }
-  75% { opacity: 0.8; transform: translate3d(10px, 28px, 0) scale(0.94); }
+@keyframes login-drift-b {
+  0%, 100% { opacity: 0.32; transform: translate3d(0, 0, 0); }
+  40% { opacity: 0.45; transform: translate3d(-18px, 13px, 0); }
+  72% { opacity: 0.36; transform: translate3d(11px, 23px, 0); }
+}
+@keyframes login-float-ring {
+  0%, 100% { opacity: 0.62; transform: translate3d(0, 0, 0) scale(1); }
+  45% { opacity: 0.9; transform: translate3d(18px, -17px, 0) scale(1.035); }
+  75% { opacity: 0.7; transform: translate3d(-7px, -26px, 0) scale(0.98); }
+}
+@keyframes login-spark-float {
+  0%, 100% { opacity: 0.48; transform: translate3d(0, 0, 0) rotate(0deg) scale(1); }
+  50% { opacity: 0.82; transform: translate3d(10px, -18px, 0) rotate(10deg) scale(1.12); }
+}
+@keyframes login-spark-pulse {
+  0%, 100% { opacity: 0.62; transform: scale(0.92) rotate(0deg); }
+  50% { opacity: 1; transform: scale(1.1) rotate(8deg); }
 }
 /* 等待澄清条的呼吸光圈（#110）：只扩散阴影，不动布局 */
 @keyframes clarify-pulse { 0%, 100% { box-shadow: var(--sh-2), 0 0 0 0 rgba(234, 88, 12, 0.5); } 50% { box-shadow: var(--sh-2), 0 0 0 8px rgba(234, 88, 12, 0); } }

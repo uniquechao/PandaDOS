@@ -17,6 +17,8 @@ import crypto from 'node:crypto';
 import type { LlmClient } from '../agents/llm';
 import type { ExecutorDriver } from '../executor/driver';
 import { readDriverText } from './skills';
+import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
+import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/language';
 
 /** 本模块需要的 Driver 子集（结构兼容 ExecutorDriver，测试可传替身） */
 export type ReadmeDriver = Pick<ExecutorDriver, 'listDir' | 'statPath' | 'readFileRange'>;
@@ -63,12 +65,28 @@ export async function findReadmePath(driver: ReadmeDriver, cwd: string): Promise
 }
 
 /** 生成简介的提示词（jsonMode 不必要：要的就是一段纯文本） */
-export function buildSummaryPrompt(projectName: string, readme: string) {
+export function buildSummaryPrompt(
+  projectName: string,
+  readme: string,
+  locale: SupportedLocale = 'zh-Hans',
+) {
   const body = readme.length > MAX_PROMPT_CHARS ? readme.slice(0, MAX_PROMPT_CHARS) : readme;
+  if (promptLanguage(locale) === 'en') {
+    return [
+      {
+        role: 'system' as const,
+        content: `You write concise software project descriptions. Return only the description body with no title, quotes, Markdown, or commentary.\n${outputLanguageInstruction(locale)}`,
+      },
+      {
+        role: 'user' as const,
+        content: `Using the README, write a description of project "${projectName}" in at most ${SUMMARY_MAX_CHARS} characters. State its name, what it does, and its role.\n\nREADME content (possibly truncated):\n${body}`,
+      },
+    ];
+  }
   return [
     {
       role: 'system' as const,
-      content: '你是项目管理助手，负责为开发项目写简介。只输出简介正文，不要标题、引号、markdown 或任何多余说明。',
+      content: `你是项目管理助手，负责为开发项目写简介。只输出简介正文，不要标题、引号、markdown 或任何多余说明。\n${outputLanguageInstruction(locale)}`,
     },
     {
       role: 'user' as const,
@@ -84,8 +102,9 @@ export async function summarizeReadme(
   llm: LlmClient,
   projectName: string,
   readme: string,
+  locale: SupportedLocale = 'zh-Hans',
 ): Promise<string> {
-  const r = await llm.chat(buildSummaryPrompt(projectName, readme));
+  const r = await llm.chat(buildSummaryPrompt(projectName, readme, locale));
   const text = r.content.trim();
   if (!text) throw new Error('LLM 返回空简介');
   const points = [...text];
@@ -108,6 +127,7 @@ export interface SummaryProject {
   id: number;
   name: string;
   cwd: string;
+  locale?: SupportedLocale;
 }
 
 export type GenerateSummaryResult =
@@ -128,7 +148,7 @@ export async function generateProjectReadmeSummary(
   const text = path ? await readDriverText(driver, path, MAX_README_BYTES) : null;
   if (text === null) return { ok: false, reason: 'no-readme' };
 
-  const summary = await summarizeReadme(llm, project.name, text);
+  const summary = await summarizeReadme(llm, project.name, text, project.locale);
   const now = deps.now ? deps.now() : Date.now();
   db.query(
     'UPDATE projects SET readme_md5 = ?, readme_summary = ?, readme_checked_ts = ? WHERE id = ?',

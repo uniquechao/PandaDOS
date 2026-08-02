@@ -24,7 +24,7 @@ const PASSWD = [
   'games:x:5:60:games:/usr/games:/usr/sbin/nologin',
   'svc:x:999:999::/var/svc:/bin/false',
   'developer:x:1002:1002::/home/developer:/bin/bash',
-  'operator:x:1000:1000::/home/operator:/bin/bash',
+  'runner:x:1000:1000::/home/runner:/bin/bash',
   '坏行',
 ].join('\n');
 
@@ -87,7 +87,7 @@ describe('parsePasswd', () => {
   test('排除 nologin/false/sync/halt/shutdown 与系统 uid；按 uid 升序', () => {
     expect(parsePasswd(PASSWD)).toEqual([
       { name: 'root', uid: 0, home: '/root' },
-      { name: 'operator', uid: 1000, home: '/home/operator' },
+      { name: 'runner', uid: 1000, home: '/home/runner' },
       { name: 'developer', uid: 1002, home: '/home/developer' },
     ]);
   });
@@ -98,7 +98,7 @@ describe('managedProjectIdOf', () => {
     expect(managedProjectIdOf('cc-3')).toBe(3);
     expect(managedProjectIdOf('cc-3-console')).toBe(3);
     expect(managedProjectIdOf('cc-abc')).toBeNull();
-    expect(managedProjectIdOf('demo-session')).toBeNull();
+    expect(managedProjectIdOf('sample-app')).toBeNull();
   });
 });
 
@@ -128,7 +128,7 @@ describe('executors 路由', () => {
     expect((await j(s.dispatch(req('GET', '/api/executors/1/os-users', s.alice.token)))).status).toBe(403);
     const r = await j(s.dispatch(req('GET', '/api/executors/1/os-users', s.admin.token)));
     expect(r.status).toBe(200);
-    expect(r.body.users.map((u: any) => u.name)).toEqual(['root', 'operator', 'developer']);
+    expect(r.body.users.map((u: any) => u.name)).toEqual(['root', 'runner', 'developer']);
 
     const s2 = setup([], { noDriver: true });
     expect((await j(s2.dispatch(req('GET', '/api/executors/1/os-users', s2.admin.token)))).status).toBe(503);
@@ -138,15 +138,15 @@ describe('executors 路由', () => {
   test('tmux-sessions：托管/已导入/同目录项目标注 + 普通用户 workspace 越权标 false', async () => {
     const s = setup([
       { name: 'cc-1', createdTs: 10, attached: false, command: 'claude', cwd: '/ws/u9/x' },
-      { name: 'demo-session', createdTs: 20, attached: true, command: 'claude', cwd: '/home/developer/onto' },
+      { name: 'sample-app', createdTs: 20, attached: true, command: 'claude', cwd: '/home/developer/sample-app' },
       { name: 'mine', createdTs: 30, attached: false, command: 'bash', cwd: `/ws/u2/mine` },
       { name: 'imported-one', createdTs: 40, attached: false, cwd: '/opt/x' },
       { name: 'nocwd', createdTs: 50, attached: false },
     ]);
-    // 项目 1（cc-1 的托管项目）+ 项目 2（cwd=/home/developer/onto 同目录）+ 登记 imported-one → 项目 2
+    // 项目 1（cc-1 的托管项目）+ 项目 2（cwd=/home/developer/sample-app 同目录）+ 登记 imported-one → 项目 2
     s.db.run(
       `INSERT INTO projects (name, executor_id, cwd, owner_user_id, created_ts) VALUES
-       ('a', 1, '/ws/u9/x', 1, 0), ('b', 1, '/home/developer/onto', 1, 0)`,
+       ('a', 1, '/ws/u9/x', 1, 0), ('b', 1, '/home/developer/sample-app', 1, 0)`,
     );
     s.db.run(`INSERT INTO sessions (name, executor_id, project_id, owner_user_id) VALUES ('imported-one', 1, 2, 1)`);
 
@@ -154,7 +154,7 @@ describe('executors 路由', () => {
     expect(r.status).toBe(200);
     const by = new Map(r.body.sessions.map((x: any) => [x.name, x]));
     expect((by.get('cc-1') as any).managedProjectId).toBe(1);
-    expect((by.get('demo-session') as any).sameCwdProjectId).toBe(2);
+    expect((by.get('sample-app') as any).sameCwdProjectId).toBe(2);
     expect((by.get('imported-one') as any).importedProjectId).toBe(2);
     expect((by.get('nocwd') as any).cwd).toBeNull();
     // admin 全 allowed
@@ -164,7 +164,7 @@ describe('executors 路由', () => {
     const ra = await j(s.dispatch(req('GET', '/api/executors/1/tmux-sessions', s.alice.token)));
     const bya = new Map(ra.body.sessions.map((x: any) => [x.name, x]));
     expect((bya.get('mine') as any).allowed).toBe(true);
-    expect((bya.get('demo-session') as any).allowed).toBe(false);
+    expect((bya.get('sample-app') as any).allowed).toBe(false);
     expect((bya.get('nocwd') as any).allowed).toBe(false);
   });
 });

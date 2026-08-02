@@ -11,6 +11,7 @@ import { api } from '../lib/api';
 import type { FsEntry, FsList } from '../lib/types';
 import { isCurrentTreeRequest, joinChildPath, treeIcon } from '../lib/filetree';
 import { Spinner } from './Loaders';
+import { tr } from '../i18n/runtime';
 
 /** 每层缩进像素 */
 const INDENT = 14;
@@ -111,14 +112,14 @@ export function FileTree({
     if (st === 'loading' && entries === undefined) {
       return (
         <div class="ft-hint" style={pad}>
-          <Spinner size="sm" /> <span>载入中…</span>
+          <Spinner size="sm" /> <span>{tr('ui.loading')}</span>
         </div>
       );
     }
     if (st === 'error' && entries === undefined) {
       return (
         <button class="ft-hint ft-err" style={pad} onClick={() => retry(dirPath)}>
-          加载失败，点此重试
+          {tr('ui.loadFailed')}
         </button>
       );
     }
@@ -126,7 +127,7 @@ export function FileTree({
     if (entries.length === 0) {
       return (
         <div class="ft-hint ft-empty" style={pad}>
-          （空目录）
+          {tr('ui.emptyDirectory')}
         </div>
       );
     }

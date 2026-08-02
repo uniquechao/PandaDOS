@@ -10,12 +10,17 @@ import { fmtTime } from '../lib/fmt';
 import type { Me, Project, Subscription, UserSettings } from '../lib/types';
 import { Loading } from '../components/Loaders';
 import { toast } from '../lib/toast';
+import { LanguageSelect } from '../i18n/LanguageSelect';
+import { TimezoneSelect } from '../i18n/TimezoneSelect';
+import { useI18n } from '../i18n/provider';
 
 export function SettingsView({ me, onLogout }: { me: Me; onLogout: () => void }) {
+  const { t } = useI18n();
   return (
     <div class="page">
-      <div class="h1">我的设定</div>
+      <div class="h1">{t('view.mySettings')}</div>
       <AccountSect me={me} onLogout={onLogout} />
+      <LanguageRegionSect />
       <MySettingsSect />
       <FeishuSect me={me} />
       <SubscriptionsSect />
@@ -23,24 +28,42 @@ export function SettingsView({ me, onLogout }: { me: Me; onLogout: () => void })
   );
 }
 
-function AccountSect({ me, onLogout }: { me: Me; onLogout: () => void }) {
+function LanguageRegionSect() {
+  const i18n = useI18n();
+  const now = Date.now();
   return (
     <div class="sect">
-      <div class="h2">账号</div>
+      <div class="h2">{i18n.t('settings.languageRegion')}</div>
+      <LanguageSelect value={i18n.locale} onChange={i18n.setLocale} />
+      <TimezoneSelect />
+      <div class="mut small locale-preview">
+        <b>{i18n.t('settings.localePreview')}：</b>{' '}
+        {i18n.formatDateTime(now)} · {i18n.formatRelativeTime(now - 5 * 60_000, now)}
+      </div>
+    </div>
+  );
+}
+
+function AccountSect({ me, onLogout }: { me: Me; onLogout: () => void }) {
+  const { t } = useI18n();
+  return (
+    <div class="sect">
+      <div class="h2">{t('view.account')}</div>
       <div class="row">
         <span class="grow">
           <b>{me.username}</b> <span class={`badge ${me.role === 'admin' ? 'b-amber' : 'b-gray'}`}>{me.role}</span>
         </span>
         <button class="btn sm danger ghost" onClick={onLogout}>
-          退出登录
+          {t('shell.signOut')}
         </button>
       </div>
-      <div class="mut small">上次登录：{fmtTime(me.lastLoginTs)}</div>
+      <div class="mut small">{t('view.lastLogin', { time: fmtTime(me.lastLoginTs) })}</div>
     </div>
   );
 }
 
 function MySettingsSect() {
+  const { t } = useI18n();
   const [s, setS] = useState<UserSettings | null>(null);
   const [msg, setMsg] = useState('');
   const [err, setErr] = useState('');
@@ -63,7 +86,7 @@ function MySettingsSect() {
         notifyPref: s.notifyPref,
       });
       setS(r.settings);
-      toast.success('设定已保存');
+      toast.success(t('view.settingsSaved'));
     } catch (x) {
       setErr(x instanceof ApiError ? x.message : String(x));
     }
@@ -74,9 +97,9 @@ function MySettingsSect() {
 
   return (
     <div class="sect">
-      <div class="h2">Persona / 记忆</div>
+      <div class="h2">{t('view.personaMemory')}</div>
       <label class="field">
-        persona（管家怎么称呼/对待你）
+        {t('view.personaHelp')}
         <textarea
           rows={3}
           value={s.persona ?? ''}
@@ -84,7 +107,7 @@ function MySettingsSect() {
         />
       </label>
       <label class="field">
-        memory（长期记忆，管家每次都会带上）
+        {t('view.memoryHelp')}
         <textarea
           rows={6}
           value={s.memory ?? ''}
@@ -97,10 +120,10 @@ function MySettingsSect() {
           checked={s.autopilotDefault}
           onChange={(e) => setS({ ...s, autopilotDefault: e.currentTarget.checked })}
         />
-        新会话默认开自动驾驶
+        {t('view.autopilotDefault')}
       </label>
       <label class="field">
-        通知偏好（JSON，可留空）
+        {t('view.notificationPreference')}
         <input
           value={s.notifyPref ?? ''}
           onInput={(e) => setS({ ...s, notifyPref: e.currentTarget.value || null })}
@@ -110,13 +133,14 @@ function MySettingsSect() {
       {err && <div class="err">{err}</div>}
       {msg && <div class="okmsg">{msg}</div>}
       <button class="btn primary" disabled={busy} onClick={save}>
-        {busy ? '保存中…' : '保存设定'}
+        {busy ? t('ui.saving') : t('view.saveSettings')}
       </button>
     </div>
   );
 }
 
 function FeishuSect({ me }: { me: Me }) {
+  const { t } = useI18n();
   const [openid, setOpenid] = useState('');
   const [bound, setBound] = useState<string | null>(me.feishuOpenid);
   const [msg, setMsg] = useState('');
@@ -141,7 +165,7 @@ function FeishuSect({ me }: { me: Me }) {
       });
       setBound(r.feishuOpenid);
       setOpenid('');
-      toast.success('绑定成功，测试消息已发送——去飞书确认收到 ✅');
+      toast.success(t('view.feishuConnectedTest'));
     } catch (x) {
       setErr(x instanceof ApiError ? x.message : String(x));
     }
@@ -149,14 +173,14 @@ function FeishuSect({ me }: { me: Me }) {
   };
 
   const unbind = async (): Promise<void> => {
-    if (busy || !confirm('解绑飞书？之后不再收到通知。')) return;
+    if (busy || !confirm(t('view.unbindFeishuConfirm'))) return;
     setBusy(true);
     setMsg('');
     setErr('');
     try {
       await api('/api/me/feishu', 'POST', { openid: null });
       setBound(null);
-      toast.info('已解绑飞书');
+      toast.info(t('view.feishuDisconnected'));
     } catch (x) {
       setErr(x instanceof ApiError ? x.message : String(x));
     }
@@ -165,14 +189,14 @@ function FeishuSect({ me }: { me: Me }) {
 
   return (
     <div class="sect">
-      <div class="h2">飞书通知绑定</div>
+      <div class="h2">{t('view.feishuNotifications')}</div>
       {bound ? (
         <div class="row">
           <span class="grow">
-            已绑定：<span class="mono small">{bound}</span>
+            {t('view.bound')} <span class="mono small">{bound}</span>
           </span>
           <button class="btn sm danger ghost" disabled={busy} onClick={unbind}>
-            解绑
+            {t('view.disconnect')}
           </button>
         </div>
       ) : (
@@ -186,28 +210,28 @@ function FeishuSect({ me }: { me: Me }) {
                   location.href = '/api/feishu/oauth/bind';
                 }}
               >
-                🛩 飞书扫码绑定
+                🛩 {t('view.feishuQrBind')}
               </button>
-              <span class="mut small">推荐：跳转飞书授权，自动回填 openid</span>
+              <span class="mut small">{t('view.feishuOAuthRecommended')}</span>
             </div>
           )}
           <div class="row">
             <input
               class="grow"
               value={openid}
-              placeholder="你的飞书 openid（ou_…）"
+              placeholder={t('view.feishuOpenIdPlaceholder')}
               onInput={(e) => setOpenid(e.currentTarget.value)}
             />
             <button class="btn" disabled={busy || !openid.trim()} onClick={bind}>
-              {busy ? '验证中…' : '手动绑定'}
+              {busy ? t('view.verifying') : t('view.bindManually')}
             </button>
           </div>
         </>
       )}
       <div class="mut small">
         {bound
-          ? '绑定后可在登录页直接飞书扫码登录。'
-          : '手动绑定会发一条测试消息验证可达，发送失败不会保存；扫码绑定无需测试消息。'}
+          ? t('view.feishuLoginAfterBind')
+          : t('view.feishuManualHelp')}
       </div>
       {err && <div class="err">{err}</div>}
       {msg && <div class="okmsg">{msg}</div>}
@@ -216,6 +240,7 @@ function FeishuSect({ me }: { me: Me }) {
 }
 
 function SubscriptionsSect() {
+  const { t } = useI18n();
   const [subs, setSubs] = useState<Subscription[] | null>(null);
   const [projects, setProjects] = useState<Map<number, string>>(new Map());
   const [err, setErr] = useState('');
@@ -232,7 +257,7 @@ function SubscriptionsSect() {
     try {
       await api('/api/subscriptions', 'DELETE', { scope: s.scope, targetId: s.targetId });
       load();
-      toast.info('已退订');
+      toast.info(t('view.unsubscribed'));
     } catch (x) {
       toast.error(x instanceof ApiError ? x.message : String(x));
     }
@@ -240,21 +265,21 @@ function SubscriptionsSect() {
 
   return (
     <div class="sect">
-      <div class="h2">我的订阅</div>
+      <div class="h2">{t('view.mySubscriptions')}</div>
       {err && <div class="err">{err}</div>}
       {subs === null && <Loading />}
-      {subs !== null && subs.length === 0 && <div class="mut small">（暂无订阅——去项目页点「订阅」）</div>}
+      {subs !== null && subs.length === 0 && <div class="mut small">{t('view.noSubscriptions')}</div>}
       {(subs ?? []).map((s) => (
         <div key={s.id} class="sub-i">
           <span class={`badge ${s.scope === 'project' ? 'b-blue' : 'b-purple'}`}>
-            {s.scope === 'project' ? '项目' : 'issue'}
+            {s.scope === 'project' ? t('view.project') : 'issue'}
           </span>
           <span class="grow">
             {s.scope === 'project' ? (projects.get(s.targetId) ?? `#${s.targetId}`) : `issue #${s.targetId}`}
           </span>
           <span class="mut small">{fmtTime(s.createdTs)}</span>
           <button class="btn sm ghost danger" onClick={() => void unsub(s)}>
-            退订
+            {t('view.unsubscribe')}
           </button>
         </div>
       ))}

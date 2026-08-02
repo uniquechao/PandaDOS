@@ -20,6 +20,7 @@ import { useWide } from '../lib/useWide';
 import { useTreeWidth } from '../lib/treewidth';
 import { joinChildPath, treeIcon } from '../lib/filetree';
 import { toast } from '../lib/toast';
+import { useI18n } from '../i18n/provider';
 
 function fmtSize(n: number | null): string {
   if (n === null) return '';
@@ -37,6 +38,7 @@ function parentDir(p: string | null): string {
 }
 
 export function FilesView({ pid }: { pid: number }) {
+  const { t } = useI18n();
   const wide = useWide();
   const treeW = useTreeWidth();
   const splitRef = useRef<HTMLDivElement>(null); // .wb-split 容器 ref，供分隔条换算左栏像素宽
@@ -97,8 +99,8 @@ export function FilesView({ pid }: { pid: number }) {
         { method: 'POST', body: fd },
       );
       const j = (await r.json().catch(() => null)) as (FsUploadResult & { error?: string }) | null;
-      if (!r.ok || !j?.ok) throw new Error(j?.error ?? `上传失败(HTTP ${r.status})`);
-      toast.success(`已上传 ${j.name}`);
+      if (!r.ok || !j?.ok) throw new Error(j?.error ?? t('view.uploadFailed', { status: r.status }));
+      toast.success(t('view.uploaded', { name: j.name }));
       if (wide) setReload((n) => n + 1); // 刷新文件树
       else loadList(rel); // 刷新当前目录列表
     } catch (e) {
@@ -156,11 +158,11 @@ export function FilesView({ pid }: { pid: number }) {
           >
             ‹
           </button>
-          <span class="btitle">{project?.name ?? `项目 #${pid}`} · 文件</span>
+          <span class="btitle">{project?.name ?? t('view.projectFallback', { id: pid })} · {t('view.files')}</span>
           <div class="bacts">
             {showUpload && (
               <button class="btn sm" disabled={busy} onClick={() => fileInput.current?.click()}>
-                {busy ? '上传中…' : '⇧ 上传'}
+                {busy ? t('ui.uploading') : `⇧ ${t('ui.upload')}`}
               </button>
             )}
           </div>
@@ -184,12 +186,12 @@ export function FilesView({ pid }: { pid: number }) {
               reloadToken={reload}
             />
           </div>
-          <ListSplitter containerRef={splitRef} list={treeW} label="文件树栏宽" />
+          <ListSplitter containerRef={splitRef} list={treeW} label={t('view.fileTreeWidth')} />
           <div class="wb-main">
             {selected ? (
               <FileViewer key={selected} pid={pid} path={selected} />
             ) : (
-              <div class="gd-empty">← 选择左侧文件预览 / 编辑</div>
+              <div class="gd-empty">← {t('view.chooseFile')}</div>
             )}
           </div>
         </div>
@@ -204,8 +206,8 @@ export function FilesView({ pid }: { pid: number }) {
           {dirCrumbs}
           <div class="fslist">
             {list === null && !err && <Loading />}
-            {list !== null && list.entries.length === 0 && <div class="empty">（空目录）</div>}
-            {list?.truncated && <div class="mut small">目录过大，仅显示前 1000 项</div>}
+            {list !== null && list.entries.length === 0 && <div class="empty">{t('ui.emptyDirectory')}</div>}
+            {list?.truncated && <div class="mut small">{t('view.directoryTooLarge')}</div>}
             {list?.entries.map((e: FsEntry) => (
               <div
                 key={e.name}
@@ -221,7 +223,7 @@ export function FilesView({ pid }: { pid: number }) {
                 {e.type !== 'dir' && (
                   <button
                     class="linkbtn"
-                    title="下载"
+                    title={t('ui.download')}
                     onClick={(ev) => {
                       ev.stopPropagation();
                       location.href = downloadUrl(joinChildPath(rel, e.name));

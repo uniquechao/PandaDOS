@@ -101,6 +101,31 @@ describe('ModuleDocs', () => {
     expect(index).toContain('## 已完成');
   });
 
+  test('执行总结写入过程页受管区块且幂等更新', async () => {
+    const { cwd, docs, module } = await setup();
+    const issue = {
+      id: 72,
+      title: 'Terminal Process Isolation',
+      body: '对话和 issue 互不影响',
+      status: 'done',
+      agent: 'codex' as const,
+      createdTs: 100,
+    };
+    await docs.ensureModule(module);
+    await docs.createIssuePage(module, issue);
+    await docs.recordResultSummary(module, issue, '第一次总结');
+    await docs.recordResultSummary(module, issue, '最终总结');
+
+    const page = await fsp.readFile(
+      path.join(cwd, moduleIssueRelPath(module.slug, issue.id, issue.title)),
+      'utf8',
+    );
+    expect(page).toContain('<!-- mando:result-summary:start -->');
+    expect(page).toContain('最终总结');
+    expect(page).not.toContain('第一次总结');
+    expect(page.match(/mando:result-summary:start/g)).toHaveLength(1);
+  });
+
   test('幂等刷新只替换管理区块，保留人工与 agent 正文', async () => {
     const { cwd, docs, module } = await setup();
     await docs.ensureModule(module);

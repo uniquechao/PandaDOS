@@ -179,7 +179,7 @@ describe('act 路由：动作语义', () => {
     t.driver.pane = MENU;
     const r2 = await t.act(t.aliceToken, { type: 'select', index: 1, sig: 'Old|Menu@0' });
     expect(r2.status).toBe(409);
-    expect(r2.body.error).toBe('stale'); // 注入前重抓核对（评审 H9）
+    expect((r2.body.error as { details: string }).details).toBe('stale'); // 注入前重抓核对（评审 H9）
     expect(t.driver.keys).toEqual([]);
 
     const r3 = await t.act(t.aliceToken, { type: 'select', index: 1, sig: MENU_SIG });
@@ -198,7 +198,7 @@ describe('act 路由：动作语义', () => {
     // 修复前网页拿到的签名只有第 1 项 → 现在按 stale 拒掉，不盲注入
     const stale = await t.act(t.aliceToken, { type: 'select', index: 2, sig: '朝向基本固定@0' });
     expect(stale.status).toBe(409);
-    expect(stale.body.error).toBe('stale');
+    expect((stale.body.error as { details: string }).details).toBe('stale');
     expect(t.driver.keys).toEqual([]);
 
     const ok = await t.act(t.aliceToken, { type: 'select', index: 2, sig: ASK_MENU_SIG });

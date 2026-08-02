@@ -23,6 +23,7 @@ import type {
 import { Loading } from '../components/Loaders';
 import { Modal } from '../components/Modal';
 import { toast } from '../lib/toast';
+import { runtimeI18n, tr } from '../i18n/runtime';
 
 // ---------- 极简 markdown 渲染（v1 SkillMD 平移；全部走文本节点，无 innerHTML） ----------
 
@@ -126,20 +127,20 @@ function SkillRow({
     <div class="skrow" onClick={onView}>
       <div class="skrow-hd">
         <span class="skrow-nm">{s.name}</span>
-        {s.source && <span class="skbadge">{s.source}</span>}
+        {s.source && <span class="skbadge">{s.source === '内置' ? tr('skills.builtIn') : s.source}</span>}
         <span class="skrow-time">{timeAgo(s.mtimeMs)}</span>
       </div>
       {s.summary && <div class="skrow-sum">{s.summary}</div>}
       {onRemove && (
         <button
           class="linkbtn skrow-rm"
-          title="卸载"
+          title={tr('skills.uninstall')}
           onClick={(e) => {
             e.stopPropagation();
             onRemove();
           }}
         >
-          卸载
+          {tr('skills.uninstall')}
         </button>
       )}
     </div>
@@ -167,7 +168,7 @@ function MarketAdmin({
     setBusy(true);
     try {
       await api('/api/admin/skill-markets', 'POST', { name, repo, subdir, note });
-      toast.success('已添加，正在同步…');
+      toast.success(tr('skills.addedSyncing'));
       setName('');
       setRepo('');
       setSubdir('');
@@ -183,10 +184,10 @@ function MarketAdmin({
   };
 
   const del = async (n: string): Promise<void> => {
-    if (!confirm(`删除市场源 ${n}？（已装技能不受影响）`)) return;
+    if (!confirm(tr('skills.deleteSourceConfirm', { name: n }))) return;
     try {
       await api(`/api/admin/skill-markets/${encodeURIComponent(n)}`, 'DELETE');
-      toast.success('已删除');
+      toast.success(tr('skills.deleted'));
       onChanged();
     } catch (e) {
       toast.error(String((e as Error).message));
@@ -194,30 +195,30 @@ function MarketAdmin({
   };
 
   return (
-    <Modal title="管理技能市场源" onClose={onClose}>
+    <Modal title={tr('skills.manageSources')} onClose={onClose}>
       <div class="mktadm">
         {markets.map((m) => (
           <div key={m.name} class="mktadm-row">
             <div class="mktadm-main">
-              <b>{m.name}</b> <span class="mut small">{m.count} 技能</span>
+              <b>{m.name}</b> <span class="mut small">{tr('skills.skillCount', { count: m.count })}</span>
               <div class="mut small">{m.repo}{m.subdir ? ` · ${m.subdir}` : ''}</div>
-              {m.lastError && <div class="err small">同步失败：{m.lastError.slice(0, 120)}</div>}
+              {m.lastError && <div class="err small">{tr('skills.syncFailed', { error: m.lastError.slice(0, 120) })}</div>}
               {m.lastSyncTs && !m.lastError && (
-                <div class="mut small">上次同步 {timeAgo(m.lastSyncTs)}</div>
+                <div class="mut small">{tr('skills.lastSync', { time: timeAgo(m.lastSyncTs) })}</div>
               )}
             </div>
             <button class="linkbtn" onClick={() => void del(m.name)}>
-              删除
+              {tr('ui.delete')}
             </button>
           </div>
         ))}
         <div class="mktadm-add">
-          <input placeholder="名称（如 my-skills）" value={name} onInput={(e) => setName(e.currentTarget.value)} />
-          <input placeholder="仓库（owner/repo 或 https://…）" value={repo} onInput={(e) => setRepo(e.currentTarget.value)} />
-          <input placeholder="子目录（可选，如 skills）" value={subdir} onInput={(e) => setSubdir(e.currentTarget.value)} />
-          <input placeholder="备注（可选）" value={note} onInput={(e) => setNote(e.currentTarget.value)} />
+          <input placeholder={tr('skills.sourceNamePlaceholder')} value={name} onInput={(e) => setName(e.currentTarget.value)} />
+          <input placeholder={tr('skills.repoPlaceholder')} value={repo} onInput={(e) => setRepo(e.currentTarget.value)} />
+          <input placeholder={tr('skills.subdirPlaceholder')} value={subdir} onInput={(e) => setSubdir(e.currentTarget.value)} />
+          <input placeholder={tr('skills.notePlaceholder')} value={note} onInput={(e) => setNote(e.currentTarget.value)} />
           <button class="btn sm primary" disabled={busy || !name || !repo} onClick={() => void add()}>
-            {busy ? '添加中…' : '＋ 添加并同步'}
+            {busy ? tr('skills.adding') : `＋ ${tr('skills.addAndSync')}`}
           </button>
         </div>
       </div>
@@ -306,7 +307,7 @@ function Market({
         }
       }
     } catch (e) {
-      toast.error(`翻译中断：${String((e as Error).message)}`);
+      toast.error(tr('skills.translationInterrupted', { error: String((e as Error).message) }));
     } finally {
       enriching.current = false;
       setProg(null);
@@ -318,8 +319,8 @@ function Market({
     try {
       const r = await api<MarketSyncResult>('/api/market/sync', 'POST', {});
       const bad = r.results.filter((x) => !x.ok);
-      if (bad.length) toast.error(`部分市场同步失败：${bad.map((b) => b.name).join('、')}`, 6000);
-      else toast.success('市场已同步');
+      if (bad.length) toast.error(tr('skills.someMarketsFailed', { names: runtimeI18n().formatList(bad.map((b) => b.name)) }), 6000);
+      else toast.success(tr('skills.marketSynced'));
       const d = await load();
       // 同步完自动补翻译（量大时不自动，等用户点）
       if (d && d.skills.some((s) => !s.descZh && s.description)) void enrich(false);
@@ -345,7 +346,7 @@ function Market({
     try {
       if (scope === 'project') {
         await api(`/api/projects/${pid}/skills/install`, 'POST', { market: s.market, rel: s.rel });
-        setInst((p) => ({ ...p, [s.key]: { ok: '✅ 已装到项目' } }));
+        setInst((p) => ({ ...p, [s.key]: { ok: `✅ ${tr('skills.installedProject')}` } }));
       } else {
         const r = await api<{ ok: boolean; results: { executor: string; ok: boolean; error?: string }[] }>(
           '/api/admin/skills/install-global',
@@ -355,7 +356,9 @@ function Market({
         const bad = r.results.filter((x) => !x.ok);
         setInst((p) => ({
           ...p,
-          [s.key]: bad.length ? { err: `部分失败：${bad.map((b) => b.executor).join('、')}` } : { ok: '✅ 已装到全局' },
+          [s.key]: bad.length
+            ? { err: tr('skills.someFailed', { names: runtimeI18n().formatList(bad.map((b) => b.executor)) }) }
+            : { ok: `✅ ${tr('skills.installedGlobal')}` },
         }));
       }
       onInstalled();
@@ -369,7 +372,7 @@ function Market({
       const r = await api<{ ok: boolean; content: string }>(
         `/api/market/skills/file?market=${encodeURIComponent(s.market)}&rel=${encodeURIComponent(s.rel)}`,
       );
-      setView({ title: `${s.title}（${s.market}）`, content: r.content });
+      setView({ title: `${s.title} (${s.market})`, content: r.content });
     } catch (e) {
       toast.error(String((e as Error).message));
     }
@@ -400,55 +403,54 @@ function Market({
     <div class="mkt">
       <div class="mkt-bar">
         <span class="mut small">
-          市场 {data.markets.filter((m) => m.count > 0).length}/{data.markets.length} · {data.skills.length} 技能
+          {tr('skills.marketStats', { active: data.markets.filter((m) => m.count > 0).length, total: data.markets.length, skills: data.skills.length })}
         </span>
         {prog && (
           <span class="mkt-prog">
-            翻译中 {prog.done}/{prog.total}
+            {tr('skills.translatingProgress', { done: prog.done, total: prog.total })}
           </span>
         )}
         {!prog && untranslated > 0 && (
           <button class="btn sm" onClick={() => void enrich(false)}>
-            🌐 翻译 {untranslated} 条
+            🌐 {tr('skills.translateCount', { count: untranslated })}
           </button>
         )}
         {!prog && untranslated === 0 && data.skills.length > 0 && (
           <button class="btn sm" onClick={() => void enrich(true)}>
-            🌐 重新翻译
+            🌐 {tr('skills.retranslate')}
           </button>
         )}
         <button class="btn sm" disabled={syncing} onClick={() => void sync()}>
-          {syncing ? '同步中…' : '↻ 同步市场'}
+          {syncing ? tr('skills.syncing') : `↻ ${tr('skills.syncMarket')}`}
         </button>
         {isAdmin && (
           <button class="btn sm" onClick={() => setAdminOpen(true)}>
-            ⚙ 管理源
+            ⚙ {tr('skills.manageSourcesAction')}
           </button>
         )}
       </div>
 
       {data.needSync ? (
         <div class="empty">
-          市场还没同步过——点上方「↻ 同步市场」拉取（内置 anthropics-skills / superpowers /
-          claude-code-skills / codex-skills 四个源）
+          {tr('skills.marketNeedsSync')}
         </div>
       ) : (
         <>
           <div class="mkt-filters">
             <input
               class="mkt-search"
-              placeholder="搜索技能（名称/描述/标签）…"
+              placeholder={tr('skills.searchPlaceholder')}
               value={q}
               onInput={(e) => setQ(e.currentTarget.value)}
             />
             <label class="mkt-rec">
               <input type="checkbox" checked={recOnly} onChange={(e) => setRecOnly(e.currentTarget.checked)} />
-              只看推荐
+              {tr('skills.recommendedOnly')}
             </label>
           </div>
           <div class="mkt-chips">
             <button class={`chip${mktFilter === '' ? ' on' : ''}`} onClick={() => setMktFilter('')}>
-              全部
+              {tr('skills.all')}
             </button>
             {data.markets
               .filter((m) => m.count > 0)
@@ -465,7 +467,7 @@ function Market({
           </div>
 
           <div class="mkt-list">
-            {filtered.length === 0 && <div class="empty">没有匹配的技能</div>}
+            {filtered.length === 0 && <div class="empty">{tr('skills.noMatches')}</div>}
             {filtered.slice(0, 200).map((s) => {
               const st = inst[s.key] ?? {};
               const installed = installedNames.get(s.name);
@@ -475,10 +477,10 @@ function Market({
                     <span class="mkt-nm" onClick={() => void preview(s)}>
                       {s.title}
                     </span>
-                    {s.recommend && <span class="mkt-star" title={s.reason}>⭐ 推荐</span>}
+                    {s.recommend && <span class="mkt-star" title={s.reason}>⭐ {tr('skills.recommended')}</span>}
                     <span class="skbadge">{s.market}</span>
                     {s.category && <span class="skbadge dim">{s.category}</span>}
-                    {installed && <span class="mkt-inst">已装·{installed === 'project' ? '项目' : '全局'}</span>}
+                    {installed && <span class="mkt-inst">{tr('skills.installedBadge', { scope: installed === 'project' ? tr('view.project') : tr('skills.globalSkills') })}</span>}
                   </div>
                   {s.descZh && <div class="mkt-desc">{s.descZh}</div>}
                   <div class={`mkt-desc-en${s.descZh ? ' dim' : ''}`}>{s.description}</div>
@@ -493,26 +495,26 @@ function Market({
                     </div>
                   )}
                   <div class="mkt-ft">
-                    {st.busy && <span class="mut small">安装中…</span>}
+                    {st.busy && <span class="mut small">{tr('skills.installing')}</span>}
                     {st.ok && <span class="ok small">{st.ok}</span>}
                     {st.err && <span class="err small">❌ {st.err}</span>}
                     <span class="flex1" />
                     <button class="linkbtn" onClick={() => void preview(s)}>
-                      查看
+                      {tr('ui.view')}
                     </button>
                     <button class="btn sm primary" disabled={st.busy} onClick={() => void install(s, 'project')}>
-                      装到项目
+                      {tr('skills.installProject')}
                     </button>
                     {isAdmin && (
                       <button class="btn sm" disabled={st.busy} onClick={() => void install(s, 'global')}>
-                        装到全局
+                        {tr('skills.installGlobal')}
                       </button>
                     )}
                   </div>
                 </div>
               );
             })}
-            {filtered.length > 200 && <div class="mut small">匹配 {filtered.length} 条，仅显示前 200——请用搜索缩小范围</div>}
+            {filtered.length > 200 && <div class="mut small">{tr('skills.matchLimit', { count: filtered.length })}</div>}
           </div>
         </>
       )}
@@ -571,10 +573,10 @@ export function SkillsView({ pid, me }: { pid: number; me: Me }) {
   };
 
   const removeProject = async (s: SkillInfo): Promise<void> => {
-    if (!confirm(`从项目卸载技能 ${s.name}？`)) return;
+    if (!confirm(tr('skills.uninstallProjectConfirm', { name: s.name }))) return;
     try {
       await api(`/api/projects/${pid}/skills/${encodeURIComponent(s.name)}`, 'DELETE');
-      toast.success('已卸载');
+      toast.success(tr('skills.uninstalled'));
       load();
     } catch (e) {
       toast.error(String((e as Error).message));
@@ -582,10 +584,10 @@ export function SkillsView({ pid, me }: { pid: number; me: Me }) {
   };
 
   const removeGlobal = async (s: SkillInfo): Promise<void> => {
-    if (!confirm(`全局卸载技能 ${s.name}？（所有执行机）`)) return;
+    if (!confirm(tr('skills.uninstallGlobalConfirm', { name: s.name }))) return;
     try {
       await api(`/api/admin/skills/global/${encodeURIComponent(s.name)}`, 'DELETE');
-      toast.success('已卸载');
+      toast.success(tr('skills.uninstalled'));
       load();
     } catch (e) {
       toast.error(String((e as Error).message));
@@ -607,13 +609,13 @@ export function SkillsView({ pid, me }: { pid: number; me: Me }) {
           <button class="back" onClick={() => nav(`/p/${pid}`)}>
             ‹
           </button>
-          <span class="btitle">{project?.name ?? `项目 #${pid}`} · 技能</span>
+          <span class="btitle">{tr('skills.pageTitle', { project: project?.name ?? tr('view.projectFallback', { id: pid }) })}</span>
           <div class="bacts">
             <button class={`btn sm${sub === 'installed' ? ' primary' : ''}`} onClick={() => setSub('installed')}>
-              已装
+              {tr('skills.installed')}
             </button>
             <button class={`btn sm${sub === 'market' ? ' primary' : ''}`} onClick={() => setSub('market')}>
-              市场
+              {tr('skills.market')}
             </button>
           </div>
         </div>
@@ -627,18 +629,18 @@ export function SkillsView({ pid, me }: { pid: number; me: Me }) {
             <>
               <div class="sksec">
                 <div class="sksec-hd">
-                  项目技能 <span class="mut small">{list.cwd}/.claude/skills（codex 经 .codex/skills 链接共用）</span>
+                  {tr('skills.projectSkills')} <span class="mut small">{tr('skills.projectSkillsPath', { path: list.cwd })}</span>
                 </div>
-                {list.project.length === 0 && <div class="empty">项目还没装技能——去「市场」挑一个</div>}
+                {list.project.length === 0 && <div class="empty">{tr('skills.noProjectSkills')}</div>}
                 {list.project.map((s) => (
                   <SkillRow key={s.path} s={s} onView={() => void openSkill(s)} onRemove={() => void removeProject(s)} />
                 ))}
               </div>
               <div class="sksec">
                 <div class="sksec-hd">
-                  全局技能 <span class="mut small">执行机 ~/.claude/skills + 已装插件自带</span>
+                  {tr('skills.globalSkills')} <span class="mut small">{tr('skills.globalSkillsPath')}</span>
                 </div>
-                {list.global.length === 0 && <div class="empty">（无全局技能）</div>}
+                {list.global.length === 0 && <div class="empty">{tr('skills.noGlobalSkills')}</div>}
                 {list.global.map((s) => (
                   <SkillRow
                     key={s.path}

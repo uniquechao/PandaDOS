@@ -26,16 +26,18 @@ import { GitView } from './views/Git';
 import { SkillsView } from './views/Skills';
 import { SettingsView } from './views/Settings';
 import { AdminView } from './views/Admin';
+import { I18nProvider, useI18n } from './i18n/provider';
 
 /** 终端视图懒加载（xterm ~300KB，别拖累手机首屏；vite 自动 code-split） */
 function LazyTerm({ pid }: { pid: number }) {
+  const { t } = useI18n();
   const [Comp, setComp] = useState<((p: { pid: number }) => JSX.Element) | null>(null);
   useEffect(() => {
     import('./views/Term')
       .then((m) => setComp(() => m.TermView))
       .catch(onLazyLoadError);
   }, []);
-  return Comp ? <Comp pid={pid} /> : <div class="boot">载入终端组件…</div>;
+  return Comp ? <Comp pid={pid} /> : <div class="boot">{t('shell.loadingTerminal')}</div>;
 }
 
 /**
@@ -56,6 +58,7 @@ function SideProjectsNav({
   curPid: number | null;
   collapsed: boolean;
 }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(() => localStorage.getItem('mando.sideProjOpen') !== '0');
   const [showAll, setShowAll] = useState(() => localStorage.getItem('mando.sideProjShowAll') === '1');
   const [q, setQ] = useState('');
@@ -116,22 +119,22 @@ function SideProjectsNav({
       >
         <span
           class={'sproj-dot' + (doingN > 0 ? ' run' : '')}
-          title={doingN > 0 ? `${doingN} 个进行中（AI 执行中）` : '在线'}
+          title={doingN > 0 ? t('shell.runningCount', { count: doingN }) : t('shell.online')}
         />
         <span class="sproj-nm">{p.name}</span>
         {reviewN > 0 && (
-          <span class="sproj-b rv" title={`${reviewN} 个待确认（含待澄清）`}>{reviewN}</span>
+          <span class="sproj-b rv" title={t('shell.reviewCount', { count: reviewN })}>{reviewN}</span>
         )}
         {doingN > 0 && (
-          <span class="sproj-b dg" title={`${doingN} 个进行中（AI 执行中）`}>{doingN}</span>
+          <span class="sproj-b dg" title={t('shell.runningCount', { count: doingN })}>{doingN}</span>
         )}
-        {waitN > 0 && <span class="sproj-b td" title={`${waitN} 个待运行（待办 + 受阻）`}>{waitN}</span>}
+        {waitN > 0 && <span class="sproj-b td" title={t('shell.waitingCount', { count: waitN })}>{waitN}</span>}
         {/* issue 项目：项目级自由对话入口（chat 项目行本身即进对话，不再重复） */}
         {p.kind !== 'chat' && (
           <span
             class="sproj-chat"
             role="button"
-            title="对话"
+            title={t('shell.chat')}
             onClick={(e) => {
               e.stopPropagation();
               nav(`/p/${p.id}/chat`);
@@ -143,7 +146,7 @@ function SideProjectsNav({
         <span
           class={'sproj-star' + (fav ? ' on' : '')}
           role="button"
-          title={fav ? '取消收藏' : '收藏'}
+          title={fav ? t('shell.unfavorite') : t('shell.favorite')}
           onClick={(e) => {
             e.stopPropagation();
             toggleFav(p.id);
@@ -182,18 +185,18 @@ function SideProjectsNav({
 
   return (
     <>
-      <button class={on ? 'on' : ''} title={collapsed ? '项目' : undefined} onClick={() => nav('/')}>
+      <button class={on ? 'on' : ''} title={collapsed ? t('shell.projects') : undefined} onClick={() => nav('/')}>
         <span class="snav-ic">📁</span>
-        <span class="snav-tx">项目</span>
+        <span class="snav-tx">{t('shell.projects')}</span>
         {/* 始终渲染（含空态）以吃掉 margin-left:auto，让箭头稳定靠右 */}
         <span class="snav-agg">
           {agg.review > 0 && (
-            <span class="snav-agg-b rv" title={`${agg.review} 个待确认，等你拍板`}>
+            <span class="snav-agg-b rv" title={t('shell.reviewCount', { count: agg.review })}>
               {agg.review}
             </span>
           )}
           {agg.blocked > 0 && (
-            <span class="snav-agg-b bk" title={`${agg.blocked} 个受阻`}>
+            <span class="snav-agg-b bk" title={t('shell.waitingCount', { count: agg.blocked })}>
               {agg.blocked}
             </span>
           )}
@@ -201,7 +204,7 @@ function SideProjectsNav({
         <span
           class={'snav-arr' + (open ? ' open' : '')}
           role="button"
-          title={open ? '收起项目列表' : '展开项目列表'}
+          title={open ? t('shell.collapseProjectList') : t('shell.expandProjectList')}
           onClick={toggle}
         >
           ▾
@@ -214,41 +217,41 @@ function SideProjectsNav({
               class="sproj-search"
               value={q}
               onInput={(e) => setQ(e.currentTarget.value)}
-              placeholder="搜索项目…"
-              aria-label="搜索项目"
+              placeholder={t('shell.searchProjects')}
+              aria-label={t('shell.searchProjects')}
             />
           )}
           <div class="sproj">
-            {active.length === 0 && <span class="sproj-empty">暂无项目</span>}
+            {active.length === 0 && <span class="sproj-empty">{t('shell.noProjects')}</span>}
             {query ? (
               filtered.length > 0 ? (
                 filtered.map(row)
               ) : (
-                <span class="sproj-empty">无匹配项目</span>
+                <span class="sproj-empty">{t('shell.noMatches')}</span>
               )
             ) : (
               <>
                 {favProjects.length > 0 && (
                   <div class="sproj-group">
-                    <div class="sproj-group-hd">⭐ 收藏</div>
+                    <div class="sproj-group-hd">⭐ {t('shell.favorites')}</div>
                     {favProjects.map(row)}
                   </div>
                 )}
                 {recentVisible.length > 0 && (
                   <div class="sproj-group">
-                    <div class="sproj-group-hd">🕘 最近</div>
+                    <div class="sproj-group-hd">🕘 {t('shell.recent')}</div>
                     {recentVisible.map(row)}
                   </div>
                 )}
                 {restVisible.length > 0 && (
                   <div class="sproj-group">
-                    {grouped && <div class="sproj-group-hd">全部</div>}
+                    {grouped && <div class="sproj-group-hd">{t('shell.all')}</div>}
                     {restVisible.map(row)}
                   </div>
                 )}
                 {collapsible && (
                   <button class="sproj-more" onClick={toggleShowAll}>
-                    {showAll ? '收起' : `展开全部（${active.length}）`}
+                    {showAll ? t('shell.collapse') : t('shell.expandAll', { count: active.length })}
                   </button>
                 )}
               </>
@@ -265,6 +268,7 @@ function SideProjectsNav({
  * 点卡外或按 Esc 收起；窄屏顶部条里改为向下弹出（CSS 处理）。
  */
 function UserCard({ me, onLogout }: { me: Me; onLogout: () => void }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   useEffect(() => {
     if (!open) return;
@@ -283,7 +287,7 @@ function UserCard({ me, onLogout }: { me: Me; onLogout: () => void }) {
   }, [open]);
 
   const initial = (me.username[0] ?? '?').toUpperCase();
-  const roleText = me.role === 'admin' ? '管理员' : '成员';
+  const roleText = me.role === 'admin' ? t('shell.roleAdmin') : t('shell.roleMember');
 
   return (
     <div class="side-user-wrap">
@@ -295,7 +299,7 @@ function UserCard({ me, onLogout }: { me: Me; onLogout: () => void }) {
               <div class="user-menu-nm">{me.username}</div>
               <div class="user-menu-role">
                 {roleText}
-                {me.feishuOpenid ? ' · 已绑飞书' : ''}
+                {me.feishuOpenid ? ` · ${t('shell.feishuBound')}` : ''}
               </div>
             </div>
           </div>
@@ -303,11 +307,11 @@ function UserCard({ me, onLogout }: { me: Me; onLogout: () => void }) {
           <button
             class="user-menu-it"
             role="menuitem"
-            onClick={() => toast.info('当前浅色主题；深色主题即将支持')}
+            onClick={() => toast.info(t('shell.lightThemeNotice'))}
           >
             <span class="user-menu-ic">🌗</span>
-            <span class="grow">主题</span>
-            <span class="badge b-gray">浅色</span>
+            <span class="grow">{t('shell.theme')}</span>
+            <span class="badge b-gray">{t('shell.lightTheme')}</span>
           </button>
           <button
             class="user-menu-it danger"
@@ -318,7 +322,7 @@ function UserCard({ me, onLogout }: { me: Me; onLogout: () => void }) {
             }}
           >
             <span class="user-menu-ic">🚪</span>
-            <span class="grow">退出登录</span>
+            <span class="grow">{t('shell.signOut')}</span>
           </button>
         </div>
       )}
@@ -343,6 +347,7 @@ function UserCard({ me, onLogout }: { me: Me; onLogout: () => void }) {
  * 仅在有进行中任务时出现；30s 轮询 /api/projects/summary（与侧栏项目区各自取数，互不影响）。
  */
 function RunningTasks() {
+  const { t } = useI18n();
   const [projects, setProjects] = useState<Project[]>([]);
   const [sum, setSum] = useState<Record<string, ProjectIssueSummary>>({});
   const [open, setOpen] = useState(false);
@@ -388,7 +393,7 @@ function RunningTasks() {
     <div class="bgtasks">
       {open && (
         <div class="bgtasks-menu" role="menu">
-          <div class="bgtasks-hd">后台任务运行中 · 离开页面也会继续跑</div>
+          <div class="bgtasks-hd">{t('shell.backgroundRunning')}</div>
           {running.map(({ p, n }) => (
             <button
               key={p.id}
@@ -408,20 +413,21 @@ function RunningTasks() {
       )}
       <button
         class="bgtasks-chip"
-        title="后台运行中的任务"
+        title={t('shell.backgroundTasks')}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
       >
         <span class="bgtasks-dot" />
         <b class="bgtasks-n">{total}</b>
-        <span class="bgtasks-tx">进行中</span>
+        <span class="bgtasks-tx">{t('shell.running')}</span>
       </button>
     </div>
   );
 }
 
 function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
+  const { t } = useI18n();
   const route = useRoute();
   const [llmStatus, setLlmStatus] = useState<LlmStatus | null>(null);
   useEffect(() => {
@@ -471,8 +477,8 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
   const tab = route.name === 'settings' ? 'settings' : route.name === 'admin' ? 'admin' : 'projects';
   const curPid = 'pid' in route ? route.pid : null;
   const menu = [
-    { key: 'settings', ic: '⚙️', tx: '设定', to: '/settings' },
-    ...(me.role === 'admin' ? [{ key: 'admin', ic: '🛡️', tx: '管理', to: '/admin' }] : []),
+    { key: 'settings', ic: '⚙️', tx: t('shell.settings'), to: '/settings' },
+    ...(me.role === 'admin' ? [{ key: 'admin', ic: '🛡️', tx: t('shell.admin'), to: '/admin' }] : []),
   ];
 
   // 宽屏侧栏折叠 248⇄72（记 localStorage；窄屏顶部条不受影响，CSS 里限定 min-width:720px）
@@ -503,11 +509,11 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
         <nav class="snav snav-foot">
           <button
             class="snav-collapse"
-            title={collapsed ? '展开侧栏' : '收起侧栏'}
+            title={collapsed ? t('shell.expandSidebar') : t('shell.collapseSidebar')}
             onClick={toggleCollapsed}
           >
             <span class="snav-ic">{collapsed ? '»' : '«'}</span>
-            <span class="snav-tx">收起</span>
+            <span class="snav-tx">{t('shell.collapse')}</span>
           </button>
           {menu.map((it) => (
             <button
@@ -530,7 +536,7 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
             <span>{llmGuidance.message}</span>
             {llmGuidance.actionPath && (
               <button class="btn sm" onClick={() => nav(llmGuidance.actionPath!)}>
-                前往配置
+                {t('shell.goToConfiguration')}
               </button>
             )}
           </div>
@@ -558,6 +564,38 @@ const feishuFlash = (() => {
   return { bound, err };
 })();
 
+function LocalizedAppBody({
+  me,
+  refresh,
+  logout,
+}: {
+  me: Me | null | undefined;
+  refresh: () => void;
+  logout: () => void;
+}) {
+  const { t } = useI18n();
+  useEffect(() => {
+    if (feishuFlash.bound) toast.success(t('shell.feishuBindSuccess'));
+    else if (feishuFlash.err) toast.error(feishuFlash.err, 8000);
+  }, []);
+  let body;
+  if (me === undefined)
+    body = (
+      <div class="boot">
+        <Spinner /> {t('common.loading')}
+      </div>
+    );
+  else if (me === null) body = <LoginView onLogin={refresh} initErr={feishuFlash.err ?? ''} />;
+  else body = <Shell me={me} onLogout={logout} />;
+
+  return (
+    <>
+      {body}
+      <Toaster />
+    </>
+  );
+}
+
 function App() {
   // undefined=启动探测中；null=未登录
   const [me, setMe] = useState<Me | null | undefined>(undefined);
@@ -571,8 +609,6 @@ function App() {
   useEffect(() => {
     setOnUnauthorized(() => setMe(null));
     refresh();
-    if (feishuFlash.bound) toast.success('飞书绑定成功 ✅');
-    else if (feishuFlash.err) toast.error(feishuFlash.err, 8000);
   }, []);
 
   const logout = (): void => {
@@ -581,21 +617,10 @@ function App() {
     nav('/');
   };
 
-  let body;
-  if (me === undefined)
-    body = (
-      <div class="boot">
-        <Spinner /> 载入中…
-      </div>
-    );
-  else if (me === null) body = <LoginView onLogin={refresh} initErr={feishuFlash.err ?? ''} />;
-  else body = <Shell me={me} onLogout={logout} />;
-
   return (
-    <>
-      {body}
-      <Toaster />
-    </>
+    <I18nProvider me={me}>
+      <LocalizedAppBody me={me} refresh={refresh} logout={logout} />
+    </I18nProvider>
   );
 }
 

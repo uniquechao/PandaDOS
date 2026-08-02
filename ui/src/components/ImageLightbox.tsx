@@ -15,6 +15,7 @@
  */
 import { createPortal } from 'preact/compat';
 import { useEffect, useState } from 'preact/hooks';
+import { useI18n } from '../i18n/provider';
 
 export function ImageLightbox({
   pid,
@@ -26,6 +27,7 @@ export function ImageLightbox({
   path: string;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   const [failed, setFailed] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
@@ -49,15 +51,15 @@ export function ImageLightbox({
   }, [onClose]);
 
   return createPortal(
-    <div class="lightbox-bg" role="dialog" aria-modal="true" aria-label={`查看截图 ${name}`}>
+    <div class="lightbox-bg" role="dialog" aria-modal="true" aria-label={t('ui.viewScreenshot', { name })}>
       <div class="lightbox-bar">
         <span class="lightbox-name" title={path}>
           🖼 {name}
         </span>
-        <a class="lightbox-dl" href={dl} title="下载原图" download>
+        <a class="lightbox-dl" href={dl} title={t('ui.downloadOriginal')} download>
           ⬇
         </a>
-        <button type="button" class="lightbox-x" title="关闭（Esc）" onClick={onClose}>
+        <button type="button" class="lightbox-x" title={`${t('action.close')} (Esc)`} onClick={onClose}>
           ✕
         </button>
       </div>
@@ -68,12 +70,12 @@ export function ImageLightbox({
           if (e.target === e.currentTarget) onClose();
         }}
       >
-        {!loaded && !failed && <div class="lightbox-hint">加载中…</div>}
+        {!loaded && !failed && <div class="lightbox-hint">{t('ui.loading')}</div>}
         {failed ? (
           <div class="lightbox-hint">
-            图片加载失败。
+            {t('ui.imageLoadFailed')}
             <a class="btn sm primary" href={dl} download>
-              ⬇ 下载查看
+              ⬇ {t('ui.downloadToView')}
             </a>
           </div>
         ) : (

@@ -18,7 +18,7 @@ function declarations(selector: string): string {
 
 describe('成员弹窗底座', () => {
   test('启用 wide 变体（桌面 640px，窄屏仍底部抽屉由 #90 约束守着）', () => {
-    expect(modalSrc).toContain('<Modal title="项目成员" wide');
+    expect(modalSrc).toContain("<Modal title={tr('board.projectMembers')} wide");
   });
 });
 
@@ -39,7 +39,7 @@ describe('成员行紧凑单行', () => {
   test('活跃时间/统计数据在行内呈现（登录·活跃 + issue 完成/总数，title 带完整信息）', () => {
     expect(modalSrc).toContain('actLine(m)');
     expect(modalSrc).toContain('actTitle(m)');
-    expect(modalSrc).toMatch(/登录 \$\{m\.lastLoginTs \? timeAgo/);
+    expect(modalSrc).toContain("tr('board.loginActive'");
     expect(modalSrc).toContain('issue {m.issueDone}/{m.issueTotal}');
   });
 });
@@ -61,9 +61,9 @@ describe('操作胶囊（设为属主/移除）', () => {
   test('转让属主先 confirm 再请求，文案说明原属主降为成员', () => {
     const fn = modalSrc.match(/const makeOwner = async[\s\S]*?\n  };/)?.[0] ?? '';
     expect(fn).toContain('confirm(');
-    expect(fn).toContain('原属主将降为成员');
+    expect(fn).toContain("tr('board.transferOwnerConfirm'");
     expect(fn.indexOf('confirm(')).toBeLessThan(fn.indexOf('transferOwner('));
-    expect(modalSrc).toContain('设为属主');
+    expect(modalSrc).toContain("tr('board.setOwner')");
   });
 });
 
@@ -81,6 +81,6 @@ describe('窄屏与添加交互', () => {
     expect(modalSrc).toContain('<select');
     expect(modalSrc).not.toContain('placeholder="输入用户名添加成员"');
     // 没有候选时下拉给出空态提示
-    expect(modalSrc).toContain('没有可添加的用户');
+    expect(modalSrc).toContain("tr('board.noUsersToAdd')");
   });
 });

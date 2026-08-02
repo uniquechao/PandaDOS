@@ -8,6 +8,7 @@
 import { genToken, hashEq, hashToken, type UserStore } from '../../core/users';
 import { loginCookie, logoutCookie, requestIsSecure } from '../auth';
 import { json, type RouteDef } from '../middleware';
+import { apiError } from '../errors';
 
 export interface AuthRoutesDeps {
   users: UserStore;
@@ -34,7 +35,7 @@ export function authRoutes(deps: AuthRoutesDeps): RouteDef[] {
         // 常数时间：无论用户存在与否都比对一次哈希
         const match = token.length > 0 && hashEq(hashToken(token), u?.tokenHash ?? DUMMY_HASH);
         if (!u || !match) {
-          return json({ ok: false, error: '用户名或 token 不对' }, 401);
+          return json(apiError('auth.invalid_credentials', 'The username or token is incorrect.', 401), 401);
         }
 
         deps.users.touchLogin(u.id);
@@ -69,12 +70,16 @@ export function authRoutes(deps: AuthRoutesDeps): RouteDef[] {
       auth: 'user',
       handler: ({ user }) => {
         const u = user!; // auth:'user' 保证非空
+        const settings = deps.users.getSettings(u.id);
         return json({
           id: u.id,
           username: u.username,
           role: u.role,
           feishuOpenid: u.feishuOpenid,
           lastLoginTs: u.lastLoginTs,
+          locale: settings.locale,
+          timezone: settings.timezone,
+          detectedTimezone: settings.detectedTimezone,
         });
       },
     },

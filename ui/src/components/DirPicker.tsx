@@ -2,6 +2,7 @@ import { useEffect, useState } from 'preact/hooks';
 import { api, ApiError } from '../lib/api';
 import type { DirListing } from '../lib/types';
 import { Modal } from './Modal';
+import { useI18n } from '../i18n/provider';
 
 export interface ExecutorPreviewConnection {
   name: string;
@@ -25,6 +26,7 @@ export function DirPicker({
   onClose(): void;
   onPick(path: string): void;
 }) {
+  const { t } = useI18n();
   const [listing, setListing] = useState<DirListing | null>(null);
   const [err, setErr] = useState('');
   const [newName, setNewName] = useState('');
@@ -78,17 +80,17 @@ export function DirPicker({
   };
 
   return (
-    <Modal title="选择执行机目录" onClose={onClose}>
+    <Modal title={t('ui.directoryPicker')} onClose={onClose}>
       <div class="formcol">
         <div class="row" style={{ gap: 6, alignItems: 'center' }}>
-          <button class="btn sm" disabled={!canUp} onClick={() => browse(parent)}>↑ 上级</button>
+          <button class="btn sm" disabled={!canUp} onClick={() => browse(parent)}>↑ {t('ui.parentDirectory')}</button>
           <code class="grow" style={{ fontSize: 12, wordBreak: 'break-all' }}>{cur || '…'}</code>
         </div>
-        {listing?.missing && <div class="mut small">该目录尚不存在，可先在当前目录新建</div>}
+        {listing?.missing && <div class="mut small">{t('ui.directoryMissing')}</div>}
         <div class="dir-picker-list">
-          {listing === null && !err && <div class="mut small">读取中…</div>}
+          {listing === null && !err && <div class="mut small">{t('ui.reading')}</div>}
           {listing && listing.dirs.length === 0 && !listing.missing && (
-            <div class="mut small">（此目录下没有子目录）</div>
+            <div class="mut small">{t('ui.noSubdirectories')}</div>
           )}
           {listing?.dirs.map((d) => (
             <div
@@ -100,7 +102,7 @@ export function DirPicker({
               📁 {d}
             </div>
           ))}
-          {listing?.truncated && <div class="mut small">目录过多，仅显示前 1000 个</div>}
+          {listing?.truncated && <div class="mut small">{t('ui.tooManyDirectories')}</div>}
         </div>
         {executorId !== undefined && (
           <div class="row dir-picker-create">
@@ -108,19 +110,19 @@ export function DirPicker({
               class="grow"
               value={newName}
               onInput={(e) => setNewName(e.currentTarget.value)}
-              placeholder="新建子目录名"
+              placeholder={t('ui.newDirectoryName')}
               onKeyDown={(e) => e.key === 'Enter' && void mkdir()}
             />
             <button class="btn sm" disabled={!newName.trim() || busy || !cur} onClick={() => void mkdir()}>
-              新建
+              {t('ui.create')}
             </button>
           </div>
         )}
         {err && <div class="err">{err}</div>}
       </div>
       <div class="mbtns">
-        <button class="btn" onClick={onClose}>取消</button>
-        <button class="btn primary" disabled={!cur} onClick={() => onPick(cur)}>选用此目录</button>
+        <button class="btn" onClick={onClose}>{t('ui.cancel')}</button>
+        <button class="btn primary" disabled={!cur} onClick={() => onPick(cur)}>{t('ui.useDirectory')}</button>
       </div>
     </Modal>
   );

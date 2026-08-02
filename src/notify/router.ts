@@ -28,6 +28,10 @@ import { join } from 'node:path';
 import type { Database } from 'bun:sqlite';
 import { migrate, type MigrationStatus } from '../core/migrate';
 import type { Gate, IssueState, Subscription, SubscriptionScope } from '../core/types';
+import { createI18n, type I18nApi } from '../../shared/i18n/formatter';
+import { catalogs } from '../../shared/i18n/catalogs';
+import { isSupportedLocale, isValidTimeZone } from '../../shared/i18n/locales';
+import type { MessageKey } from '../../shared/i18n/messages';
 
 // ---------- 模块自带迁移（060 编号空间，同 issues/030 模式） ----------
 
@@ -45,6 +49,22 @@ export function migrateNotify(db: Database): MigrationStatus {
 // ---------- 事件与通道抽象（骨架原样，引擎按此结构化依赖） ----------
 
 /** 一条待分发的业务事件 */
+export type NotifySummaryCode =
+  | 'status_transition'
+  | 'issue_blocked'
+  | 'plan_review'
+  | 'auto_git_failure'
+  | 'merge_review'
+  | 'conversation_displaced'
+  | 'menu_stuck'
+  | 'rate_limited'
+  | 'clarification_needed'
+  | 'module_organization'
+  | 'analysis_clarification'
+  | 'progress'
+  | 'progress_needs_reply'
+  | 'approval_selection';
+
 export interface NotifyEvent {
   kind: 'status_change' | 'gate_waiting' | 'issue_done' | 'issue_blocked';
   projectId: number;
@@ -54,7 +74,11 @@ export interface NotifyEvent {
   to?: IssueState;
   /** gate_waiting 专用：卡点详情（飞书出确认卡） */
   gate?: Gate;
-  /** 人可读摘要（PM/引擎产出） */
+  /** 结构化产品文案；由通知通道按收件人语言最终渲染。 */
+  summaryCode?: NotifySummaryCode;
+  /** 参数保持原文（issue 标题、错误、代理输出等不翻译）。 */
+  summaryParams?: Record<string, string | number>;
+  /** 已经是用户/AI 产出的原文摘要；仅供不能结构化的兼容事件使用。 */
   summary?: string;
 }
 
@@ -71,21 +95,124 @@ export interface NotifyChannel {
   /** 普通文本 */
   sendText(target: NotifyTarget, text: string): Promise<void>;
   /** 卡点确认卡（带 approve/reject 按钮 + 一次性 requestId 防重放）；不支持卡片的通道降级为文本 */
-  sendGateCard(target: NotifyTarget, event: NotifyEvent): Promise<void>;
+  sendGateCard(target: NotifyTarget, event: NotifyEvent, i18n: I18nApi): Promise<void>;
 }
 
 /** 事件→单行通知文案（确定性渲染，不过 LLM——评审 M18：确定性事件直推） */
-export function formatEventText(e: NotifyEvent): string {
+const STATUS_KEYS: Partial<Record<IssueState, MessageKey>> = {
+  pending: 'status.pending', clarifying: 'status.clarifying', planning: 'status.planning',
+  plan_review: 'status.planReview', implementing: 'status.implementing', testing: 'status.testing',
+  merge_review: 'status.mergeReview', merging: 'status.merging', done: 'status.done',
+  blocked: 'status.blocked', cancelled: 'status.cancelled',
+};
+
+function stateText(state: IssueState | undefined, i18n: I18nApi): string {
+  if (!state) return '?';
+  const key = STATUS_KEYS[state];
+  return key ? i18n.t(key) : state;
+}
+
+function summaryParam(e: NotifyEvent, key: string): string | number {
+  return e.summaryParams?.[key] ?? '';
+}
+
+/** 按具体收件人的 locale 渲染确定性业务摘要。 */
+export function eventSummary(e: NotifyEvent, i18n: I18nApi): string {
+  switch (e.summaryCode) {
+    case 'status_transition':
+      return i18n.t('notify.summary.statusTransition', {
+        title: summaryParam(e, 'title'), from: stateText(e.from, i18n), to: stateText(e.to, i18n),
+      });
+    case 'issue_blocked':
+      return i18n.t('notify.summary.issueBlocked', {
+        title: summaryParam(e, 'title'),
+        detail: summaryParam(e, 'detail') || i18n.t('notify.notExplained'),
+      });
+    case 'plan_review':
+      return i18n.t('notify.summary.planReview', { title: summaryParam(e, 'title') });
+    case 'auto_git_failure':
+      return i18n.t('notify.summary.autoGitFailure', {
+        title: summaryParam(e, 'title'), action: summaryParam(e, 'action'), detail: summaryParam(e, 'detail'),
+      });
+    case 'merge_review':
+      return i18n.t('notify.summary.mergeReview', { title: summaryParam(e, 'title') });
+    case 'conversation_displaced':
+      return i18n.t('notify.summary.conversationDisplaced', { title: summaryParam(e, 'title') });
+    case 'menu_stuck':
+      return i18n.t('notify.summary.menuStuck', {
+        minutes: summaryParam(e, 'minutes'), context: summaryParam(e, 'context'),
+      });
+    case 'rate_limited':
+      return i18n.t('notify.summary.rateLimited', {
+        title: summaryParam(e, 'title'), minutes: summaryParam(e, 'minutes'),
+      });
+    case 'clarification_needed': {
+      const body = summaryParam(e, 'body');
+      const questions = summaryParam(e, 'questions') || i18n.t('notify.summary.seeConversation');
+      const key = body ? 'notify.summary.clarification' : 'notify.summary.clarificationNoBody';
+      return i18n.t(key, {
+        title: summaryParam(e, 'title'), body, questions, minutes: summaryParam(e, 'minutes'),
+      });
+    }
+    case 'module_organization':
+      return i18n.t('notify.summary.moduleOrganization', {
+        total: summaryParam(e, 'total'), merges: summaryParam(e, 'merges'),
+        renames: summaryParam(e, 'renames'), creates: summaryParam(e, 'creates'),
+        moves: summaryParam(e, 'moves'),
+      });
+    case 'analysis_clarification': {
+      const body = summaryParam(e, 'body');
+      const key = body
+        ? 'notify.summary.analysisClarification'
+        : 'notify.summary.analysisClarificationNoBody';
+      return i18n.t(key, {
+        title: summaryParam(e, 'title'), body,
+        questions: summaryParam(e, 'questions') || i18n.t('notify.summary.seeConversation'),
+      });
+    }
+    case 'progress':
+      return i18n.t('notify.summary.progress', {
+        emoji: summaryParam(e, 'emoji'), headline: summaryParam(e, 'headline'),
+      });
+    case 'progress_needs_reply':
+      return i18n.t('notify.summary.progressNeedsReply', {
+        emoji: summaryParam(e, 'emoji'), headline: summaryParam(e, 'headline'),
+      });
+    case 'approval_selection':
+      return i18n.t('notify.summary.approvalSelection', { context: summaryParam(e, 'context') });
+  }
+  if (e.summary !== undefined) return e.summary;
+  if (e.kind === 'status_change') return `${stateText(e.from, i18n)} → ${stateText(e.to, i18n)}`;
+  if (e.kind === 'issue_blocked') return i18n.t('notify.notExplained');
+  if (e.kind === 'gate_waiting') return i18n.t('notify.gateWaiting');
+  return '';
+}
+
+export function formatEventText(e: NotifyEvent, i18n: I18nApi): string {
   switch (e.kind) {
     case 'status_change':
-      return `🔄 [issue #${e.issueId}] ${e.summary ?? `${e.from ?? '?'} → ${e.to ?? '?'}`}`;
+      return i18n.t('notify.statusChange', { id: e.issueId, summary: eventSummary(e, i18n) });
     case 'issue_done':
-      return `✅ [issue #${e.issueId}] 完成：${e.summary ?? ''}`.trimEnd();
+      return i18n.t('notify.done', { id: e.issueId, summary: eventSummary(e, i18n) }).trimEnd();
     case 'issue_blocked':
-      return `⛔ [issue #${e.issueId}] 受阻：${e.summary ?? '(未说明)'}`;
+      return i18n.t('notify.blocked', { id: e.issueId, summary: eventSummary(e, i18n) });
     case 'gate_waiting':
-      return `🚦 [issue #${e.issueId}] ${e.summary ?? '卡点待确认'}`;
+      return `🚦 [issue #${e.issueId}] ${eventSummary(e, i18n)}`;
   }
+}
+
+export function userI18n(db: Database, userId: number): I18nApi {
+  const row = db.query<{
+    locale: string | null;
+    timezone: string | null;
+    detected_timezone: string | null;
+  }, [number]>(
+    'SELECT locale, timezone, detected_timezone FROM user_settings WHERE user_id = ?',
+  ).get(userId);
+  const locale = isSupportedLocale(row?.locale) ? row.locale : 'en';
+  const candidate = row?.timezone ?? row?.detected_timezone ?? 'UTC';
+  const timeZone = isValidTimeZone(candidate) ? candidate : 'UTC';
+  return createI18n({ locale, timeZone, catalog: catalogs[locale] });
 }
 
 // ---------- users 表的飞书绑定查询（core/users.ts 不许动，模块内薄查询） ----------
@@ -272,7 +399,7 @@ export const DEFAULT_THROTTLE_MS = 30_000;
 
 interface UserBuf {
   lastSentTs: number;
-  pending: string[];
+  pending: NotifyEvent[];
   timer: ReturnType<typeof setTimeout> | null;
   channel: NotifyChannel;
   target: NotifyTarget;
@@ -325,9 +452,9 @@ export class NotifyRouter {
         try {
           if (event.kind === 'gate_waiting' && event.gate) {
             this.touchWindow(channel, target); // 卡也占节流窗：随后的文本进聚合
-            await channel.sendGateCard(target, event);
+            await channel.sendGateCard(target, event, userI18n(this.db, userId));
           } else {
-            await this.enqueueText(channel, target, formatEventText(event));
+            await this.enqueueEvent(channel, target, event);
           }
         } catch (e) {
           console.error(`[notify] 发送失败 channel=${channel.name} user=${userId}:`, e);
@@ -386,9 +513,9 @@ export class NotifyRouter {
     this.bufOf(channel, target).lastSentTs = this.now();
   }
 
-  private async enqueueText(channel: NotifyChannel, target: NotifyTarget, text: string): Promise<void> {
+  private async enqueueEvent(channel: NotifyChannel, target: NotifyTarget, event: NotifyEvent): Promise<void> {
     if (this.throttleMs <= 0) {
-      await channel.sendText(target, text);
+      await channel.sendText(target, formatEventText(event, userI18n(this.db, target.userId)));
       return;
     }
     const b = this.bufOf(channel, target);
@@ -396,11 +523,14 @@ export class NotifyRouter {
     // 窗口外且无积压：立即发（首条不等 30s）
     if (!b.timer && b.pending.length === 0 && now - b.lastSentTs >= this.throttleMs) {
       b.lastSentTs = now;
-      await channel.sendText(target, text);
+      await channel.sendText(target, formatEventText(event, userI18n(this.db, target.userId)));
       return;
     }
     // 窗口内：进聚合缓冲，窗口到期一次性发
-    b.pending.push(text);
+    b.pending.push({
+      ...event,
+      ...(event.summaryParams ? { summaryParams: { ...event.summaryParams } } : {}),
+    });
     if (!b.timer) {
       const delay = Math.max(0, b.lastSentTs + this.throttleMs - now);
       const key = this.bufKey(channel, target);
@@ -415,11 +545,16 @@ export class NotifyRouter {
       clearTimeout(b.timer);
       b.timer = null;
     }
-    const texts = b.pending.splice(0);
-    if (texts.length === 0) return;
+    const events = b.pending.splice(0);
+    if (events.length === 0) return;
+    const address = this.addressOf(b.channel.name, b.target.userId);
+    if (!address) return;
+    b.target = { ...b.target, address };
+    const i18n = userI18n(this.db, b.target.userId);
+    const text = events.map((event) => formatEventText(event, i18n)).join('\n');
     b.lastSentTs = this.now();
     try {
-      await b.channel.sendText(b.target, texts.join('\n'));
+      await b.channel.sendText(b.target, text);
     } catch (e) {
       // 聚合批失败只丢这一批并记日志（v1 评审 H14 是 LLM 分析路径的静默蒸发；
       // 这里事件本体已在 issue_events 落库，通知层丢失可从时间线追溯）

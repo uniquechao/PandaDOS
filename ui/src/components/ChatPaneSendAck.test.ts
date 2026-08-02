@@ -15,7 +15,7 @@ describe('ChatPane 发送回执（issue #116）', () => {
     const src = await Bun.file(paneUrl).text();
     expect(src).toContain("send({ type: 'text', text: t, ...(rels.length ? { images: rels } : {}), id })");
     expect(src).toContain("sinceOff: maxOffOf(msgs), state: 'sending'");
-    expect(src).toContain('{PENDING_HINT[p.state]}');
+    expect(src).toContain('{pendingHint(p.state)}');
   });
 
   test('ack → 已送达；带 id 的 err → 失败（不带 id 的重启补发帧保持发送中）', async () => {

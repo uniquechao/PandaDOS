@@ -5,6 +5,7 @@
  * 纯展示：动作全由父层回调注入。
  */
 import type { ComponentChildren } from 'preact';
+import { useI18n } from '../i18n/provider';
 
 export function RunControls({
   leading,
@@ -27,10 +28,11 @@ export function RunControls({
   onTerminate: () => void;
   busy?: boolean;
 }) {
+  const { t } = useI18n();
   return (
     <div class="runctl">
       {leading}
-      <span class="rc-label">运行中</span>
+      <span class="rc-label">{t('ui.runRunning')}</span>
       <button
         class="rc-btn"
         disabled={!retryEnabled}
@@ -39,8 +41,8 @@ export function RunControls({
       >
         ↻ {retryLabel}
       </button>
-      <button class="rc-btn danger" disabled={busy} title="取消整个 issue" onClick={onTerminate}>
-        ■ 终止
+      <button class="rc-btn danger" disabled={busy} title={t('ui.terminateIssue')} onClick={onTerminate}>
+        ■ {t('ui.terminate')}
       </button>
     </div>
   );

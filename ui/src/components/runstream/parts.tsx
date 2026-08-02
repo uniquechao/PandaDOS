@@ -1,5 +1,6 @@
 /** runstream 共享小件：状态徽标、diff 着色行、单行预览。 */
 import type { RunStatus } from '../../lib/runstream';
+import { tr } from '../../i18n/runtime';
 
 export { firstLine } from './textutil';
 
@@ -9,12 +10,12 @@ export function RunStatusBadge({ status }: { status: RunStatus }) {
     return (
       <span class="rs-badge run">
         <span class="tool-spin" />
-        运行中
+        {tr('ui.runRunning')}
       </span>
     );
   }
-  if (status === 'error') return <span class="rs-badge err">✕ 失败</span>;
-  return <span class="rs-badge ok">✓ 成功</span>;
+  if (status === 'error') return <span class="rs-badge err">✕ {tr('ui.failed')}</span>;
+  return <span class="rs-badge ok">✓ {tr('ui.succeeded')}</span>;
 }
 
 /** 多行文本按 "- "/"+ " 前缀着色（toolfmt diff 正文）；空行占位保高。 */

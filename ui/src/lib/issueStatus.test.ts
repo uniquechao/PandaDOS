@@ -33,30 +33,30 @@ describe('retryPlan', () => {
     const p = retryPlan('blocked', false);
     expect(p.action).toBe('unblock');
     expect(p.enabled).toBe(true);
-    expect(p.label).toBe('解除阻塞重跑');
+    expect(p.label).toBe('Unblock and retry');
   });
 
   test('驱动中 + 最近异常 → inject 可用', () => {
     const p = retryPlan('implementing', true);
     expect(p.action).toBe('inject');
     expect(p.enabled).toBe(true);
-    expect(p.label).toBe('重试');
+    expect(p.label).toBe('Retry');
   });
 
   test('驱动中但无失败步骤 → 禁用', () => {
     const p = retryPlan('testing', false);
     expect(p.action).toBe('none');
     expect(p.enabled).toBe(false);
-    expect(p.hint).toContain('暂无');
+    expect(p.hint).toContain('No failed step');
   });
 
   test('cancelled → reopen 复活重跑，始终可用（#93）', () => {
     const p = retryPlan('cancelled', false);
     expect(p.action).toBe('reopen');
     expect(p.enabled).toBe(true);
-    expect(p.label).toBe('重新运行');
+    expect(p.label).toBe('Run again');
     // 提示必须点破「立刻开跑」，否则用户会以为还能先改需求
-    expect(p.hint).toContain('立即排队开跑');
+    expect(p.hint).toContain('queue immediately');
   });
 
   test('done 是真终态：不给重跑（状态机也不接 reopen）', () => {

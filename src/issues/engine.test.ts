@@ -151,6 +151,7 @@ async function setup(opts: {
   migrateIssueEngine(db); // 030：module/impl_mode 列 + project_active_conv
   const users = new UserStore(db);
   const { user: admin } = users.create('admin', 'admin');
+  users.putSettings(admin.id, { locale: 'zh-Hans' }); // legacy prompt assertions in this suite
   db.run(
     `INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir)
      VALUES ('local', '127.0.0.1', 22, 'root', 'k', '${dir}/ws', '${dir}/claude')`,
@@ -514,7 +515,7 @@ describe('默认自动流：manual_review 关闭时计划卡点自动放行', ()
     // 审计事件 + 自动确认通知
     const evs = s.engine.store.listEvents(issue.id);
     expect(evs.some((e) => e.kind === 'auto_approved' && (e.dataJson ?? '').includes('"plan"'))).toBe(true);
-    expect(s.notifications.some((n) => n.summary?.includes('计划自动确认'))).toBe(true);
+    expect(s.notifications.some((n) => n.summaryCode === 'status_transition' && n.to === 'implementing')).toBe(true);
     expect(s.notifications.some((n) => n.kind === 'gate_waiting')).toBe(false);
     // 起点 commit 照记（impl_base）
     expect(evs.some((e) => e.kind === 'impl_base')).toBe(true);
@@ -550,7 +551,7 @@ describe('默认自动流：manual_review 关闭时计划卡点自动放行', ()
     expect(evs.some((e) => e.kind === 'auto_approved' && (e.dataJson ?? '').includes('merge_review'))).toBe(true);
     expect(evs.some((e) => e.kind === 'auto_commit' && (e.dataJson ?? '').includes(`(#${issue.id})`))).toBe(true);
     expect(evs.some((e) => e.kind === 'error' && (e.dataJson ?? '').includes('auto_push'))).toBe(true);
-    expect(s.notifications.some((n) => n.summary?.includes('自动 push 失败'))).toBe(true);
+    expect(s.notifications.some((n) => n.summaryCode === 'auto_git_failure' && n.summaryParams?.action === 'push')).toBe(true);
     // commit 真实落库且在本 issue 范围内（impl_commits 快照含自动提交）
     const log = await s.g(['log', '-1', '--pretty=%s']);
     expect(log.out.trim()).toBe(`导出功能 (#${issue.id})`);
@@ -997,7 +998,7 @@ describe('正式模块绑定', () => {
     expect(st.suggestion!.actions.length).toBe(4); // 幻觉 merge 被清洗
     expect(st.suggestion!.actions.map((x) => x.kind)).toEqual(['rename', 'merge', 'create', 'move']);
     expect(st.suggestion!.actions[1]).toMatchObject({ targetName: '执行', sourceNames: ['执行页面'] });
-    expect(s.notifications.some((n) => n.summary?.includes('整理分析完成'))).toBe(true);
+    expect(s.notifications.some((n) => n.summaryCode === 'module_organization')).toBe(true);
 
     // 逐项执行：rename → slug 三处同步（模块行 / 文档目录 / issues.module 文本列）
     expect((await s.engine.applyOrganizeAction(s.projectId, 0)).ok).toBe(true);
@@ -1881,7 +1882,8 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
     ).toBe(true);
     expect(
       s.notifications.some(
-        (n) => n.kind === 'issue_blocked' && n.issueId === issueId && !!n.summary?.includes('代理起不来'),
+        (n) => n.kind === 'issue_blocked' && n.issueId === issueId &&
+          String(n.summaryParams?.detail ?? '').includes('代理起不来'),
       ),
     ).toBe(true);
   });
@@ -1996,7 +1998,7 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
     expect(engine.store.get(issue.id)!.status).toBe('blocked');
     expect(replans()).toBe(2); // 第三次不再指令，直接兜底
     expect(
-      s.notifications.some((n) => n.kind === 'issue_blocked' && (n.summary ?? '').includes('SUBTASKS')),
+      s.notifications.some((n) => n.kind === 'issue_blocked' && String(n.summaryParams?.detail ?? '').includes('SUBTASKS')),
     ).toBe(true);
   });
 
@@ -2048,7 +2050,7 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
     clock.advance(6 * 60 * 1000);
     await engine.tick();
     expect(engine.store.countEvents(issue.id, 'menu_stuck')).toBe(1);
-    expect(s.notifications.some((n) => n.summary?.includes('弹窗滞留'))).toBe(true);
+    expect(s.notifications.some((n) => n.summaryCode === 'menu_stuck')).toBe(true);
     // 菜单消失后恢复 kickoff
     s.driver.pane = '';
     await engine.tick();
@@ -2091,7 +2093,7 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
     clock.advance(6 * 60 * 1000);
     await engine.tick();
     expect(engine.store.countEvents(issue.id, 'menu_stuck')).toBe(1);
-    expect(s.notifications.some((n) => n.summary?.includes('弹窗滞留'))).toBe(true);
+    expect(s.notifications.some((n) => n.summaryCode === 'menu_stuck')).toBe(true);
   });
 
   test('blocked 接力：不建/不切分支，靠 impl_base 起点把 B 的范围与 A 的残留提交隔开', async () => {
@@ -2208,11 +2210,11 @@ describe('I2 门禁跳过可观测：conv_displaced 事件+通知一次，恢复
     await convs.activate(other.id);
     await engine.tick();
     expect(engine.store.countEvents(issue.id, 'conv_displaced')).toBe(1);
-    expect(s.notifications.filter((n) => n.summary?.includes('切走')).length).toBe(1);
+    expect(s.notifications.filter((n) => n.summaryCode === 'conversation_displaced').length).toBe(1);
     await engine.tick(); // 去重：不重复
     await engine.tick();
     expect(engine.store.countEvents(issue.id, 'conv_displaced')).toBe(1);
-    expect(s.notifications.filter((n) => n.summary?.includes('切走')).length).toBe(1);
+    expect(s.notifications.filter((n) => n.summaryCode === 'conversation_displaced').length).toBe(1);
 
     // 切回 issue 对话 → 标志复位；再切走 → 第二次事件
     await convs.activate(engine.store.get(issue.id)!.convId!);
@@ -2220,7 +2222,7 @@ describe('I2 门禁跳过可观测：conv_displaced 事件+通知一次，恢复
     await convs.activate(other.id);
     await engine.tick();
     expect(engine.store.countEvents(issue.id, 'conv_displaced')).toBe(2);
-    expect(s.notifications.filter((n) => n.summary?.includes('切走')).length).toBe(2);
+    expect(s.notifications.filter((n) => n.summaryCode === 'conversation_displaced').length).toBe(2);
   });
 });
 
@@ -2295,7 +2297,8 @@ describe('I4 kickoff 就绪真检测', () => {
     await s.engine.tick();
     expect(s.engine.store.get(issue.id)!.status).toBe('blocked');
     expect(
-      s.notifications.some((n) => n.kind === 'issue_blocked' && n.summary?.includes('CC 启动超时')),
+      s.notifications.some((n) => n.kind === 'issue_blocked' &&
+        String(n.summaryParams?.detail ?? '').includes('CC 启动超时')),
     ).toBe(true);
     expect(s.driver.prompts().length).toBe(0); // 全程没盲注入过
   });
@@ -2888,7 +2891,7 @@ describe('issue 目标/源分支准备', () => {
     let lockedDuringFailureNotice: boolean | undefined;
     const s = await setup({
       onNotify(event) {
-        if (event.summary?.includes('自动 push 失败')) {
+        if (event.summaryCode === 'auto_git_failure' && event.summaryParams?.action === 'push') {
           lockedDuringFailureNotice = mutex?.isLocked(gitLockKey(1));
         }
       },
@@ -3686,18 +3689,18 @@ describe('执行中澄清：NEED_CLARIFY 检测 + 停催停判 + 超时自动继
     expect(engine.store.get(issue.id)!.status).toBe('planning'); // 不推进
     expect(engine.store.execClarifyWait(issue.id)).not.toBeNull();
     expect(
-      s.notifications.some((n) => n.issueId === issue.id && (n.summary ?? '').includes('执行中需要你澄清')),
+      s.notifications.some((n) => n.issueId === issue.id && n.summaryCode === 'clarification_needed'),
     ).toBe(true);
-    expect(s.notifications.some((n) => (n.summary ?? '').includes('下线钮改蓝色'))).toBe(true);
+    expect(s.notifications.some((n) => String(n.summaryParams?.questions ?? '').includes('下线钮改蓝色'))).toBe(true);
     // 推送带需求正文摘要：手机上收到就知道这条 issue 原来在做什么
-    expect(s.notifications.some((n) => (n.summary ?? '').includes('需求：样式要跟首页一致'))).toBe(true);
-    const notifN = s.notifications.filter((n) => (n.summary ?? '').includes('执行中需要你澄清')).length;
+    expect(s.notifications.some((n) => n.summaryParams?.body === '样式要跟首页一致')).toBe(true);
+    const notifN = s.notifications.filter((n) => n.summaryCode === 'clarification_needed').length;
 
     // 幂等：再输出一遍 NEED_CLARIFY，不重复记事件/不重复推送
     await s.appendOutput(jl, asst(`还是那几个问题\nNEED_CLARIFY:${issue.id}`));
     await engine.tick();
     expect(engine.store.listEvents(issue.id).filter((e) => e.kind === 'clarify_questions').length).toBe(1);
-    expect(s.notifications.filter((n) => (n.summary ?? '').includes('执行中需要你澄清')).length).toBe(notifN);
+    expect(s.notifications.filter((n) => n.summaryCode === 'clarification_needed').length).toBe(notifN);
 
     // 等待期停催停判：静默超过 nudge(180s)/fallback(360s) 但未到 clarifyTimeout(600s)
     s.pm.judgement = 'done';
@@ -3736,7 +3739,7 @@ describe('执行中澄清：NEED_CLARIFY 检测 + 停催停判 + 超时自动继
     expect(engine.store.execClarifyWait(issue.id)).not.toBeNull();
     expect(engine.store.get(issue.id)!.status).toBe('planning'); // 不 block
     expect(
-      s.notifications.some((n) => n.issueId === issue.id && (n.summary ?? '').includes('执行中需要你澄清')),
+      s.notifications.some((n) => n.issueId === issue.id && n.summaryCode === 'clarification_needed'),
     ).toBe(true);
 
     // 进入等待后停判：execClarifyWait 非空 → 不再 judge（clarifyTimeout 2000s 内不触发超时）
@@ -3911,8 +3914,9 @@ describe('创建时澄清：后台分析不占队列不改状态', () => {
     const qEv = s.engine.store.listEvents(b.id).find((e) => e.kind === 'clarify_questions')!;
     expect(JSON.parse(qEv.dataJson!).questions).toEqual(['问 1？']);
     expect(JSON.parse(qEv.dataJson!).text).toBe('1. 问 1？\n   A. 选项一\n   B. 选项二');
-    const note = s.notifications.find((n) => n.issueId === b.id && n.summary?.includes('问 1？'));
-    expect(note?.summary).toContain('需求：加导出'); // 推送带正文摘要——手机上不用点进来也知道在问什么
+    const note = s.notifications.find((n) => n.issueId === b.id &&
+      String(n.summaryParams?.questions ?? '').includes('问 1？'));
+    expect(note?.summaryParams?.body).toBe('加导出'); // 推送带正文摘要——手机上不用点进来也知道在问什么
     expect(s.engine.store.listEvents(a.id).map((e) => e.kind)).not.toContain('clarify_started');
   });
 
@@ -4295,12 +4299,15 @@ describe('start() 恢复扫描：被重启打断的创建时澄清', () => {
 
 describe('执行结果总结：done/blocked 收尾注入 + 文件哨兵读回', () => {
   /** 带虚拟 sleep 的 setup：sleep 推进假时钟并触发钩子（模拟 CC 写产物文件） */
-  async function summarySetup(timeoutMs = 500) {
+  async function summarySetup(timeoutMs = 500, persistToModule = false) {
+    const persisted: string[] = [];
+    let modules!: NonNullable<EngineDeps['modulesFor']> extends (project: Project) => infer T ? T : never;
     const ref: { hook: (() => Promise<void>) | null; adv: ((ms: number) => void) | null } = {
       hook: null,
       adv: null,
     };
     const s = await setup({
+      ...(persistToModule ? { modulesFor: () => modules } : {}),
       config: {
         resultSummaryTimeoutMs: timeoutMs,
         resultSummaryPollMs: 10,
@@ -4310,12 +4317,27 @@ describe('执行结果总结：done/blocked 收尾注入 + 文件哨兵读回', 
         },
       },
     });
+    if (persistToModule) {
+      s.db.query(
+        `INSERT INTO project_modules
+           (id, project_id, slug, display_name, agent, source, created_by, created_ts)
+         VALUES (71, ?, 'summary-module', 'Summary Module', 'claude', 'manual', ?, 1)`,
+      ).run(s.projectId, s.admin.id);
+      const module = new ModuleStore(s.db).get(71)!;
+      modules = {
+        resolve: async () => module,
+        recordIssue: async () => {},
+        recordResultSummary: async (_module, _issue, summary) => {
+          persisted.push(summary);
+        },
+      };
+    }
     ref.adv = (ms) => s.clock.advance(ms);
-    return { s, ref };
+    return { s, ref, persisted };
   }
 
   test('blocked：注入受阻变体 prompt，读回落库 + 事件留痕 + scratch 清理', async () => {
-    const { s, ref } = await summarySetup();
+    const { s, ref, persisted } = await summarySetup(500, true);
     const issue = await s.engine.createIssue(s.projectId, { title: '任务A' });
     expect(s.engine.store.get(issue.id)!.status).toBe('planning');
     const p = resultSummaryPaths(s.repo, issue.id);
@@ -4336,6 +4358,7 @@ describe('执行结果总结：done/blocked 收尾注入 + 文件哨兵读回', 
     const kinds = s.engine.store.listEvents(issue.id).map((e) => e.kind);
     expect(kinds).toContain('summary_requested');
     expect(kinds).toContain('summary_done');
+    expect(persisted).toEqual(['做到一半，改了 a.ts，卡在权限弹窗']);
     expect(await fsp.stat(p.scratch).catch(() => null)).toBeNull(); // scratch 已清
   });
 

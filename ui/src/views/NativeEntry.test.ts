@@ -8,15 +8,15 @@ describe('项目级原生 Bash 入口契约', () => {
   test('看板、项目卡片和对话页头都使用原生 Bash 文案并只导航项目终端路由', () => {
     for (const name of ['Board.tsx', 'Projects.tsx', 'Chat.tsx']) {
       const source = read(name);
-      expect(source).toContain('原生 Bash');
+      expect(source).toContain("'view.nativeBash'");
       expect(source).toContain('/term');
     }
   });
 
   test('项目终端页明确连接 Bash target，并展示原生 Bash 标题', () => {
     const source = read('Term.tsx');
-    expect(source).toContain('· 原生 Bash');
+    expect(source).toContain("{t('view.nativeBash')}");
     expect(source).toContain("target={{ kind: 'bash' }}");
-    expect(source).not.toContain('· 终端');
+    expect(source).not.toContain(' · Terminal</span>');
   });
 });

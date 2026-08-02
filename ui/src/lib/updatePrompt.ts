@@ -5,6 +5,7 @@
  * 点「刷新」即 location.reload()，取到新的 index.html（no-cache）与新 chunk。
  * 一次页面加载只弹一次（两处懒加载同时失败也只一条），避免刷屏。
  */
+import { tr } from '../i18n/runtime';
 
 let shown = false;
 
@@ -19,18 +20,18 @@ export function promptReload(): void {
 
   const tx = document.createElement('span');
   tx.className = 'update-bar-tx';
-  tx.textContent = '检测到新版本';
+  tx.textContent = tr('action.newVersion');
   bar.appendChild(tx);
 
   const btn = document.createElement('button');
   btn.className = 'update-bar-btn';
-  btn.textContent = '点此刷新';
+  btn.textContent = tr('action.reload');
   btn.onclick = () => location.reload();
   bar.appendChild(btn);
 
   const x = document.createElement('button');
   x.className = 'update-bar-x';
-  x.setAttribute('aria-label', '关闭');
+  x.setAttribute('aria-label', tr('action.close'));
   x.textContent = '✕';
   x.onclick = () => bar.remove();
   bar.appendChild(x);

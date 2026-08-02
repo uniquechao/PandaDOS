@@ -58,6 +58,7 @@ import {
 import { ChatView } from './Chat';
 import { IssueWorkbench } from './IssueDetail';
 import { reconcileAgent } from '../components/AgentPicker';
+import { tr } from '../i18n/runtime';
 
 const POLL_MS = 5000;
 
@@ -73,12 +74,12 @@ const GROUPS: {
   searchable?: boolean;
 }[] = [
   // clarifying 在等发起人回答——归待确认组（别装成还没开始）
-  { key: 'review', label: '待确认', statuses: ['clarifying', 'plan_review', 'merge_review'], tone: 'review' },
-  { key: 'doing', label: '进行中', statuses: ['planning', 'implementing', 'testing', 'merging'], tone: 'doing' },
-  { key: 'todo', label: '待办', statuses: ['pending'], tone: 'todo' },
-  { key: 'blocked', label: '受阻', statuses: ['blocked'], tone: 'blocked', paged: true },
-  { key: 'finished', label: '完成', statuses: ['done'], tone: 'finished', paged: true, searchable: true },
-  { key: 'cancelled', label: '已取消', statuses: ['cancelled'], tone: 'cancelled', paged: true },
+  { key: 'review', get label() { return tr('project.statusReview'); }, statuses: ['clarifying', 'plan_review', 'merge_review'], tone: 'review' },
+  { key: 'doing', get label() { return tr('project.statusDoing'); }, statuses: ['planning', 'implementing', 'testing', 'merging'], tone: 'doing' },
+  { key: 'todo', get label() { return tr('project.statusTodo'); }, statuses: ['pending'], tone: 'todo' },
+  { key: 'blocked', get label() { return tr('project.statusBlocked'); }, statuses: ['blocked'], tone: 'blocked', paged: true },
+  { key: 'finished', get label() { return tr('status.done'); }, statuses: ['done'], tone: 'finished', paged: true, searchable: true },
+  { key: 'cancelled', get label() { return tr('status.cancelled'); }, statuses: ['cancelled'], tone: 'cancelled', paged: true },
 ];
 
 export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
@@ -168,11 +169,11 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
       if (subscribed) {
         await api('/api/subscriptions', 'DELETE', { scope: 'project', targetId: pid });
         setSubscribed(false);
-        toast.info('已退订本项目');
+        toast.info(tr('board.unsubscribed'));
       } else {
         await api('/api/subscriptions', 'POST', { scope: 'project', targetId: pid });
         setSubscribed(true);
-        toast.success('已订阅，有进展会通知你');
+        toast.success(tr('board.subscribed'));
       }
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : String(e));
@@ -192,10 +193,10 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
       if (isAsyncMode(mode)) {
         // 202 running：落 running 态，下面的 effect 会接管轮询直到收敛
         setProject(r.project);
-        toast.info(`已用 ${mode} 开始生成，稍候…`);
+        toast.info(tr('project.startedSummary', { mode }));
       } else {
         setProject((prev) => (prev ? { ...prev, readmeSummary: r.summary ?? prev.readmeSummary } : prev));
-        toast.success('简介已更新');
+        toast.success(tr('project.summaryUpdated'));
       }
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : String(e));
@@ -211,8 +212,8 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
     pollingRef.current = true;
     pollProjectSummary(pid, { onTick: (p) => setProject(p) })
       .then((final) => {
-        if (final.summaryStatus === 'done') toast.success('认知总结已更新');
-        else if (final.summaryStatus === 'error') toast.error(final.summaryError ?? '生成失败');
+        if (final.summaryStatus === 'done') toast.success(tr('project.knowledgeUpdated'));
+        else if (final.summaryStatus === 'error') toast.error(final.summaryError ?? tr('project.generationFailed'));
       })
       .catch(() => {})
       .finally(() => {
@@ -227,7 +228,7 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
   const pinIssue = async (iid: number, pinned: boolean): Promise<void> => {
     try {
       await api(`/api/projects/${pid}/issues/${iid}/pin`, 'POST', { pinned });
-      toast.success(pinned ? '已置顶，优先调度' : '已取消置顶');
+      toast.success(pinned ? tr('board.pinned') : tr('board.unpinned'));
       load();
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : String(e));
@@ -245,15 +246,15 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
   const list = (
     <div class="wb-issuelist">
       <div class="wb-list-hd">
-        <span class="wb-list-t">任务{issues ? ` · ${issues.length}` : ''}</span>
+        <span class="wb-list-t">{tr('board.tasks')}{issues ? ` · ${issues.length}` : ''}</span>
         <button class="btn sm primary" onClick={() => setCreating(true)}>
-          ＋ 新建
+          ＋ {tr('ui.create')}
         </button>
       </div>
       <div class="wb-groups">
         {issues === null && <Loading />}
         {issues !== null && issues.length === 0 && (
-          <div class="empty">还没有 issue，点「＋ 新建」开始。</div>
+          <div class="empty">{tr('board.noIssues')}</div>
         )}
         {issues !== null &&
           GROUPS.map((g) => {
@@ -279,7 +280,7 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
                   {g.searchable && (
                     <button
                       class={`wb-group-srch${searchOpen ? ' on' : ''}`}
-                      title="搜索全部 issue"
+                      title={tr('board.searchIssues')}
                       onClick={() => {
                         if (searchOpen) {
                           setSearchOpen(false);
@@ -299,7 +300,7 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
                   <input
                     class="wb-group-search"
                     type="search"
-                    placeholder="搜全部 issue：标题 / #编号 / 模块"
+                    placeholder={tr('board.searchIssuePlaceholder')}
                     value={searchQ}
                     autofocus
                     onInput={(e) => {
@@ -320,18 +321,18 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
                       />
                     ))}
                     {searching && g.searchable && searched.length === 0 && (
-                      <div class="wb-group-empty mut small">本组没有匹配「{searchQ.trim()}」的 issue</div>
+                      <div class="wb-group-empty mut small">{tr('board.noGroupMatches', { query: searchQ.trim() })}</div>
                     )}
                     {pages > 1 && (
                       <div class="wb-group-pager">
                         <button class="linkbtn" disabled={page === 0} onClick={() => setPage(page - 1)}>
-                          ‹ 上一页
+                          ‹ {tr('board.previous')}
                         </button>
                         <span class="mut small">
                           {page + 1}/{pages}
                         </span>
                         <button class="linkbtn" disabled={page >= pages - 1} onClick={() => setPage(page + 1)}>
-                          下一页 ›
+                          {tr('board.next')} ›
                         </button>
                       </div>
                     )}
@@ -351,22 +352,22 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
           <button class="back" onClick={() => nav('/')}>
             ‹
           </button>
-          <span class="btitle">{project?.name ?? `项目 #${pid}`}</span>
+          <span class="btitle">{project?.name ?? tr('view.projectFallback', { id: pid })}</span>
           <div class="bacts">
             {/* 项目对话模式入口：切到 chat 视图（chat 类型项目已在上方整页渲染，不会走到这里） */}
             <button class="btn sm" onClick={() => nav(`/p/${pid}/chat`)}>
-              对话
+              {tr('view.conversation')}
             </button>
             <button class="btn sm" onClick={toggleSub} disabled={subscribed === null}>
-              {subscribed ? '已订阅 ✓' : '订阅'}
+              {subscribed ? tr('board.subscribedLabel') : tr('board.subscribe')}
             </button>
             <button class="btn sm" onClick={() => setMembersOpen(true)}>
-              成员
+              {tr('board.members')}
             </button>
             <button class="btn sm" onClick={() => setModulesOpen(true)}>
-              模块
+              {tr('board.modules')}
               {hasPendingSuggestion(orgStatus, readOrganizeDismissedTs(pid)) && (
-                <span class="merge-dot" title="有模块整理方案待确认">
+                <span class="merge-dot" title={tr('board.modulePlanPending')}>
                   ✨
                 </span>
               )}
@@ -380,16 +381,16 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
               )}
             />
             <button class="btn sm" onClick={() => nav(`/p/${pid}/term`)}>
-              原生 Bash
+              {tr('view.nativeBash')}
             </button>
             <button class="btn sm" onClick={() => nav(`/p/${pid}/files`)}>
-              文件
+              {tr('view.files')}
             </button>
             <button class="btn sm" onClick={() => nav(`/p/${pid}/git`)}>
               Git
             </button>
             <button class="btn sm" onClick={() => nav(`/p/${pid}/skills`)}>
-              技能
+              {tr('board.skills')}
             </button>
           </div>
         </div>
@@ -398,7 +399,7 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
         {project?.understanding && (
           <details class="understanding">
             <summary>
-              🧠 认知总结
+              🧠 {tr('board.knowledgeSummary')}
               {project.understandingAgent ? `（${project.understandingAgent}）` : ''}
             </summary>
             <div class="understanding-body">{project.understanding}</div>
@@ -415,12 +416,12 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
           >
             {list}
           </div>
-          <ListSplitter containerRef={splitRef} list={listW} label="任务列表栏宽" />
+          <ListSplitter containerRef={splitRef} list={listW} label={tr('board.taskListWidth')} />
           <div class="wb-main">
             {selectedId != null ? (
               <IssueWorkbench key={selectedId} pid={pid} iid={selectedId} embedded />
             ) : (
-              <div class="gd-empty">← 选择一个 issue 开工</div>
+              <div class="gd-empty">← {tr('board.chooseIssue')}</div>
             )}
           </div>
         </div>
@@ -487,7 +488,7 @@ function IssueRow({
   return (
     <button class={`wb-row${tone}${active ? ' on' : ''}${pinned ? ' pinned' : ''}`} onClick={onOpen}>
       <div class="wb-row-t">
-        {pinned && canPin && <span class="wb-pin-flag" title="已置顶">📌</span>}
+        {pinned && canPin && <span class="wb-pin-flag" title={tr('board.pinnedFlag')}>📌</span>}
         <span class="wb-row-id mono">#{issue.id}</span> {issue.title}
       </div>
       <div class="wb-row-m">
@@ -495,13 +496,13 @@ function IssueRow({
         {issue.waitingInput && <WaitingBadge />}
         {/* awaitingClarify 已由状态徽标覆盖显示，这里不再重复挂一个「澄清待答」 */}
         {issue.clarifyPending && !issue.awaitingClarify && (
-          <span class="badge b-amber" title="执行代理分析后有问题想确认（不回也不影响排队执行）">
-            ❓ 澄清待答
+          <span class="badge b-amber" title={tr('board.clarifyOptional')}>
+            ❓ {tr('board.clarificationPending')}
           </span>
         )}
         {issue.module && <span class="badge b-gray">{issue.module}</span>}
         {issue.agent === 'codex' && <span class="badge b-ai">codex</span>}
-        <span class="badge b-gray" title={`创建者：${issue.createdByName || '—'}`}>
+        <span class="badge b-gray" title={tr('board.creator', { name: issue.createdByName || '—' })}>
           👤 {issue.createdByName || '—'}
         </span>
         <span class="wb-row-time">{timeAgo(issue.createdTs)}</span>
@@ -509,13 +510,13 @@ function IssueRow({
           <span
             class={`wb-pin${pinned ? ' on' : ''}`}
             role="button"
-            title={pinned ? '取消置顶' : '置顶（优先调度）'}
+            title={pinned ? tr('board.unpin') : tr('board.pin')}
             onClick={(e) => {
               e.stopPropagation();
               onPin(!pinned);
             }}
           >
-            {pinned ? '📌 取消置顶' : '📌 置顶'}
+            {pinned ? `📌 ${tr('board.unpin')}` : `📌 ${tr('board.pin')}`}
           </span>
         )}
       </div>
@@ -568,8 +569,8 @@ function MembersModal({ pid, onClose }: { pid: number; onClose: () => void }) {
     try {
       const r = await addMember(pid, u);
       setSel('');
-      if (r.added) toast.success(`已添加成员 ${r.member.username}`);
-      else toast.info(`${r.member.username} 已是成员`);
+      if (r.added) toast.success(tr('board.addedMember', { name: r.member.username }));
+      else toast.info(tr('board.alreadyMember', { name: r.member.username }));
       load();
     } catch (x) {
       setErr(x instanceof ApiError ? x.message : String(x));
@@ -579,12 +580,12 @@ function MembersModal({ pid, onClose }: { pid: number; onClose: () => void }) {
   };
 
   const remove = async (m: ProjectMember): Promise<void> => {
-    if (busy || !confirm(`移除成员 ${m.username}？`)) return;
+    if (busy || !confirm(tr('board.removeMemberConfirm', { name: m.username }))) return;
     setBusy(true);
     setErr('');
     try {
       await removeMember(pid, m.userId);
-      toast.success(`已移除 ${m.username}`);
+      toast.success(tr('board.removedMember', { name: m.username }));
       load();
     } catch (x) {
       setErr(x instanceof ApiError ? x.message : String(x));
@@ -594,12 +595,12 @@ function MembersModal({ pid, onClose }: { pid: number; onClose: () => void }) {
   };
 
   const makeOwner = async (m: ProjectMember): Promise<void> => {
-    if (busy || !confirm(`把属主转让给 ${m.username}？原属主将降为成员。`)) return;
+    if (busy || !confirm(tr('board.transferOwnerConfirm', { name: m.username }))) return;
     setBusy(true);
     setErr('');
     try {
       await transferOwner(pid, m.userId);
-      toast.success(`已把属主转让给 ${m.username}`);
+      toast.success(tr('board.transferredOwner', { name: m.username }));
       load();
     } catch (x) {
       setErr(x instanceof ApiError ? x.message : String(x));
@@ -610,15 +611,15 @@ function MembersModal({ pid, onClose }: { pid: number; onClose: () => void }) {
 
   // 活跃时间：一行小字（挤压省略），完整时刻放 title
   const actLine = (m: ProjectMember): string =>
-    `登录 ${m.lastLoginTs ? timeAgo(m.lastLoginTs) : '从未'} · 活跃 ${m.lastSeenTs ? timeAgo(m.lastSeenTs) : '从未'}`;
+    tr('board.loginActive', { login: m.lastLoginTs ? timeAgo(m.lastLoginTs) : tr('ui.never'), active: m.lastSeenTs ? timeAgo(m.lastSeenTs) : tr('ui.never') });
   const actTitle = (m: ProjectMember): string =>
-    `最近登录：${m.lastLoginTs ? fmtTime(m.lastLoginTs) : '从未'}\n最后使用：${m.lastSeenTs ? fmtTime(m.lastSeenTs) : '从未'}`;
+    tr('board.loginActiveTitle', { login: m.lastLoginTs ? fmtTime(m.lastLoginTs) : tr('ui.never'), active: m.lastSeenTs ? fmtTime(m.lastSeenTs) : tr('ui.never') });
 
   return (
-    <Modal title="项目成员" wide onClose={onClose}>
+    <Modal title={tr('board.projectMembers')} wide onClose={onClose}>
       <div class="formcol">
         {members === null ? (
-          <div class="mut">加载中…</div>
+          <div class="mut">{tr('ui.loading')}</div>
         ) : (
           <div class="memlist">
             {members.map((m) => (
@@ -626,22 +627,22 @@ function MembersModal({ pid, onClose }: { pid: number; onClose: () => void }) {
                 <div class="memrow-main">
                   <span class="memrow-name">👤 {m.username}</span>
                   <span class={`badge ${m.role === 'owner' ? 'b-amber' : 'b-gray'}`}>
-                    {m.role === 'owner' ? '属主' : '成员'}
+                    {m.role === 'owner' ? tr('board.owner') : tr('board.member')}
                   </span>
                 </div>
                 <span class="memrow-meta" title={actTitle(m)}>
                   {actLine(m)}
                 </span>
-                <span class="memrow-stat" title="本项目内创建的 issue（完成/总数）">
+                <span class="memrow-stat" title={tr('board.memberIssueStats')}>
                   issue {m.issueDone}/{m.issueTotal}
                 </span>
                 {canManage && m.role === 'member' && (
                   <div class="memrow-acts">
                     <button class="memrow-act" disabled={busy} onClick={() => void makeOwner(m)}>
-                      设为属主
+                      {tr('board.setOwner')}
                     </button>
                     <button class="memrow-act danger" disabled={busy} onClick={() => void remove(m)}>
-                      移除
+                      {tr('board.remove')}
                     </button>
                   </div>
                 )}
@@ -652,7 +653,7 @@ function MembersModal({ pid, onClose }: { pid: number; onClose: () => void }) {
         {canManage ? (
           <div class="row">
             <select class="grow" value={sel} onChange={(e) => setSel(e.currentTarget.value)}>
-              <option value="">{cands.length ? '选择要添加的用户…' : '（没有可添加的用户）'}</option>
+              <option value="">{cands.length ? tr('board.chooseUser') : tr('board.noUsersToAdd')}</option>
               {cands.map((c) => (
                 <option key={c.id} value={c.username}>
                   {c.username}
@@ -660,17 +661,17 @@ function MembersModal({ pid, onClose }: { pid: number; onClose: () => void }) {
               ))}
             </select>
             <button class="btn primary" disabled={busy || !sel} onClick={() => void add()}>
-              添加
+              {tr('board.add')}
             </button>
           </div>
         ) : (
-          members !== null && <div class="mut small">仅项目属主或管理员可增删成员。</div>
+          members !== null && <div class="mut small">{tr('board.memberPermission')}</div>
         )}
         {err && <div class="err">{err}</div>}
       </div>
       <div class="mbtns">
         <button class="btn" onClick={onClose}>
-          关闭
+          {tr('action.close')}
         </button>
       </div>
     </Modal>
@@ -751,27 +752,27 @@ function NewIssueModal({
   };
 
   return (
-    <Modal title="新建 issue" onClose={onClose}>
+    <Modal title={tr('board.newIssue')} onClose={onClose}>
       <div class="formcol">
         <label class="field">
-          标题
-          <input value={title} onInput={(e) => setTitle(e.currentTarget.value)} placeholder="要做什么？" />
+          {tr('board.title')}
+          <input value={title} onInput={(e) => setTitle(e.currentTarget.value)} placeholder={tr('board.whatToDo')} />
         </label>
         <label class="field">
-          详情（可选）
-          <textarea rows={3} value={body} onInput={(e) => setBody(e.currentTarget.value)} placeholder="背景 / 验收标准 / 复现步骤…" />
+          {tr('board.detailsOptional')}
+          <textarea rows={3} value={body} onInput={(e) => setBody(e.currentTarget.value)} placeholder={tr('board.issueBodyPlaceholder')} />
         </label>
         <div class="row">
           <label class="field grow">
-            类别
+            {tr('board.category')}
             <select value={category} onChange={(e) => setCategory(e.currentTarget.value as IssueCategory)}>
-              <option value="task">任务</option>
-              <option value="design">设计</option>
+              <option value="task">{tr('status.categoryTask')}</option>
+              <option value="design">{tr('status.categoryDesign')}</option>
               <option value="debug">DEBUG</option>
             </select>
           </label>
           <label class="field grow">
-            模块（可选）
+            {tr('board.moduleOptional')}
             <ModuleSelect
               modules={modules}
               value={module}
@@ -780,12 +781,12 @@ function NewIssueModal({
                 const picked = modules.find((m) => m.slug === value.trim() || m.displayName === value.trim());
                 if (picked) setAgent(picked.agent);
               }}
-              placeholder="留空自动归类，或选择模块"
+              placeholder={tr('board.autoModule')}
             />
           </label>
         </div>
         <label class="field">
-          执行代理
+          {tr('board.agent')}
           <select
             value={selectedModule?.agent ?? agent}
             disabled={Boolean(selectedModule)}
@@ -795,8 +796,8 @@ function NewIssueModal({
               <option key={a} value={a}>{a === 'claude' ? 'Claude Code' : 'Codex'}</option>
             ))}
           </select>
-          {selectedModule && <span class="mut small">该模块固定使用 {selectedModule.agent}</span>}
-          {agentUnavailable && <span class="err small">该模块/Agent 未在项目执行机上启用</span>}
+          {selectedModule && <span class="mut small">{tr('board.moduleAgent', { agent: selectedModule.agent })}</span>}
+          {agentUnavailable && <span class="err small">{tr('board.agentUnavailable')}</span>}
         </label>
         <IssueGitBranchFields
           pid={pid}
@@ -807,18 +808,18 @@ function NewIssueModal({
         {/* 批准档位（#115）：与执行页顶栏同一个切换钮，档位说明也一并复用，建完还能在详情页改 */}
         <div class="nia-aa">
           <AutoApproveSwitch level={autoApprove} onChange={setAutoApprove} />
-          <span class="mut small">记住这台设备上次选的档位</span>
+          <span class="mut small">{tr('board.rememberApproval')}</span>
         </div>
         <label class="chkrow">
           <input type="checkbox" checked={team} onChange={(e) => setTeam(e.currentTarget.checked)} />
-          团队模式（子任务并行，默认串行）
+          {tr('board.teamMode')}
         </label>
         <ImageAttach projectId={pid} images={images} onChange={setImages} />
         {err && <div class="err">{err}</div>}
       </div>
       <div class="mbtns">
         <button class="btn" onClick={onClose}>
-          取消
+          {tr('ui.cancel')}
         </button>
         <button
           class="btn primary"
@@ -826,12 +827,12 @@ function NewIssueModal({
           onClick={submit}
         >
           {busy
-            ? '创建中…'
+            ? tr('ui.creating')
             : gitBranchLoading
-              ? '读取分支中…'
+              ? tr('board.readingBranches')
               : uploading
-                ? '图片上传中…'
-                : '创建'}
+                ? tr('ui.imageUploading')
+                : tr('ui.create')}
         </button>
       </div>
     </Modal>

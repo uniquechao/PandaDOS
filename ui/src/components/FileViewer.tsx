@@ -13,6 +13,7 @@ import type { FsFile } from '../lib/types';
 import { previewKind } from '../lib/preview';
 import { Loading } from './Loaders';
 import { toast } from '../lib/toast';
+import { useI18n } from '../i18n/provider';
 
 interface Edit {
   content: string;
@@ -20,6 +21,7 @@ interface Edit {
 }
 
 export function FileViewer({ pid, path }: { pid: number; path: string }) {
+  const { t } = useI18n();
   const kind = previewKind(path);
   const previewable = kind === 'image' || kind === 'html' || kind === 'pdf';
 
@@ -77,7 +79,7 @@ export function FileViewer({ pid, path }: { pid: number; path: string }) {
         content: edit.content,
       });
       setEdit({ content: edit.content, orig: edit.content });
-      toast.success('已保存');
+      toast.success(t('ui.saved'));
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : String(e));
     } finally {
@@ -94,12 +96,12 @@ export function FileViewer({ pid, path }: { pid: number; path: string }) {
           {name}
         </span>
         <div class="fv-acts">
-          <a class="btn sm" href={dl} title="下载">
-            下载
+          <a class="btn sm" href={dl} title={t('ui.download')}>
+            {t('ui.download')}
           </a>
           {canSave && (
             <button class="btn sm primary" disabled={!dirty || busy} onClick={save}>
-              {busy ? '保存中…' : dirty ? '保存' : '已保存'}
+              {busy ? t('ui.saving') : dirty ? t('ui.save') : t('ui.saved')}
             </button>
           )}
         </div>
@@ -110,9 +112,9 @@ export function FileViewer({ pid, path }: { pid: number; path: string }) {
         {kind === 'html' && <iframe class="fp-frame" src={raw} sandbox="" title={name} />}
         {kind === 'pdf' && (
           <div class="fp-dl">
-            PDF 文件，请下载后查看。
+            {t('ui.pdfDownload')}
             <a class="btn sm primary" href={dl}>
-              ⬇ 下载 PDF
+              ⬇ {t('ui.downloadPdf')}
             </a>
           </div>
         )}
@@ -122,15 +124,15 @@ export function FileViewer({ pid, path }: { pid: number; path: string }) {
           <div class="fp-dl">
             {err}
             <a class="btn sm primary" href={dl}>
-              ⬇ 下载
+              ⬇ {t('ui.download')}
             </a>
           </div>
         )}
         {!previewable && downloadOnly && (
           <div class="fp-dl">
-            该文件无法在线编辑（二进制或超过 1MB）。
+            {t('ui.fileNotEditable')}
             <a class="btn sm primary" href={dl}>
-              ⬇ 下载
+              ⬇ {t('ui.download')}
             </a>
           </div>
         )}

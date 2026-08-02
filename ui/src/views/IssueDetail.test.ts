@@ -10,8 +10,8 @@ describe('Issue 工作台信息架构', () => {
     expect(source).toContain('<NativeModeSwitch mode={mode} onChange={setMode} />');
     expect(source).toContain('target={{ kind: \'issue\', issueId: issue.id }}');
     expect(source).toContain('nativeUnavailableReason(issue)');
-    expect(source).toContain('当前执行会话不可接管');
-    expect(source).toContain("unavailable ? '不可接管'");
+    expect(source).toContain("tr('issue.nativeSessionUnavailable')");
+    expect(source).toContain("unavailable ? tr('issue.nativeUnavailable')");
     expect(source).not.toContain("useState<'chat' | 'term'>");
     expect(source).not.toContain('onTakeover');
     expect(source).not.toContain('onPause');
@@ -42,8 +42,8 @@ describe('Issue 工作台信息架构', () => {
     expect(source).toContain('{clarifyPanel}');
     // 弹窗承接原面板全部内容（问题清单完整展示随弹窗滚动），提交即关窗
     expect(source).toContain('function ClarifyPanel');
-    expect(source).toContain('<Modal title="澄清"');
-    expect(source).toContain('提交澄清答复');
+    expect(source).toContain("<Modal title={tr('issue.clarification')}");
+    expect(source).toContain("tr('issue.submitClarification')");
     // 状态徽标覆盖：awaitingClarify 透传给 StatusBadge（仅 issue 详情页）
     expect(source).toContain('awaitingClarify={issue.awaitingClarify}');
     // 澄清面板派生统一走纯函数 clarifyPanelState（lib/issueStatus，事件溯源，含 clarify_timeout 终止）
@@ -55,16 +55,16 @@ describe('Issue 工作台信息架构', () => {
 
   test('澄清面板附原始需求：标题常显 + 正文可折叠（答问题时看得到在答什么）', () => {
     expect(source).toContain('clarify-ctx');
-    expect(source).toContain('原始需求');
+    expect(source).toContain("tr('issue.originalRequest')");
     expect(source).toContain('title={issue.title}');
     expect(source).toContain('body={issue.body}');
   });
 
   test('review 状态缺 gate 时提供重试与取消，不把按钮永久禁用在“加载中”', () => {
     expect(source).toContain('/issues/${iid}/retry-gate');
-    expect(source).toContain('卡点创建失败或被中断');
-    expect(source).toContain('重新生成评审');
-    expect(source).toContain('取消任务');
+    expect(source).toContain("tr('issue.gateFailed')");
+    expect(source).toContain("tr('issue.regenerateReview')");
+    expect(source).toContain("tr('issue.cancelTask')");
     expect(source).not.toContain('（卡点数据加载中…）');
   });
 
@@ -77,9 +77,9 @@ describe('Issue 工作台信息架构', () => {
     expect(source).toContain('<ChangeTree leaves={rangeLeaves}');
     expect(source).toContain('dedupWorktree');
     // 分区标题：未提交 / 已提交 / 提交记录
-    expect(source).toContain('进行中 · 未提交');
-    expect(source).toContain('✅ 已提交');
-    expect(source).toContain('提交记录 · {info.commits.length}');
+    expect(source).toContain("tr('issue.runningUncommitted')");
+    expect(source).toContain("tr('issue.committed')");
+    expect(source).toContain("tr('issue.commitHistory', { count: info.commits.length })");
     // 提交钻入保留（全屏 CommitPanel + 返回）
     expect(source).toContain('<CommitPanel key={sha}');
   });
@@ -93,8 +93,8 @@ describe('Issue 工作台信息架构', () => {
     expect(source).toContain('wb-list-col');
     expect(source).toContain('wb-main');
     // 右栏三态：提交详情 / 文件 diff（可收起）/ 未选占位
-    expect(source).toContain('← 点选文件看 diff，点选提交看详情');
-    expect(source).toContain('收起 diff');
+    expect(source).toContain("tr('issue.chooseChange')");
+    expect(source).toContain("tr('issue.collapseDiff')");
     // 文件与提交互斥选中；选中项在左列高亮（树 selKey / 提交行 .on）
     expect(source).toContain('setSha(null); // 文件与提交互斥选中');
     expect(source).toContain('selKey={fd.file?.leaf.key}');
@@ -112,9 +112,9 @@ describe('Issue 工作台信息架构', () => {
     expect(source).toContain("openLeaf('wt', l)");
     expect(source).toContain("openLeaf('range', l)");
     // 空态按状态区分：未启动 / 执行中尚未提交 / 已并入
-    expect(source).toContain('执行中，暂无改动');
-    expect(source).toContain('该 issue 尚未产生改动（未启动或未落分支）。');
-    expect(source).toContain('已并入 ${info.base}，本分支无独立改动。');
+    expect(source).toContain("tr('issue.noChangesRunning')");
+    expect(source).toContain("tr('issue.noChanges')");
+    expect(source).toContain("tr('issue.mergedNoChanges', { base: info.base })");
     // 「正在进行」视角以后端 worktree 字段有无为准（仅活跃 issue 附带）
     expect(source).toContain('info.worktree !== undefined');
   });
@@ -124,16 +124,16 @@ describe('Issue 工作台信息架构', () => {
     // 状态段只在 IssueGitHead 内行内渲染一次（并成单行），不再独立成行；↑N 徽标与「N 条提交」重复已删
     expect(source.split('<IssueGitStatus info={info} />').length - 1).toBe(1);
     expect(source).not.toContain('↑{info.ahead}');
-    expect(source).toContain('条提交</span>');
+    expect(source).toContain("tr('issue.commitCount', { count: info.ahead })");
     // 推送状态全谱文案（badge 配色按语义：绿=已推送，琥珀=有未推送，灰=无远程）
-    expect(source).toContain("{ text: '已推送', cls: 'b-green' }");
-    expect(source).toContain('领先 origin ${p.n} 条未推送');
-    expect(source).toContain('未推送到 origin');
-    expect(source).toContain('未配置远程');
-    expect(source).toContain('{info.files.length} 个文件');
-    expect(source).toContain('工作区 {wtN} 个文件未提交');
+    expect(source).toContain("{ text: tr('issue.pushed'), cls: 'b-green' }");
+    expect(source).toContain("tr('issue.aheadOrigin', { count: p.n })");
+    expect(source).toContain("tr('issue.notPushed')");
+    expect(source).toContain("tr('issue.noRemote')");
+    expect(source).toContain("tr('issue.fileCount', { count: info.files.length })");
+    expect(source).toContain("tr('issue.uncommittedFiles', { count: wtN })");
     // 快照兜底提示
-    expect(source).toContain('分支已清理，按完成时快照展示');
+    expect(source).toContain("tr('issue.snapshot')");
   });
 
   test('角标常显：进详情即预取 git info；改动角标 = 已提交∪未提交去重文件数', () => {
@@ -142,7 +142,7 @@ describe('Issue 工作台信息架构', () => {
     expect(source).toContain("const needGit = tab === 'changes'");
     // 改动角标去重合并未提交（执行中也能看到规模）；独立提交角标随 tab 合并移除
     expect(source).toContain('const changesN = useMemo');
-    expect(source).toContain('改动{changesN > 0 ?');
+    expect(source).toContain("{tr('issue.changesTab')}{changesN > 0 ?");
     expect(source).not.toContain('提交{git.info');
   });
 
@@ -166,11 +166,10 @@ describe('Issue 工作台信息架构', () => {
 
   test('「分析中」占位与「最新分析」反馈标题已接入渲染', () => {
     // 澄清面板与「代理反馈」区的重新分析占位
-    expect(source).toContain('代理正在重新分析');
+    expect(source).toContain("tr('issue.agentReanalyzingInline')");
     expect(source).toContain('analyzingOnly');
     // 反馈标题不再叫「创建时分析」——每轮答复/改正文都会重析
-    expect(source).toContain('（最新分析）');
-    expect(source).not.toContain('（创建时分析）');
+    expect(source).toContain("tr('issue.agentFeedback')");
     // 分析中也展示反馈区块（无旧反馈时只有占位）
     expect(source).toContain('(issue.clarifyFeedback || analyzing)');
   });

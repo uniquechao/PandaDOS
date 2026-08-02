@@ -33,6 +33,8 @@
  */
 import type { Database } from 'bun:sqlite';
 import type { LlmClient, LlmMessage } from '../../agents/llm';
+import { userPromptLocale, outputLanguageInstruction, promptLanguage } from '../../agents/prompts/language';
+import type { SupportedLocale } from '../../../shared/i18n/locales';
 import type { Project } from '../../core/types';
 import type { ExecutorDriver } from '../../executor/driver';
 import { getProject, type ImplCommitsSnapshot } from '../../issues/engine';
@@ -451,18 +453,30 @@ const AI_SYSTEM: Record<GitAiKind, string> = {
     + '（可用 Conventional Commits 前缀，如 feat/fix/refactor），需要时空一行后再写简要正文要点。'
     + '只输出提交信息本身，不要任何解释、引号或 markdown。',
 };
+const AI_SYSTEM_EN: Record<GitAiKind, string> = {
+  'commit-summary': 'You are a senior engineer. Concisely explain what this Git commit changed and why. Use short points, do not narrate the diff line by line, and output only the body.',
+  'commit-risk': 'You are a rigorous code reviewer. Identify risks such as bugs, breaking changes, edge cases, concurrency, security, or missing tests in severity order. If no material risk is visible, say so. Output only the body.',
+  'commit-explain': 'You are a senior engineer. Explain the important sections of this diff, what changed, and why, without line-by-line narration. Output only the body.',
+  'file-explain': 'You are a senior engineer. Explain what changed in this file, the intent, and anything reviewers should watch. Output only the body.',
+  'commit-message': 'Write a conventional Git commit message for the supplied uncommitted changes. Use an imperative subject of at most 50 characters, optionally followed by a short body. Output only the commit message.',
+};
 
 /** 纯函数：kind + 素材 → chat 消息（无 IO，供单测直接断言） */
-export function buildGitAiPrompt(kind: GitAiKind, ctx: GitAiCtx): LlmMessage[] {
+export function buildGitAiPrompt(
+  kind: GitAiKind,
+  ctx: GitAiCtx,
+  locale: SupportedLocale = 'zh-Hans',
+): LlmMessage[] {
+  const zh = promptLanguage(locale) === 'zh';
   const parts: string[] = [];
-  if (ctx.subject) parts.push(`提交标题：${ctx.subject}`);
-  if (ctx.message) parts.push(`提交信息：\n${ctx.message}`);
-  if (ctx.path) parts.push(`文件：${ctx.path}`);
-  if (ctx.files) parts.push(`改动文件：\n${ctx.files}`);
-  if (ctx.diff) parts.push(`diff（可能已截断）：\n${ctx.diff}`);
+  if (ctx.subject) parts.push(zh ? `提交标题：${ctx.subject}` : `Commit subject:\n${ctx.subject}`);
+  if (ctx.message) parts.push(zh ? `提交信息：\n${ctx.message}` : `Commit message:\n${ctx.message}`);
+  if (ctx.path) parts.push(zh ? `文件：${ctx.path}` : `File:\n${ctx.path}`);
+  if (ctx.files) parts.push(zh ? `改动文件：\n${ctx.files}` : `Changed files:\n${ctx.files}`);
+  if (ctx.diff) parts.push(zh ? `diff（可能已截断）：\n${ctx.diff}` : `diff (may be truncated):\n${ctx.diff}`);
   return [
-    { role: 'system', content: AI_SYSTEM[kind] },
-    { role: 'user', content: parts.join('\n\n') || '（无可用内容）' },
+    { role: 'system', content: `${zh ? AI_SYSTEM[kind] : AI_SYSTEM_EN[kind]}\n${outputLanguageInstruction(locale)}` },
+    { role: 'user', content: parts.join('\n\n') || (zh ? '（无可用内容）' : '(No content available)') },
   ];
 }
 
@@ -1055,7 +1069,7 @@ export function gitRoutes(deps: GitRoutesDeps): RouteDef[] {
           }
 
           try {
-            const res = await llm.chat(buildGitAiPrompt(kind, gctx));
+            const res = await llm.chat(buildGitAiPrompt(kind, gctx, userPromptLocale(deps.db, ctx.user?.id)));
             const text = res.content.trim();
             if (!text) return json({ ok: false, error: 'AI 返回空结果' }, 502);
             return json({ ok: true, text });

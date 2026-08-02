@@ -6,6 +6,7 @@
 import type { ComponentChildren } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
 import { uploadImage } from '../lib/api';
+import { useI18n } from '../i18n/provider';
 
 export interface AttachedImage {
   /** 本地预览（objectURL） */
@@ -36,8 +37,9 @@ export function ImageAttach({
   /** 附截图按钮右侧的内联插槽（如快捷键条），与按钮同处一行 */
   trailing?: ComponentChildren;
 }) {
+  const { t } = useI18n();
   const fileRef = useRef<HTMLInputElement>(null);
-  const hint = `拍照/相册/直接粘贴，最多 ${max} 张，≤5MB`;
+  const hint = t('ui.attachHint', { max });
 
   const addFiles = (files: FileList | File[] | null): void => {
     const pics = [...(files ?? [])].filter((f) => f.type && f.type.startsWith('image/'));
@@ -91,7 +93,7 @@ export function ImageAttach({
           title={compact ? hint : undefined}
           onClick={() => fileRef.current?.click()}
         >
-          📷 附截图
+          📷 {t('ui.attachScreenshot')}
         </button>
         {!compact && <span class="attach-hint">{hint}</span>}
         {trailing}
@@ -119,7 +121,9 @@ export function ImageAttach({
           ))}
         </div>
       )}
-      {images.some((im) => im.error) && <div class="err">部分图片上传失败：{images.find((im) => im.error)?.error}</div>}
+      {images.some((im) => im.error) && (
+        <div class="err">{t('ui.someUploadsFailed', { error: images.find((im) => im.error)?.error ?? '' })}</div>
+      )}
     </div>
   );
 }

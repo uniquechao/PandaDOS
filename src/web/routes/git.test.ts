@@ -74,6 +74,7 @@ async function setup(opts?: { llm?: LlmClient }) {
   const users = new UserStore(db);
   const admin = users.create('admin', 'admin');
   const alice = users.create('alice');
+  users.putSettings(alice.user.id, { locale: 'zh-Hans' });
   const bob = users.create('bob');
   db.run(
     `INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir)
@@ -403,7 +404,7 @@ describe('POST /api/projects/:projectId/git/stage|unstage', () => {
       const r = await j(s.dispatch(post(url, body, s.alice.token)));
       expect(r.status).toBe(400);
       expect(r.body.ok).toBe(false);
-      expect(typeof r.body.error).toBe('string');
+      expect(typeof r.body.error.details).toBe('string');
     }
   });
 
@@ -415,7 +416,7 @@ describe('POST /api/projects/:projectId/git/stage|unstage', () => {
       s.alice.token,
     )));
     expect(missing.status).toBe(409);
-    expect(missing.body.error).toContain('pathspec');
+    expect(missing.body.error.details).toContain('pathspec');
 
     const plain = await j(s.dispatch(post(
       '/api/projects/2/git/stage',
@@ -508,7 +509,7 @@ describe('POST /api/projects/:projectId/git/commit', () => {
       s.alice.token,
     )));
     expect(none.status).toBe(409);
-    expect(none.body.error).toContain('没有已暂存');
+    expect(none.body.error.details).toContain('没有已暂存');
     expect((await driver.git(s.repo, ['status', '--porcelain=v1', '--', 'only-worktree.txt'])).out.trim())
       .toBe('?? only-worktree.txt');
   });
@@ -526,7 +527,7 @@ describe('POST /api/projects/:projectId/git/commit', () => {
       s.alice.token,
     )));
     expect(r.status).toBe(409);
-    expect(r.body.error).toMatch(/identity|email|name/i);
+    expect(r.body.error.details).toMatch(/identity|email|name/i);
   });
 });
 
@@ -581,7 +582,7 @@ describe('POST /api/projects/:projectId/git/push', () => {
       s.alice.token,
     )));
     expect(noRemote.status).toBe(409);
-    expect(noRemote.body.error).toContain('origin');
+    expect(noRemote.body.error.details).toContain('origin');
 
     await driver.git(s.repo, ['checkout', '-q', '--detach']);
     const detached = await j(s.dispatch(post(
@@ -590,7 +591,7 @@ describe('POST /api/projects/:projectId/git/push', () => {
       s.alice.token,
     )));
     expect(detached.status).toBe(409);
-    expect(detached.body.error).toContain('detached HEAD');
+    expect(detached.body.error.details).toContain('detached HEAD');
 
     const unborn = await j(s.dispatch(post(
       '/api/projects/3/git/push',
@@ -598,7 +599,7 @@ describe('POST /api/projects/:projectId/git/push', () => {
       s.alice.token,
     )));
     expect(unborn.status).toBe(409);
-    expect(unborn.body.error).toContain('尚无提交');
+    expect(unborn.body.error.details).toContain('尚无提交');
   });
 
   test('远程 push 命令失败返回 502 与 git 诊断', async () => {
@@ -613,7 +614,7 @@ describe('POST /api/projects/:projectId/git/push', () => {
     )));
     expect(r.status).toBe(502);
     expect(r.body.ok).toBe(false);
-    expect(r.body.error).toMatch(/推送|repository|remote/i);
+    expect(r.body.error.details).toMatch(/推送|repository|remote/i);
   });
 });
 
@@ -1256,10 +1257,10 @@ describe('POST /api/projects/:projectId/git/ai —— AI 助读', () => {
       post('/api/projects/1/git/ai', { kind: 'commit-explain', sha }, s.alice.token),
     ));
     expect(r.status).toBe(503);
-    expect(r.body).toEqual({
+    expect(r.body).toMatchObject({
       ok: false,
       code: 'llm_not_configured',
-      error: '请联系管理员配置驱动大模型',
+      error: { code: 'legacy.error', details: '请联系管理员配置驱动大模型' },
     });
   });
 });

@@ -57,7 +57,11 @@ describe('POST /api/login', () => {
     for (const req of cases) {
       const r = await dispatch(req);
       expect(r!.status).toBe(401);
-      expect(((await r!.json()) as { error: string }).error).toBe('用户名或 token 不对');
+      expect(((await r!.json()) as { error: { code: string; params: object; fallback: string } }).error).toEqual({
+        code: 'auth.invalid_credentials',
+        params: {},
+        fallback: 'The username or token is incorrect.',
+      });
       expect(r!.headers.get('set-cookie')).toBeNull();
     }
   });
@@ -100,6 +104,24 @@ describe('GET /api/me', () => {
     expect(body.id).toBe(user.id);
     expect(body.username).toBe('alice');
     expect(body.role).toBe('user');
+  });
+
+  test('/api/me 带账户语言和时区供首屏初始化', async () => {
+    const { users, dispatch } = makeApp();
+    const { user, token } = users.create('localized', 'user');
+    users.putSettings(user.id, {
+      locale: 'ja',
+      timezone: null,
+      detectedTimezone: 'Asia/Tokyo',
+    });
+    const me = await dispatch(
+      new Request('http://x/api/me', { headers: { cookie: `${COOKIE}=${token}` } }),
+    );
+    expect((await me!.json()) as unknown).toMatchObject({
+      locale: 'ja',
+      timezone: null,
+      detectedTimezone: 'Asia/Tokyo',
+    });
   });
 
   test('Bearer 兼容脚本', async () => {

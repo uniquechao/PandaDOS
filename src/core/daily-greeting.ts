@@ -12,6 +12,8 @@
  */
 import type { Database } from 'bun:sqlite';
 import type { LlmClient, LlmMessage } from '../agents/llm';
+import type { SupportedLocale } from '../../shared/i18n/locales';
+import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/language';
 
 /** 欢迎语字数上限（需求「20 字左右」；留少量余量，按 Unicode 码点截，防 emoji 腰斩） */
 export const GREETING_MAX_CHARS = 24;
@@ -44,13 +46,29 @@ function weekdayLabel(day: string): string {
 }
 
 /** 生成欢迎语的提示词（纯文本，不用 jsonMode）；带日期/星期让每天自然不同 */
-export function buildGreetingPrompt(username: string, day: string): LlmMessage[] {
+export function buildGreetingPrompt(
+  username: string,
+  day: string,
+  locale: SupportedLocale = 'zh-Hans',
+): LlmMessage[] {
   const wd = weekdayLabel(day);
+  if (promptLanguage(locale) === 'en') {
+    return [
+      {
+        role: 'system',
+        content: `Write one warm, upbeat daily welcome sentence for a software project user. Return only the sentence with no title, quotes, or Markdown.\n${outputLanguageInstruction(locale)}`,
+      },
+      {
+        role: 'user',
+        content: `Date: ${day}. User name: ${username}. Write no more than ${GREETING_MAX_CHARS} characters and vary it naturally from day to day.`,
+      },
+    ];
+  }
   return [
     {
       role: 'system',
       content:
-        '你是暖心的项目助理，为用户写每天的欢迎语。只输出一句欢迎语正文，不要标题、引号、markdown 或任何多余说明。',
+        `你是暖心的项目助理，为用户写每天的欢迎语。只输出一句欢迎语正文，不要标题、引号、markdown 或任何多余说明。\n${outputLanguageInstruction(locale)}`,
     },
     {
       role: 'user',
@@ -85,8 +103,9 @@ export async function generateDailyGreeting(
   llm: LlmClient,
   username: string,
   day: string,
+  locale: SupportedLocale = 'zh-Hans',
 ): Promise<string> {
-  const r = await llm.chat(buildGreetingPrompt(username, day));
+  const r = await llm.chat(buildGreetingPrompt(username, day, locale));
   const text = sanitize(r.content ?? '');
   if (!text) throw new Error('LLM 返回空欢迎语');
   return text;
@@ -105,6 +124,7 @@ export interface DailyGreetingDeps {
 export interface GreetingUser {
   id: number;
   username: string;
+  locale?: SupportedLocale;
 }
 
 interface GreetingRow {
@@ -133,7 +153,7 @@ export async function getOrCreateDailyGreeting(
 
   let text: string;
   try {
-    text = truncateGreeting(await generateDailyGreeting(llm, user.username, day));
+    text = truncateGreeting(await generateDailyGreeting(llm, user.username, day, user.locale));
   } catch {
     return null;
   }

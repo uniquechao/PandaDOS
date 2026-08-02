@@ -32,6 +32,8 @@ import {
   pickSafeAffirmative,
 } from './approval-policy';
 import type { LlmClient } from './llm';
+import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
+import { outputLanguageInstruction, promptLanguage } from './prompts/language';
 
 // ---------- prompt 常量（评审附录逐字摘录，改一个字都要 diff 可见） ----------
 
@@ -45,10 +47,16 @@ Claude Code 弹出了一个选择/审批菜单。替主人判断：自动批准�
 - approve（安全·可逆·在任务范围内）：读文件/浏览、跑测试或只读命令、普通代码编辑、新建文件/目录、git add/commit/普通 push（非 force、不改历史）、装任务明确需要的依赖、确认计划继续。选最能推进【当前任务】的那项。
 - escalate（危险·不可逆·超范围）：删文件/数据(rm/drop/truncate)、git reset --hard / force push / 改历史、部署/发布/上线、改生产配置或密钥、对外改外部状态（普通 git push 除外）、关机/重启、与当前任务无关的操作、任何看不懂或拿不准的。
 - 宁可 escalate，也别误批。`;
+export const AUTOPILOT_APPROVAL_SYS_EN = `# Task: grade an autopilot approval request
+Claude Code displayed a choice or approval menu. Decide whether to approve one option automatically or escalate to the user. Return JSON only:
+{"action":"approve"|"escalate","option":one-based option number when approving,"reason":"concise reason"}
+Approve only safe, reversible, in-scope reading, tests, ordinary edits, file creation, non-force git add/commit/push, required dependencies, or plan continuation. Escalate deletion, destructive Git history changes, deployments, production/secrets changes, external side effects, unrelated work, and anything uncertain.`;
 
 /** 选项解读 prompt（v1 agent.ts:124-125 逐字）——升级人工时给通知卡生成人话摘要 */
 export const EXPLAIN_SELECTION_SYS = `# 任务：说清 CC 在让主人选什么
 2-3 行中文说清在问什么、各选项含义、你的建议（结合会话进度）。飞书 lark_md，结尾原样列出全部编号选项。`;
+export const EXPLAIN_SELECTION_SYS_EN = `# Task: explain what Claude Code is asking the user to choose
+In 2-3 lines, explain the question, the meaning of each option, and your evidence-based recommendation. Use Feishu lark_md and finish by reproducing every numbered option exactly as supplied.`;
 
 /**
  * 网页版菜单解读 prompt（issue #112）：给的是**盯着屏幕的人**看的，不是通知卡。
@@ -60,6 +68,8 @@ export const EXPLAIN_MENU_WEB_SYS = `# 任务：给主人讲清这个弹窗在�
 - 同意之后会发生什么，有没有不可逆的后果或风险（删数据、改 git 历史、强推、发布上线、动生产配置或密钥这类必须点名）；
 - 你建议选第几项、一句话理由；拿不准就直说拿不准、请主人自己判断。
 只输出纯文本：不要重复罗列选项，不要标题/加粗/代码块等 markdown，不要飞书 lark_md 语法，不要客套话。`;
+export const EXPLAIN_MENU_WEB_SYS_EN = `# Task: explain the coding agent's choice menu
+In 3-5 plain-text lines, explain what is happening, why the menu appeared, what approval would do, any irreversible risk, and which numbered option you recommend with one reason. State uncertainty plainly. Do not repeat the options, use headings, Markdown, or pleasantries.`;
 
 // ---------- 规则本体：见 approval-policy.ts（这里只做便捷 re-export，调用方无需两处 import） ----------
 
@@ -94,6 +104,10 @@ export type ApprovalRule =
   | 'auto_danger'
   /** 全自动档：本地规则选同意项直接放行（不问 LLM）；找不到同意项时同 rule 转人工 */
   | 'auto_affirm';
+
+function approvalReason(locale: SupportedLocale, zh: string, en: string): string {
+  return promptLanguage(locale) === 'zh' ? zh : en;
+}
 
 export interface ApprovalMenu {
   /** 菜单上下文（detectSelection 的 context / MenuSnapshot.title） */
@@ -132,12 +146,13 @@ export async function decideApproval(
   menu: ApprovalMenu,
   task: ApprovalTask = {},
   level: AutoApproveLevel = 'medium',
+  locale: SupportedLocale = 'zh-Hans',
 ): Promise<ApprovalOutcome> {
   const requestId = genRequestId();
 
   // 1) 多选/交互表单：一律升级人工（绝不自动点，v1 铁律）
   if (menu.multiSelect || isMultiSelectMenu(menu.context, menu.options)) {
-    return { requestId, action: 'escalate', reason: '交互式多选表单，需人工填写', rule: 'multi_select' };
+    return { requestId, action: 'escalate', reason: approvalReason(locale, '交互式多选表单，需人工填写', 'Interactive multi-select form requires user input'), rule: 'multi_select' };
   }
 
   // 2) trust 弹窗：直接同意；yes 未命中不 return，落回下一层（v1 语义）
@@ -145,7 +160,7 @@ export async function decideApproval(
   if (APPROVAL_POLICY.trust.test(blob)) {
     const yes = menu.options.findIndex((o) => APPROVAL_POLICY.trustYes.test(o));
     if (yes >= 0) {
-      return { requestId, action: 'approve', optionIndex: yes, reason: '信任弹窗，选同意', rule: 'trust' };
+      return { requestId, action: 'approve', optionIndex: yes, reason: approvalReason(locale, '信任弹窗，选同意', 'Approved the trust prompt'), rule: 'trust' };
     }
   }
 
@@ -158,7 +173,7 @@ export async function decideApproval(
       requestId,
       action: 'approve',
       optionIndex: rec,
-      reason: '选项标了推荐，按推荐选',
+      reason: approvalReason(locale, '选项标了推荐，按推荐选', 'Selected the option marked recommended'),
       rule: 'recommended',
     };
   }
@@ -169,11 +184,11 @@ export async function decideApproval(
     return {
       requestId,
       action: 'escalate',
-      reason: '谨慎档：非零风险弹窗一律等人工',
+      reason: approvalReason(locale, '谨慎档：非零风险弹窗一律等人工', 'Cautious mode requires user approval for non-zero-risk prompts'),
       rule: 'cautious_hold',
     };
   }
-  if (level === 'auto') return autoDecide(requestId, menu);
+  if (level === 'auto') return autoDecide(requestId, menu, locale);
 
   // 4) 驱动大模型 分级（裸 system，评审 M17；user 模板 v1 agent.ts:643 平移）
   const optionsText = menu.options.map((o, i) => `${i + 1}. ${o}`).join('\n');
@@ -181,12 +196,12 @@ export async function decideApproval(
   try {
     const r = await llm.chat(
       [
-        { role: 'system', content: AUTOPILOT_APPROVAL_SYS },
+        { role: 'system', content: (promptLanguage(locale) === 'zh' ? AUTOPILOT_APPROVAL_SYS : AUTOPILOT_APPROVAL_SYS_EN) + `\n${outputLanguageInstruction(locale)}` },
         {
           role: 'user',
-          content:
-            `总目标：${task.goal || '(未设)'}\n当前任务：${task.taskText || '(未设)'}\n\n` +
-            `Claude Code 弹出的选择/审批：\n上下文：${menu.context}\n选项：\n${optionsText}`,
+          content: promptLanguage(locale) === 'zh'
+            ? `总目标：${task.goal || '(未设)'}\n当前任务：${task.taskText || '(未设)'}\n\nClaude Code 弹出的选择/审批：\n上下文：${menu.context}\n选项：\n${optionsText}`
+            : `Overall goal: ${task.goal || '(not set)'}\nCurrent task: ${task.taskText || '(not set)'}\n\nClaude Code choice/approval:\nContext: ${menu.context}\nOptions:\n${optionsText}`,
         },
       ],
       { jsonMode: true },
@@ -197,7 +212,7 @@ export async function decideApproval(
     // 原先这里无条件升级人工，看着保守，实际后果更糟：驱动大模型 一挂（如 2026-07-25
     // llm-chat 下线），跑测试、改文件、git commit 这种日常弹窗全部堵在等人点，
     // 全自动流直接瘫痪。改为「危险的仍交人工，普通的本地放行」。
-    return localFallback(requestId, menu);
+    return localFallback(requestId, menu, locale);
   }
   const opt = Number(decision?.option);
   if (decision?.action === 'approve' && Number.isInteger(opt) && opt >= 1 && opt <= menu.options.length) {
@@ -212,7 +227,7 @@ export async function decideApproval(
   return {
     requestId,
     action: 'escalate',
-    reason: String(decision?.reason ?? '').slice(0, 100) || '需判断',
+    reason: String(decision?.reason ?? '').slice(0, 100) || approvalReason(locale, '需判断', 'Needs user judgment'),
     rule: 'llm',
   };
 }
@@ -229,19 +244,19 @@ export async function decideApproval(
  * 主人已知悉并接受 c 的小概率误批（issue #91 澄清第 4 问）：宁可偶尔误批一次普通操作，
  * 也不要 LLM 一挂就全线停摆。危险操作仍然一个都不自动点。
  */
-function localFallback(requestId: string, menu: ApprovalMenu): ApprovalOutcome {
+function localFallback(requestId: string, menu: ApprovalMenu, locale: SupportedLocale): ApprovalOutcome {
   if (isDangerousMenu(menu.context, menu.options)) {
-    return { requestId, action: 'escalate', reason: 'LLM 分级失败且疑似危险操作，需人工判断', rule: 'llm_error' };
+    return { requestId, action: 'escalate', reason: approvalReason(locale, 'LLM 分级失败且疑似危险操作，需人工判断', 'LLM grading failed and the operation may be dangerous; user judgment is required'), rule: 'llm_error' };
   }
   const yes = pickSafeAffirmative(menu.options);
   if (yes < 0) {
-    return { requestId, action: 'escalate', reason: 'LLM 分级失败且无明确同意项，需人工判断', rule: 'llm_error' };
+    return { requestId, action: 'escalate', reason: approvalReason(locale, 'LLM 分级失败且无明确同意项，需人工判断', 'LLM grading failed and there is no clear affirmative option; user judgment is required'), rule: 'llm_error' };
   }
   return {
     requestId,
     action: 'approve',
     optionIndex: yes,
-    reason: 'LLM 分级不可用，本地规则判为安全操作',
+    reason: approvalReason(locale, 'LLM 分级不可用，本地规则判为安全操作', 'LLM grading is unavailable; local rules classified this as safe'),
     rule: 'local_fallback',
   };
 }
@@ -251,19 +266,19 @@ function localFallback(requestId: string, menu: ApprovalMenu): ApprovalOutcome {
  * 那个是「LLM 挂了才退到本地」，这个是主人主动选了「除红线外别烦我」。所以规则一致（危险
  * 不可逆仍交人工、没有明确同意项也交人工），rule 分开记，事后能看出到底是谁放的行。
  */
-function autoDecide(requestId: string, menu: ApprovalMenu): ApprovalOutcome {
+function autoDecide(requestId: string, menu: ApprovalMenu, locale: SupportedLocale): ApprovalOutcome {
   if (isDangerousMenu(menu.context, menu.options)) {
-    return { requestId, action: 'escalate', reason: '全自动档红线：危险不可逆操作仍需人工', rule: 'auto_danger' };
+    return { requestId, action: 'escalate', reason: approvalReason(locale, '全自动档红线：危险不可逆操作仍需人工', 'Automatic mode safety boundary: dangerous irreversible work still requires the user'), rule: 'auto_danger' };
   }
   const yes = pickSafeAffirmative(menu.options);
   if (yes < 0) {
-    return { requestId, action: 'escalate', reason: '全自动档：无明确同意项，需人工判断', rule: 'auto_affirm' };
+    return { requestId, action: 'escalate', reason: approvalReason(locale, '全自动档：无明确同意项，需人工判断', 'Automatic mode found no clear affirmative option; user judgment is required'), rule: 'auto_affirm' };
   }
   return {
     requestId,
     action: 'approve',
     optionIndex: yes,
-    reason: '全自动档，本地规则判为可放行',
+    reason: approvalReason(locale, '全自动档，本地规则判为可放行', 'Automatic mode local rules approved this operation'),
     rule: 'auto_affirm',
   };
 }
@@ -283,19 +298,25 @@ export async function explainSelection(
     /** 会话滚动摘要（runningSummary） */
     progress?: string;
     systemPrefix?: string;
+    locale?: SupportedLocale;
   },
 ): Promise<string> {
   const optionsText = opts.options.map((o, i) => `${i + 1}. ${o}`).join('\n');
+  const locale = opts.locale ?? 'zh-Hans';
   const fallback = `${opts.context}\n\n**选项：**\n${optionsText}`;
   try {
     const r = await llm.chat([
       {
         role: 'system',
-        content: (opts.systemPrefix ? `${opts.systemPrefix}\n\n` : '') + EXPLAIN_SELECTION_SYS,
+        content: (opts.systemPrefix ? `${opts.systemPrefix}\n\n` : '') +
+          (promptLanguage(locale) === 'zh' ? EXPLAIN_SELECTION_SYS : EXPLAIN_SELECTION_SYS_EN) +
+          `\n${outputLanguageInstruction(locale)}`,
       },
       {
         role: 'user',
-        content: `会话 @${opts.label}\n会话进度：${opts.progress || '(无)'}\n\n上下文：${opts.context}\n选项：\n${optionsText}`,
+        content: promptLanguage(locale) === 'zh'
+          ? `会话 @${opts.label}\n会话进度：${opts.progress || '(无)'}\n\n上下文：${opts.context}\n选项：\n${optionsText}`
+          : `Session @${opts.label}\nProgress: ${opts.progress || '(none)'}\n\nContext: ${opts.context}\nOptions:\n${optionsText}`,
       },
     ]);
     return r.content.trim() || fallback;
@@ -322,21 +343,29 @@ export async function explainMenuForHuman(
     multiSelect?: boolean;
     /** PM 的 systemPrompt（persona/记忆）；解读不是安全判定，可以带 */
     systemPrefix?: string;
+    locale?: SupportedLocale;
   },
 ): Promise<string | null> {
   const optionsText = opts.options.map((o, i) => `${i + 1}. ${o}`).join('\n');
+  const locale = opts.locale ?? 'zh-Hans';
   const multiHint = opts.multiSelect
-    ? '\n注意：这是多选表单，点选项只是勾选/取消，要再按「→」进复核页才真正提交。'
+    ? promptLanguage(locale) === 'zh'
+      ? '\n注意：这是多选表单，点选项只是勾选/取消，要再按「→」进复核页才真正提交。'
+      : '\nThis is a multi-select form: selecting an item only toggles it; the review step submits it.'
     : '';
   try {
     const r = await llm.chat([
       {
         role: 'system',
-        content: (opts.systemPrefix ? `${opts.systemPrefix}\n\n` : '') + EXPLAIN_MENU_WEB_SYS,
+        content: (opts.systemPrefix ? `${opts.systemPrefix}\n\n` : '') +
+          (promptLanguage(locale) === 'zh' ? EXPLAIN_MENU_WEB_SYS : EXPLAIN_MENU_WEB_SYS_EN) +
+          `\n${outputLanguageInstruction(locale)}`,
       },
       {
         role: 'user',
-        content: `会话 @${opts.label}${multiHint}\n\n屏幕上下文：${opts.context}\n选项：\n${optionsText}`,
+        content: promptLanguage(locale) === 'zh'
+          ? `会话 @${opts.label}${multiHint}\n\n屏幕上下文：${opts.context}\n选项：\n${optionsText}`
+          : `Session @${opts.label}${multiHint}\n\nScreen context: ${opts.context}\nOptions:\n${optionsText}`,
       },
     ]);
     return r.content.trim() || null;

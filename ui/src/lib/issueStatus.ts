@@ -1,5 +1,6 @@
 /** issue 状态分类小工具（纯函数，便于单测）。 */
 import { tryJson } from './fmt';
+import { tr } from '../i18n/runtime';
 import type { IssueEvent, IssueStatus } from './types';
 
 /** 「驱动中」= AI 正在跑的状态（可终止/重试，执行页显示运行操作栏） */
@@ -34,22 +35,22 @@ export interface RetryPlan {
  */
 export function retryPlan(status: IssueStatus, hasError: boolean): RetryPlan {
   if (status === 'blocked') {
-    return { action: 'unblock', label: '解除阻塞重跑', enabled: true, hint: '重新调度这个受阻的 issue' };
+    return { action: 'unblock', label: tr('action.unblockRetry'), enabled: true, hint: tr('action.unblockRetryHint') };
   }
   if (status === 'cancelled') {
     return {
       action: 'reopen',
-      label: '重新运行',
+      label: tr('action.runAgain'),
       enabled: true,
-      hint: '回到「待办」并立即排队开跑；要改需求请先改完再运行',
+      hint: tr('action.runAgainHint'),
     };
   }
   if (isDriving(status)) {
     return hasError
-      ? { action: 'inject', label: '重试', enabled: true, hint: '让 AI 重试刚才失败的步骤' }
-      : { action: 'none', label: '重试', enabled: false, hint: '暂无失败步骤可重试' };
+      ? { action: 'inject', label: tr('action.retry'), enabled: true, hint: tr('action.retryHint') }
+      : { action: 'none', label: tr('action.retry'), enabled: false, hint: tr('action.noRetry') };
   }
-  return { action: 'none', label: '重试', enabled: false, hint: '' };
+  return { action: 'none', label: tr('action.retry'), enabled: false, hint: '' };
 }
 
 /** 澄清分析在途标记的兜底时限：runner 超时 8 分钟，超过 15 分钟仍无终结事件视为已死（如服务重启丢链），不再显示「分析中」 */

@@ -36,19 +36,19 @@ describe('issue Git 分支配置表单接线', () => {
 
   test('目标不等于当前分支时显示源选择，本地/远程分组且允许不指定', () => {
     expect(fields).toContain('targetNeedsSourceRef(');
-    expect(fields).toContain('<optgroup label="本地分支">');
-    expect(fields).toContain('<optgroup label="远程分支">');
+    expect(fields).toContain("<optgroup label={t('ui.localBranches')}>");
+    expect(fields).toContain("<optgroup label={t('ui.remoteBranches')}>");
     expect(fields).toContain('branches.local.map');
     expect(fields).toContain('branches.remote.map');
-    expect(fields).toContain('<option value="">不指定');
-    expect(fields).toContain('当前分支：');
-    expect(fields).toContain('没有可用的本地或远程跟踪分支');
+    expect(fields).toContain("<option value=\"\">{t('ui.noSourceBranch')}</option>");
+    expect(fields).toContain("t('ui.currentBranch'");
+    expect(fields).toContain("t('ui.noTrackingBranches')");
   });
 
   test('详情页始终回显目标分支和源分支，历史空配置有明确兜底', () => {
     expect(detail).toContain('<IssueGitBranchSummary issue={issue} />');
-    expect(fields).toContain('目标分支');
-    expect(fields).toContain("issue.targetBranch || '当前分支（沿用）'");
+    expect(fields).toContain("t('ui.targetBranch')");
+    expect(fields).toContain("issue.targetBranch || t('ui.currentBranchInherited')");
     expect(fields).toContain('formatIssueSourceRef(issue.sourceRef)');
     expect(style).toContain('.issue-git-summary');
   });

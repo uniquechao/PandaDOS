@@ -6,8 +6,10 @@ import { api } from '../lib/api';
 import { nav } from '../lib/router';
 import { TermPane, type TermStatus } from '../components/TermPane';
 import type { Project } from '../lib/types';
+import { useI18n } from '../i18n/provider';
 
 export function TermView({ pid }: { pid: number }) {
+  const { t } = useI18n();
   const [project, setProject] = useState<Project | null>(null);
   const [status, setStatus] = useState<TermStatus>('connecting');
 
@@ -22,9 +24,9 @@ export function TermView({ pid }: { pid: number }) {
           <button class="back" onClick={() => nav(`/p/${pid}`)}>
             ‹
           </button>
-          <span class="btitle">{project?.name ?? `项目 #${pid}`} · 原生 Bash</span>
+          <span class="btitle">{project?.name ?? t('view.projectFallback', { id: pid })} · {t('view.nativeBash')}</span>
           <span class="mut small">
-            {status === 'open' ? '🟢' : status === 'connecting' ? '…' : status === 'exit' ? '已结束' : '已断开'}
+            {status === 'open' ? '🟢' : status === 'connecting' ? '…' : status === 'exit' ? t('view.ended') : t('ui.disconnected')}
           </span>
         </div>
       </div>

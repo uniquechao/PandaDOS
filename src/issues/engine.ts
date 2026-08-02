@@ -87,6 +87,8 @@ import { clarifyPaths, clarifySessionName } from './clarify-runner';
 import { parseOrganizePlan, type OrganizeAction } from './organize-runner';
 import { BUSY_STATES, isBusy, moduleKeyOf, pickNext } from './queue';
 import { gitLockKey, KeyedMutex, projectLockKey, tmuxLockKey } from './mutex';
+import { outputLanguageInstruction, promptLanguage, userPromptLocale } from '../agents/prompts/language';
+import type { SupportedLocale } from '../../shared/i18n/locales';
 
 /** pending 元数据编辑与自动合并落地共用的项目锁，避免 LLM 返回后的 Git 意图被并发改写。 */
 function issueMetaLockKey(projectId: number): string {
@@ -251,6 +253,7 @@ export interface EngineOrganizeInput {
     agent: AgentKind;
     moduleId: number | null;
   }>;
+  locale?: SupportedLocale;
 }
 
 /** 模块智能整理分析结果（issues/organize-runner RunOrganizeResult 结构一致） */
@@ -272,6 +275,7 @@ export interface EngineClarifyInput {
   history?: Array<{ questions: string[]; answer: string | null }>;
   /** false = 提问轮数到顶：本轮只更新反馈不出新题（引擎对结果另有确定性压制） */
   allowQuestions?: boolean;
+  locale?: SupportedLocale;
 }
 
 /** 创建时澄清分析结果（issues/clarify-runner RunClarifyResult 结构一致） */
@@ -295,8 +299,19 @@ export function resultSummaryPaths(cwd: string, issueId: number): {
 }
 
 /** 组装注入 CC 会话的总结 prompt（单段；哨兵是文件不是输出行，不受回显歧义影响） */
-export function buildResultSummaryPrompt(issueId: number, kind: 'done' | 'blocked'): string {
+export function buildResultSummaryPrompt(
+  issueId: number,
+  kind: 'done' | 'blocked',
+  locale: SupportedLocale = 'zh-Hans',
+): string {
   const rel = `${RESULT_SUMMARY_SCRATCH_BASE}/${issueId}`;
+  if (promptLanguage(locale) === 'en') {
+    const ask = kind === 'done' ? 'This task is complete.' : 'This task is blocked and has been handed to a person.';
+    const points = kind === 'done'
+      ? 'what was done, changed files, test results, and remaining work'
+      : 'current progress, changed files, the blocker, and what a person must provide';
+    return `[Execution summary] ${ask} Write ${points} to ${rel}/summary.md in at most 300 words. Then create ${rel}/done containing ok as the final step. Write only these two files and do nothing else. ${outputLanguageInstruction(locale)}`;
+  }
   const ask =
     kind === 'done'
       ? '本任务已完成。请把执行结果总结写到文件'
@@ -307,7 +322,7 @@ export function buildResultSummaryPrompt(issueId: number, kind: 'done' | 'blocke
       : '做到哪一步、已改动哪些文件、卡在哪里/需要人提供什么';
   return (
     `【执行总结】${ask} ${rel}/summary.md：${points}，简洁中文 300 字以内；` +
-    `写完后最后创建标记文件 ${rel}/done（内容写 ok）。只写这两个文件，不要做任何其他事。`
+    `写完后最后创建标记文件 ${rel}/done（内容写 ok）。只写这两个文件，不要做任何其他事。 ${outputLanguageInstruction(locale)}`
   );
 }
 
@@ -335,6 +350,19 @@ export interface EngineNotifyEvent {
   from?: IssueState;
   to?: IssueState;
   gate?: Gate;
+  summaryCode?:
+    | 'status_transition'
+    | 'issue_blocked'
+    | 'plan_review'
+    | 'auto_git_failure'
+    | 'merge_review'
+    | 'conversation_displaced'
+    | 'menu_stuck'
+    | 'rate_limited'
+    | 'clarification_needed'
+    | 'module_organization'
+    | 'analysis_clarification';
+  summaryParams?: Record<string, string | number>;
   summary?: string;
 }
 
@@ -1374,6 +1402,11 @@ export interface EngineDeps {
       createdBy?: number | null;
     }): Promise<ProjectModule>;
     recordIssue(module: ProjectModule, issue: EngineIssue, projectIssues: EngineIssue[]): Promise<void>;
+    recordResultSummary?(
+      module: ProjectModule,
+      issue: EngineIssue,
+      summary: string,
+    ): Promise<void>;
     /** 模块合并（归档来源前经 repoint 让引擎重指 issues）；缺省 = 旧装配不支持合并。 */
     merge?(input: {
       projectId: number;
@@ -1875,7 +1908,7 @@ export class IssueEngine {
    * 后落 module_organize_suggested 事件（免迁移；锚在项目最新 issue 上）。执行永远走用户
    * 逐项确认（applyOrganizeAction）。分析链是内存态：重启即蒸发，用户重新触发即可。
    */
-  organizeModules(projectId: number, agent?: AgentKind): { ok: true } | { ok: false; error: string } {
+  organizeModules(projectId: number, agent?: AgentKind, userId?: number): { ok: true } | { ok: false; error: string } {
     if (this.organizing.has(projectId)) return { ok: false, error: '整理分析已在进行中' };
     const project = this.project(projectId);
     if (!project) return { ok: false, error: '项目不存在' };
@@ -1901,6 +1934,7 @@ export class IssueEngine {
           agent: useAgent,
           projectName: project.name,
           goal: project.goal,
+          locale: userPromptLocale(this.deps.db, userId, project.ownerUserId),
           modules: active.map(({ active: _a, ...m }) => m),
           issues: issues.map((i) => ({
             id: i.id,
@@ -1959,11 +1993,14 @@ export class IssueEngine {
             kind: 'status_change',
             projectId,
             issueId: anchor.id,
-            summary:
-              `模块整理分析完成：共 ${named.length} 项建议` +
-              `（合并 ${named.filter((a) => a.kind === 'merge').length} / 改名 ${named.filter((a) => a.kind === 'rename').length}` +
-              ` / 新建 ${named.filter((a) => a.kind === 'create').length} / 挪 issue ${named.filter((a) => a.kind === 'move').length}）` +
-              `\n请到项目页「模块」面板逐项确认执行`,
+            summaryCode: 'module_organization',
+            summaryParams: {
+              total: named.length,
+              merges: named.filter((a) => a.kind === 'merge').length,
+              renames: named.filter((a) => a.kind === 'rename').length,
+              creates: named.filter((a) => a.kind === 'create').length,
+              moves: named.filter((a) => a.kind === 'move').length,
+            },
           });
         }
       } catch (e) {
@@ -2301,6 +2338,7 @@ export class IssueEngine {
         projectName: project.name,
         history,
         allowQuestions,
+        locale: this.promptLocale(issue, project),
       });
     } catch (e) {
       r = { ok: false, reason: 'error', error: String(e).slice(0, 200) };
@@ -2343,11 +2381,12 @@ export class IssueEngine {
         kind: 'status_change',
         projectId: fresh.projectId,
         issueId,
-        summary:
-          `「${fresh.title.slice(0, 40)}」分析后想确认：\n` +
-          (bodyExcerpt(fresh.body) ? `需求：${bodyExcerpt(fresh.body)}\n` : '') +
-          r.questions.map((q, i) => `${i + 1}. ${q}`).join('\n') +
-          `\n（不回也不影响排队执行；回复会并入需求）`,
+        summaryCode: 'analysis_clarification',
+        summaryParams: {
+          title: fresh.title.slice(0, 40),
+          body: bodyExcerpt(fresh.body),
+          questions: r.questions.map((q, i) => `${i + 1}. ${q}`).join('\n'),
+        },
       });
     }
   }
@@ -3068,7 +3107,8 @@ export class IssueEngine {
       issueId,
       from,
       to,
-      summary: `${issue.title.slice(0, 60)}：${from} → ${to}${opts.note ? `（${opts.note.slice(0, 120)}）` : ''}`,
+      summaryCode: 'status_transition',
+      summaryParams: { title: issue.title.slice(0, 60) },
     });
     if (to === 'done') {
       await this.notifySafe({ kind: 'issue_done', projectId: issue.projectId, issueId, summary: issue.title });
@@ -3077,7 +3117,8 @@ export class IssueEngine {
         kind: 'issue_blocked',
         projectId: issue.projectId,
         issueId,
-        summary: `${issue.title.slice(0, 60)}：${opts.note ?? '(未说明)'}`,
+        summaryCode: 'issue_blocked',
+        summaryParams: { title: issue.title.slice(0, 60), detail: opts.note ?? '' },
       });
     }
     await this.onEnter(issueId, from, to, opts.note);
@@ -3158,7 +3199,8 @@ export class IssueEngine {
           projectId: issue.projectId,
           issueId,
           gate,
-          summary: `计划待确认：${issue.title.slice(0, 60)}`,
+          summaryCode: 'plan_review',
+          summaryParams: { title: issue.title.slice(0, 60) },
         });
         break;
       }
@@ -3199,7 +3241,12 @@ export class IssueEngine {
               kind: 'status_change',
               projectId: issue.projectId,
               issueId: issue.id,
-              summary: `${issue.title.slice(0, 60)}：${where === 'auto_commit' ? '自动 commit' : '自动 push'} 失败（不影响完成）：${detail.slice(0, 160)}`,
+              summaryCode: 'auto_git_failure',
+              summaryParams: {
+                title: issue.title.slice(0, 60),
+                action: where === 'auto_commit' ? 'commit' : 'push',
+                detail: detail.slice(0, 160),
+              },
             });
           }
           this.store.logEvent(issueId, 'auto_approved', { kind: 'merge_review' });
@@ -3230,7 +3277,8 @@ export class IssueEngine {
           projectId: issue.projectId,
           issueId,
           gate,
-          summary: `改动待 review：${issue.title.slice(0, 60)}`,
+          summaryCode: 'merge_review',
+          summaryParams: { title: issue.title.slice(0, 60) },
         });
         break;
       }
@@ -3670,7 +3718,7 @@ export class IssueEngine {
         return;
       }
       await this.deps.driver.removeTree(p.scratch).catch(() => {}); // 清残留，防读到上轮旧产物
-      await this.inject(session, buildResultSummaryPrompt(issue.id, kind));
+      await this.inject(session, buildResultSummaryPrompt(issue.id, kind, this.promptLocale(issue, project)));
       this.store.logEvent(issue.id, 'summary_requested', { kind });
       const deadline = this.now() + this.cfg.resultSummaryTimeoutMs;
       let found = false;
@@ -3695,6 +3743,16 @@ export class IssueEngine {
         return;
       }
       this.store.setResultSummary(issue.id, text);
+      const module = issue.moduleId === null ? null : this.moduleRow(issue.projectId, issue.moduleId);
+      const modules = this.deps.modulesFor?.(project);
+      if (module && modules?.recordResultSummary) {
+        await modules.recordResultSummary(module, { ...issue, status: kind }, text).catch((e) => {
+          this.store.logEvent(issue.id, 'error', {
+            where: 'resultSummaryDoc',
+            error: String(e).slice(0, 200),
+          });
+        });
+      }
       this.store.logEvent(issue.id, 'summary_done', { kind, chars: text.length });
     } catch (e) {
       this.store.logEvent(issue.id, 'error', { where: 'resultSummary', error: String(e).slice(0, 200) });
@@ -4001,7 +4059,8 @@ export class IssueEngine {
           kind: 'status_change',
           projectId: issue.projectId,
           issueId: issue.id,
-          summary: `${issue.title.slice(0, 60)}：驱动暂停——项目当前对话被切走（浏览/人工接管），切回该 issue 对话后自动恢复`,
+          summaryCode: 'conversation_displaced',
+          summaryParams: { title: issue.title.slice(0, 60) },
         });
       }
       return;
@@ -4077,7 +4136,11 @@ export class IssueEngine {
           kind: 'issue_blocked',
           projectId: issue.projectId,
           issueId: issue.id,
-          summary: `CC 弹窗滞留超 ${Math.round(this.cfg.menuStuckMs / 60000)} 分钟，需人工处理：${sel.context.slice(0, 120)}`,
+          summaryCode: 'menu_stuck',
+          summaryParams: {
+            minutes: Math.round(this.cfg.menuStuckMs / 60000),
+            context: sel.context.slice(0, 120),
+          },
         });
       }
     } else {
@@ -4123,6 +4186,7 @@ export class IssueEngine {
             issue: resumed,
             stage: resumed.status as 'planning' | 'implementing' | 'testing',
             seqPending,
+            locale: this.promptLocale(resumed, project),
           }),
         );
         w.fedTs = this.now();
@@ -4213,6 +4277,7 @@ export class IssueEngine {
               issue: fresh2,
               stage: fresh2.status as 'planning' | 'implementing' | 'testing',
               seqPending: seqPending2,
+              locale: this.promptLocale(fresh2, project),
             }),
           );
           w.fedTs = this.now();
@@ -4234,7 +4299,7 @@ export class IssueEngine {
     const wait = this.store.execClarifyWait(fresh.id);
     if (wait) {
       if (now - wait.since >= this.cfg.clarifyTimeoutMs) {
-        await this.inject(session, buildClarifyContinue());
+        await this.inject(session, buildClarifyContinue(this.promptLocale(fresh, project)));
         this.store.logEvent(fresh.id, 'clarify_timeout', { stage: fresh.status });
         w.fedTs = this.now();
         w.activityTs = this.now();
@@ -4253,6 +4318,7 @@ export class IssueEngine {
         issue: fresh,
         stage: fresh.status as 'planning' | 'implementing' | 'testing',
         seqPending,
+        locale: this.promptLocale(fresh, project),
       });
       await this.inject(session, msg);
       w.nudged = true;
@@ -4326,12 +4392,17 @@ export class IssueEngine {
     }
   }
 
+  private promptLocale(issue: EngineIssue, project: Project): SupportedLocale {
+    return userPromptLocale(this.deps.db, issue.createdBy, project.ownerUserId);
+  }
+
   private buildKickoffPrompt(
     issue: EngineIssue,
     project: Project,
   ): { text: string; meta: Record<string, unknown> } | null {
     const branch = issue.branch ?? ''; // 进 implementing 时已记下目标分支或历史 issue 的当前分支
     const imgHint = imageReadHint(this.absImages(project, issue));
+    const locale = this.promptLocale(issue, project);
     switch (issue.status) {
       case 'planning': {
         const entry = this.store.lastEnterInfo(issue.id, 'planning');
@@ -4348,7 +4419,7 @@ export class IssueEngine {
                 .get(issue.moduleId)?.display_name
             : null;
         return {
-          text: buildPlanningPrompt({ issue, goal: project.goal, feedback, imgHint, moduleName }),
+          text: buildPlanningPrompt({ issue, goal: project.goal, feedback, imgHint, moduleName, locale }),
           meta: { kind: 'planning', ...(feedback ? { rework: true } : {}) },
         };
       }
@@ -4361,6 +4432,7 @@ export class IssueEngine {
               feedback: entry.note ?? '',
               branch,
               source: entry.event === 'tests_failed' ? 'tests_failed' : 'review_rejected',
+              locale,
             }),
             meta: { kind: 'rework', source: entry.event },
           };
@@ -4368,19 +4440,19 @@ export class IssueEngine {
         const subtasks = this.store.subtasksOf(issue).map((s) => s.text);
         if (issue.implMode === 'team') {
           return {
-            text: buildTeamPrompt({ issue, subtasks, goal: project.goal, branch, imgHint }),
+            text: buildTeamPrompt({ issue, subtasks, goal: project.goal, branch, imgHint, locale }),
             meta: { kind: 'team', n: subtasks.length },
           };
         }
         const idx = issue.subIndex;
         if (!subtasks[idx]) return null; // 无子任务可喂（异常态，等 nudge/人工）
         return {
-          text: buildSubtaskPrompt({ issue, subtasks, idx, branch }),
+          text: buildSubtaskPrompt({ issue, subtasks, idx, branch, locale }),
           meta: { kind: 'subtask', idx },
         };
       }
       case 'testing':
-        return { text: buildTestingPrompt({ issue, branch }), meta: { kind: 'testing' } };
+        return { text: buildTestingPrompt({ issue, branch, locale }), meta: { kind: 'testing' } };
       default:
         return null;
     }
@@ -4405,7 +4477,11 @@ export class IssueEngine {
             kind: 'status_change',
             projectId: fresh.projectId,
             issueId,
-            summary: `${fresh.title.slice(0, 60)}：撞用量限制，${Math.round(this.cfg.limitBackoffMs / 60000)} 分钟后自动续`,
+            summaryCode: 'rate_limited',
+            summaryParams: {
+              title: fresh.title.slice(0, 60),
+              minutes: Math.round(this.cfg.limitBackoffMs / 60000),
+            },
           });
         }
       }
@@ -4488,6 +4564,7 @@ export class IssueEngine {
                   subtasks: list,
                   idx,
                   branch: fresh.branch ?? `issue/${fresh.id}`,
+                  locale: this.promptLocale(fresh, project),
                 });
                 await this.inject(session, prompt);
                 this.store.logEvent(id, 'injected', { stage: 'implementing', kind: 'subtask', idx });
@@ -4575,7 +4652,7 @@ export class IssueEngine {
             note: `planning 连续 ${strikes} 次判完成但未收到 SUBTASKS 块（产物丢失或格式不符），转人工`,
           });
         } else {
-          await this.inject(session, buildReplanRequest());
+          await this.inject(session, buildReplanRequest(this.promptLocale(issue, project)));
           this.store.logEvent(issue.id, 'replan_requested', { strikes });
           w.fedTs = this.now();
           w.nudged = false; // 重置催促状态：重输出指令后允许常规 nudge 再催
@@ -4624,11 +4701,13 @@ export class IssueEngine {
       kind: 'status_change',
       projectId: issue.projectId,
       issueId: issue.id,
-      summary:
-        `「${issue.title.slice(0, 40)}」执行中需要你澄清：\n` +
-        (bodyExcerpt(issue.body) ? `需求：${bodyExcerpt(issue.body)}\n` : '') +
-        (questions.length ? questions.map((q, i) => `${i + 1}. ${q}`).join('\n') : '（详见对话）') +
-        `\n（到 issue 页面回答；${Math.round(this.cfg.clarifyTimeoutMs / 60000)} 分钟不答将按最佳判断自动继续）`,
+      summaryCode: 'clarification_needed',
+      summaryParams: {
+        title: issue.title.slice(0, 40),
+        body: bodyExcerpt(issue.body),
+        questions: questions.map((q, i) => `${i + 1}. ${q}`).join('\n'),
+        minutes: Math.round(this.cfg.clarifyTimeoutMs / 60000),
+      },
     });
   }
 

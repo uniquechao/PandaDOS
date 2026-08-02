@@ -9,7 +9,7 @@ import type { JSX } from 'preact';
 import { connectWs, type WsHandle } from '../lib/ws';
 import { mergeMessages } from '../lib/chatMerge';
 import { createMockChat, isMockMode } from '../lib/mockChat';
-import { markPending, maxOffOf, prunePending, PENDING_HINT, type PendingMsg } from '../lib/pending';
+import { markPending, maxOffOf, prunePending, type PendingMsg } from '../lib/pending';
 import { ImageAttach, type AttachedImage } from './ImageAttach';
 import { ImageLightbox } from './ImageLightbox';
 import { RunStream } from './runstream';
@@ -25,6 +25,8 @@ import type {
   ConversationSegment,
   IssueStatus,
 } from '../lib/types';
+import { useI18n } from '../i18n/provider';
+import { tr } from '../i18n/runtime';
 
 /** 常用键条（key 名 = 后端 tmux 白名单键名，与 v1 ALLOWED_KEYS 一致） */
 const KEYS: Array<[string, string]> = [
@@ -75,6 +77,7 @@ export function ChatPane({
   conversationSegments?: ConversationSegment[];
   currentIssueId?: number;
 }) {
+  const { t } = useI18n();
   const [msgs, setMsgs] = useState<ChatMessage[]>([]);
   const [sel, setSel] = useState<ChatSelection | null>(null);
   const [live, setLive] = useState(conv === undefined); // 钉住模式等 mode 帧定夺
@@ -187,7 +190,7 @@ export function ChatPane({
         if (failedId) setPending((p) => markPending(p, failedId, 'failed'));
         // 就绪门禁：代理未就绪/正在重启——显式提示（替代「发了没反应」），别当普通报错塞进状态行。
         // 文案以服务端下发的 msg 为准（issue #97：文本消息会「重启并自动补发」，不用手动重发）
-        if (f.code === 'agent_not_ready') setNotReady(f.msg ?? 'AI 不在，正在重启并自动补发…');
+        if (f.code === 'agent_not_ready') setNotReady(f.msg ?? t('ui.agentRestarting'));
         else if (f.code === 'explain_failed') {
           // 解读失败只在菜单卡里说一声，别塞进连接状态行（那是连接层的位置）
           setExplaining(false);
@@ -311,11 +314,11 @@ export function ChatPane({
   const connHint = connErr
     ? `⚠ ${connErr}`
     : conn === 'connecting'
-      ? '连接中…'
+      ? t('ui.connecting')
       : conn === 'down'
-        ? '⚪ 断开，重连中…'
+        ? `⚪ ${t('ui.reconnecting')}`
         : conn === 'mock'
-          ? '🧪 mock 模式'
+          ? `🧪 ${t('ui.mockMode')}`
           : null;
   // 流式活动：同步显示 AI 当前步骤（执行某工具 / 思考中）——菜单弹出时是用户回合，不显示。
   const activity = live && !menuUp ? activityOf(msgs.length > 0 ? msgs[msgs.length - 1] : undefined) : null;
@@ -343,19 +346,19 @@ export function ChatPane({
         headerLeading && <div class="runctl">{headerLeading}</div>
       )}
       <div class="chat-msgs runstream" ref={listRef} onScroll={onScroll}>
-        {msgs.length === 0 && pending.length === 0 && <div class="empty">（暂无对话消息）</div>}
+        {msgs.length === 0 && pending.length === 0 && <div class="empty">{t('ui.noChatMessages')}</div>}
         {msgs.length > 0 && (
           <div class="chat-hist-top">
             {loadingHistory ? (
               <span class="chat-hist-hint">
-                <span class="tool-spin" /> 加载更早…
+                <span class="tool-spin" /> {t('ui.loadingEarlier')}
               </span>
             ) : hasMore ? (
               <button class="chat-hist-more" onClick={loadOlder}>
-                ↑ 加载更早
+                ↑ {t('ui.loadingEarlier')}
               </button>
             ) : (
-              <span class="chat-hist-hint mut">· 已到最早 ·</span>
+              <span class="chat-hist-hint mut">· {t('ui.startOfHistory')} ·</span>
             )}
           </div>
         )}
@@ -374,8 +377,8 @@ export function ChatPane({
         {pending.map((p) => (
           <div key={p.id} class={`rs-msg user pending ${p.state}`}>
             {p.text || null}
-            {p.imgCount > 0 && <div class="rs-msg-note">📎 {p.imgCount} 张图</div>}
-            <span class="rs-msg-ack">{PENDING_HINT[p.state]}</span>
+            {p.imgCount > 0 && <div class="rs-msg-note">📎 {t('ui.imageCount', { count: p.imgCount })}</div>}
+            <span class="rs-msg-ack">{pendingHint(p.state)}</span>
           </div>
         ))}
       </div>
@@ -392,31 +395,31 @@ export function ChatPane({
           <div class="copts">
             <div class="copt-hd">
               <span>
-                ⬇ Claude 在等你选择
-                {sel.multiSelect && <span class="copt-tag">多选</span>}
+                ⬇ {t('ui.agentWaitingChoice')}
+                {sel.multiSelect && <span class="copt-tag">{t('ui.multipleChoice')}</span>}
               </span>
               {/* 解读按需生成（issue #112）：不点不调 LLM，省额度也不拖慢菜单出现 */}
               <button
                 class="copt-why-btn"
                 disabled={explaining}
-                title="让 AI 用大白话说清这在问什么、同意后会发生什么、建议选哪项"
+                title={t('ui.explainChoice')}
                 onClick={askExplain}
               >
-                {explaining ? '解读中…' : '🤔 解释一下'}
+                {explaining ? t('ui.explaining') : `🤔 ${t('ui.explain')}`}
               </button>
             </div>
             {/* 多选表单的按键语义与单选不同（实测）：点/回车只是勾选，→ 才进复核页提交。
                 不说清楚的话用户点完以为答过了，实际什么都没提交。 */}
             {sel.multiSelect && (
               <div class="copt-multi-hint">
-                点选项 = 勾选 / 取消，<b>不会提交</b>；勾完点下方「→ 去提交」进复核页确认
+                {t('ui.multiSelectHelp')}
               </div>
             )}
             {sel.context && <div class="copt-ctx">{sel.context}</div>}
             {explain && explain.optionsSig === sel.options.join('|') && (
               <div class="copt-why">{explain.text}</div>
             )}
-            {explainErr && <div class="copt-why bad">解读失败，可重试</div>}
+            {explainErr && <div class="copt-why bad">{t('ui.explainFailed')}</div>}
             {sel.options.map((o, i) => (
               <button key={i} class={`copt${i === sel.cursorIndex ? ' cur' : ''}`} onClick={() => choose(i)}>
                 <span class="copt-n">{i + 1}</span>
@@ -428,12 +431,12 @@ export function ChatPane({
             ))}
             {sel.multiSelect && (
               <button class="copt-submit" onClick={() => send({ type: 'key', key: 'Right' })}>
-                → 去提交（复核页确认）
+                → {t('ui.goReview')}
               </button>
             )}
           </div>
         )}
-        {staleHint && !sel && <div class="stale-hint">⟳ 刚才的菜单已过期，等待新菜单…</div>}
+        {staleHint && !sel && <div class="stale-hint">⟳ {t('ui.staleMenu')}</div>}
         {notReady && <div class="not-ready-hint">⏳ {notReady}</div>}
         {!menuUp && gateBar}
         {!menuUp && !gateBar && live && (
@@ -446,7 +449,7 @@ export function ChatPane({
               leading={
                 <span
                   class={`conn-dot${conn === 'open' ? ' ok' : ''}`}
-                  title={conn === 'open' ? '已连接' : connHint ?? ''}
+                  title={conn === 'open' ? t('ui.connected') : connHint ?? ''}
                 />
               }
               trailing={
@@ -463,7 +466,7 @@ export function ChatPane({
               <textarea
                 rows={1}
                 value={text}
-                placeholder="发消息 / 干预…（回车换行，点按钮发送）"
+                placeholder={t('ui.sendPlaceholder')}
                 onInput={(e) => {
                   setText(e.currentTarget.value);
                   e.currentTarget.style.height = 'auto';
@@ -474,8 +477,8 @@ export function ChatPane({
               <button
                 class="send"
                 disabled={!canSend}
-                title={uploading ? '图片上传中…' : '发送'}
-                aria-label={uploading ? '图片上传中' : '发送'}
+                title={uploading ? t('ui.imageUploading') : t('ui.send')}
+                aria-label={uploading ? t('ui.imageUploading') : t('ui.send')}
                 onClick={sendText}
               >
                 {uploading ? '…' : '↑'}
@@ -484,7 +487,7 @@ export function ChatPane({
           </>
         )}
         {!menuUp && !gateBar && !live && (
-          <div class="ro-note">📖 只读回看——该对话当前不在驱动（issue 已结束或让位）</div>
+          <div class="ro-note">📖 {t('ui.readOnlyChat')}</div>
         )}
       </div>
       {lightbox !== null && (
@@ -499,7 +502,13 @@ export function ChatPane({
 /** 最新消息驱动的「运行状态」文案：正在执行某工具 / 思考中 → 别的返回 null。 */
 function activityOf(m: ChatMessage | undefined): string | null {
   if (!m) return null;
-  if (m.role === 'tool_use') return `正在执行 · ${m.title ?? m.tool ?? '工具'}`;
-  if (m.role === 'thinking') return '思考中…';
+  if (m.role === 'tool_use') return tr('ui.toolRunning', { tool: m.title ?? m.tool ?? tr('ui.tool') });
+  if (m.role === 'thinking') return tr('ui.thinking');
   return null;
+}
+
+function pendingHint(state: PendingMsg['state']): string {
+  if (state === 'sent') return tr('ui.pendingSent');
+  if (state === 'failed') return tr('ui.pendingFailed');
+  return tr('ui.pendingSending');
 }

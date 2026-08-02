@@ -26,7 +26,7 @@ describe('TermPane PC 端回归', () => {
     const source = await Bun.file(termPaneUrl).text();
 
     expect(source).toContain('closedMessage?: string;');
-    expect(source).toContain("{status === 'closed' ? (closedMessage ?? '连接已断开') : '终端会话已结束'}");
+    expect(source).toContain("{status === 'closed' ? (closedMessage ?? tr('ui.terminalDisconnected')) : tr('ui.terminalEnded')}");
   });
 
   test('xterm、fit addon 与样式在面板 effect 内按需加载，并规避卸载竞态', async () => {

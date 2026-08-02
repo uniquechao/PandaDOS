@@ -1,4 +1,5 @@
 import type { JSX } from 'preact';
+import { useI18n } from '../i18n/provider';
 
 export type NativeMode = 'chat' | 'native';
 
@@ -8,13 +9,14 @@ interface NativeModeSwitchProps {
 }
 
 export function NativeModeSwitch({ mode, onChange }: NativeModeSwitchProps): JSX.Element {
+  const { t } = useI18n();
   return (
     <div class="wb-seg">
       <button class={mode === 'chat' ? 'on' : ''} onClick={() => onChange('chat')}>
-        对话
+        {t('ui.chat')}
       </button>
       <button class={mode === 'native' ? 'on' : ''} onClick={() => onChange('native')}>
-        原生
+        {t('ui.native')}
       </button>
     </div>
   );

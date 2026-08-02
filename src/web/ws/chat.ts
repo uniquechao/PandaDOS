@@ -83,6 +83,7 @@ export interface ChatWsDeps {
    */
   explain?(input: {
     projectId: number;
+    userId: number;
     context: string;
     options: string[];
     multiSelect: boolean;
@@ -449,6 +450,7 @@ async function handleExplain(
   try {
     const text = await deps.explain({
       projectId: d.projectId,
+      userId: d.userId,
       context: sel.context,
       options: sel.options,
       multiSelect: sel.multiSelect,

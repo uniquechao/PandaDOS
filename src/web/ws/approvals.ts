@@ -29,8 +29,9 @@ import type { AutoApproveLevel, Project } from '../../core/types';
 import { getProject, type EngineIssue, type EngineMenuCtx } from '../../issues/engine';
 import type { KeyedMutex } from '../../issues/mutex';
 import { buildSelectionCard } from '../../notify/cards';
-import { feishuOpenidOf, userByFeishuOpenid } from '../../notify/router';
+import { feishuOpenidOf, userByFeishuOpenid, userI18n } from '../../notify/router';
 import { actOnMenu, optionsSigOf, type MenuActResult, type MenuDriver } from './inject';
+import { userPromptLocale } from '../../agents/prompts/language';
 
 // ---------- 依赖最小面（结构化依赖，PM/通知全可 mock） ----------
 
@@ -38,7 +39,7 @@ import { actOnMenu, optionsSigOf, type MenuActResult, type MenuDriver } from './
 export interface ApprovalPm {
   decideApproval(
     menu: MenuSnapshot,
-    task: { taskText?: string | null },
+    task: { taskText?: string | null; createdBy?: number | null },
     /** 该 issue 的自动批准档位（issue #108）；不传 = medium（历史行为） */
     level?: AutoApproveLevel,
   ): Promise<ApprovalOutcome>;
@@ -51,7 +52,8 @@ export interface ApprovalNotifier {
     kind: 'status_change';
     projectId: number;
     issueId: number;
-    summary: string;
+    summaryCode: 'approval_selection';
+    summaryParams: { context: string };
   }): Promise<void>;
 }
 
@@ -155,7 +157,7 @@ export class ApprovalPipeline {
       const menu = menuFromSelection(sel, pane);
       // 档位取自 issue 自身（038；对话那份互不影响）——每轮现取，用户中途改档下一轮即生效
       const level: AutoApproveLevel = issue.autoApprove;
-      const outcome = await pm.decideApproval(menu, { taskText: issueText(issue) }, level);
+      const outcome = await pm.decideApproval(menu, { taskText: issueText(issue), createdBy: issue.createdBy }, level);
 
       if (outcome.action === 'approve') {
         const r = await this.inject(project, session, outcome.optionIndex, sig);
@@ -179,6 +181,7 @@ export class ApprovalPipeline {
         context: sel.context,
         options: sel.options,
         systemPrefix: pm.systemPrompt(),
+        locale: userPromptLocale(this.deps.db, issue.createdBy, project.ownerUserId),
       });
       this.registry.register(outcome, session, sig);
       this.sweepMeta();
@@ -187,12 +190,18 @@ export class ApprovalPipeline {
         issueId: issue.id,
         createdTs: Date.now(),
       });
-      const card = buildSelectionCard(outcome.requestId, project.name, summary, sel.options);
       let sent = 0;
       for (const uid of this.deps.subs.subscriberIds(project.id, issue.id)) {
         const openid = feishuOpenidOf(this.deps.db, uid);
         if (!openid || !this.deps.feishu) continue;
         try {
+          const card = buildSelectionCard(
+            userI18n(this.deps.db, uid),
+            outcome.requestId,
+            project.name,
+            summary,
+            sel.options,
+          );
           await this.deps.feishu.sendCard(openid, card);
           sent++;
         } catch (e) {
@@ -206,7 +215,8 @@ export class ApprovalPipeline {
             kind: 'status_change',
             projectId: project.id,
             issueId: issue.id,
-            summary: `🔢 CC 需要人工选择：${sel.context.slice(0, 120)}（请到网页处理）`,
+            summaryCode: 'approval_selection',
+            summaryParams: { context: sel.context.slice(0, 120) },
           })
           .catch(() => {});
       }

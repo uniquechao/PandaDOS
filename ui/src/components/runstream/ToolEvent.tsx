@@ -9,6 +9,7 @@ import { DiffLines, RunStatusBadge } from './parts';
 import { toolHeadView } from './toolview';
 import { ResultView } from './ResultView';
 import { ExceptionView } from './ExceptionView';
+import { tr } from '../../i18n/runtime';
 
 export function ToolEvent({ ev }: { ev: RunToolEvent }) {
   const [open, setOpen] = useState(false);
@@ -31,7 +32,7 @@ export function ToolEvent({ ev }: { ev: RunToolEvent }) {
           )}
           {ev.result != null &&
             (ev.result === '' ? (
-              <div class="rs-empty">（无输出）</div>
+              <div class="rs-empty">{tr('ui.noOutput')}</div>
             ) : ev.isError ? (
               <ExceptionView text={ev.result} />
             ) : (

@@ -135,7 +135,7 @@ export async function executeTool(
       const path = await deps.locator.locate(convId);
       if (!path) return `对话 ${convId} 还没有输出记录`;
       const msgs = await readRecentMessages(deps.driver, path, READ_PROGRESS_BYTES);
-      const lines = msgs.map(fmtChatEvent).filter(Boolean);
+      const lines = msgs.map((message) => fmtChatEvent(message)).filter(Boolean);
       if (!lines.length) return '（最近没有活动）';
       return lines.slice(-READ_PROGRESS_LINES).join('\n');
     }

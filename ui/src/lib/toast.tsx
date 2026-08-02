@@ -4,6 +4,7 @@
  * 在应用根挂一个 <Toaster/> 即可（main.tsx）。无 context、无依赖。
  */
 import { useEffect, useState } from 'preact/hooks';
+import { tr } from '../i18n/runtime';
 
 export type ToastKind = 'success' | 'error' | 'warn' | 'info';
 
@@ -72,7 +73,7 @@ function ToastRow({ item }: { item: ToastItem }) {
     <div class={`toast ${item.kind}${leaving ? ' out' : ''}`} role="status">
       <span class="ic">{ICON[item.kind]}</span>
       <span class="tx">{item.text}</span>
-      <button class="tx-x" aria-label="关闭" onClick={() => setLeaving(true)}>
+      <button class="tx-x" aria-label={tr('action.close')} onClick={() => setLeaving(true)}>
         ✕
       </button>
     </div>

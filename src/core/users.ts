@@ -13,6 +13,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { Database } from 'bun:sqlite';
 import type { User, UserRole, UserSettings } from './types';
+import type { SupportedLocale } from '../../shared/i18n/locales';
 
 // ---------- 常量（v1 护栏平移，评审 5.7：迁移别瞎改） ----------
 
@@ -68,6 +69,9 @@ interface SettingsRow {
   memory: string | null;
   autopilot_default: number;
   notify_pref: string | null;
+  locale: string | null;
+  timezone: string | null;
+  detected_timezone: string | null;
 }
 
 function mapUser(r: UserRow): User {
@@ -90,6 +94,9 @@ function mapSettings(r: SettingsRow): UserSettings {
     memory: r.memory,
     autopilotDefault: r.autopilot_default !== 0,
     notifyPref: r.notify_pref,
+    locale: r.locale as SupportedLocale | null,
+    timezone: r.timezone,
+    detectedTimezone: r.detected_timezone,
   };
 }
 
@@ -100,6 +107,9 @@ export interface SettingsPatch {
   memory?: string | null;
   autopilotDefault?: boolean;
   notifyPref?: string | null;
+  locale?: SupportedLocale;
+  timezone?: string | null;
+  detectedTimezone?: string | null;
 }
 
 // ---------- UserStore ----------
@@ -234,7 +244,16 @@ export class UserStore {
       .query<SettingsRow, [number]>('SELECT * FROM user_settings WHERE user_id = ?')
       .get(userId);
     if (r) return mapSettings(r);
-    return { userId, persona: null, memory: null, autopilotDefault: false, notifyPref: null };
+    return {
+      userId,
+      persona: null,
+      memory: null,
+      autopilotDefault: false,
+      notifyPref: null,
+      locale: null,
+      timezone: null,
+      detectedTimezone: null,
+    };
   }
 
   /** 局部更新（未提供的字段保持原值）；persona/memory 按护栏截断。用户不存在时 FK 抛错。 */
@@ -257,18 +276,35 @@ export class UserStore {
       autopilotDefault:
         patch.autopilotDefault === undefined ? cur.autopilotDefault : Boolean(patch.autopilotDefault),
       notifyPref: patch.notifyPref === undefined ? cur.notifyPref : patch.notifyPref,
+      locale: patch.locale === undefined ? cur.locale : patch.locale,
+      timezone: patch.timezone === undefined ? cur.timezone : patch.timezone,
+      detectedTimezone:
+        patch.detectedTimezone === undefined ? cur.detectedTimezone : patch.detectedTimezone,
     };
     this.db
       .query(
-        `INSERT INTO user_settings (user_id, persona, memory, autopilot_default, notify_pref)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO user_settings
+           (user_id, persona, memory, autopilot_default, notify_pref, locale, timezone, detected_timezone)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id) DO UPDATE SET
            persona = excluded.persona,
            memory = excluded.memory,
            autopilot_default = excluded.autopilot_default,
-           notify_pref = excluded.notify_pref`,
+           notify_pref = excluded.notify_pref,
+           locale = excluded.locale,
+           timezone = excluded.timezone,
+           detected_timezone = excluded.detected_timezone`,
       )
-      .run(userId, next.persona, next.memory, next.autopilotDefault ? 1 : 0, next.notifyPref);
+      .run(
+        userId,
+        next.persona,
+        next.memory,
+        next.autopilotDefault ? 1 : 0,
+        next.notifyPref,
+        next.locale,
+        next.timezone,
+        next.detectedTimezone,
+      );
     return next;
   }
 }

@@ -27,7 +27,7 @@ const EXPECTED_TABLES = [
 ].sort();
 
 /** core/migrations 当前最新编号（新增迁移文件时同步 +1） */
-const LATEST_MIGRATION = 15;
+const LATEST_MIGRATION = 16;
 
 function tableNames(db: Database): string[] {
   return db
@@ -180,6 +180,23 @@ describe('migrate', () => {
       )
       .get('idx_executors_one_system_local')?.sql;
     expect(indexSql).toContain('WHERE is_system_local = 1');
+    db.close();
+  });
+
+  test('016 迁移：用户语言、固定时区与最近设备时区均可空', () => {
+    const db = openDb(':memory:');
+    migrate(db);
+    const cols = db
+      .query<{ name: string; notnull: number; dflt_value: string | null }, []>(
+        'PRAGMA table_info(user_settings)',
+      )
+      .all();
+    for (const name of ['locale', 'timezone', 'detected_timezone']) {
+      const col = cols.find((item) => item.name === name);
+      expect(col).toBeTruthy();
+      expect(col?.notnull).toBe(0);
+      expect(col?.dflt_value).toBeNull();
+    }
     db.close();
   });
 

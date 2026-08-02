@@ -1,3 +1,5 @@
+import type { SupportedLocale } from '../../../shared/i18n/locales';
+
 /**
  * ui/lib/types —— 前端侧 API/WS 资源类型镜像。
  * 形状以 src/web/routes/*.ts 与 core/types.ts、issues/engine.ts 为准（以代码为契约）；
@@ -15,6 +17,9 @@ export interface Me {
   role: Role;
   feishuOpenid: string | null;
   lastLoginTs: number | null;
+  locale: SupportedLocale | null;
+  timezone: string | null;
+  detectedTimezone: string | null;
 }
 
 /** GET/PUT /api/me/settings、GET/PUT /api/admin/users/:id/settings */
@@ -24,6 +29,9 @@ export interface UserSettings {
   memory: string | null;
   autopilotDefault: boolean;
   notifyPref: string | null;
+  locale: SupportedLocale | null;
+  timezone: string | null;
+  detectedTimezone: string | null;
 }
 
 /** admin 用户表行（safeUser，不含 token） */

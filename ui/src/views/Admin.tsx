@@ -26,6 +26,7 @@ import { Loading } from '../components/Loaders';
 import { toast } from '../lib/toast';
 import { AgentPicker } from '../components/AgentPicker';
 import { DirPicker } from '../components/DirPicker';
+import { tr } from '../i18n/runtime';
 
 export type AdminTab = 'users' | 'execs' | 'llm' | 'owner' | 'overview';
 
@@ -33,11 +34,11 @@ export function AdminView({ initialTab = 'users' }: { initialTab?: AdminTab }) {
   const [tab, setTab] = useState<AdminTab>(initialTab);
   useEffect(() => setTab(initialTab), [initialTab]);
   const TABS: Array<[AdminTab, string]> = [
-    ['users', '用户'],
-    ['execs', '执行机'],
-    ['llm', '驱动大模型'],
-    ['owner', '项目归属'],
-    ['overview', '活跃概览'],
+    ['users', tr('admin.users')],
+    ['execs', tr('admin.executors')],
+    ['llm', tr('admin.llm')],
+    ['owner', tr('admin.ownership')],
+    ['overview', tr('admin.overview')],
   ];
   return (
     <div class="page">
@@ -92,7 +93,7 @@ function LlmConfigTab() {
         buildLlmConfigUpdate({ baseUrl, model, apiKey, clearApiKey: false }),
       );
       apply(r.config);
-      toast.success(r.config.configured ? '驱动大模型配置已生效' : '配置已保存，但尚不完整');
+      toast.success(r.config.configured ? tr('admin.configApplied') : tr('admin.configIncomplete'));
     } catch (x) {
       const message = x instanceof ApiError ? x.message : String(x);
       setErr(message);
@@ -103,7 +104,7 @@ function LlmConfigTab() {
   };
 
   const clearKey = async (): Promise<void> => {
-    if (busy || !confirm('清除当前 API Key？依赖驱动大模型的功能将暂停。')) return;
+    if (busy || !confirm(tr('admin.clearKeyConfirm'))) return;
     setBusy(true);
     setErr('');
     try {
@@ -113,7 +114,7 @@ function LlmConfigTab() {
         buildLlmConfigUpdate({ baseUrl, model, apiKey: '', clearApiKey: true }),
       );
       apply(r.config);
-      toast.info('API Key 已清除');
+      toast.info(tr('admin.keyCleared'));
     } catch (x) {
       const message = x instanceof ApiError ? x.message : String(x);
       setErr(message);
@@ -128,15 +129,15 @@ function LlmConfigTab() {
     <div class="sect llm-config">
       <div class="row">
         <div class="grow">
-          <div class="h2">驱动大模型</div>
-          <div class="mut small">支持 OpenAI-compatible Chat Completions 接口，保存后立即生效。</div>
+          <div class="h2">{tr('admin.llm')}</div>
+          <div class="mut small">{tr('admin.llmHelp')}</div>
         </div>
         <span class={`badge ${config?.configured ? 'b-green' : 'b-amber'}`}>
-          {config?.configured ? '已配置' : '未配置'}
+          {config?.configured ? tr('admin.configured') : tr('admin.notConfigured')}
         </span>
       </div>
       <label>
-        接口地址
+        {tr('admin.baseUrl')}
         <input
           value={baseUrl}
           placeholder="https://example.com/v1"
@@ -144,7 +145,7 @@ function LlmConfigTab() {
         />
       </label>
       <label>
-        模型名称
+        {tr('admin.model')}
         <input
           value={model}
           placeholder="model-name"
@@ -152,28 +153,28 @@ function LlmConfigTab() {
         />
       </label>
       <label>
-        API Key
+        {tr('admin.apiKey')}
         <input
           type="password"
           value={apiKey}
           autocomplete="new-password"
-          placeholder={config?.apiKeyConfigured ? '留空表示保留当前 Key' : '请输入 API Key'}
+          placeholder={config?.apiKeyConfigured ? tr('admin.keepKey') : tr('admin.enterKey')}
           onInput={(e) => setApiKey(e.currentTarget.value)}
         />
       </label>
       <div class="mut small">
         {config?.apiKeyConfigured
-          ? `当前 Key：${config.apiKeyMasked}（明文不会被读取或回显）`
-          : '当前未配置 API Key'}
+          ? tr('admin.currentKey', { key: config.apiKeyMasked })
+          : tr('admin.noCurrentKey')}
       </div>
       {err && <div class="err">{err}</div>}
       <div class="row">
         <button class="btn primary" disabled={busy} onClick={() => void save()}>
-          {busy ? '保存中…' : '保存配置'}
+          {busy ? tr('ui.saving') : tr('admin.saveConfig')}
         </button>
         {config?.apiKeyConfigured && (
           <button class="btn danger" disabled={busy} onClick={() => void clearKey()}>
-            清除 API Key
+            {tr('admin.clearKey')}
           </button>
         )}
       </div>
@@ -193,15 +194,15 @@ function TokenModal({ title, token, extra, onClose }: { title: string; token: st
   };
   return (
     <Modal title={title} onClose={onClose}>
-      <div class="err">⚠ token 明文只显示这一次，关掉就没了——现在就复制发给用户。</div>
+      <div class="err">⚠ {tr('admin.tokenOnce')}</div>
       <div class="token-box">{token}</div>
       {extra && extra.length > 0 && <div class="mut small">{extra.join('\n')}</div>}
       <div class="mbtns">
         <button class="btn" onClick={copy}>
-          {copied ? '已复制 ✓' : '复制'}
+          {copied ? tr('ui.copied') : tr('ui.copy')}
         </button>
         <button class="btn primary" onClick={onClose}>
-          我已保存，关闭
+          {tr('admin.savedClose')}
         </button>
       </div>
     </Modal>
@@ -227,12 +228,12 @@ function UsersTab() {
   };
 
   const rename = async (u: AdminUser): Promise<void> => {
-    const name = prompt('新用户名（字母数字 _ -）', u.username);
+    const name = prompt(tr('admin.newUsernamePrompt'), u.username);
     if (!name || name === u.username) return;
     try {
       await api(`/api/admin/users/${u.id}`, 'PATCH', { username: name });
       load();
-      toast.success(`已改名为 ${name}`);
+      toast.success(tr('admin.renamedUser', { name }));
     } catch (x) {
       fail(x);
     }
@@ -240,32 +241,32 @@ function UsersTab() {
 
   const toggleRole = async (u: AdminUser): Promise<void> => {
     const to: Role = u.role === 'admin' ? 'user' : 'admin';
-    if (!confirm(`把 ${u.username} 的角色改成 ${to}？`)) return;
+    if (!confirm(tr('admin.changeRoleConfirm', { name: u.username, role: to }))) return;
     try {
       await api(`/api/admin/users/${u.id}`, 'PATCH', { role: to });
       load();
-      toast.success(`${u.username} 已${to === 'admin' ? '升为 admin' : '降为 user'}`);
+      toast.success(tr(to === 'admin' ? 'admin.promoted' : 'admin.demoted', { name: u.username }));
     } catch (x) {
       fail(x);
     }
   };
 
   const resetToken = async (u: AdminUser): Promise<void> => {
-    if (!confirm(`重置 ${u.username} 的 token？旧 token 立即失效。`)) return;
+    if (!confirm(tr('admin.resetTokenConfirm', { name: u.username }))) return;
     try {
       const r = await api<{ ok: boolean; token: string }>(`/api/admin/users/${u.id}/token`, 'POST');
-      setTokenModal({ title: `${u.username} 的新 token`, token: r.token });
+      setTokenModal({ title: tr('admin.newToken', { name: u.username }), token: r.token });
     } catch (x) {
       fail(x);
     }
   };
 
   const remove = async (u: AdminUser): Promise<void> => {
-    if (!confirm(`删除用户 ${u.username}？`)) return;
+    if (!confirm(tr('admin.deleteUserConfirm', { name: u.username }))) return;
     try {
       await api(`/api/admin/users/${u.id}`, 'DELETE');
       load();
-      toast.info(`已删除用户 ${u.username}`);
+      toast.info(tr('admin.userDeleted', { name: u.username }));
     } catch (x) {
       fail(x);
     }
@@ -274,9 +275,9 @@ function UsersTab() {
   return (
     <div>
       <div class="row" style={{ marginBottom: 10 }}>
-        <span class="grow mut small">{users ? `${users.length} 个用户` : ''}</span>
+        <span class="grow mut small">{users ? tr('admin.userCount', { count: users.length }) : ''}</span>
         <button class="btn primary sm" onClick={() => setCreating(true)}>
-          ＋ 建用户
+          ＋ {tr('admin.createUser')}
         </button>
       </div>
       {err && <div class="err" style={{ marginBottom: 8 }}>{err}</div>}
@@ -284,14 +285,14 @@ function UsersTab() {
         <table class="tbl">
           <thead>
             <tr>
-              <th>用户</th>
-              <th>角色</th>
-              <th>飞书</th>
-              <th>上次登录</th>
-              <th>最近使用</th>
-              <th>任务（今天/总）</th>
-              <th>消息（今天/总）</th>
-              <th>操作</th>
+              <th>{tr('admin.user')}</th>
+              <th>{tr('admin.role')}</th>
+              <th>{tr('admin.feishu')}</th>
+              <th>{tr('admin.lastLogin')}</th>
+              <th>{tr('admin.recentUse')}</th>
+              <th>{tr('admin.tasksTodayTotal')}</th>
+              <th>{tr('admin.messagesTodayTotal')}</th>
+              <th>{tr('admin.actions')}</th>
             </tr>
           </thead>
           <tbody>
@@ -315,19 +316,19 @@ function UsersTab() {
                 <td>
                   <div class="acts">
                     <button class="btn sm" onClick={() => void rename(u)}>
-                      改名
+                      {tr('ui.rename')}
                     </button>
                     <button class="btn sm" onClick={() => void toggleRole(u)}>
-                      {u.role === 'admin' ? '降为 user' : '升为 admin'}
+                      {u.role === 'admin' ? tr('admin.demote') : tr('admin.promote')}
                     </button>
                     <button class="btn sm warn" onClick={() => void resetToken(u)}>
-                      重置 token
+                      {tr('admin.resetToken')}
                     </button>
                     <button class="btn sm" onClick={() => setEditSettings(u)}>
-                      设定
+                      {tr('admin.settings')}
                     </button>
                     <button class="btn sm danger" onClick={() => void remove(u)}>
-                      删
+                      {tr('admin.remove')}
                     </button>
                   </div>
                 </td>
@@ -342,7 +343,7 @@ function UsersTab() {
           onCreated={(username, token, warnings) => {
             setCreating(false);
             load();
-            setTokenModal({ title: `${username} 的 token`, token, extra: warnings });
+            setTokenModal({ title: tr('admin.newToken', { name: username }), token, extra: warnings });
           }}
         />
       )}
@@ -383,14 +384,14 @@ function CreateUserModal({
   };
 
   return (
-    <Modal title="建用户" onClose={onClose}>
+    <Modal title={tr('admin.createUser')} onClose={onClose}>
       <div class="formcol">
         <label class="field">
-          用户名（字母数字 _ -）
+          {tr('admin.username')}
           <input value={username} autocapitalize="off" onInput={(e) => setUsername(e.currentTarget.value)} />
         </label>
         <label class="field">
-          角色
+          {tr('admin.role')}
           <select value={role} onChange={(e) => setRole(e.currentTarget.value as Role)}>
             <option value="user">user</option>
             <option value="admin">admin</option>
@@ -400,10 +401,10 @@ function CreateUserModal({
       </div>
       <div class="mbtns">
         <button class="btn" onClick={onClose}>
-          取消
+          {tr('ui.cancel')}
         </button>
         <button class="btn primary" disabled={busy || !username.trim()} onClick={submit}>
-          {busy ? '创建中…' : '创建'}
+          {busy ? tr('ui.creating') : tr('ui.create')}
         </button>
       </div>
     </Modal>
@@ -431,7 +432,7 @@ function UserSettingsModal({ user, onClose }: { user: AdminUser; onClose: () => 
         autopilotDefault: s.autopilotDefault,
         notifyPref: s.notifyPref,
       });
-      toast.success(`已保存 ${user.username} 的设定`);
+      toast.success(tr('admin.settingsSaved', { name: user.username }));
       onClose();
     } catch (x) {
       setErr(x instanceof ApiError ? x.message : String(x));
@@ -440,7 +441,7 @@ function UserSettingsModal({ user, onClose }: { user: AdminUser; onClose: () => 
   };
 
   return (
-    <Modal title={`${user.username} 的设定`} onClose={onClose}>
+    <Modal title={tr('admin.userSettings', { name: user.username })} onClose={onClose}>
       {!s && !err && <Loading />}
       {s && (
         <div class="formcol">
@@ -458,10 +459,10 @@ function UserSettingsModal({ user, onClose }: { user: AdminUser; onClose: () => 
               checked={s.autopilotDefault}
               onChange={(e) => setS({ ...s, autopilotDefault: e.currentTarget.checked })}
             />
-            新会话默认开自动驾驶
+            {tr('admin.autopilotDefault')}
           </label>
           <label class="field">
-            通知偏好（JSON）
+            {tr('admin.notificationPref')}
             <input value={s.notifyPref ?? ''} onInput={(e) => setS({ ...s, notifyPref: e.currentTarget.value || null })} />
           </label>
         </div>
@@ -469,10 +470,10 @@ function UserSettingsModal({ user, onClose }: { user: AdminUser; onClose: () => 
       {err && <div class="err">{err}</div>}
       <div class="mbtns">
         <button class="btn" onClick={onClose}>
-          取消
+          {tr('ui.cancel')}
         </button>
         <button class="btn primary" disabled={busy || !s} onClick={save}>
-          {busy ? '保存中…' : '保存'}
+          {busy ? tr('ui.saving') : tr('ui.save')}
         </button>
       </div>
     </Modal>
@@ -503,11 +504,11 @@ function ExecutorsTab() {
   useEffect(load, []);
 
   const remove = async (x: Executor): Promise<void> => {
-    if (!confirm(`删除执行机 ${x.name}？`)) return;
+    if (!confirm(tr('admin.deleteExecutorConfirm', { name: x.name }))) return;
     try {
       await api(`/api/admin/executors/${x.id}`, 'DELETE');
       load();
-      toast.info(`已删除执行机 ${x.name}`);
+      toast.info(tr('admin.executorDeleted', { name: x.name }));
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : String(e));
     }
@@ -516,9 +517,9 @@ function ExecutorsTab() {
   return (
     <div>
       <div class="row" style={{ marginBottom: 10 }}>
-        <span class="grow mut small">{execs ? `${execs.length} 台执行机` : ''}</span>
+        <span class="grow mut small">{execs ? tr('admin.executorCount', { count: execs.length }) : ''}</span>
         <button class="btn primary sm" onClick={() => setEditing('new')}>
-          ＋ 登记执行机
+          ＋ {tr('admin.registerExecutor')}
         </button>
       </div>
       {err && <div class="err" style={{ marginBottom: 8 }}>{err}</div>}
@@ -535,23 +536,23 @@ function ExecutorsTab() {
           </div>
           <div class="mono small mut">ws: {x.workspaceRoot} · claude: {x.claudeDir}</div>
           <div class="small mut">
-            Agent：{[
+            {tr('admin.agent')}: {[
               x.supportsClaude ? 'Claude' : '',
               x.supportsCodex ? 'Codex' : '',
-            ].filter(Boolean).join('、') || '未配置'}
-            {x.isSystemLocal && <span class="badge" style={{ marginLeft: 6 }}>系统本机</span>}
+            ].filter(Boolean).join(', ') || tr('admin.notConfigured')}
+            {x.isSystemLocal && <span class="badge" style={{ marginLeft: 6 }}>{tr('admin.systemLocal')}</span>}
           </div>
           <div class="row" style={{ marginTop: 8 }}>
             <button class="btn sm" onClick={() => setEditing(x)}>
-              编辑
+              {tr('ui.edit')}
             </button>
             {!x.isSystemLocal && (
-              <button class="btn sm danger" onClick={() => void remove(x)}>删除</button>
+              <button class="btn sm danger" onClick={() => void remove(x)}>{tr('ui.delete')}</button>
             )}
           </div>
         </div>
       ))}
-      {execs !== null && execs.length === 0 && <div class="empty">还没有执行机</div>}
+      {execs !== null && execs.length === 0 && <div class="empty">{tr('admin.noExecutors')}</div>}
       {editing && (
         <ExecModal
           exec={editing === 'new' ? null : editing}
@@ -641,7 +642,7 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
     try {
       if (exec) await api(`/api/admin/executors/${exec.id}`, 'PATCH', body);
       else await api('/api/admin/executors', 'POST', body);
-      toast.success(exec ? `已更新执行机 ${f.name}` : `已登记执行机 ${f.name}`);
+      toast.success(tr(exec ? 'admin.executorUpdated' : 'admin.executorRegistered', { name: f.name }));
       onSaved();
     } catch (x) {
       setErr(x instanceof ApiError ? x.message : String(x));
@@ -650,11 +651,11 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
   };
 
   const CONNECTION_FIELDS: Array<[keyof typeof EMPTY_EXEC, string, string]> = [
-    ['name', '名称', 'local-1'],
-    ['host', 'host（留空 = 本机执行机）', '10.0.0.2'],
-    ['port', 'SSH 端口', '22'],
-    ['sshUser', 'SSH 用户（本机执行机可留空）', 'root'],
-    ['keyRef', '私钥路径或引用名（引用名从 ~/.mando/keys/ 读取；本机留空）', '/Users/you/.ssh/id_ed25519'],
+    ['name', tr('admin.name'), 'local-1'],
+    ['host', tr('admin.host'), '10.0.0.2'],
+    ['port', tr('admin.sshPort'), '22'],
+    ['sshUser', tr('admin.sshUser'), 'root'],
+    ['keyRef', tr('admin.keyRef'), '/Users/you/.ssh/id_ed25519'],
   ];
 
   const detect = async (): Promise<void> => {
@@ -695,22 +696,22 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
       {label}
       <div class="row exec-path-row">
         <input class="grow" value={f[key]} placeholder={placeholder} onInput={set(key)} />
-        <button class="btn sm" disabled={!canUseConnection} onClick={() => setPicking(key)}>选择目录</button>
+        <button class="btn sm" disabled={!canUseConnection} onClick={() => setPicking(key)}>{tr('admin.chooseDirectory')}</button>
       </div>
       {!exec && !canUseConnection && (
-        <span class="mut small">请先填写名称和有效连接信息，即可检测并浏览远端目录。</span>
+        <span class="mut small">{tr('admin.connectionFirst')}</span>
       )}
       {suggestion && suggestion !== f[key] && (
         <span class="small">
-          建议：<code>{suggestion}</code>{' '}
-          <button class="linkbtn" onClick={() => setF({ ...f, [key]: suggestion })}>采用建议</button>
+          {tr('admin.suggestion')} <code>{suggestion}</code>{' '}
+          <button class="linkbtn" onClick={() => setF({ ...f, [key]: suggestion })}>{tr('admin.useSuggestion')}</button>
         </span>
       )}
     </label>
   );
 
   return (
-    <Modal title={exec ? `编辑执行机 ${exec.name}` : '登记执行机'} onClose={onClose}>
+    <Modal title={exec ? tr('admin.editExecutor', { name: exec.name }) : tr('admin.registerExecutor')} onClose={onClose}>
       <div class="formcol">
         {CONNECTION_FIELDS.map(([k, label, ph]) => (
           <label key={k} class="field">
@@ -723,12 +724,12 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
             />
           </label>
         ))}
-        {exec?.isSystemLocal && <div class="mut small">系统本机执行机的 host 与 SSH 配置固定为本机。</div>}
+        {exec?.isSystemLocal && <div class="mut small">{tr('admin.localFixed')}</div>}
         <div class="field">
           <div class="row">
-            <span class="grow">可用 Agent</span>
+            <span class="grow">{tr('admin.availableAgents')}</span>
             <button class="btn sm" disabled={!canUseConnection || detecting} onClick={() => void detect()}>
-              {detecting ? '检测中…' : '自动检测'}
+              {detecting ? tr('admin.detecting') : tr('admin.autoDetect')}
             </button>
           </div>
           <AgentPicker value={agents} onChange={setAgents} />
@@ -739,7 +740,7 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
                 return (
                   <span class={`badge ${d.commandFound || d.stateDirFound ? 'ok' : ''}`}>
                     {agent === 'claude' ? 'Claude' : 'Codex'}：
-                    {d.commandFound ? '命令已检测' : d.stateDirFound ? '目录存在' : '未检测到'}
+                    {d.commandFound ? tr('admin.commandDetected') : d.stateDirFound ? tr('admin.directoryExists') : tr('admin.notDetected')}
                   </span>
                 );
               })}
@@ -749,24 +750,24 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
         </div>
         {pathField(
           'workspaceRoot',
-          'workspace 根',
+          tr('admin.workspaceRoot'),
           '/Users/you/workspace',
           detection?.workspaceSuggestion,
         )}
         <details class="exec-advanced" open={!!exec}>
-          <summary>高级设置（Agent 会话目录）</summary>
+          <summary>{tr('admin.advanced')}</summary>
           <div class="formcol" style={{ marginTop: 8 }}>
             {agents.includes('claude') &&
               pathField(
                 'claudeDir',
-                'Claude projects 目录',
+                tr('admin.claudeDir'),
                 '/Users/you/.claude/projects',
                 detection?.agents.claude.suggestedDir,
               )}
             {agents.includes('codex') &&
               pathField(
                 'codexDir',
-                'Codex sessions 目录',
+                tr('admin.codexDir'),
                 '/Users/you/.codex/sessions',
                 detection?.agents.codex.suggestedDir,
               )}
@@ -776,10 +777,10 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
       </div>
       <div class="mbtns">
         <button class="btn" onClick={onClose}>
-          取消
+          {tr('ui.cancel')}
         </button>
         <button class="btn primary" disabled={busy} onClick={submit}>
-          {busy ? '保存中…' : '保存'}
+          {busy ? tr('ui.saving') : tr('ui.save')}
         </button>
       </div>
       {picking && canUseConnection && (
@@ -813,7 +814,7 @@ function OwnerTab() {
   const assign = async (p: Project, userId: number): Promise<void> => {
     try {
       await api(`/api/admin/projects/${p.id}/owner`, 'PUT', { userId });
-      toast.success(`已把「${p.name}」转给 ${users.find((u) => u.id === userId)?.username ?? userId}`);
+      toast.success(tr('admin.ownerChanged', { project: p.name, owner: users.find((u) => u.id === userId)?.username ?? userId }));
       load();
     } catch (x) {
       toast.error(x instanceof ApiError ? x.message : String(x));
@@ -827,9 +828,9 @@ function OwnerTab() {
         <table class="tbl">
           <thead>
             <tr>
-              <th>项目</th>
-              <th>状态</th>
-              <th>属主</th>
+              <th>{tr('admin.project')}</th>
+              <th>{tr('admin.status')}</th>
+              <th>{tr('admin.owner')}</th>
             </tr>
           </thead>
           <tbody>
@@ -859,7 +860,7 @@ function OwnerTab() {
           </tbody>
         </table>
       </div>
-      {projects !== null && projects.length === 0 && <div class="empty">没有项目</div>}
+      {projects !== null && projects.length === 0 && <div class="empty">{tr('admin.noProjects')}</div>}
     </div>
   );
 }
@@ -883,10 +884,10 @@ function OverviewTab() {
         <table class="tbl">
           <thead>
             <tr>
-              <th>用户</th>
-              <th>角色</th>
-              <th>项目数</th>
-              <th>上次登录</th>
+              <th>{tr('admin.user')}</th>
+              <th>{tr('admin.role')}</th>
+              <th>{tr('admin.projectCount')}</th>
+              <th>{tr('admin.lastLogin')}</th>
             </tr>
           </thead>
           <tbody>
@@ -899,7 +900,7 @@ function OverviewTab() {
                   <span class={`badge ${r.role === 'admin' ? 'b-amber' : 'b-gray'}`}>{r.role}</span>
                 </td>
                 <td>{r.projectCount}</td>
-                <td class="mut">{r.lastLoginTs ? `${timeAgo(r.lastLoginTs)}（${fmtTime(r.lastLoginTs)}）` : '从未'}</td>
+                <td class="mut">{r.lastLoginTs ? `${timeAgo(r.lastLoginTs)} (${fmtTime(r.lastLoginTs)})` : tr('admin.never')}</td>
               </tr>
             ))}
           </tbody>

@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { Database } from 'bun:sqlite';
+import { catalogs } from '../../shared/i18n/catalogs';
+import { createI18n } from '../../shared/i18n/formatter';
 import { openDb } from '../core/db';
 import { migrate } from '../core/migrate';
 import { UserStore } from '../core/users';
@@ -9,6 +11,7 @@ import {
   SubscriptionStore,
   formatEventText,
   migrateNotify,
+  userI18n,
   type NotifyChannel,
   type NotifyEvent,
   type NotifyTarget,
@@ -197,7 +200,7 @@ describe('NotifyRouter.dispatch', () => {
   }
 
   test('订阅解析：绑定用户收到，无绑定静默跳过，非订阅者不收', async () => {
-    const { users, alice, bob, pid, iid, router, ch } = setup();
+    const { db, users, alice, bob, pid, iid, router, ch } = setup();
     users.create('carol'); // 不订阅
     router.subscriptions.add(alice.id, 'project', pid);
     router.subscriptions.add(bob.id, 'project', pid); // bob 未绑 openid
@@ -215,6 +218,20 @@ describe('NotifyRouter.dispatch', () => {
     router.subscriptions.add(alice.id, 'issue', iid);
     await router.dispatch(statusEvent(pid, iid));
     expect(ch.texts).toHaveLength(1);
+  });
+
+  test('同一结构化事件按收件人语言与时区分别渲染', async () => {
+    const { db, users, alice, bob, pid, iid, router, ch } = setup();
+    users.setFeishuOpenid(bob.id, 'ou_bob');
+    users.putSettings(alice.id, { locale: 'en', timezone: 'Europe/Berlin' });
+    users.putSettings(bob.id, { locale: 'ja', timezone: null, detectedTimezone: 'Asia/Tokyo' });
+    router.subscriptions.add(alice.id, 'project', pid);
+    router.subscriptions.add(bob.id, 'project', pid);
+    await router.dispatch({ kind: 'issue_done', projectId: pid, issueId: iid, summary: 'T' });
+    expect(ch.texts.find((x) => x.target.userId === alice.id)!.text).toContain('Done');
+    expect(ch.texts.find((x) => x.target.userId === bob.id)!.text).toContain('完了');
+    const ts = Date.UTC(2026, 0, 1, 12, 0, 0);
+    expect(userI18n(db, alice.id).formatTime(ts)).not.toBe(userI18n(db, bob.id).formatTime(ts));
   });
 
   test('gate_waiting 出确认卡（不聚合），缺 gate 降级文本', async () => {
@@ -289,6 +306,26 @@ describe('NotifyRouter.dispatch', () => {
     expect(ch.texts[0]!.text).toContain('卡后文本');
     router.stop();
   });
+
+  test('节流缓冲保存结构化事件，并在真正发送时读取最新语言', async () => {
+    const { users, alice, pid, iid, router, ch } = setup(60_000);
+    router.subscriptions.add(alice.id, 'project', pid);
+    users.putSettings(alice.id, { locale: 'en' });
+    await router.dispatch(statusEvent(pid, iid, 'first'));
+    await router.dispatch({
+      kind: 'status_change', projectId: pid, issueId: iid,
+      summaryCode: 'plan_review', summaryParams: { title: 'OAuth login' },
+    });
+    expect(ch.texts).toHaveLength(1);
+
+    users.putSettings(alice.id, { locale: 'ja' });
+    await router.flushAll();
+
+    expect(ch.texts).toHaveLength(2);
+    expect(ch.texts[1]!.text).toContain('計画の確認待ち：OAuth login');
+    expect(ch.texts[1]!.text).not.toContain('Plan awaiting confirmation');
+    router.stop();
+  });
 });
 
 // ---------- routeInbound ----------
@@ -325,11 +362,60 @@ describe('NotifyRouter.routeInbound', () => {
 
 describe('formatEventText', () => {
   test('四类事件确定性渲染', () => {
-    expect(formatEventText({ kind: 'status_change', projectId: 1, issueId: 2, from: 'planning', to: 'testing' })).toContain(
-      'planning → testing',
+    const i18n = userI18n(makeDb(), 0);
+    expect(formatEventText({ kind: 'status_change', projectId: 1, issueId: 2, from: 'planning', to: 'testing' }, i18n)).toContain(
+      'Planning → Testing',
     );
-    expect(formatEventText({ kind: 'issue_done', projectId: 1, issueId: 2, summary: 'T' })).toContain('完成');
-    expect(formatEventText({ kind: 'issue_blocked', projectId: 1, issueId: 2 })).toContain('受阻');
-    expect(formatEventText({ kind: 'gate_waiting', projectId: 1, issueId: 2 })).toContain('卡点');
+    expect(formatEventText({ kind: 'issue_done', projectId: 1, issueId: 2, summary: 'T' }, i18n)).toContain('Done');
+    expect(formatEventText({ kind: 'issue_blocked', projectId: 1, issueId: 2 }, i18n)).toContain('Blocked');
+    expect(formatEventText({ kind: 'gate_waiting', projectId: 1, issueId: 2 }, i18n)).toContain('awaiting confirmation');
+  });
+
+  test('结构化业务摘要按收件人语言最终渲染', () => {
+    const en = createI18n({ locale: 'en', timeZone: 'UTC', catalog: catalogs.en });
+    const ja = createI18n({ locale: 'ja', timeZone: 'UTC', catalog: catalogs.ja });
+    const event = {
+      kind: 'gate_waiting' as const,
+      projectId: 1,
+      issueId: 2,
+      summaryCode: 'plan_review' as const,
+      summaryParams: { title: 'OAuth login' },
+    };
+
+    expect(formatEventText(event, en)).toContain('Plan awaiting confirmation: OAuth login');
+    expect(formatEventText(event, ja)).toContain('計画の確認待ち：OAuth login');
+    expect(formatEventText(event, ja)).not.toContain('计划待确认');
+  });
+
+  test('状态变更摘要本地化状态名但保留 issue 标题原文', () => {
+    const ja = createI18n({ locale: 'ja', timeZone: 'UTC', catalog: catalogs.ja });
+    const text = formatEventText({
+      kind: 'status_change',
+      projectId: 1,
+      issueId: 2,
+      from: 'planning',
+      to: 'testing',
+      summaryCode: 'status_transition',
+      summaryParams: { title: '修复 OAuth' },
+    }, ja);
+
+    expect(text).toContain('修复 OAuth：計画中 → テスト中');
+  });
+
+  test('进度回复提示与人工选择说明本地化，AI/CLI 原文保持不变', () => {
+    const ja = createI18n({ locale: 'ja', timeZone: 'UTC', catalog: catalogs.ja });
+    const progress = formatEventText({
+      kind: 'status_change', projectId: 1, issueId: 2,
+      summaryCode: 'progress_needs_reply',
+      summaryParams: { emoji: '💬', headline: 'Raw AI headline' },
+    }, ja);
+    const approval = formatEventText({
+      kind: 'status_change', projectId: 1, issueId: 2,
+      summaryCode: 'approval_selection',
+      summaryParams: { context: 'rm -rf build?' },
+    }, ja);
+
+    expect(progress).toContain('Raw AI headline（返信待ち）');
+    expect(approval).toContain('選択が必要です：rm -rf build?');
   });
 });

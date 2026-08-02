@@ -9,6 +9,7 @@
 import type { Database } from 'bun:sqlite';
 import path from 'node:path';
 import type { LlmClient } from '../../agents/llm';
+import { userPromptLocale } from '../../agents/prompts/language';
 import type { SummaryTarget } from '../../core/agent-summary';
 import { projectAgentSupport, supportedAgents } from '../../core/executors';
 import { ProjectMemberStore } from '../../core/members';
@@ -728,7 +729,7 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
       method: 'POST',
       path: '/api/projects/:projectId/members',
       auth: 'project-owner',
-      handler: async ({ req, params }) => {
+      handler: async ({ req, params, user }) => {
         const project = getProject(db, Number(params.projectId));
         if (!project) return json({ ok: false, error: '无此项目' }, 404); // owner 校验已过
         const b = await readBody(req);
@@ -900,7 +901,7 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
       method: 'POST',
       path: '/api/projects/:projectId/readme-summary',
       auth: 'project-access',
-      handler: async ({ req, params }) => {
+      handler: async ({ req, params, user }) => {
         const project = getProject(db, Number(params.projectId));
         if (!project) return json({ ok: false, error: '无此项目' }, 404); // owner 校验已过=admin
         const mode = parseSummaryMode(await readBody(req));
@@ -915,7 +916,7 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
           try {
             const r = await generateProjectReadmeSummary(
               { db, llm: deps.llm, driver: deps.driverForProject(project) },
-              { id: project.id, name: project.name, cwd: project.cwd },
+              { id: project.id, name: project.name, cwd: project.cwd, locale: userPromptLocale(db, user?.id, project.ownerUserId) },
             );
             if (!r.ok) return json({ ok: false, error: '未找到 README，无法生成简介' }, 400);
             return json({ ok: true, summary: r.summary, project: getProject(db, project.id) });

@@ -8,8 +8,8 @@ describe('Admin 执行机配置源码契约', () => {
   test('系统本机保护、检测建议与三个执行机目录入口齐全，新建草稿连接也可操作', () => {
     expect(source).toContain('!x.isSystemLocal');
     expect(source).toContain('/detect');
-    expect(source).toContain('采用建议');
-    expect(source.match(/选择目录/g)?.length ?? 0).toBeGreaterThanOrEqual(1);
+    expect(source).toContain("tr('admin.useSuggestion')");
+    expect(source).toContain("tr('admin.chooseDirectory')");
     for (const field of ['workspaceRoot', 'claudeDir', 'codexDir']) {
       expect(source).toContain(field);
     }

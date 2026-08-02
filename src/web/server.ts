@@ -23,6 +23,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { explainMenuForHuman } from '../agents/approval';
 import { createLlmClient } from '../agents/llm';
 import { createPmPool, migratePmAgent } from '../agents/pm';
+import { userPromptLocale } from '../agents/prompts/language';
 import { MessageCounter } from '../core/activity';
 import { ensureArtifactSkill, ensureMandoIssueSkill } from '../core/agent-compat';
 import { ConversationManager } from '../core/conversations';
@@ -190,7 +191,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<MandoServer
     chmodSync(f, 0o600); // 文件已存在时 writeFileSync 的 mode 不生效，补一刀
     // 明文 token 仅此一次输出 stdout + 0600 文件；严禁进任何日志（v1 前科）
     process.stdout.write(
-      `[mando] 首启已创建 admin 用户（username=admin）。token 仅显示这一次（已写入 ${f}，0600）：\n${boot.token}\n`,
+      `[MandoAI] 首启已创建 admin 用户（username=admin）。token 仅显示这一次（已写入 ${f}，0600）：\n${boot.token}\n`,
     );
   }
 
@@ -228,7 +229,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<MandoServer
     if (!d) return;
     drivers.delete(id);
     void Promise.resolve((d as { close?: () => Promise<void> | void }).close?.()).catch((e) =>
-      console.error('[mando] 旧 executor driver 关闭失败:', e),
+      console.error('[MandoAI] 旧 executor driver 关闭失败:', e),
     );
   };
 
@@ -307,10 +308,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<MandoServer
   // 仅在能从执行机 claude_dir 推出真实家目录时装；推不出（退化/测试装配）跳过，免污染兜底 homedir。
   if (derivedHomes) {
     void ensureArtifactSkill(primaryDriver, derivedHomes).catch((e) =>
-      console.error('[mando] 内置技能 artifacts-to-cwd 安装失败（best-effort）:', e),
+      console.error('[MandoAI] 内置技能 artifacts-to-cwd 安装失败（best-effort）:', e),
     );
     void ensureMandoIssueSkill(primaryDriver, derivedHomes).catch((e) =>
-      console.error('[mando] 内置技能 mando-issue 安装失败（best-effort）:', e),
+      console.error('[MandoAI] 内置技能 mando-issue 安装失败（best-effort）:', e),
     );
   }
 
@@ -337,6 +338,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<MandoServer
         agent,
         historyDigest,
         projectName: project.name,
+        locale: userPromptLocale(db, project.ownerUserId),
         ...(target ? { target } : {}),
       }),
   });
@@ -368,7 +370,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<MandoServer
       const answer = await pmFor(project).answerQuestion(user.id, q);
       await feishu.sendText({ userId: user.id, address: openid }, answer);
     } catch (e) {
-      console.error('[mando] 飞书入站处理失败:', e);
+      console.error('[MandoAI] 飞书入站处理失败:', e);
     }
   };
 
@@ -385,14 +387,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<MandoServer
       onSelection: (requestId, idx, openid) =>
         void approvals
           .consumeFromCard(requestId, idx, openid)
-          .catch((e) => console.error('[mando] 选择卡回调处理失败:', e)),
+          .catch((e) => console.error('[MandoAI] 选择卡回调处理失败:', e)),
     });
     try {
       await ch.start();
       notify.register(ch);
       feishu = ch;
     } catch (e) {
-      console.error('[mando] 飞书通道启动失败（本次不注册，通知静默跳过）:', e);
+      console.error('[MandoAI] 飞书通道启动失败（本次不注册，通知静默跳过）:', e);
     }
   }
 
@@ -503,7 +505,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<MandoServer
     approvals,
     messages, // chat 文本帧计入用户消息数
     // 菜单解读（issue #112「解释一下」）：点了才调，issue 执行页与独立对话共用这一条 WS
-    explain: async ({ projectId, context, options, multiSelect }) => {
+    explain: async ({ projectId, userId, context, options, multiSelect }) => {
       const project = getProject(db, projectId);
       if (!project) return null;
       return explainMenuForHuman(llm, {
@@ -512,6 +514,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<MandoServer
         options,
         multiSelect,
         systemPrefix: pmFor(project).systemPrompt(),
+        locale: users.getSettings(userId).locale ?? 'en',
       });
     },
     ...(opts.wsChatPollMs !== undefined ? { chatPollMs: opts.wsChatPollMs } : {}),
@@ -558,7 +561,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<MandoServer
         }
       }
     } catch (e) {
-      console.error('[mando] executor status 同步失败:', e);
+      console.error('[MandoAI] executor status 同步失败:', e);
     }
   };
   syncExecutorStatus();
@@ -655,7 +658,7 @@ if (import.meta.main) {
     `mando listening on :${s.port}（迁移 latest=${s.migrations.latest}，执行机 ${s.drivers.size} 台，飞书=${s.feishuEnabled ? 'on' : 'off'}）`,
   );
   const shutdown = async (sig: string): Promise<void> => {
-    console.log(`[mando] 收到 ${sig}，优雅停机…`);
+    console.log(`[MandoAI] 收到 ${sig}，优雅停机…`);
     await s.stop();
     process.exit(0);
   };

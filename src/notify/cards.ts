@@ -14,6 +14,7 @@
  *   点击校验在 FeishuChannel.handleCard（feishu.ts）。
  */
 import type { GateKind } from '../core/types';
+import type { I18nApi } from '../../shared/i18n/formatter';
 
 // ---------- 事件状态（v1 cards.ts:3-18 原样） ----------
 
@@ -38,10 +39,8 @@ export function isEventStatus(s: unknown): s is EventStatus {
   return typeof s === 'string' && s in HEADER_COLOR;
 }
 
-function nowHHMM(): string {
-  const d = new Date();
-  const p = (n: number) => String(n).padStart(2, '0');
-  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+function nowHHMM(i18n: I18nApi): string {
+  return i18n.formatTime(Date.now());
 }
 
 // ---------- 三卡（v1 平移） ----------
@@ -51,6 +50,7 @@ function nowHHMM(): string {
  * needsReply=true 时高亮「它在等你」（v1 的 `#N` 序号回复提示已弃用）。
  */
 export function buildEventCard(
+  i18n: I18nApi,
   title: string,
   status: EventStatus,
   headline: string,
@@ -60,12 +60,12 @@ export function buildEventCard(
   if (needsReply) {
     elements.push({
       tag: 'div',
-      text: { tag: 'lark_md', content: '💬 **它在等你回话** — 请到网页或直接回复处理' },
+      text: { tag: 'lark_md', content: i18n.t('notify.waitingReply') },
     });
   }
   elements.push({
     tag: 'note',
-    elements: [{ tag: 'plain_text', content: `🕘 ${nowHHMM()} · ${title}` }],
+    elements: [{ tag: 'plain_text', content: `🕘 ${nowHHMM(i18n)} · ${title}` }],
   });
   return {
     config: { wide_screen_mode: true },
@@ -90,6 +90,7 @@ export function buildReplyCard(markdown: string): unknown {
  * 文案截 18 字、首项 primary；value 带 requestId + optionIndex（v1 协议原样）。
  */
 export function buildSelectionCard(
+  i18n: I18nApi,
   requestId: string,
   title: string,
   summary: string,
@@ -103,7 +104,7 @@ export function buildSelectionCard(
   }));
   return {
     config: { wide_screen_mode: true, update_multi: true },
-    header: { template: 'orange', title: { tag: 'plain_text', content: `🔢 ${title} 需要你选择` } },
+    header: { template: 'orange', title: { tag: 'plain_text', content: i18n.t('notify.selectionTitle', { title }) } },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: summary } },
       { tag: 'action', actions: buttons },
@@ -124,7 +125,7 @@ const PLAN_ITEMS_MAX = 15;
  * - merge_review：分支→基线 + `--stat` 变更文件清单（截断）+ 完整 diff 看网页提示。
  * payload 解析失败时兜底为「详情见网页」——卡片是提醒+快捷通道，不是唯一真相源。
  */
-export function gateSummary(kind: GateKind, payloadJson: string | null): string {
+export function gateSummary(kind: GateKind, payloadJson: string | null, i18n: I18nApi): string {
   let payload: Record<string, unknown> = {};
   try {
     payload = payloadJson ? (JSON.parse(payloadJson) as Record<string, unknown>) : {};
@@ -137,27 +138,27 @@ export function gateSummary(kind: GateKind, payloadJson: string | null): string 
     const subtasks = Array.isArray(payload.subtasks)
       ? (payload.subtasks as unknown[]).filter((s): s is string => typeof s === 'string')
       : [];
-    const mode = payload.implMode === 'team' ? 'team（一次性交付）' : 'seq（逐个子任务）';
+    const mode = payload.implMode === 'team' ? i18n.t('notify.modeTeam') : i18n.t('notify.modeSeq');
     if (subtasks.length === 0) {
-      body = '（计划为空，请到网页查看详情）';
+      body = i18n.t('notify.planEmpty');
     } else {
       const lines = subtasks
         .slice(0, PLAN_ITEMS_MAX)
         .map((s, i) => `${i + 1}. ${s.length > PLAN_ITEM_MAX ? s.slice(0, PLAN_ITEM_MAX) + '…' : s}`);
-      if (subtasks.length > PLAN_ITEMS_MAX) lines.push(`…（共 ${subtasks.length} 步，其余见网页）`);
-      body = `**计划（${subtasks.length} 步 · ${mode}）**\n${lines.join('\n')}`;
+      if (subtasks.length > PLAN_ITEMS_MAX) lines.push(i18n.t('notify.planMore', { count: subtasks.length }));
+      body = `${i18n.t('notify.planHeading', { count: subtasks.length, mode })}\n${lines.join('\n')}`;
     }
   } else {
     const branch = typeof payload.branch === 'string' ? payload.branch : '?';
     const base = typeof payload.base === 'string' ? payload.base : '?';
     const stat = typeof payload.stat === 'string' ? payload.stat.trim() : '';
-    const parts = [`**分支** \`${branch}\` → \`${base}\``];
+    const parts = [`**${i18n.t('notify.branch')}** \`${branch}\` → \`${base}\``];
     if (typeof payload.gitError === 'string' && payload.gitError) {
-      parts.push(`⚠️ diff 生成出错：${payload.gitError.slice(0, 200)}`);
+      parts.push(i18n.t('notify.diffFailed', { error: payload.gitError.slice(0, 200) }));
     }
     if (stat) parts.push('```\n' + stat.slice(0, 1600) + (stat.length > 1600 ? '\n…' : '') + '\n```');
-    if (payload.diffTruncated === true) parts.push('（diff 超长已截断）');
-    parts.push('完整 diff 请到网页 review。');
+    if (payload.diffTruncated === true) parts.push(i18n.t('notify.diffTruncated'));
+    parts.push(i18n.t('notify.fullDiffWeb'));
     body = parts.join('\n');
   }
   return body.length > GATE_SUMMARY_MAX ? body.slice(0, GATE_SUMMARY_MAX) + '…' : body;
@@ -178,9 +179,11 @@ export interface GateCardArgs {
  * 任一被消费后另一个即失效（防重放的一次性语义在 DB CAS，见 router.ts）。
  * 卡片一键 reject 带默认意见（引擎要求 reject 必附 note），详细意见走网页。
  */
-export function buildGateCard(a: GateCardArgs): unknown {
+export function buildGateCard(a: GateCardArgs, i18n: I18nApi): unknown {
   const title =
-    a.kind === 'plan' ? `🚦 计划待确认 · issue #${a.issueId}` : `🔍 合并前 review · issue #${a.issueId}`;
+    a.kind === 'plan'
+      ? i18n.t('notify.planGateTitle', { id: a.issueId })
+      : i18n.t('notify.mergeGateTitle', { id: a.issueId });
   return {
     config: { wide_screen_mode: true, update_multi: true },
     header: { template: 'orange', title: { tag: 'plain_text', content: title } },
@@ -191,13 +194,13 @@ export function buildGateCard(a: GateCardArgs): unknown {
         actions: [
           {
             tag: 'button',
-            text: { tag: 'plain_text', content: '✅ 批准' },
+            text: { tag: 'plain_text', content: i18n.t('notify.approve') },
             type: 'primary',
             value: { forge: 'gate', requestId: a.requestId, action: 'approve' },
           },
           {
             tag: 'button',
-            text: { tag: 'plain_text', content: '❌ 拒绝' },
+            text: { tag: 'plain_text', content: i18n.t('notify.reject') },
             type: 'danger',
             value: { forge: 'gate', requestId: a.requestId, action: 'reject' },
           },
@@ -208,7 +211,7 @@ export function buildGateCard(a: GateCardArgs): unknown {
         elements: [
           {
             tag: 'plain_text',
-            content: `🕘 ${nowHHMM()} · 按钮一次性有效；拒绝的详细意见请到网页补充`,
+            content: `🕘 ${nowHHMM(i18n)} · ${i18n.t('notify.oneTimeFooter')}`,
           },
         ],
       },

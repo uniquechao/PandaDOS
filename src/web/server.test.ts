@@ -175,12 +175,12 @@ describe('server 集成冒烟（完整装配）', () => {
   test('healthz → admin 登录 → 建用户/项目/issue → 属主隔离 → 优雅停机', async () => {
     const ctx = await boot();
 
-    // ---- healthz：迁移链全量（001-015/030-038/040/060）+ executor online + engine running ----
+    // ---- healthz：迁移链全量（001-016/030-038/040/060）+ executor online + engine running ----
     const h = await api(ctx, 'GET', '/healthz');
     expect(h.status).toBe(200);
     expect(h.body.ok).toBe(true);
     expect(h.body.db.latest).toBe(60);
-    expect(h.body.db.applied).toBe(26);
+    expect(h.body.db.applied).toBe(27);
     expect(h.body.executors).toEqual([{ id: 1, name: 'local', status: 'online' }]);
     expect(h.body.engine.running).toBe(true);
     expect(h.body.feishu).toBe(false);

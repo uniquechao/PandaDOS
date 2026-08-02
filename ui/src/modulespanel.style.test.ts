@@ -30,7 +30,7 @@ describe('Modal wide 变体', () => {
   });
 
   test('ModulesPanel 启用 wide', () => {
-    expect(panelSrc).toContain('<Modal title="项目模块" wide');
+    expect(panelSrc).toContain("<Modal title={t('ui.projectModules')} wide");
   });
 });
 

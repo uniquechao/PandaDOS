@@ -394,10 +394,10 @@ describe('WS chat 菜单解读（issue #112，点了才生成）', () => {
 
   /** 记录调用的 explain 假件 */
   function fakeExplain(reply: string | null = '这一步只是跑测试，安全可逆，建议选 1。') {
-    const calls: Array<{ projectId: number; context: string; options: string[]; multiSelect: boolean }> = [];
+    const calls: Array<{ projectId: number; userId: number; context: string; options: string[]; multiSelect: boolean }> = [];
     return {
       calls,
-      fn: async (input: { projectId: number; context: string; options: string[]; multiSelect: boolean }) => {
+      fn: async (input: { projectId: number; userId: number; context: string; options: string[]; multiSelect: boolean }) => {
         calls.push(input);
         return reply;
       },
@@ -425,7 +425,7 @@ describe('WS chat 菜单解读（issue #112，点了才生成）', () => {
       text: '这一步只是跑测试，安全可逆，建议选 1。',
     });
     expect(ex.calls).toEqual([
-      { projectId: 1, context: 'Do you want to proceed?', options: ['Yes', 'No'], multiSelect: false },
+      { projectId: 1, userId: 7, context: 'Do you want to proceed?', options: ['Yes', 'No'], multiSelect: false },
     ]);
   });
 

@@ -23,6 +23,8 @@ import {
 import { detectSelection } from '../core/screen';
 import { readDriverText } from '../core/skills';
 import type { AgentKind, IssueCategory } from '../core/types';
+import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
+import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/language';
 
 /** runner 需要的 Driver 子集 = agent-summary 同款（tmux + 受限文件） */
 export type ClarifyDriver = SummaryDriver;
@@ -113,6 +115,7 @@ export function buildClarifyPrompt(
   agent: AgentKind,
   issueId: number,
   opts: { allowQuestions?: boolean } = {},
+  locale: SupportedLocale = 'zh-Hans',
 ): string {
   const rel = `${CLARIFY_SCRATCH_BASE}/${issueId}`;
   const allowQuestions = opts.allowQuestions !== false;
@@ -120,6 +123,20 @@ export function buildClarifyPrompt(
   const questionStep = allowQuestions
     ? `(3) 若存在**不问清楚就会做错方向**的关键歧义或缺失信息，把要问发起人的问题写到文件 ${rel}/questions.md——每行一个、最多 ${MAX_QUESTIONS} 个、简短中文口语（发起人在手机上打字回）；task.md 里历轮问答已回答过的**不要重复问**；实现细节可自行决定的不算歧义，需求清晰就不要创建该文件；`
     : `(3) 本轮不要提问：**不要创建** ${rel}/questions.md——即使仍有歧义，也按 task.md（含历轮问答）里的信息取最佳判断，把取舍写进反馈；`;
+  if (promptLanguage(locale) === 'en') {
+    const questionStepEn = allowQuestions
+      ? `(3) If critical ambiguity would otherwise send implementation in the wrong direction, write up to ${MAX_QUESTIONS} short questions, one per line, to ${rel}/questions.md. Do not repeat questions already answered in task.md. Do not create the file when the request is clear.`
+      : `(3) Do not ask questions or create ${rel}/questions.md in this round. Use the best judgment available from task.md and record tradeoffs in the feedback.`;
+    return [
+      `Perform a read-only pre-implementation analysis. Do not change code or any file outside ${rel}/.`,
+      `(1) Read ${rel}/task.md and the relevant repository code to understand the current behavior and where the request belongs.`,
+      `(2) Write a concise analysis of the request, likely implementation, affected modules/files, impact, and risks to ${rel}/feedback.md (at most 400 words).`,
+      questionStepEn,
+      `(4) As the final step, create ${rel}/done containing ok.`,
+      agent === 'codex' ? 'Proceed without requesting approval.' : '',
+      outputLanguageInstruction(locale),
+    ].filter(Boolean).join(' ');
+  }
   return [
     `你在对一条新任务做「实施前分析」，这是只读分析，除下述 ${rel}/ 下的产物文件外，不要改动任何文件、不要写代码。请严格按顺序完成：`,
     `(1) 读取文件 ${rel}/task.md（任务需求，含历轮澄清问答），并浏览项目代码库中与之相关的部分，理解现状与该需求的落点；`,
@@ -127,6 +144,7 @@ export function buildClarifyPrompt(
     questionStep,
     `(4) 全部完成后，最后创建标记文件 ${rel}/done（内容写 ok 即可）——这一步必须最后做。`,
     agent === 'codex' ? '（无需请求审批，直接执行。）' : '',
+    outputLanguageInstruction(locale),
   ]
     .filter(Boolean)
     .join(' ');
@@ -172,6 +190,7 @@ export interface RunClarifyInput {
   history?: ClarifyRound[];
   /** false = 提问轮数到顶：本轮只更新反馈，禁止产出 questions.md（引擎侧另有兜底压制） */
   allowQuestions?: boolean;
+  locale?: SupportedLocale;
 }
 
 export interface ClarifyRunOptions {
@@ -300,7 +319,7 @@ export class ClarifyRunner {
       // 4) 注入任务提示词
       await this.driver.sendKeys(
         session,
-        buildClarifyPrompt(input.agent, input.issueId, { allowQuestions: input.allowQuestions !== false }),
+        buildClarifyPrompt(input.agent, input.issueId, { allowQuestions: input.allowQuestions !== false }, input.locale),
       );
 
       // 5) 轮询 done 标记

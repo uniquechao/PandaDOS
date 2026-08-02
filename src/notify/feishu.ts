@@ -18,10 +18,14 @@
  *   点击权来自 requestId 绑定的用户。
  */
 import type { Database } from 'bun:sqlite';
+import type { I18nApi } from '../../shared/i18n/formatter';
 import { buildGateCard, gateSummary } from './cards';
 import {
   GateRequestStore,
+  eventSummary,
   feishuOpenidOf,
+  userI18n,
+  userByFeishuOpenid,
   type NotifyChannel,
   type NotifyEvent,
   type NotifyTarget,
@@ -106,11 +110,11 @@ export function larkSdk(): FeishuSdk {
 // ---------- 通道实现 ----------
 
 /** 卡片一键拒绝的默认意见（引擎 decideGate 要求 reject 必附 note；详细意见走网页） */
-export const CARD_REJECT_NOTE = '飞书卡片一键拒绝（详细意见待网页补充）';
+export const CARD_REJECT_NOTE = 'Rejected from the Feishu card; add detailed feedback in the web app.';
 
 /** 绑定验证的测试消息文案 */
 export const BIND_TEST_TEXT =
-  '✅ MandoAI（曼拓）绑定验证：收到本条消息说明 openid 可达，绑定已生效。';
+  '✅ MandoAI connection test: this message confirms that notifications can reach you.';
 
 /**
  * 卡点决定转发（issue-engine decideGate 骨架签名的结构化镜像；
@@ -222,41 +226,46 @@ export class FeishuChannel implements NotifyChannel {
     const requestId = typeof value.requestId === 'string' ? value.requestId : '';
     const action =
       value.action === 'approve' ? ('approve' as const) : value.action === 'reject' ? ('reject' as const) : null;
-    if (!requestId || !action) return toastErr('无效的卡片回调');
+    const operator = userByFeishuOpenid(this.deps.db, openId);
+    const operatorI18n = operator ? userI18n(this.deps.db, operator.id) : userI18n(this.deps.db, 0);
+    if (!requestId || !action) return toastErr(operatorI18n.t('notify.invalidCard'));
 
     const req = this.requests.get(requestId);
-    if (!req) return toastErr('卡片已失效');
-    if (req.consumedTs !== null) return toastErr('这张卡已处理过');
+    if (!req) return toastErr(operatorI18n.t('notify.cardExpired'));
+    const i18n = userI18n(this.deps.db, req.userId);
+    if (req.consumedTs !== null) return toastErr(i18n.t('notify.cardHandled'));
 
     // 操作者必须是发卡对象本人（openid 与该用户当前绑定一致；换绑后旧卡对新 openid 有效）
     const bound = feishuOpenidOf(this.deps.db, req.userId);
-    if (!openId || !bound || openId !== bound) return toastErr('这张卡不是发给你的');
+    if (!openId || !bound || openId !== bound) return toastErr(operatorI18n.t('notify.cardNotYours'));
 
     // 一次性语义：CAS 消费，并发/重放到这里被拒
     const consumed = this.requests.consume(requestId);
-    if (!consumed) return toastErr('这张卡已处理过');
+    if (!consumed) return toastErr(i18n.t('notify.cardHandled'));
 
-    if (!this.deps.decideGate) return toastErr('卡点处理未接线，请到网页操作');
-    const note = action === 'reject' ? CARD_REJECT_NOTE : undefined;
+    if (!this.deps.decideGate) return toastErr(i18n.t('notify.gateUnavailable'));
+    const note = action === 'reject' ? i18n.t('notify.rejectNote') : undefined;
     const r = await this.deps.decideGate(consumed.gateId, consumed.userId, action, note);
-    if (!r.ok) return toastErr(r.error ?? '处理失败'); // gates 表 CAS 是第二道防线（如网页已先处理）
+    if (!r.ok) return toastErr(r.error ?? i18n.t('notify.failed')); // gates 表 CAS 是第二道防线（如网页已先处理）
     return {
       toast: {
         type: 'success',
-        content: action === 'approve' ? '✅ 已批准' : '❌ 已拒绝（详细意见请到网页补充）',
+        content: action === 'approve' ? i18n.t('notify.approved') : i18n.t('notify.rejected'),
       },
     };
   }
 
   /** v1 选择卡回调兼容；optionIndex 严格整数校验（拒绝畸形值，不再 ||0 误选第 1 项） */
   private handleSelectionClick(openId: string, value: Record<string, unknown>): FeishuToast {
+    const user = userByFeishuOpenid(this.deps.db, openId);
+    const i18n = userI18n(this.deps.db, user?.id ?? 0);
     const requestId = typeof value.requestId === 'string' ? value.requestId : '';
     const idx = value.optionIndex;
     if (!requestId || typeof idx !== 'number' || !Number.isInteger(idx) || idx < 0) {
-      return toastErr('无效的选择回调');
+      return toastErr(i18n.t('notify.invalidSelection'));
     }
     this.deps.onSelection?.(requestId, idx, openId);
-    return { toast: { type: 'success', content: `已选择第 ${idx + 1} 项` } };
+    return { toast: { type: 'success', content: i18n.t('notify.selectedOption', { index: idx + 1 }) } };
   }
 
   // ---- 发送（v1 sendText/sendCard 平移；未连接改为显式抛错，不再静默降级日志） ----
@@ -285,20 +294,25 @@ export class FeishuChannel implements NotifyChannel {
    * 卡点确认卡：计划/diff 摘要 + approve/reject 按钮（一次性 requestId 防重放）。
    * requestId 发卡时落 DB（重启后卡仍可点，评审 H4 整改）；缺 gate 详情降级为文本。
    */
-  async sendGateCard(target: NotifyTarget, event: NotifyEvent): Promise<void> {
+  async sendGateCard(
+    target: NotifyTarget,
+    event: NotifyEvent,
+    i18n: I18nApi = userI18n(this.deps.db, target.userId),
+  ): Promise<void> {
     const gate = event.gate;
+    const localizedSummary = eventSummary(event, i18n);
     if (!gate) {
-      await this.sendText(target, `🚦 [issue #${event.issueId}] ${event.summary ?? '卡点待确认'}`);
+      await this.sendText(target, `🚦 [issue #${event.issueId}] ${localizedSummary}`);
       return;
     }
     const requestId = this.requests.create(gate.id, target.userId);
-    const heading = event.summary ? `**${event.summary}**\n\n` : '';
+    const heading = localizedSummary ? `**${localizedSummary}**\n\n` : '';
     const card = buildGateCard({
       requestId,
       kind: gate.kind,
       issueId: event.issueId,
-      summary: heading + gateSummary(gate.kind, gate.payloadJson),
-    });
+      summary: heading + gateSummary(gate.kind, gate.payloadJson, i18n),
+    }, i18n);
     await this.sendCard(target.address, card);
   }
 
@@ -306,9 +320,10 @@ export class FeishuChannel implements NotifyChannel {
    * openid 绑定验证：发一条测试消息，可达才允许落库（防填错导致通知外泄，spec §8/§12）。
    * @returns 是否送达（false = 调用方不保存）
    */
-  async verifyBinding(openid: string): Promise<boolean> {
+  async verifyBinding(openid: string, userId = 0): Promise<boolean> {
     try {
-      await this.sendText({ userId: 0, address: openid }, BIND_TEST_TEXT);
+      const i18n = userI18n(this.deps.db, userId);
+      await this.sendText({ userId, address: openid }, i18n.t('notify.bindTest'));
       return true;
     } catch {
       return false;

@@ -20,8 +20,8 @@ describe('GitView VSCode 式工作区组合', () => {
     expect(source).toContain("dispatch({ type: 'show-worktree' })");
     expect(source).toContain("kind: 'commit', sha: tree.sha");
     expect(source).toContain('class="git-tree-pane"');
-    expect(source).toContain('全部');
-    expect(source).toContain('只看改动');
+    expect(source).toContain("tr('git.all')");
+    expect(source).toContain("tr('git.changesOnly')");
   });
 
   test('左下 commit 图可折叠；行点击切树，独立详情按钮打开完整 commit', () => {
@@ -31,7 +31,7 @@ describe('GitView VSCode 式工作区组合', () => {
     expect(source).toContain('if (ev.target !== ev.currentTarget) return;');
     expect(source).toContain('ev.stopPropagation()');
     expect(source).toContain("dispatch({ type: 'open-commit-detail', sha: c.sha })");
-    expect(source).toContain('查看详情');
+    expect(source).toContain("tr('git.viewDetails')");
   });
 
   test('宽屏两栏可拖拽：左树+历史，右侧按内容展示文件、diff 或 commit message', () => {
@@ -80,7 +80,7 @@ describe('GitView VSCode 式工作区组合', () => {
     expect(source).toContain('<WorkspaceContext');
     expect(source).toContain('mobile');
     expect(source).toContain("dispatch({ type: 'close-content' })");
-    expect(source).toContain('返回 Git 工作区');
+    expect(source).toContain("tr('git.backWorkspace')");
   });
 
   test('手机 commit 内文件 diff 独占宽度，刷新会重拉已打开的详情内 diff', () => {
@@ -92,8 +92,8 @@ describe('GitView VSCode 式工作区组合', () => {
 
   test('只看改动来源接入逐个/全部暂存与撤销暂存，重命名沿用模型给出的完整路径组', () => {
     expect(source).toContain('<GitOperationsPanel');
-    expect(source).toContain('全部暂存');
-    expect(source).toContain('全部撤销暂存');
+    expect(source).toContain("tr('git.stageAll')");
+    expect(source).toContain("tr('git.unstageAll')");
     expect(source).toContain('operations.write(');
     expect(source.match(/\{ paths: operation\.paths \}/g)).toHaveLength(2);
     expect(source).toContain("'stage',");

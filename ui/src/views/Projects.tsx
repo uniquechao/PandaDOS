@@ -33,6 +33,7 @@ import { Modal } from '../components/Modal';
 import { SkeletonCards } from '../components/Loaders';
 import { toast } from '../lib/toast';
 import { DirPicker } from '../components/DirPicker';
+import { tr } from '../i18n/runtime';
 
 /** 与后端 projectSlug 同规则（默认 cwd 预览用） */
 function slug(name: string): string {
@@ -81,8 +82,8 @@ function ExecutorSelect({
       <select value={value} onChange={(e) => onChange(e.currentTarget.value)}>
         {executors.map((x) => (
           <option key={x.id} value={String(x.id)} disabled={!x.availableForProjects}>
-            {x.name} · {x.supportedAgents.join(' / ') || '未配置 Agent'}
-            {x.status === 'online' ? ' · 在线' : ''}
+            {x.name} · {x.supportedAgents.join(' / ') || tr('project.noAgent')}
+            {x.status === 'online' ? ` · ${tr('status.online')}` : ''}
           </option>
         ))}
       </select>
@@ -93,7 +94,7 @@ function ExecutorSelect({
       inputMode="numeric"
       value={value}
       onInput={(e) => onChange(e.currentTarget.value)}
-      placeholder="执行机 ID（不清楚问管理员，通常是 1）"
+      placeholder={tr('project.executorIdPlaceholder')}
     />
   );
 }
@@ -110,9 +111,9 @@ function RunUserSelect({
   if (osUsers.length === 0) return null;
   return (
     <label class="field">
-      Linux 用户（项目落谁的目录）
+      {tr('project.linuxUser')}
       <select value={value} onChange={(e) => onChange(e.currentTarget.value)}>
-        <option value="">跟随执行机（默认）</option>
+        <option value="">{tr('project.followExecutor')}</option>
         {osUsers.map((u) => (
           <option key={u.name} value={u.name}>
             {u.name}（{u.home}）
@@ -158,9 +159,10 @@ function CwdMigrateModal({
         'POST',
         { dest },
       );
-      toast.success(
-        `已迁移到 ${r.project.cwd}${r.killedSessions.length ? `（关闭 ${r.killedSessions.length} 个会话）` : ''}`,
-      );
+      toast.success(tr('project.migratedTo', {
+        cwd: r.project.cwd,
+        sessions: r.killedSessions.length ? tr('project.closedSessions', { count: r.killedSessions.length }) : '',
+      }));
       onMigrated(r.project);
       onClose();
     } catch (x) {
@@ -171,40 +173,39 @@ function CwdMigrateModal({
   };
 
   return (
-    <Modal title="迁移工程目录" onClose={onClose}>
+    <Modal title={tr('project.migrateWorkspace')} onClose={onClose}>
       <div class="formcol">
         <div class="mut small">
-          当前目录：<code style={{ wordBreak: 'break-all' }}>{cwd}</code>
+          {tr('project.currentDirectory')} <code style={{ wordBreak: 'break-all' }}>{cwd}</code>
         </div>
         <div class="row" style={{ gap: 6, alignItems: 'center' }}>
           <code class="grow" style={{ fontSize: 12, wordBreak: 'break-all' }}>
             {parent}
           </code>
           <button class="btn sm" onClick={() => setPicking(true)}>
-            浏览…
+            {tr('project.browse')}…
           </button>
         </div>
         <input
           class="grow"
           value={name}
           onInput={(e) => setName(e.currentTarget.value)}
-          placeholder="目标目录名（不能已存在）"
+          placeholder={tr('project.targetDirectoryName')}
         />
         <div class="mut small">
-          迁移到：<code style={{ wordBreak: 'break-all' }}>{dest}</code>
+          {tr('project.moveTo')} <code style={{ wordBreak: 'break-all' }}>{dest}</code>
         </div>
         <div class="mut small">
-          ⚠️ 迁移会关闭该项目的全部终端会话，旧对话不可恢复（下次使用自动新建）；有执行中
-          issue 时无法迁移。
+          ⚠️ {tr('project.migrateWarning')}
         </div>
         {err && <div class="err">{err}</div>}
       </div>
       <div class="mbtns">
         <button class="btn" onClick={onClose}>
-          取消
+          {tr('ui.cancel')}
         </button>
         <button class="btn primary" disabled={!canGo} onClick={() => void go()}>
-          {busy ? '迁移中…' : '开始迁移'}
+          {busy ? tr('project.migrating') : tr('project.startMigration')}
         </button>
       </div>
       {picking && (
@@ -235,7 +236,7 @@ export function ProjectsView({ me }: { me: Me }) {
   const [summaryBusy, setSummaryBusy] = useState<Set<number>>(new Set());
   const [migrating, setMigrating] = useState<Project | null>(null);
   // 空闲时的每日欢迎语：默认静态兜底，挂载后拉 LLM 生成的当天欢迎语覆盖（失败/加载中仍用兜底）
-  const [greeting, setGreeting] = useState('今天也顺顺利利 ✨');
+  const [greeting, setGreeting] = useState(() => tr('project.greeting'));
   const { isFav, toggle: toggleFav } = useFavorites();
   const executors = useExecutors();
 
@@ -267,13 +268,13 @@ export function ProjectsView({ me }: { me: Me }) {
       );
       if (isAsyncMode(mode)) {
         patchProject(p.id, r.project); // 落 running 态
-        toast.info(`已用 ${mode} 开始生成，稍候…`);
+        toast.info(tr('project.startedSummary', { mode }));
         const final = await pollProjectSummary(p.id, { onTick: (pp) => patchProject(p.id, pp) });
-        if (final.summaryStatus === 'done') toast.success('认知总结已更新');
-        else if (final.summaryStatus === 'error') toast.error(final.summaryError ?? '生成失败');
+        if (final.summaryStatus === 'done') toast.success(tr('project.knowledgeUpdated'));
+        else if (final.summaryStatus === 'error') toast.error(final.summaryError ?? tr('project.generationFailed'));
       } else {
         patchProject(p.id, { readmeSummary: r.summary ?? p.readmeSummary });
-        toast.success('简介已更新');
+        toast.success(tr('project.summaryUpdated'));
       }
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : String(e));
@@ -291,9 +292,9 @@ export function ProjectsView({ me }: { me: Me }) {
 
   // 归档/启用：PATCH status + 确认；归档同时清收藏与最近访问（本地入口不再指向归档项目）
   const setArchived = async (p: Project, archived: boolean): Promise<void> => {
-    const verb = archived ? '归档' : '启用';
-    const hint = archived ? '归档后不再出现在进行中列表，可随时启用恢复。' : '';
-    if (!confirm(`${verb}项目「${p.name}」？${hint}`)) return;
+    const verb = archived ? tr('project.archiveVerb') : tr('project.enableVerb');
+    const hint = archived ? tr('project.archiveHint') : '';
+    if (!confirm(tr('project.archiveConfirm', { verb, name: p.name, hint }))) return;
     try {
       const r = await api<{ ok: boolean; project: Project }>(`/api/projects/${p.id}`, 'PATCH', {
         status: archived ? 'archived' : 'active',
@@ -303,7 +304,7 @@ export function ProjectsView({ me }: { me: Me }) {
         removeFavorite(p.id);
         removeRecent(p.id);
       }
-      toast.success(`已${verb}「${p.name}」`);
+      toast.success(tr('project.archiveSuccess', { verb, name: p.name }));
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : String(e));
     }
@@ -316,9 +317,9 @@ export function ProjectsView({ me }: { me: Me }) {
   // 统计卡口径：进行中/待确认任务总数按活跃项目聚合（归档不计）
   const agg = aggregateSummary(sum, activeProjects.map((p) => p.id));
   const FILTERS: { key: ProjFilter; label: string; n: number }[] = [
-    { key: 'all', label: '全部', n: all.length },
-    { key: 'active', label: '进行中', n: activeCount },
-    { key: 'archived', label: '已归档', n: archivedCount },
+    { key: 'all', label: tr('shell.all'), n: all.length },
+    { key: 'active', label: tr('project.statusDoing'), n: activeCount },
+    { key: 'archived', label: tr('project.archived'), n: archivedCount },
   ];
 
   // 状态筛选 → 搜索 → 收藏排前：驱动下方网格。全部时活跃在前、归档在后。
@@ -359,24 +360,24 @@ export function ProjectsView({ me }: { me: Me }) {
             <div class="pcard-nm">
               <span
                 class={'pcard-dot' + (doingN > 0 ? ' run' : '')}
-                title={doingN > 0 ? `${doingN} 个进行中` : '在线'}
+                title={doingN > 0 ? tr('shell.runningCount', { count: doingN }) : tr('status.online')}
               />
               <b>{p.name}</b>
             </div>
             <div class="pcard-badges">
-              {p.kind === 'chat' && <span class="badge b-purple">对话</span>}
-              {p.status === 'archived' && <span class="badge b-gray">已归档</span>}
-              {!!s && s.review > 0 && <span class="badge b-amber">待确认 {s.review}</span>}
-              {!!s && s.doing > 0 && <span class="badge b-green">进行中 {s.doing}</span>}
-              {!!s && s.todo > 0 && <span class="badge b-gray">待办 {s.todo}</span>}
-              {!!s && s.blocked > 0 && <span class="badge b-red">受阻 {s.blocked}</span>}
+              {p.kind === 'chat' && <span class="badge b-purple">{tr('view.conversation')}</span>}
+              {p.status === 'archived' && <span class="badge b-gray">{tr('project.archived')}</span>}
+              {!!s && s.review > 0 && <span class="badge b-amber">{tr('project.statusReview')} {s.review}</span>}
+              {!!s && s.doing > 0 && <span class="badge b-green">{tr('project.statusDoing')} {s.doing}</span>}
+              {!!s && s.todo > 0 && <span class="badge b-gray">{tr('project.statusTodo')} {s.todo}</span>}
+              {!!s && s.blocked > 0 && <span class="badge b-red">{tr('project.statusBlocked')} {s.blocked}</span>}
               {p.runUser && <span class="badge b-blue">@{p.runUser}</span>}
             </div>
           </div>
           <span
             class={'pcard-star' + (fav ? ' on' : '')}
             role="button"
-            title={fav ? '取消收藏' : '收藏'}
+            title={fav ? tr('shell.unfavorite') : tr('shell.favorite')}
             onClick={(e) => {
               e.stopPropagation();
               toggleFav(p.id);
@@ -411,7 +412,7 @@ export function ProjectsView({ me }: { me: Me }) {
                   nav(`/p/${p.id}/chat`);
                 }}
               >
-                对话
+                {tr('view.conversation')}
               </button>
             )}
             <button
@@ -421,7 +422,7 @@ export function ProjectsView({ me }: { me: Me }) {
                 nav(`/p/${p.id}/term`);
               }}
             >
-              原生 Bash
+              {tr('view.nativeBash')}
             </button>
             <button
               class="pcard-act"
@@ -430,7 +431,7 @@ export function ProjectsView({ me }: { me: Me }) {
                 nav(`/p/${p.id}/files`);
               }}
             >
-              文件
+              {tr('view.files')}
             </button>
             <button
               class="pcard-act"
@@ -449,19 +450,19 @@ export function ProjectsView({ me }: { me: Me }) {
                   void setArchived(p, p.status !== 'archived');
                 }}
               >
-                {p.status === 'archived' ? '启用' : '归档'}
+                {p.status === 'archived' ? tr('project.enableVerb') : tr('project.archiveVerb')}
               </button>
             )}
             {me.role === 'admin' && (
               <button
                 class="pcard-act"
-                title="把工程目录整体迁移到新位置（仅 admin）"
+                title={tr('project.migrateAdmin')}
                 onClick={(e) => {
                   e.stopPropagation();
                   setMigrating(p);
                 }}
               >
-                迁移目录
+                {tr('project.migrateWorkspace')}
               </button>
             )}
           </div>
@@ -473,13 +474,13 @@ export function ProjectsView({ me }: { me: Me }) {
   return (
     <div class="page">
       <div class="ph-head">
-        <h1 class="ph-title">项目</h1>
+        <h1 class="ph-title">{tr('shell.projects')}</h1>
         <input
           class="ph-search"
           value={search}
           onInput={(e) => setSearch(e.currentTarget.value)}
-          placeholder="搜索项目…"
-          aria-label="搜索项目"
+          placeholder={tr('shell.searchProjects')}
+          aria-label={tr('shell.searchProjects')}
         />
         <div class="ph-filters">
           {FILTERS.map((f) => (
@@ -495,10 +496,10 @@ export function ProjectsView({ me }: { me: Me }) {
         </div>
         <div class="ph-acts">
           <button class="btn sm" onClick={() => setImporting(true)}>
-            导入 tmux
+            {tr('project.importTmuxShort')}
           </button>
           <button class="btn primary sm" onClick={() => setCreating(true)}>
-            ＋ 新建项目
+            ＋ {tr('project.newProject')}
           </button>
         </div>
       </div>
@@ -509,12 +510,12 @@ export function ProjectsView({ me }: { me: Me }) {
           <div class="ph-welcome">
             <span class="avatar ph-welcome-av">{(me.username[0] ?? '?').toUpperCase()}</span>
             <div class="ph-welcome-tx">
-              <div class="ph-welcome-hi">欢迎回来，{me.username}</div>
+              <div class="ph-welcome-hi">{tr('project.welcomeBack', { name: me.username })}</div>
               <div class="ph-welcome-sub">
                 {agg.review > 0
-                  ? `有 ${agg.review} 个待确认等你拍板`
+                  ? tr('project.reviewAttention', { count: agg.review })
                   : agg.doing > 0
-                    ? `${agg.doing} 个任务进行中`
+                    ? tr('project.tasksRunning', { count: agg.doing })
                     : greeting}
               </div>
             </div>
@@ -524,21 +525,21 @@ export function ProjectsView({ me }: { me: Me }) {
               <span class="ph-stat-ic">📁</span>
               <div>
                 <div class="ph-stat-n">{activeCount}</div>
-                <div class="ph-stat-l">项目</div>
+                <div class="ph-stat-l">{tr('shell.projects')}</div>
               </div>
             </div>
             <div class="ph-stat run">
               <span class="ph-stat-ic">⚙️</span>
               <div>
                 <div class="ph-stat-n">{agg.doing}</div>
-                <div class="ph-stat-l">进行中</div>
+                <div class="ph-stat-l">{tr('project.statusDoing')}</div>
               </div>
             </div>
             <div class="ph-stat rv">
               <span class="ph-stat-ic">🔔</span>
               <div>
                 <div class="ph-stat-n">{agg.review}</div>
-                <div class="ph-stat-l">待确认</div>
+                <div class="ph-stat-l">{tr('project.statusReview')}</div>
               </div>
             </div>
           </div>
@@ -546,21 +547,21 @@ export function ProjectsView({ me }: { me: Me }) {
       )}
       {projects !== null && all.length === 0 && (
         <div class="empty">
-          还没有项目
+          {tr('project.noProjects')}
           <br />
-          点右上「新建项目」，或「导入 tmux」接管机器上已有的会话
+          {tr('project.noProjectsHelp')}
         </div>
       )}
       {projects !== null &&
         all.length > 0 &&
         shown.length === 0 &&
         !(filter === 'active' && archivedShown.length > 0) && (
-          <div class="empty">没有符合条件的项目{q ? `（搜索「${search.trim()}」）` : ''}</div>
+          <div class="empty">{tr('project.noMatches', { query: q ? tr('project.searchSuffix', { query: search.trim() }) : '' })}</div>
         )}
       <div class="ph-grid stagger">{shown.map(card)}</div>
       {filter === 'active' && archivedShown.length > 0 && (
         <details class="ph-archived">
-          <summary>已归档（{archivedShown.length}）</summary>
+          <summary>{tr('project.archivedCount', { count: archivedShown.length })}</summary>
           <div class="ph-grid">{archivedShown.map(card)}</div>
         </details>
       )}
@@ -646,7 +647,7 @@ function CreateProjectModal({
     const eid = Number(executorId);
     if (!effName || !Number.isInteger(eid) || eid <= 0 || busy) return;
     if (source === 'git' && !gitUrl.trim()) {
-      setErr('请填写 Git 仓库地址');
+      setErr(tr('project.gitRequired'));
       return;
     }
     setBusy(true);
@@ -668,8 +669,8 @@ function CreateProjectModal({
           withConversation: kind === 'chat' ? false : withConv,
         },
       );
-      if (r.cloned) toast.success('已从 Git 克隆并创建项目');
-      if (r.warnings?.length) toast.warn('已创建，但有警告：\n' + r.warnings.join('\n'));
+      if (r.cloned) toast.success(tr('project.clonedCreated'));
+      if (r.warnings?.length) toast.warn(tr('project.createdWarnings', { warnings: r.warnings.join('\n') }));
       onCreated(r.project);
     } catch (x) {
       setErr(x instanceof ApiError ? x.message : String(x));
@@ -681,45 +682,45 @@ function CreateProjectModal({
   const canBrowse = Number.isInteger(eid) && eid > 0;
 
   return (
-    <Modal title="新建项目" onClose={onClose}>
+    <Modal title={tr('project.newProject')} onClose={onClose}>
       <div class="formcol">
         <label class="field">
-          项目类型
+          {tr('project.projectType')}
           <div class="seg" role="tablist">
             <button class={`seg-btn ${kind === 'issue' ? 'on' : ''}`} onClick={() => setKind('issue')}>
-              issue 看板
+              {tr('project.issueBoard')}
             </button>
             <button class={`seg-btn ${kind === 'chat' ? 'on' : ''}`} onClick={() => setKind('chat')}>
-              对话
+              {tr('view.conversation')}
             </button>
           </div>
         </label>
         {kind === 'chat' && (
-          <div class="mut small">对话模式：纯聊天问答、产物落项目目录，不建 issue（进入后在对话视图里开多条对话）。</div>
+          <div class="mut small">{tr('project.chatModeHelp')}</div>
         )}
         <div class="seg" role="tablist">
           <button
             class={`seg-btn ${source === 'blank' ? 'on' : ''}`}
             onClick={() => setSource('blank')}
           >
-            空白项目
+            {tr('project.blankProject')}
           </button>
           <button class={`seg-btn ${source === 'git' ? 'on' : ''}`} onClick={() => setSource('git')}>
-            从 Git 克隆
+            {tr('project.cloneFromGit')}
           </button>
         </div>
         {source === 'git' && (
           <label class="field">
-            Git 仓库地址
+            {tr('project.gitUrl')}
             <input
               value={gitUrl}
               onInput={(e) => setGitUrl(e.currentTarget.value)}
-              placeholder="https://github.com/owner/repo.git 或 git@host:owner/repo.git"
+              placeholder={tr('project.gitUrlPlaceholder')}
             />
           </label>
         )}
         <label class="field">
-          项目名{source === 'git' && !nameTouched ? '（留空则用仓库名）' : ''}
+          {tr('project.projectName')}{source === 'git' && !nameTouched ? tr('project.repoNameDefault') : ''}
           <input
             value={name}
             onInput={(e) => {
@@ -730,23 +731,22 @@ function CreateProjectModal({
           />
         </label>
         <label class="field">
-          执行机
+          {tr('project.executor')}
           <ExecutorSelect executors={executors} value={executorId} onChange={setExecutorId} />
         </label>
         {isAdmin && <RunUserSelect osUsers={osUsers} value={runUser} onChange={setRunUser} />}
         <label class="field">
-          目标（可选，给 PM 管家看）
+          {tr('project.goalOptional')}
           <textarea rows={2} value={goal} onInput={(e) => setGoal(e.currentTarget.value)} />
         </label>
         <label class="field">
-          {source === 'git' ? '克隆到' : 'cwd'}（可选，默认落
-          {runUser ? '所选用户家目录' : '你的 workspace'}）
+          {tr('project.locationOptional', { target: source === 'git' ? tr('project.cloneTo') : 'cwd', home: runUser ? tr('project.selectedUserHome') : tr('project.yourWorkspace') })}
           <div class="row" style={{ gap: 6 }}>
             <input
               class="grow"
               value={cwd}
               onInput={(e) => setCwd(e.currentTarget.value)}
-              placeholder={anchoredCwd || '点「浏览」选择目录'}
+              placeholder={anchoredCwd || tr('project.pickDirectory')}
             />
             <button
               type="button"
@@ -754,38 +754,38 @@ function CreateProjectModal({
               disabled={!canBrowse}
               onClick={() => setPicking(true)}
             >
-              浏览
+              {tr('project.browse')}
             </button>
           </div>
         </label>
         {kind !== 'chat' && (
           <label class="field">
-            工作分支（可选，兜底）
+            {tr('project.workBranch')}
             <input
               value={workBranch}
               onInput={(e) => setWorkBranch(e.currentTarget.value)}
-              placeholder="任务都在你当前所在的分支上干活，mando 不新建/不切/不合并分支（分支与 MR 你自己在 GitLab 管理）；此项仅当读不到当前分支时兜底用"
+              placeholder={tr('project.branchFallbackHelp')}
             />
           </label>
         )}
         {kind !== 'chat' && (
           <label class="chkrow">
             <input type="checkbox" checked={withConv} onChange={(e) => setWithConv(e.currentTarget.checked)} />
-            顺手建一条对话
+            {tr('project.createConversation')}
           </label>
         )}
         {err && <div class="err">{err}</div>}
       </div>
       <div class="mbtns">
         <button class="btn" onClick={onClose}>
-          取消
+          {tr('ui.cancel')}
         </button>
         <button
           class="btn primary"
           disabled={busy || !effName || !executorId || (source === 'git' && !gitUrl.trim())}
           onClick={submit}
         >
-          {busy ? (source === 'git' ? '克隆中…' : '创建中…') : source === 'git' ? '克隆并创建' : '创建'}
+          {busy ? (source === 'git' ? tr('project.cloning') : tr('ui.creating')) : source === 'git' ? tr('project.cloneCreate') : tr('ui.create')}
         </button>
       </div>
       {picking && canBrowse && (
@@ -806,10 +806,10 @@ function CreateProjectModal({
 // ---------- 导入现有 tmux 会话 ----------
 
 function sessionBadge(s: TmuxSessionInfo) {
-  if (s.managedProjectId !== null) return <span class="badge b-gray">托管 #{s.managedProjectId}</span>;
-  if (s.importedProjectId !== null) return <span class="badge b-green">已导入 #{s.importedProjectId}</span>;
-  if (!s.allowed) return <span class="badge b-gray">无权限</span>;
-  if (s.sameCwdProjectId !== null) return <span class="badge b-amber">并入 #{s.sameCwdProjectId}</span>;
+  if (s.managedProjectId !== null) return <span class="badge b-gray">{tr('project.managed', { id: s.managedProjectId })}</span>;
+  if (s.importedProjectId !== null) return <span class="badge b-green">{tr('project.imported', { id: s.importedProjectId })}</span>;
+  if (!s.allowed) return <span class="badge b-gray">{tr('project.noPermission')}</span>;
+  if (s.sameCwdProjectId !== null) return <span class="badge b-amber">{tr('project.mergeInto', { id: s.sameCwdProjectId })}</span>;
   return null;
 }
 
@@ -885,8 +885,8 @@ function ImportTmuxModal({
           ...(runUser ? { runUser } : {}),
         },
       );
-      if (r.warnings?.length) toast.warn('已导入，但有警告：\n' + r.warnings.join('\n'));
-      if (!r.created) toast.info(`已并入既有项目「${r.project.name}」`);
+      if (r.warnings?.length) toast.warn(tr('project.importedWarnings', { warnings: r.warnings.join('\n') }));
+      if (!r.created) toast.info(tr('project.mergedExisting', { name: r.project.name }));
       onImported(r.project);
     } catch (x) {
       setErr(x instanceof ApiError ? x.message : String(x));
@@ -897,14 +897,14 @@ function ImportTmuxModal({
   const importable = (s: TmuxSessionInfo): boolean => s.managedProjectId === null && s.allowed;
 
   return (
-    <Modal title="导入 tmux 会话" onClose={onClose}>
+    <Modal title={tr('project.importTmux')} onClose={onClose}>
       <div class="formcol">
         <label class="field">
-          执行机
+          {tr('project.executor')}
           <ExecutorSelect executors={executors} value={executorId} onChange={setExecutorId} />
         </label>
-        {sessions === null && <div class="mut small">读取会话中…</div>}
-        {sessions !== null && sessions.length === 0 && !err && <div class="empty">执行机上没有 tmux 会话</div>}
+        {sessions === null && <div class="mut small">{tr('project.readingSessions')}</div>}
+        {sessions !== null && sessions.length === 0 && !err && <div class="empty">{tr('project.noTmuxSessions')}</div>}
         {sessions !== null && sessions.length > 0 && (
           <div style={{ maxHeight: '38vh', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
             {sessions.map((s) => (
@@ -928,7 +928,7 @@ function ImportTmuxModal({
                   {sessionBadge(s)}
                 </div>
                 <div class="mut small" style={{ wordBreak: 'break-all' }}>
-                  {s.cwd ?? '（无法定位工作目录）'} · {timeAgo(s.createdTs * 1000)}
+                  {s.cwd ?? tr('project.cwdUnavailable')} · {timeAgo(s.createdTs * 1000)}
                 </div>
               </div>
             ))}
@@ -937,16 +937,16 @@ function ImportTmuxModal({
         {picked && (
           <>
             <label class="field">
-              项目名
+              {tr('project.projectName')}
               <input value={name} onInput={(e) => setName(e.currentTarget.value)} />
             </label>
             {isAdmin && <RunUserSelect osUsers={osUsers} value={runUser} onChange={setRunUser} />}
             <label class="field">
-              目标（可选）
+              {tr('project.goal')}
               <textarea rows={2} value={goal} onInput={(e) => setGoal(e.currentTarget.value)} />
             </label>
             {picked.sameCwdProjectId !== null && (
-              <div class="mut small">该目录已有项目 #{picked.sameCwdProjectId}，导入将并入它（不新建项目）</div>
+              <div class="mut small">{tr('project.sameDirectory', { id: picked.sameCwdProjectId })}</div>
             )}
           </>
         )}
@@ -954,10 +954,10 @@ function ImportTmuxModal({
       </div>
       <div class="mbtns">
         <button class="btn" onClick={onClose}>
-          取消
+          {tr('ui.cancel')}
         </button>
         <button class="btn primary" disabled={busy || !picked || !name.trim()} onClick={submit}>
-          {busy ? '导入中…' : '导入'}
+          {busy ? tr('project.importing') : tr('project.import')}
         </button>
       </div>
     </Modal>

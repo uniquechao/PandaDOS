@@ -88,7 +88,8 @@ describe('审批分级矩阵', () => {
     expect(r.reason).toBe('跑测试安全');
     // 裸 system（评审 M17：不拼 persona/memory）+ jsonMode + user 模板（v1 agent.ts:643）
     const call = llm.calls[0]!;
-    expect(call.messages[0]!.content).toBe(AUTOPILOT_APPROVAL_SYS);
+    expect(call.messages[0]!.content).toStartWith(AUTOPILOT_APPROVAL_SYS);
+    expect(call.messages[0]!.content).toContain('zh-Hans');
     expect(call.opts?.jsonMode).toBe(true);
     expect(call.messages[1]!.content).toContain('总目标：做导出');
     expect(call.messages[1]!.content).toContain('当前任务：加 CSV 导出');

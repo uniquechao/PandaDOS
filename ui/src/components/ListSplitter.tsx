@@ -10,6 +10,7 @@
 import type { RefObject } from 'preact';
 import { useRef, useState } from 'preact/hooks';
 import type { ListWidth } from '../lib/listwidth';
+import { tr } from '../i18n/runtime';
 
 export function ListSplitter({
   containerRef,
@@ -60,8 +61,8 @@ export function ListSplitter({
       class={`gsplit${active ? ' on' : ''}`}
       role="separator"
       aria-orientation="vertical"
-      aria-label={label ?? '拖拽调整列表栏宽'}
-      title="拖拽调整列表栏宽 · 双击复位"
+      aria-label={label ?? tr('ui.dragList')}
+      title={tr('ui.dragListReset')}
       onPointerDown={(e) => {
         e.preventDefault();
         dragging.current = true;

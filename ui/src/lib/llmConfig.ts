@@ -1,4 +1,5 @@
 import type { Role } from './types';
+import { tr } from '../i18n/runtime';
 
 export interface LlmConfigFormState {
   baseUrl: string;
@@ -13,7 +14,7 @@ export function llmConfigGuidance(
 ): { message: string; actionPath: string | null } | null {
   if (configured) return null;
   return {
-    message: '请联系管理员配置驱动大模型',
+    message: tr('action.llmNotConfigured'),
     actionPath: role === 'admin' ? '/admin/llm' : null,
   };
 }

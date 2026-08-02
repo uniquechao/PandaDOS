@@ -191,7 +191,10 @@ function setup(
         };
   const dispatched: Array<Record<string, unknown>> = [];
   const notify = {
-    async dispatch(e: { kind: 'status_change'; projectId: number; issueId: number; summary: string }) {
+    async dispatch(e: {
+      kind: 'status_change'; projectId: number; issueId: number;
+      summaryCode: 'approval_selection'; summaryParams: Record<string, string | number>;
+    }) {
       dispatched.push(e);
     },
   };
@@ -499,7 +502,10 @@ describe('审批管道：escalate + consume', () => {
     await t.pipeline.process(t.ctx(MENU_YES_NO));
     expect(t.cards.length).toBe(0);
     expect(t.dispatched.length).toBe(1);
-    expect(String(t.dispatched[0]!.summary)).toContain('人工选择');
+    expect(t.dispatched[0]).toMatchObject({
+      summaryCode: 'approval_selection',
+      summaryParams: { context: expect.stringContaining('proceed?') },
+    });
     expect(t.pipeline.registry.size).toBe(1); // 网页仍可 consume
   });
 

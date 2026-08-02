@@ -23,7 +23,7 @@ const MOBILE_ENTRIES = [
       '<ExecNative pid={pid} issue={issue} seg={seg} />',
       "import('../components/TermPane')",
       "target={{ kind: 'issue', issueId: issue.id }}",
-      'closedMessage="当前执行会话不可接管：它可能已让位，或其共享会话已被其他 issue 复用。"',
+      "closedMessage={tr('issue.nativeSessionUnavailable')}",
     ],
   },
 ] as const;

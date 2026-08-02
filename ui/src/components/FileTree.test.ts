@@ -35,8 +35,8 @@ describe('FileTree 结构约束', () => {
   test('加载/空/错误三态齐备', () => {
     expect(source).toContain("'loading'");
     expect(source).toContain("'error'");
-    expect(source).toContain('（空目录）');
-    expect(source).toContain('加载失败');
+    expect(source).toContain("tr('ui.emptyDirectory')");
+    expect(source).toContain("tr('ui.loadFailed')");
   });
 
   test('文件点击回调、目录不回调', () => {

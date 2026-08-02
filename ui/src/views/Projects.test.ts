@@ -36,7 +36,7 @@ describe('项目归档/启用', () => {
   });
 
   test('归档卡片显示「启用」，其余显示「归档」；点按不触发整卡导航', () => {
-    expect(source).toContain("{p.status === 'archived' ? '启用' : '归档'}");
+    expect(source).toContain("{p.status === 'archived' ? tr('project.enableVerb') : tr('project.archiveVerb')}");
     expect(source).toContain("void setArchived(p, p.status !== 'archived')");
     // 按钮在整卡 onClick 里，必须 stopPropagation（与其它 pcard-act 一致）
     const btn = source.match(/\{canManage\(p\) && \([\s\S]*?<\/button>/)?.[0] ?? '';
@@ -57,7 +57,7 @@ describe('迁移工程目录（admin）', () => {
   const modal = source.match(/function CwdMigrateModal[\s\S]*?\ntype ProjFilter/)?.[0] ?? '';
 
   test('入口仅 admin 可见，点按不触发整卡导航', () => {
-    const entry = source.match(/\{me\.role === 'admin' && \([\s\S]*?迁移目录[\s\S]*?<\/button>/)?.[0] ?? '';
+    const entry = source.match(/\{me\.role === 'admin' && \([\s\S]*?project\.migrateWorkspace[\s\S]*?<\/button>/)?.[0] ?? '';
     expect(entry).not.toBe('');
     expect(entry).toContain('e.stopPropagation()');
     expect(entry).toContain('setMigrating(p)');
@@ -76,8 +76,7 @@ describe('迁移工程目录（admin）', () => {
   test('前置校验错误展示 + 「旧对话不可恢复」提醒', () => {
     expect(modal).toContain('setErr(x instanceof ApiError ? x.message : String(x))');
     expect(modal).toContain('{err && <div class="err">{err}</div>}');
-    expect(modal).toContain('旧对话不可恢复');
-    expect(modal).toContain('有执行中');
+    expect(modal).toContain("tr('project.migrateWarning')");
   });
 
   test('成功后就地更新项目并提示关闭的会话数；目录名为空/请求中禁点', () => {

@@ -363,7 +363,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
       s.dispatch(req('PATCH', `/api/projects/1/issues/${runId}`, s.alice.token, { title: '偷改' })),
     );
     expect(drivingRes.status).toBe(400);
-    expect(String(drivingRes.body.error)).toContain('已开跑');
+    expect(String(drivingRes.body.error.details)).toContain('已开跑');
 
     // 取消后：可改内容（本 issue 的核心诉求——取消 → 改需求 → 重新运行）
     expect((await s.engine.cancelIssue(runId, s.alice.user.id)).ok).toBe(true);
@@ -399,7 +399,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
       s.dispatch(req('PATCH', `/api/projects/1/issues/${finished.id}`, s.alice.token, { title: 'y' })),
     );
     expect(doneRes.status).toBe(400);
-    expect(String(doneRes.body.error)).toContain('已完成');
+    expect(String(doneRes.body.error.details)).toContain('已完成');
   });
 
   test('PATCH 需求内容变化触发重新分析：title/body/截图变了才析，仅元数据或未变不析', async () => {
@@ -562,7 +562,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
       s.dispatch(req('POST', `/api/projects/1/issues/${iid}/auto-approve`, s.alice.token, { level: 'cautious' })),
     );
     expect(onDone.status).toBe(409);
-    expect(String(onDone.body.error)).toContain('已完成/已取消');
+    expect(String(onDone.body.error.details)).toContain('已完成/已取消');
     expect(s.engine.store.get(iid)!.autoApprove).toBe('auto');
     expect(s.engine.store.countEvents(iid, 'auto_approve_changed')).toBe(1); // 拒改不记审计
 
@@ -586,8 +586,8 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     // 非 cancelled（驱动中）→ 409 且文案说清为什么
     const notCancelled = await j(s.dispatch(req('POST', `/api/projects/1/issues/${iid1}/reopen`, s.alice.token)));
     expect(notCancelled.status).toBe(409);
-    expect(String(notCancelled.body.error)).toContain('仅已取消的 issue 可重新运行');
-    expect(String(notCancelled.body.error)).toContain('planning'); // 带上当前状态，便于排查
+    expect(String(notCancelled.body.error.details)).toContain('仅已取消的 issue 可重新运行');
+    expect(String(notCancelled.body.error.details)).toContain('planning'); // 带上当前状态，便于排查
 
     // 取消 → 改需求 → 复活：完整走一遍本 issue 的目标流程
     expect((await s.engine.cancelIssue(iid1, s.alice.user.id)).ok).toBe(true);
@@ -1152,7 +1152,7 @@ describe('模块管理路由：智能整理 / 执行合并 / 改名归档', () =
 
     const ar1 = await j(s.dispatch(req('PATCH', `/api/projects/1/modules/${m1.id}`, s.alice.token, { status: 'archived' })));
     expect(ar1.status).toBe(400);
-    expect(ar1.body.error).toContain('未完结');
+    expect(ar1.body.error.details).toContain('未完结');
     await s.engine.cancelIssue(a.id, s.alice.user.id);
     const ar2 = await j(s.dispatch(req('PATCH', `/api/projects/1/modules/${m1.id}`, s.alice.token, { status: 'archived' })));
     expect(ar2.status).toBe(200);

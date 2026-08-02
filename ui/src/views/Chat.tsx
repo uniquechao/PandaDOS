@@ -38,8 +38,11 @@ import type {
 import { useConvModel } from '../lib/useConvModel';
 import { useWide } from '../lib/useWide';
 import { reconcileAgent } from '../components/AgentPicker';
+import { useI18n } from '../i18n/provider';
+import { tr } from '../i18n/runtime';
 
 export function ChatView({ pid }: { pid: number }) {
+  const { t } = useI18n();
   const [project, setProject] = useState<Project | null>(null);
   const [convs, setConvs] = useState<Conversation[] | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
@@ -112,7 +115,7 @@ export function ChatView({ pid }: { pid: number }) {
   };
 
   const archiveConv = async (id: string): Promise<void> => {
-    if (!window.confirm('归档这条对话？会停止其后台会话（历史保留，可在归档中找回）。')) return;
+    if (!window.confirm(t('view.archiveConversationConfirm'))) return;
     try {
       await api(`/api/projects/${pid}/conversations/${id}/archive`, 'POST');
       const rest = (convs ?? []).filter((c) => c.id !== id);
@@ -175,8 +178,8 @@ export function ChatView({ pid }: { pid: number }) {
       await api(`/api/projects/${pid}/memory`, 'POST', { agent });
       setProject((p) => (p ? { ...p, summaryStatus: 'running' } : p));
       const final = await pollProjectSummary(pid, { onTick: setProject });
-      if (final.summaryStatus === 'done') toast.success('项目记忆已更新');
-      else if (final.summaryStatus === 'error') toast.error(final.summaryError ?? '更新失败');
+      if (final.summaryStatus === 'done') toast.success(t('view.projectMemoryUpdated'));
+      else if (final.summaryStatus === 'error') toast.error(final.summaryError ?? t('view.updateFailed'));
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : String(e));
     } finally {
@@ -219,12 +222,12 @@ export function ChatView({ pid }: { pid: number }) {
           />
         ) : (
           <>
-            <span class="conv-nm grow">{c.label || '新对话'}</span>
+            <span class="conv-nm grow">{c.label || t('view.newConversation')}</span>
             <span class="conv-time">{timeAgo(c.lastActiveTs ?? c.createdTs)}</span>
             <span
               class="conv-act"
               role="button"
-              title="重命名"
+              title={t('ui.rename')}
               onClick={(e) => {
                 e.stopPropagation();
                 startRename(c);
@@ -235,7 +238,7 @@ export function ChatView({ pid }: { pid: number }) {
             <span
               class="conv-act"
               role="button"
-              title="归档"
+              title={t('ui.archive')}
               onClick={(e) => {
                 e.stopPropagation();
                 void archiveConv(c.id);
@@ -252,7 +255,7 @@ export function ChatView({ pid }: { pid: number }) {
   const list = (
     <div class="conv-list">
       <div class="conv-list-hd">
-        <span class="conv-list-t">对话{convs ? ` · ${convs.length}` : ''}</span>
+        <span class="conv-list-t">{t('view.conversation')}{convs ? ` · ${convs.length}` : ''}</span>
         <div class="conv-new">
           <div class="seg sm" role="tablist">
             {supportedAgents.map((agent) => (
@@ -270,14 +273,14 @@ export function ChatView({ pid }: { pid: number }) {
             disabled={busy || supportedAgents.length === 0}
             onClick={() => void createConv()}
           >
-            ＋ 新建
+            ＋ {t('ui.create')}
           </button>
         </div>
       </div>
       <div class="conv-items">
         {convs === null && <Loading />}
         {convs !== null && convs.length === 0 && (
-          <div class="empty">还没有对话，选择代理后点「＋ 新建」开始。</div>
+          <div class="empty">{t('view.noConversations')}</div>
         )}
         {(convs ?? []).map(convRow)}
       </div>
@@ -293,7 +296,7 @@ export function ChatView({ pid }: { pid: number }) {
             <button class="back" onClick={() => setSelected(null)}>
               ‹
             </button>
-            <span class="btitle">{selectedConv?.label || '对话'}</span>
+            <span class="btitle">{selectedConv?.label || t('view.conversation')}</span>
             <span class="badge b-gray">{selectedConv?.agent ?? ''}</span>
           </div>
         </div>
@@ -319,8 +322,8 @@ export function ChatView({ pid }: { pid: number }) {
           <button class="back" onClick={() => nav(backTo)}>
             ‹
           </button>
-          <span class="btitle">{project?.name ?? `项目 #${pid}`}</span>
-          <span class="badge b-purple">对话</span>
+          <span class="btitle">{project?.name ?? t('view.projectFallback', { id: pid })}</span>
+          <span class="badge b-purple">{t('view.conversation')}</span>
           <div class="bacts">
             <SummaryButton
               status={project?.summaryStatus}
@@ -329,25 +332,25 @@ export function ChatView({ pid }: { pid: number }) {
                 supportedAgents.includes(m.mode as AgentKind),
               )}
               renderLabel={memoryBtnLabel}
-              title="更新项目记忆（读对话历史+代码库，刷新 CLAUDE.md/AGENTS.md）"
+              title={t('view.updateProjectMemory')}
               onPick={(mode) => void updateMemory(mode)}
             />
             <button
               class={'btn sm' + (wide && showFiles ? ' primary' : '')}
-              title="文件与预览"
+              title={t('view.filesPreview')}
               onClick={() => (wide ? setShowFiles((v) => !v) : nav(`/p/${pid}/files`))}
             >
-              文件
+              {t('view.files')}
             </button>
             <button class="btn sm" onClick={() => nav(`/p/${pid}/term`)}>
-              原生 Bash
+              {t('view.nativeBash')}
             </button>
           </div>
         </div>
         {project?.understanding && (
           <details class="understanding">
             <summary>
-              🧠 项目记忆
+              🧠 {t('view.projectMemory')}
               {project.understandingAgent ? `（${project.understandingAgent}）` : ''}
               {project.understandingTs ? ` · ${timeAgo(project.understandingTs)}` : ''}
             </summary>
@@ -355,7 +358,7 @@ export function ChatView({ pid }: { pid: number }) {
           </details>
         )}
         {project?.summaryError && project.summaryStatus === 'error' && (
-          <div class="err">记忆更新失败：{project.summaryError}</div>
+          <div class="err">{t('view.memoryUpdateFailed', { error: project.summaryError })}</div>
         )}
         {err && <div class="err">{err}</div>}
       </div>
@@ -368,7 +371,7 @@ export function ChatView({ pid }: { pid: number }) {
           >
             {list}
           </div>
-          <ListSplitter containerRef={splitRef} list={listW} label="对话列表栏宽" />
+          <ListSplitter containerRef={splitRef} list={listW} label={t('view.conversationListWidth')} />
           <div class="wb-main">
             {selected ? (
               <ConversationPane
@@ -381,7 +384,7 @@ export function ChatView({ pid }: { pid: number }) {
                 onProducedFiles={handleProduced}
               />
             ) : (
-              <div class="gd-empty">← 选择或新建一条对话</div>
+              <div class="gd-empty">← {t('view.chooseConversation')}</div>
             )}
           </div>
           {showFiles && (
@@ -483,15 +486,15 @@ function NativeConversationTerminal({
         <TermPane pid={pid} target={{ kind: 'conversation', convId: selected }} />
       ) : error ? (
         <div class="empty">
-          原生会话启动失败：{error}
+          {tr('view.nativeStartFailed', { error })}
           <div>
             <button class="btn primary" onClick={() => setGen((g) => g + 1)}>
-              重试
+              {tr('action.retry')}
             </button>
           </div>
         </div>
       ) : (
-        <div class="empty">正在启动原生会话…</div>
+        <div class="empty">{tr('view.startingNative')}</div>
       )}
     </div>
   );
@@ -508,6 +511,7 @@ function FilePanel({
   produced: string[];
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   const [rel, setRel] = useState('');
   const [list, setList] = useState<FsList | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
@@ -570,8 +574,8 @@ function FilePanel({
         body: fd,
       });
       const j = (await r.json().catch(() => null)) as (FsUploadResult & { error?: string }) | null;
-      if (!r.ok || !j?.ok) throw new Error(j?.error ?? `上传失败(HTTP ${r.status})`);
-      toast.success(`已上传 ${j.name}`);
+      if (!r.ok || !j?.ok) throw new Error(j?.error ?? t('view.uploadFailed', { status: r.status }));
+      toast.success(t('view.uploaded', { name: j.name }));
       load(rel);
     } catch (e) {
       toast.error(String(e instanceof Error ? e.message : e));
@@ -585,19 +589,19 @@ function FilePanel({
   return (
     <div class="fpanel">
       <div class="fpanel-hd">
-        <span class="fpanel-t">文件</span>
+        <span class="fpanel-t">{t('view.files')}</span>
         <button
           class="linkbtn"
-          title="上传到当前目录"
+          title={t('view.uploadCurrentDirectory')}
           disabled={uploading}
           onClick={() => fileInput.current?.click()}
         >
           {uploading ? '…' : '⇧'}
         </button>
-        <button class="linkbtn" title="刷新" onClick={() => load(rel, false)}>
+        <button class="linkbtn" title={t('ui.refresh')} onClick={() => load(rel, false)}>
           🔄
         </button>
-        <button class="linkbtn" title="关闭" onClick={onClose}>
+        <button class="linkbtn" title={t('action.close')} onClick={onClose}>
           ✕
         </button>
       </div>
@@ -631,7 +635,7 @@ function FilePanel({
       {err && <div class="err">{err}</div>}
       <div class="fpanel-list">
         {list === null && !err && <Loading />}
-        {list !== null && list.entries.length === 0 && <div class="empty">（空目录）</div>}
+        {list !== null && list.entries.length === 0 && <div class="empty">{t('ui.emptyDirectory')}</div>}
         {(list?.entries ?? []).map((e) => (
           <div
             key={e.name}
@@ -655,7 +659,7 @@ function FilePreview({ pid, path, onBack }: { pid: number; path: string; onBack:
   return (
     <div class="fp-preview">
       <div class="fp-preview-hd">
-        <button class="linkbtn" title="收起预览" onClick={onBack}>
+        <button class="linkbtn" title={tr('view.collapsePreview')} onClick={onBack}>
           ▾
         </button>
         <span class="fp-preview-nm" title={path}>
@@ -663,10 +667,10 @@ function FilePreview({ pid, path, onBack }: { pid: number; path: string; onBack:
         </span>
         <button
           class="btn sm"
-          title="在完整文件目录页中打开"
+          title={tr('view.openFullFiles')}
           onClick={() => nav(`/p/${pid}/files`)}
         >
-          展开
+          {tr('ui.expand')}
         </button>
         <a class="btn sm" href={dl}>
           ⬇
@@ -677,18 +681,18 @@ function FilePreview({ pid, path, onBack }: { pid: number; path: string; onBack:
         {kind === 'html' && <iframe class="fp-frame" src={raw} sandbox="" title={name} />}
         {kind === 'pdf' && (
           <div class="fp-dl">
-            PDF 文件，请下载后查看。
+            {tr('ui.pdfDownload')}
             <a class="btn sm primary" href={dl}>
-              ⬇ 下载 PDF
+              ⬇ {tr('ui.downloadPdf')}
             </a>
           </div>
         )}
         {kind === 'text' && <TextPreview pid={pid} path={path} />}
         {kind === 'download' && (
           <div class="fp-dl">
-            该类型不支持预览。
+            {tr('view.previewUnsupported')}
             <a class="btn sm primary" href={dl}>
-              ⬇ 下载
+              ⬇ {tr('ui.download')}
             </a>
           </div>
         )}
@@ -707,7 +711,7 @@ function TextPreview({ pid, path }: { pid: number; path: string }) {
       .then((r) => setText(r.content))
       .catch((e: Error) => setErr(e.message));
   }, [pid, path]);
-  if (err) return <div class="fp-dl">{err}（请下载查看）</div>;
+  if (err) return <div class="fp-dl">{err} ({tr('view.downloadToOpen')})</div>;
   if (text === null) return <Loading />;
   return <pre class="fp-code">{text}</pre>;
 }

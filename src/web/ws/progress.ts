@@ -38,7 +38,8 @@ export interface ProgressNotifier {
     kind: 'status_change';
     projectId: number;
     issueId: number;
-    summary: string;
+    summaryCode: 'progress' | 'progress_needs_reply';
+    summaryParams: { emoji: string; headline: string };
   }): Promise<void>;
 }
 
@@ -63,10 +64,17 @@ export function progressToEvent(
   projectId: number,
   issueId: number,
   a: ProgressAnalysis,
-): { kind: 'status_change'; projectId: number; issueId: number; summary: string } {
+): {
+  kind: 'status_change'; projectId: number; issueId: number;
+  summaryCode: 'progress' | 'progress_needs_reply';
+  summaryParams: { emoji: string; headline: string };
+} {
   const emoji = STATUS_EMOJI[a.status] ?? '🛠️';
-  const tail = a.needsReply ? '（它在等你回话）' : '';
-  return { kind: 'status_change', projectId, issueId, summary: `${emoji} ${a.headline}${tail}` };
+  return {
+    kind: 'status_change', projectId, issueId,
+    summaryCode: a.needsReply ? 'progress_needs_reply' : 'progress',
+    summaryParams: { emoji, headline: a.headline },
+  };
 }
 
 export class ProgressBridge {

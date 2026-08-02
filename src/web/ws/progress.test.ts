@@ -143,19 +143,27 @@ describe('ProgressBridge', () => {
     const r = t.reporters.get(10)!;
     await r.onPush!({ push: true, status: 'error', needsReply: true, headline: '测试炸了' });
     expect(t.dispatched).toEqual([
-      { kind: 'status_change', projectId: 10, issueId: 42, summary: '❗ 测试炸了（它在等你回话）' },
+      {
+        kind: 'status_change', projectId: 10, issueId: 42,
+        summaryCode: 'progress_needs_reply', summaryParams: { emoji: '❗', headline: '测试炸了' },
+      },
     ]);
     await r.onPush!({ push: true, status: 'milestone', needsReply: false, headline: '阶段完成' });
-    expect(t.dispatched[1]!.summary).toBe('📌 阶段完成');
+    expect(t.dispatched[1]).toMatchObject({
+      summaryCode: 'progress', summaryParams: { emoji: '📌', headline: '阶段完成' },
+    });
   });
 
   test('progressToEvent 帧形状（确定性翻译）', () => {
     expect(progressToEvent(1, 2, { push: true, status: 'done', needsReply: false, headline: 'ok' }))
-      .toEqual({ kind: 'status_change', projectId: 1, issueId: 2, summary: '✅ ok' });
+      .toEqual({
+        kind: 'status_change', projectId: 1, issueId: 2,
+        summaryCode: 'progress', summaryParams: { emoji: '✅', headline: 'ok' },
+      });
     expect(
       progressToEvent(1, 2, { push: true, status: 'waiting', needsReply: true, headline: '等确认' })
-        .summary,
-    ).toBe('💬 等确认（它在等你回话）');
+        .summaryCode,
+    ).toBe('progress_needs_reply');
   });
 
   test('stopAll：清全部 reporter，之后消息忽略（停机语义）', () => {

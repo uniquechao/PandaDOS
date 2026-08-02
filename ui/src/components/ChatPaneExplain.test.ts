@@ -16,7 +16,7 @@ describe('ChatPane「解释一下」（issue #112）', () => {
     expect(src).toContain("send({ type: 'explain', sig: sel.sig })");
     expect(src).toContain('onClick={askExplain}');
     expect(src).toContain('disabled={explaining}');
-    expect(src).toContain("{explaining ? '解读中…' : '🤔 解释一下'}");
+    expect(src).toContain("{explaining ? t('ui.explaining') : `🤔 ${t('ui.explain')}`}");
     // 连点守卫：在途不重复发
     expect(src).toContain('if (!sel || explaining) return');
   });
@@ -36,7 +36,7 @@ describe('ChatPane「解释一下」（issue #112）', () => {
     const src = await Bun.file(paneUrl).text();
     expect(src).toContain("f.code === 'explain_failed'");
     expect(src).toContain('setExplainErr(true)');
-    expect(src).toContain('解读失败，可重试');
+    expect(src).toContain("t('ui.explainFailed')");
   });
 
   test('帧类型、mock 与样式都补齐了', async () => {

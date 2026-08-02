@@ -1,3 +1,5 @@
+import type { SupportedLocale } from '../../shared/i18n/locales';
+
 /**
  * core/types —— 领域类型（对应 SQLite 数据模型，spec §4）。
  * 依赖方向最内层：不 import 任何其他业务模块。
@@ -27,6 +29,12 @@ export interface UserSettings {
   autopilotDefault: boolean;
   /** JSON 字符串：通知偏好（渠道/节流等） */
   notifyPref: string | null;
+  /** Explicit account language; null only until an existing account is initialized. */
+  locale: SupportedLocale | null;
+  /** Fixed IANA timezone; null follows the current device. */
+  timezone: string | null;
+  /** Last valid browser timezone for server-side notifications in automatic mode. */
+  detectedTimezone: string | null;
 }
 
 // ---------- 执行机 ----------

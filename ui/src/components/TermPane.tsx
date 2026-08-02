@@ -8,6 +8,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { connectWs, type WsHandle } from '../lib/ws';
 import { bindTermTouchScroll, createTermTouchScrollController } from './termTouchScroll';
+import { tr } from '../i18n/runtime';
 
 /** 按键条 → 直接写入 pty 的字节 */
 const TERM_KEYS: Array<[string, string]> = [
@@ -173,9 +174,9 @@ export function TermPane({ pid, target, onStatus, closedMessage }: TermPaneProps
       <div class="termbox" ref={boxRef}>
         {(status === 'closed' || status === 'exit') && (
           <div class="term-overlay">
-            <div>{status === 'closed' ? (closedMessage ?? '连接已断开') : '终端会话已结束'}</div>
+            <div>{status === 'closed' ? (closedMessage ?? tr('ui.terminalDisconnected')) : tr('ui.terminalEnded')}</div>
             <button class="btn primary big" onClick={() => setGen((g) => g + 1)}>
-              重新连接
+              {tr('ui.reconnect')}
             </button>
           </div>
         )}

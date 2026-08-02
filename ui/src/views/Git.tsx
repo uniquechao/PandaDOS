@@ -56,6 +56,7 @@ import { FileTree } from '../components/FileTree';
 import { FileViewer } from '../components/FileViewer';
 import { ListSplitter } from '../components/ListSplitter';
 import { Splitter } from '../components/Splitter';
+import { tr } from '../i18n/runtime';
 
 // ---------- 绘图常量 ----------
 
@@ -138,21 +139,22 @@ export function RefBadges({ refs, max = 3 }: { refs: string[]; max?: number }) {
   );
 }
 
-const FILE_STATUS: Record<string, { label: string; cls: string }> = {
-  A: { label: '新增', cls: 'fs-a' },
-  M: { label: '修改', cls: 'fs-m' },
-  D: { label: '删除', cls: 'fs-d' },
-  R: { label: '重命名', cls: 'fs-r' },
-  C: { label: '复制', cls: 'fs-r' },
-  T: { label: '类型变更', cls: 'fs-m' },
-  U: { label: '冲突', cls: 'fs-d' },
-  '?': { label: '未跟踪', cls: 'fs-u' },
+const FILE_STATUS: Record<string, { key: Parameters<typeof tr>[0]; cls: string }> = {
+  A: { key: 'git.added', cls: 'fs-a' },
+  M: { key: 'git.modified', cls: 'fs-m' },
+  D: { key: 'git.deleted', cls: 'fs-d' },
+  R: { key: 'git.renamed', cls: 'fs-r' },
+  C: { key: 'git.copied', cls: 'fs-r' },
+  T: { key: 'git.typeChanged', cls: 'fs-m' },
+  U: { key: 'git.conflict', cls: 'fs-d' },
+  '?': { key: 'git.untracked', cls: 'fs-u' },
 };
 
 export function StatusChip({ code }: { code: string }) {
-  const st = FILE_STATUS[code[0] ?? ''] ?? { label: code, cls: 'fs-m' };
+  const st = FILE_STATUS[code[0] ?? ''];
+  const label = st ? tr(st.key) : code;
   return (
-    <span class={`fschip ${st.cls}`} title={st.label}>
+    <span class={`fschip ${st?.cls ?? 'fs-m'}`} title={label}>
       {code[0]}
     </span>
   );
@@ -172,7 +174,7 @@ export function PathText({ path, oldPath }: { path: string; oldPath?: string }) 
 
 export function PlusMinus({ adds, dels }: { adds?: number | null; dels?: number | null }) {
   if (adds === undefined && dels === undefined) return null;
-  if (adds === null || dels === null) return <span class="gf-bin">二进制</span>;
+  if (adds === null || dels === null) return <span class="gf-bin">{tr('git.binary')}</span>;
   return (
     <span class="gf-pm mono">
       {adds ? <em class="d-add">+{adds}</em> : null}
@@ -185,8 +187,8 @@ export function PlusMinus({ adds, dels }: { adds?: number | null; dels?: number 
 function copyText(s: string, hint: string): void {
   navigator.clipboard
     ?.writeText(s)
-    .then(() => toast.success(`已复制${hint}`))
-    .catch(() => toast.error('复制失败'));
+    .then(() => toast.success(tr('git.copiedHint', { hint })))
+    .catch(() => toast.error(tr('git.copyFailed')));
 }
 
 // ---------- AI 助读交互件（结果仅存组件内存，不落库） ----------
@@ -215,7 +217,7 @@ function useGitAi(): {
         if (seq.current === my) setRun({ label, loading: false, text });
       })
       .catch((e: Error) => {
-        if (seq.current === my) setRun({ label, loading: false, error: e.message || 'AI 生成失败' });
+        if (seq.current === my) setRun({ label, loading: false, error: e.message || tr('git.aiFailed') });
       });
   };
   const clear = (): void => {
@@ -231,17 +233,17 @@ function AiPanel({ run, onClose }: { run: AiRun; onClose: () => void }) {
   return (
     <div class="ai-panel">
       <div class="ai-panel-hd">
-        <button class="gd-collapse" title={open ? '折叠' : '展开'} onClick={() => setOpen((o) => !o)}>
+        <button class="gd-collapse" title={open ? tr('git.collapse') : tr('git.expand')} onClick={() => setOpen((o) => !o)}>
           {open ? '▾' : '▸'}
         </button>
         <span class="ai-panel-title">🤖 {run.label}</span>
-        {run.loading && <span class="ai-panel-status mut">生成中…</span>}
+        {run.loading && <span class="ai-panel-status mut">{tr('git.generating')}</span>}
         {!run.loading && run.text && (
-          <button class="ai-copy" title="复制结果" onClick={() => copyText(run.text!, ' AI 结果')}>
-            复制
+          <button class="ai-copy" title={tr('git.copyResult')} onClick={() => copyText(run.text!, ' AI result')}>
+            {tr('ui.copy')}
           </button>
         )}
-        <button class="gs-x" title="关闭" onClick={onClose}>✕</button>
+        <button class="gs-x" title={tr('git.close')} onClick={onClose}>✕</button>
       </div>
       {open && (
         <div class="ai-panel-body">
@@ -259,14 +261,14 @@ function CommitAiBtns({ pid, sha, ai }: { pid: number; sha: string; ai: ReturnTy
   const busy = ai.run?.loading ?? false;
   return (
     <div class="ai-btns">
-      <button class="ai-btn" disabled={busy} onClick={() => ai.start('总结提交', () => aiSummarizeCommit(pid, sha))}>
-        ✨ 总结提交
+      <button class="ai-btn" disabled={busy} onClick={() => ai.start(tr('git.summarizeCommit'), () => aiSummarizeCommit(pid, sha))}>
+        ✨ {tr('git.summarizeCommit')}
       </button>
-      <button class="ai-btn" disabled={busy} onClick={() => ai.start('识别风险', () => aiCommitRisk(pid, sha))}>
-        ⚠ 识别风险
+      <button class="ai-btn" disabled={busy} onClick={() => ai.start(tr('git.identifyRisk'), () => aiCommitRisk(pid, sha))}>
+        ⚠ {tr('git.identifyRisk')}
       </button>
-      <button class="ai-btn" disabled={busy} onClick={() => ai.start('解释 Diff', () => aiExplainCommit(pid, sha))}>
-        🔍 解释整条 Diff
+      <button class="ai-btn" disabled={busy} onClick={() => ai.start(tr('git.explainDiff'), () => aiExplainCommit(pid, sha))}>
+        🔍 {tr('git.explainWholeDiff')}
       </button>
     </div>
   );
@@ -289,7 +291,7 @@ function diffLineCls(l: string): string {
 export function DiffBody({ d, error }: { d: GitDiff | null; error?: string }) {
   if (error) return <div class="empty"><span class="err">{error}</span></div>;
   if (d === null) return <Loading />;
-  if (!d.diff.trim()) return <div class="empty">没有内容差异</div>;
+  if (!d.diff.trim()) return <div class="empty">{tr('git.noDiff')}</div>;
   const lines = d.diff.split('\n');
   const shown = lines.slice(0, DIFF_MAX_LINES);
   return (
@@ -298,7 +300,7 @@ export function DiffBody({ d, error }: { d: GitDiff | null; error?: string }) {
         <div class={diffLineCls(l)}>{l || ' '}</div>
       ))}
       {(lines.length > DIFF_MAX_LINES || d.truncated) && (
-        <div class="dl dh">… diff 过长已截断 …</div>
+        <div class="dl dh">{tr('git.diffTooLong')}</div>
       )}
     </pre>
   );
@@ -397,26 +399,26 @@ export function CommitMeta({ d, onJump }: { d: GitCommitDetail; onJump: (sha: st
       {body && <pre class="gs-msg">{body}</pre>}
       <div class="gs-meta">
         <div>
-          <span class="gs-k">作者</span>
+          <span class="gs-k">{tr('git.author')}</span>
           <b>{d.author}</b> <span class="mut">&lt;{d.authorEmail}&gt;</span>
           <span class="mut"> · {fmtTime(d.authorTs)}（{timeAgo(d.authorTs)}）</span>
         </div>
         {(d.committer !== d.author || d.commitTs !== d.authorTs) && (
           <div>
-            <span class="gs-k">提交</span>
+            <span class="gs-k">{tr('git.committer')}</span>
             <b>{d.committer}</b>
             <span class="mut"> · {fmtTime(d.commitTs)}（{timeAgo(d.commitTs)}）</span>
           </div>
         )}
         {d.parents.length > 0 && (
           <div>
-            <span class="gs-k">父提交</span>
+            <span class="gs-k">{tr('git.parentCommit')}</span>
             {d.parents.map((p) => (
               <button class="gs-parent mono" onClick={() => onJump(p)}>
                 {p.slice(0, 8)}
               </button>
             ))}
-            {d.parents.length > 1 && <span class="mut">（合并）</span>}
+            {d.parents.length > 1 && <span class="mut"> ({tr('git.merge')})</span>}
           </div>
         )}
       </div>
@@ -448,7 +450,7 @@ export function CommitHead({
         <div class="gd-headrow">
           <button
             class="gd-collapse"
-            title={open ? '折叠详情' : '展开详情'}
+            title={open ? tr('git.collapseDetails') : tr('git.expandDetails')}
             aria-expanded={open}
             onClick={() => setOpen((o) => !o)}
           >
@@ -456,7 +458,7 @@ export function CommitHead({
           </button>
           <span
             class="gs-sha mono"
-            title="点击复制完整 sha"
+            title={tr('git.copySha')}
             onClick={() => d && copyText(d.sha, ' sha')}
           >
             {short} ⧉
@@ -488,7 +490,7 @@ export function FilesHead({ files }: { files: GitFile[] }) {
   const totals = sumFiles(files);
   return (
     <div class="gs-fhead">
-      {files.length} 个文件
+      {tr('git.fileCount', { count: files.length })}
       {(totals.adds > 0 || totals.dels > 0) && (
         <span class="gf-pm mono">
           <em class="d-add">+{totals.adds}</em>
@@ -508,7 +510,7 @@ export function FileRows({
 }) {
   return (
     <div class="gs-files">
-      {files.length === 0 && <div class="mut small">（无文件改动）</div>}
+      {files.length === 0 && <div class="mut small">{tr('git.noFileChanges')}</div>}
       {files.map((f) => (
         <button class={`gf-row${selPath === f.path ? ' on' : ''}`} onClick={() => onOpen(f)}>
           <StatusChip code={f.status} />
@@ -524,9 +526,15 @@ export function FileRows({
 
 export interface WtEntry {
   change: GitChange;
-  group: '已暂存' | '未暂存' | '未跟踪';
+  group: 'staged' | 'unstaged' | 'untracked';
   code: string;
 }
+
+const WT_GROUP_KEYS: Record<WtEntry['group'], Parameters<typeof tr>[0]> = {
+  staged: 'git.staged',
+  unstaged: 'git.unstaged',
+  untracked: 'git.untrackedGroup',
+};
 
 /** porcelain 两列码 → 按暂存区/工作区拆组（同一文件可同时出现在两组） */
 function groupChanges(changes: GitChange[]): WtEntry[] {
@@ -535,11 +543,11 @@ function groupChanges(changes: GitChange[]): WtEntry[] {
     const x = c.status[0] ?? ' ';
     const y = c.status[1] ?? ' ';
     if (c.status === '??') {
-      out.push({ change: c, group: '未跟踪', code: '?' });
+      out.push({ change: c, group: 'untracked', code: '?' });
       continue;
     }
-    if (x !== ' ') out.push({ change: c, group: '已暂存', code: x });
-    if (y !== ' ') out.push({ change: c, group: '未暂存', code: y });
+    if (x !== ' ') out.push({ change: c, group: 'staged', code: x });
+    if (y !== ' ') out.push({ change: c, group: 'unstaged', code: y });
   }
   return out;
 }
@@ -550,7 +558,7 @@ export const wtKey = (e: WtEntry): string => `${e.group}:${e.change.path}`;
 export function wtDiffUrl(pid: number, e: WtEntry): string {
   const q = new URLSearchParams({ path: e.change.path });
   if (e.change.oldPath) q.set('old', e.change.oldPath);
-  if (e.group === '未跟踪') q.set('untracked', '1');
+  if (e.group === 'untracked') q.set('untracked', '1');
   return `/api/projects/${pid}/git/worktree/diff?${q}`;
 }
 
@@ -562,14 +570,14 @@ export function WtGroups({
   onOpen: (e: WtEntry) => void;
 }) {
   const entries = groupChanges(changes);
-  const groups = (['已暂存', '未暂存', '未跟踪'] as const)
+  const groups = (['staged', 'unstaged', 'untracked'] as const)
     .map((g) => ({ g, items: entries.filter((e) => e.group === g) }))
     .filter((x) => x.items.length > 0);
   return (
     <>
       {groups.map(({ g, items }) => (
         <div class="gs-group">
-          <div class="gs-fhead">{g} · {items.length}</div>
+          <div class="gs-fhead">{tr(WT_GROUP_KEYS[g])} · {items.length}</div>
           <div class="gs-files">
             {items.map((e) => (
               <button class={`gf-row${selKey === wtKey(e) ? ' on' : ''}`} onClick={() => onOpen(e)}>
@@ -626,11 +634,11 @@ function CommitSheet({
             <button
               class="ai-btn ai-btn-sm"
               disabled={fileAi.run?.loading}
-              title="AI 解释此文件改动"
-              onClick={() => fileAi.start('解释 Diff', () =>
+              title={tr('git.explainFile')}
+              onClick={() => fileAi.start(tr('git.explainDiff'), () =>
                 aiExplainFile(pid, { sha, path: fd.file!.path, old: fd.file!.oldPath }))}
             >
-              ✨ 解释
+              ✨ {tr('git.explain')}
             </button>
             <button class="gs-x" onClick={onClose}>✕</button>
           </div>
@@ -642,7 +650,7 @@ function CommitSheet({
           <div class="gs-head">
             <span
               class="gs-sha mono"
-              title="点击复制完整 sha"
+              title={tr('git.copySha')}
               onClick={() => d && copyText(d.sha, ' sha')}
             >
               {d?.short ?? sha.slice(0, 8)} ⧉
@@ -659,7 +667,7 @@ function CommitSheet({
                 aria-expanded={openMeta}
                 onClick={() => setOpenMeta((o) => !o)}
               >
-                {openMeta ? '▾ 收起详情' : '▸ 展开详情'}
+                {openMeta ? `▾ ${tr('git.collapseDetails')}` : `▸ ${tr('git.expandDetails')}`}
               </button>
               {openMeta && <CommitMeta d={d} onJump={onJump} />}
               <CommitAiBtns pid={pid} sha={sha} ai={commitAi} />
@@ -696,14 +704,14 @@ function WorktreeSheet({
             <button
               class="ai-btn ai-btn-sm"
               disabled={fileAi.run?.loading}
-              title="AI 解释此文件改动"
-              onClick={() => fileAi.start('解释 Diff', () => aiExplainFile(pid, {
+              title={tr('git.explainFile')}
+              onClick={() => fileAi.start(tr('git.explainDiff'), () => aiExplainFile(pid, {
                 path: fd.file!.change.path,
                 old: fd.file!.change.oldPath,
-                untracked: fd.file!.group === '未跟踪',
+                untracked: fd.file!.group === 'untracked',
               }))}
             >
-              ✨ 解释
+              ✨ {tr('git.explain')}
             </button>
             <button class="gs-x" onClick={onClose}>✕</button>
           </div>
@@ -713,7 +721,7 @@ function WorktreeSheet({
       ) : (
         <>
           <div class="gs-head">
-            <span class="gs-subject">未提交改动 · {changes.length} 个文件</span>
+            <span class="gs-subject">{tr('git.uncommittedCount', { count: changes.length })}</span>
             <button class="gs-x" onClick={onClose}>✕</button>
           </div>
           <div class="gs-body">
@@ -722,9 +730,9 @@ function WorktreeSheet({
                 <button
                   class="ai-btn"
                   disabled={ai.run?.loading}
-                  onClick={() => ai.start('生成 Commit Message', () => aiCommitMessage(pid))}
+                  onClick={() => ai.start(tr('git.generateMessage'), () => aiCommitMessage(pid))}
                 >
-                  ✨ 生成 Commit Message
+                  ✨ {tr('git.generateMessage')}
                 </button>
               </div>
             )}
@@ -762,13 +770,13 @@ function DiffCol({
           <button
             class="ai-btn ai-btn-sm"
             disabled={ai.run?.loading}
-            title="AI 解释此文件改动"
-            onClick={() => ai.start('解释 Diff', explain)}
+            title={tr('git.explainFile')}
+            onClick={() => ai.start(tr('git.explainDiff'), explain)}
           >
-            ✨ 解释
+            ✨ {tr('git.explain')}
           </button>
         )}
-        <button class="gs-x" title="收起 diff" onClick={onClose}>✕</button>
+        <button class="gs-x" title={tr('git.collapseDiff')} onClick={onClose}>✕</button>
       </div>
       {ai.run && <AiPanel run={ai.run} onClose={ai.clear} />}
       {error ? (
@@ -872,7 +880,7 @@ function CommitCols({
           </div>
         )}
       </div>
-      <Splitter containerRef={splitRef} cols={cols} boundary={1} label="文件/Diff 列宽" />
+      <Splitter containerRef={splitRef} cols={cols} boundary={1} label={tr('git.fileDiffWidth')} />
       <div class="git-col git-col-diff" style={colStyle(cols.widths[2])}>
         {fd.file ? (
           <DiffCol
@@ -885,7 +893,7 @@ function CommitCols({
             explain={() => aiExplainFile(pid, { sha, path: fd.file!.path, old: fd.file!.oldPath })}
           />
         ) : (
-          <div class="gd-empty">{d ? '← 选择文件查看 diff' : ''}</div>
+          <div class="gd-empty">{d ? tr('git.chooseFileDiff') : ''}</div>
         )}
       </div>
     </>
@@ -908,16 +916,16 @@ function WorktreeCols({
       <div class="git-col git-col-files" style={colStyle(cols.widths[1])}>
         <div class="gd-head">
           <div class="gd-headrow">
-            <span class="gs-subject">未提交改动 · {changes.length} 个文件</span>
+            <span class="gs-subject">{tr('git.uncommittedCount', { count: changes.length })}</span>
           </div>
           {changes.length > 0 && (
             <div class="ai-btns">
               <button
                 class="ai-btn"
                 disabled={ai.run?.loading}
-                onClick={() => ai.start('生成 Commit Message', () => aiCommitMessage(pid))}
+                onClick={() => ai.start(tr('git.generateMessage'), () => aiCommitMessage(pid))}
               >
-                ✨ 生成 Commit Message
+                ✨ {tr('git.generateMessage')}
               </button>
             </div>
           )}
@@ -925,13 +933,13 @@ function WorktreeCols({
         {ai.run && <AiPanel run={ai.run} onClose={ai.clear} />}
         <div class="gd-files">
           {changes.length === 0 ? (
-            <div class="gd-empty">工作区干净</div>
+            <div class="gd-empty">{tr('git.clean')}</div>
           ) : (
             <WtGroups changes={changes} selKey={fd.file ? wtKey(fd.file) : undefined} onOpen={fd.open} />
           )}
         </div>
       </div>
-      <Splitter containerRef={splitRef} cols={cols} boundary={1} label="文件/Diff 列宽" />
+      <Splitter containerRef={splitRef} cols={cols} boundary={1} label={tr('git.fileDiffWidth')} />
       <div class="git-col git-col-diff" style={colStyle(cols.widths[2])}>
         {fd.file ? (
           <DiffCol
@@ -944,11 +952,11 @@ function WorktreeCols({
             explain={() => aiExplainFile(pid, {
               path: fd.file!.change.path,
               old: fd.file!.change.oldPath,
-              untracked: fd.file!.group === '未跟踪',
+              untracked: fd.file!.group === 'untracked',
             })}
           />
         ) : (
-          <div class="gd-empty">← 选择文件查看 diff</div>
+          <div class="gd-empty">{tr('git.chooseFileDiff')}</div>
         )}
       </div>
     </>
@@ -960,11 +968,11 @@ function EmptyCols({ cols, splitRef }: { cols: ColSizes; splitRef: RefObject<HTM
   return (
     <>
       <div class="git-col git-col-files" style={colStyle(cols.widths[1])}>
-        <div class="gd-empty">← 点选提交 / 未提交改动</div>
+        <div class="gd-empty">{tr('git.chooseCommit')}</div>
       </div>
-      <Splitter containerRef={splitRef} cols={cols} boundary={1} label="文件/Diff 列宽" />
+      <Splitter containerRef={splitRef} cols={cols} boundary={1} label={tr('git.fileDiffWidth')} />
       <div class="git-col git-col-diff" style={colStyle(cols.widths[2])}>
-        <div class="gd-empty">查看文件 diff</div>
+        <div class="gd-empty">{tr('git.viewFileDiff')}</div>
       </div>
     </>
   );
@@ -1106,9 +1114,9 @@ function useGitOperations(
       .then((run) => {
         if (!run.started || !mountedRef.current || !coordinator.isCurrent(token)) return;
         const text = run.value.trim();
-        if (!text) throw new Error('AI 未生成可用的提交信息');
+        if (!text) throw new Error(tr('git.aiNoMessage'));
         setCommitMessage(text.trim());
-        toast.success('已生成提交信息');
+        toast.success(tr('git.messageGenerated'));
       })
       .catch((error: unknown) => {
         if (mountedRef.current && coordinator.isCurrent(token)) {
@@ -1129,12 +1137,12 @@ function useGitOperations(
   };
 }
 
-const OPERATION_LABEL: Record<GitOperationKind, string> = {
-  stage: '正在暂存…',
-  unstage: '正在撤销暂存…',
-  commit: '正在提交…',
-  push: '正在推送…',
-  'generate-message': 'AI 正在生成…',
+const OPERATION_LABEL: Record<GitOperationKind, Parameters<typeof tr>[0]> = {
+  stage: 'git.staging',
+  unstage: 'git.unstaging',
+  commit: 'git.committing',
+  push: 'git.pushing',
+  'generate-message': 'git.aiGenerating',
 };
 
 function GitOperationsPanel({
@@ -1159,15 +1167,15 @@ function GitOperationsPanel({
     write('commit', { message }, (result) => {
       const committed = result as GitCommitResult;
       setCommitMessage('');
-      return `已提交 ${committed.short}`;
+      return tr('git.committed', { sha: committed.short });
     });
   };
   const push = (): void => {
     write('push', undefined, (result) => {
       const pushed = result as GitPushResult;
       return pushed.createdUpstream
-        ? `已推送并建立 ${pushed.upstream}`
-        : `已推送到 ${pushed.upstream}`;
+        ? tr('git.pushedUpstream', { upstream: pushed.upstream })
+        : tr('git.pushedTo', { upstream: pushed.upstream });
     });
   };
 
@@ -1177,24 +1185,24 @@ function GitOperationsPanel({
         <button
           class="btn sm"
           disabled={busy !== null || !hasUnstaged}
-          onClick={() => write('stage', { all: true }, () => '已暂存全部改动')}
+          onClick={() => write('stage', { all: true }, () => tr('git.stageAllDone'))}
         >
-          ＋ 全部暂存
+          ＋ {tr('git.stageAll')}
         </button>
         <button
           class="btn sm"
           disabled={busy !== null || !hasStaged}
-          onClick={() => write('unstage', { all: true }, () => '已撤销全部暂存')}
+          onClick={() => write('unstage', { all: true }, () => tr('git.unstageAllDone'))}
         >
-          － 全部撤销暂存
+          － {tr('git.unstageAll')}
         </button>
         <button
           class="btn sm git-push-btn"
           disabled={busy !== null || !info.branch}
-          title={!info.branch ? 'detached HEAD 无法推送当前分支' : '推送当前分支'}
+          title={!info.branch ? tr('git.detachedNoPush') : tr('git.pushCurrent')}
           onClick={push}
         >
-          ↑ Push
+          ↑ {tr('git.pushCurrent')}
         </button>
       </div>
       <textarea
@@ -1203,8 +1211,8 @@ function GitOperationsPanel({
         maxLength={20_000}
         disabled={busy !== null}
         value={commitMessage}
-        placeholder="填写 commit message…"
-        aria-label="Commit message"
+        placeholder={tr('git.commitPlaceholder')}
+        aria-label={tr('git.commitPlaceholder')}
         onInput={(event) => setCommitMessage(event.currentTarget.value)}
       />
       <div class="git-ops-row git-commit-actions">
@@ -1213,17 +1221,17 @@ function GitOperationsPanel({
           disabled={busy !== null || !hasUnstaged && !hasStaged}
           onClick={generateMessage}
         >
-          ✨ AI 生成
+          ✨ {tr('git.generate')}
         </button>
         <span class="git-ops-status mut" role="status" aria-live="polite">
-          {busy ? OPERATION_LABEL[busy] : hasStaged ? '可提交已暂存内容' : '请先暂存改动'}
+          {busy ? tr(OPERATION_LABEL[busy]) : hasStaged ? tr('git.readyCommit') : tr('git.stageFirst')}
         </span>
         <button
           class="btn sm primary"
           disabled={busy !== null || !hasStaged || !commitMessage.trim()}
           onClick={commit}
         >
-          提交
+          {tr('git.commitAction')}
         </button>
       </div>
     </div>
@@ -1260,25 +1268,25 @@ function WorkspaceTree({
   return (
     <section class="git-tree-pane">
       <div class="git-pane-head git-tree-head">
-        <span class="git-pane-title">文件</span>
-        <div class="git-source-tabs" role="tablist" aria-label="文件树来源">
+        <span class="git-pane-title">{tr('git.files')}</span>
+        <div class="git-source-tabs" role="tablist" aria-label={tr('git.fileTreeSource')}>
           <button
             class={tree.kind === 'all' ? 'on' : ''}
             onClick={() => dispatch({ type: 'show-all' })}
           >
-            全部
+            {tr('git.all')}
           </button>
           <button
             class={tree.kind === 'worktree' ? 'on' : ''}
             onClick={() => dispatch({ type: 'show-worktree' })}
           >
-            只看改动{(info.dirty ?? 0) > 0 ? ` ${info.dirty}` : ''}
+            {tr('git.changesOnly')}{(info.dirty ?? 0) > 0 ? ` ${info.dirty}` : ''}
           </button>
         </div>
       </div>
       {tree.kind === 'commit' && (
         <div class="git-tree-context" title={tree.sha}>
-          <span>提交改动</span>
+          <span>{tr('git.commitChanges')}</span>
           <b class="mono">{tree.sha.slice(0, 8)}</b>
         </div>
       )}
@@ -1300,7 +1308,7 @@ function WorkspaceTree({
           commitErr ? <div class="empty">{commitErr}</div> : <Loading />
         ) : tree.leaves.length === 0 ? (
           <div class="empty">
-            {tree.kind === 'worktree' ? '工作区干净' : '该提交没有文件改动'}
+            {tree.kind === 'worktree' ? tr('git.clean') : tr('git.commitNoFiles')}
           </div>
         ) : (
           <ChangeTree
@@ -1322,14 +1330,14 @@ function WorkspaceTree({
                     <button
                       class="git-file-op"
                       disabled={operations.busy !== null}
-                      title={`暂存 ${leaf.path}`}
-                      aria-label={`暂存 ${leaf.path}`}
+                      title={tr('git.stagePath', { path: leaf.path })}
+                      aria-label={tr('git.stagePath', { path: leaf.path })}
                       onClick={(ev) => {
                         ev.stopPropagation();
                         operations.write(
                           'stage',
                           { paths: operation.paths },
-                          () => `已暂存 ${leaf.path}`,
+                          () => tr('git.stagedPath', { path: leaf.path }),
                         );
                       }}
                     >
@@ -1340,14 +1348,14 @@ function WorkspaceTree({
                     <button
                       class="git-file-op"
                       disabled={operations.busy !== null}
-                      title={`撤销暂存 ${leaf.path}`}
-                      aria-label={`撤销暂存 ${leaf.path}`}
+                      title={tr('git.unstagePath', { path: leaf.path })}
+                      aria-label={tr('git.unstagePath', { path: leaf.path })}
                       onClick={(ev) => {
                         ev.stopPropagation();
                         operations.write(
                           'unstage',
                           { paths: operation.paths },
-                          () => `已撤销暂存 ${leaf.path}`,
+                          () => tr('git.unstagedPath', { path: leaf.path }),
                         );
                       }}
                     >
@@ -1400,12 +1408,12 @@ function CommitHistory({
         onClick={onToggle}
       >
         <span class={`ft-arrow${open ? ' open' : ''}`}>▸</span>
-        <span class="git-pane-title">提交记录</span>
+        <span class="git-pane-title">{tr('git.commitHistory')}</span>
         <span class="mut small">{commits.length}</span>
       </button>
       {open && (
         <div class="git-history-scroll">
-          {commits.length === 0 && <div class="empty">（还没有提交）</div>}
+          {commits.length === 0 && <div class="empty">{tr('git.noCommits')}</div>}
           {commits.length > 0 && (
             <div class="git-rows" ref={rowsRef} style={{ minWidth: graphW + 286 }}>
               <svg class="git-svg" width={graphW} height={svgH}>
@@ -1468,13 +1476,13 @@ function CommitHistory({
                     <span class="git-subj">{c.subject}</span>
                     <button
                       class="git-commit-detail"
-                      title="查看完整 commit message"
+                      title={tr('git.viewFullMessage')}
                       onClick={(ev) => {
                         ev.stopPropagation();
                         dispatch({ type: 'open-commit-detail', sha: c.sha });
                       }}
                     >
-                      查看详情
+                      {tr('git.viewDetails')}
                     </button>
                   </div>
                   <div class="git-r2 mut">
@@ -1488,7 +1496,7 @@ function CommitHistory({
               ))}
               {commits.length >= 200 && (
                 <div class="mut small" style={{ padding: '10px 12px 16px' }}>
-                  只展示最近 200 条提交
+                  {tr('git.recentOnly')}
                 </div>
               )}
             </div>
@@ -1515,7 +1523,7 @@ function WorkspaceContext({
   const { diff, err } = useWorkspaceDiff(pid, state);
   const content = state.content;
   if (!content) {
-    return <div class="gd-empty">← 选择文件查看内容，或查看 commit 详情</div>;
+    return <div class="gd-empty">{tr('git.chooseContent')}</div>;
   }
   if (content.kind === 'commit-detail') {
     return (
@@ -1663,7 +1671,7 @@ export function GitView({ pid }: { pid: number }) {
 
   const jump = (sha: string): void => {
     if (!commits.some((c) => c.sha === sha)) {
-      toast.info('该提交不在最近 200 条窗口内');
+      toast.info(tr('git.notRecent'));
       return;
     }
     dispatch({ type: 'open-commit-detail', sha });
@@ -1695,18 +1703,18 @@ export function GitView({ pid }: { pid: number }) {
         <div class="bhead-row">
           <button
             class="back"
-            aria-label={drilling ? '返回 Git 工作区' : '返回项目'}
+            aria-label={drilling ? tr('git.backWorkspace') : tr('git.backProject')}
             onClick={() => drilling
               ? dispatch({ type: 'close-content' })
               : nav(`/p/${pid}`)}
           >
             ‹
           </button>
-          <span class="btitle">{project?.name ?? `项目 #${pid}`} · Git</span>
+          <span class="btitle">{tr('git.pageTitle', { project: project?.name ?? tr('view.projectFallback', { id: pid }) })}</span>
           <div class="bacts">
             {info?.ok && (
               <span class="gitstat">
-                <span class="badge b-blue">⎇ {info.branch || '(detached)'}</span>
+                <span class="badge b-blue">⎇ {info.branch || `(${tr('git.detached')})`}</span>
                 {behindAhead && (
                   <span class={`badge ${(info.ahead ?? 0) + (info.behind ?? 0) > 0 ? 'b-purple' : 'b-gray'}`}>
                     {behindAhead}
@@ -1714,7 +1722,7 @@ export function GitView({ pid }: { pid: number }) {
                 )}
               </span>
             )}
-            <button class="btn sm" onClick={refresh}>↻ 刷新</button>
+            <button class="btn sm" onClick={refresh}>↻ {tr('ui.refresh')}</button>
           </div>
         </div>
         {err && <div class="err">{err}</div>}
@@ -1723,7 +1731,7 @@ export function GitView({ pid }: { pid: number }) {
       {info === null && !err && <Loading />}
       {info !== null && !info.ok && (
         <div class="empty">
-          {info.error ?? '加载失败'}
+          {info.error ?? tr('git.loadFailed')}
           <div class="mut small">{info.cwd}</div>
         </div>
       )}
@@ -1774,7 +1782,7 @@ export function GitView({ pid }: { pid: number }) {
               operations={operations}
             />
           </div>
-          <ListSplitter containerRef={splitRef} list={treeW} label="Git 导航栏宽" />
+          <ListSplitter containerRef={splitRef} list={treeW} label={tr('git.navWidth')} />
           <main class="git-context">
             <WorkspaceContext pid={pid} state={workspace} dispatch={dispatch} onJump={jump} />
           </main>

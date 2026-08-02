@@ -12,9 +12,9 @@ describe('AutoApproveSwitch（issue #108，#111 改下拉，#113 Apple pull-down
     expect(source).toContain("level: 'cautious'");
     expect(source).toContain("level: 'medium'");
     expect(source).toContain("level: 'auto'");
-    expect(source).toContain('谨慎');
-    expect(source).toContain('中等');
-    expect(source).toContain('全自动');
+    expect(source).toContain("label: t('ui.cautious')");
+    expect(source).toContain("label: t('ui.medium')");
+    expect(source).toContain("label: t('ui.automatic')");
   });
 
   test('收起态按钮显示当前档：缺失/脏值兜底 medium，选回当前档不重复发请求', async () => {
@@ -58,7 +58,7 @@ describe('AutoApproveSwitch（issue #108，#111 改下拉，#113 Apple pull-down
     const source = await Bun.file(switchUrl).text();
 
     expect(source).toContain('disabled={disabled}');
-    expect(source).toContain("title={disabled ? (disabledHint ?? '当前状态不能改自动批准档位') : hint}");
+    expect(source).toContain("title={disabled ? (disabledHint ?? t('ui.approvalUnavailable')) : hint}");
     expect(source).toContain('const hint = curMeta ? `${curMeta.label}：${curMeta.desc}` : ');
   });
 
@@ -79,7 +79,7 @@ describe('AutoApproveSwitch（issue #108，#111 改下拉，#113 Apple pull-down
     const issue = await Bun.file(issueUrl).text();
     expect(issue).toContain("const aaLocked = issue.status === 'done' || issue.status === 'cancelled'");
     expect(issue).toContain('disabled={aaLocked}');
-    expect(issue).toContain('不会再有弹窗，档位不可改');
+    expect(issue).toContain("disabledHint={tr('issue.approvalLocked')}");
 
     // 对话没有「完成」概念，切换钮永远可用
     const chat = await Bun.file(chatUrl).text();

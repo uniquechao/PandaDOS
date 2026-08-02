@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { Database } from 'bun:sqlite';
+import { catalogs } from '../../shared/i18n/catalogs';
+import { createI18n } from '../../shared/i18n/formatter';
 import { openDb } from '../core/db';
 import { migrate } from '../core/migrate';
 import { UserStore } from '../core/users';
@@ -224,6 +226,22 @@ describe('卡点确认卡（一次性 requestId）', () => {
     expect(row.consumedTs).toBeNull();
   });
 
+  test('结构化卡片摘要按收件人语言渲染', async () => {
+    const s = seed();
+    const w = await wire(s.db);
+    const event = gateEvent(s);
+    delete event.summary;
+    event.summaryCode = 'plan_review';
+    event.summaryParams = { title: 'OAuth login' };
+    const ja = createI18n({ locale: 'ja', timeZone: 'Asia/Tokyo', catalog: catalogs.ja });
+
+    await w.ch.sendGateCard({ userId: s.alice.id, address: 'ou_alice' }, event, ja);
+
+    const text = JSON.stringify(cardOf(w.fk.sent[0]!));
+    expect(text).toContain('計画の確認待ち：OAuth login');
+    expect(text).not.toContain('计划待确认');
+  });
+
   test('缺 gate 详情降级为文本提醒', async () => {
     const s = seed();
     const w = await wire(s.db);
@@ -246,7 +264,7 @@ describe('卡点确认卡（一次性 requestId）', () => {
 
     const t2 = await clickGate(w, 'ou_alice', rid, 'approve'); // 重放
     expect(t2.toast.type).toBe('error');
-    expect(t2.toast.content).toContain('已处理过');
+    expect(t2.toast.content).toContain('already handled');
     expect(w.decided).toHaveLength(1); // 引擎只被调一次
   });
 
@@ -270,7 +288,7 @@ describe('卡点确认卡（一次性 requestId）', () => {
 
     const t1 = await clickGate(w, 'ou_bob', rid, 'approve'); // bob 点 alice 的卡
     expect(t1.toast.type).toBe('error');
-    expect(t1.toast.content).toContain('不是发给你的');
+    expect(t1.toast.content).toContain('not sent to you');
     expect(w.decided).toHaveLength(0);
     expect(w.ch.requests.get(rid)!.consumedTs).toBeNull(); // 未被烧掉
 
@@ -304,7 +322,7 @@ describe('卡点确认卡（一次性 requestId）', () => {
     const rid = cardOf(w2.fk.sent[0]!).elements.find((e: any) => e.tag === 'action').actions[0].value.requestId;
     const t = await clickGate(w2, 'ou_alice', rid, 'approve');
     expect(t.toast.type).toBe('error');
-    expect(t.toast.content).toContain('未接线');
+    expect(t.toast.content).toContain('unavailable');
   });
 });
 

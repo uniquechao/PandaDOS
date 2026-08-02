@@ -55,6 +55,8 @@ import {
   type SummaryStore,
 } from './progress';
 import { executeTool, TOOL_SCHEMAS, type PmToolsDeps, type ToolConvOps, type ToolLocator } from './tools';
+import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
+import { outputLanguageInstruction, promptLanguage } from './prompts/language';
 
 // ---------- 模块自带迁移（040 编号空间） ----------
 
@@ -94,6 +96,12 @@ tmux 里运行的 Claude Code 会话**，并通过飞书向主人汇报。
 - 不把整段终端日志/代码原样转发（提炼，不复述）。
 - 不泄露密钥、不在消息里回显敏感配置。`;
 
+export const DEFAULT_GLOBAL_PERSONA_EN = `# Persona: tmux remote operations assistant
+
+You supervise Claude Code sessions running in tmux. Do not implement code yourself. Monitor progress, report meaningful milestones, explain approval requests, and answer status questions from observed evidence and memory.
+
+Be concise and conversational. Avoid noisy updates, identify the project when multiple sessions exist, state uncertainty plainly, never invent intent, never reveal secrets, and do not reproduce long code or terminal logs. Do not approve decisions for the user unless their configured automatic policy permits it.`;
+
 /** 读全局 persona：显式路径 > MANDO_PERSONA_FILE > 内置默认（读失败也回默认） */
 export function loadGlobalPersona(path?: string): string {
   const p = path ?? process.env.MANDO_PERSONA_FILE;
@@ -115,6 +123,10 @@ export const JUDGE_DONE_SYS = `你在判断一个 Claude Code 任务/调试的�
 - done=true 仅当：最近输出显示工作已收尾、改动已落地且(若涉及)测试/自测已通过、没有在问用户或等用户输入、没有报错或卡住、没有明显未完的后续步骤。
 - clarify=true 当：最近输出显示它在**向用户提问 / 等用户回答或拍板后才能继续**（例如列出待确认的问题、征求你决策）；此时 done 必为 false。
 - done 与 clarify 都为 false：还在进行中、报错、被卡住、或证据不足以确认完成。`;
+export const JUDGE_DONE_SYS_EN = `Judge the current state of a Claude Code task from evidence only and be conservative. Return JSON only: {"done": bool, "clarify": bool, "reason": "a concise reason"}.
+- done=true only when work is complete, changes landed, relevant checks passed, no user input is pending, and no error or obvious next step remains.
+- clarify=true when the latest output asks the user a question or cannot continue without their decision; done must then be false.
+- otherwise both values are false.`;
 
 /**
  * 同模块任务智能合并 system（v2 新增）：把同一模块下若干待办 issue 交 LLM 判断哪些
@@ -135,6 +147,9 @@ export const MERGE_SYS = `# 任务：判断同一模块下的多条待办能否�
 - title ≤ 60 字，概括合并后的整体目标。
 - body：把被合并各条的需求**完整保留**并条理化（分条列出，不要丢信息），供工程师一次实施。
 - 没有任何可合并的组时，groups 给空数组。`;
+export const MERGE_SYS_EN = `# Task: decide whether pending issues in one module should be merged
+Return JSON only: {"groups":[{"members":[1,2],"title":"merged title","body":"complete merged requirements"}]}.
+Merge only highly related work with overlapping boundaries that can safely be implemented together. Keep independent or risky work separate. Every group needs at least two supplied IDs. Preserve every requirement in the merged body. Return an empty groups array when nothing should merge.`;
 
 /** clarifying 判定 system（v2 新增，风格沿用四段调优 prompt 的保守哲学） */
 export const CLARIFYING_SYS = `# 任务：判断需求是否需要先向发起人澄清
@@ -144,6 +159,9 @@ export const CLARIFYING_SYS = `# 任务：判断需求是否需要先向发起�
 - clear=true：目标明确、范围可判断、没有会做错方向的关键歧义（实现细节可由工程师在规划阶段自行决定，不算歧义）。
 - clear=false 仅当：存在不问清楚就会做错方向的关键歧义或缺失信息；questions 里每条是一个独立可回答的简短中文问题（口语，我在手机上打字回）。
 - clear=true 时 questions 给空数组。`;
+export const CLARIFYING_SYS_EN = `# Task: decide whether a request needs clarification before implementation
+Return JSON only: {"clear": bool, "questions": ["question 1"]}.
+Prefer not to interrupt the user. Set clear=false only for missing information or critical ambiguity that would send implementation in the wrong direction. Ask at most five short, independently answerable questions. Implementation details the engineer can choose are not ambiguity. When clear=true, questions must be empty.`;
 
 /** issue → 项目模块的保守分类；英文 slug 是稳定目录名，不能生成泛滥。 */
 export const MODULE_SUGGEST_SYS = `# Task: assign an issue to one project module
@@ -211,7 +229,7 @@ export interface SuggestModuleInput {
 }
 
 export interface PmUserStore {
-  getSettings(userId: number): { persona: string | null; memory: string | null };
+  getSettings(userId: number): { persona: string | null; memory: string | null; locale?: SupportedLocale | null };
   byId(id: number): { username: string } | undefined;
 }
 
@@ -266,6 +284,7 @@ function composeIssueText(issue: Issue): string {
 
 export class PmAgent {
   private readonly globalPersona: string;
+  private readonly customGlobalPersona: boolean;
   /** 进度滚动摘要：有 db 落 pm_progress（重启不丢，评审 H4），否则内存 */
   private readonly summary: SummaryStore;
 
@@ -274,6 +293,7 @@ export class PmAgent {
     public project: Project,
     private readonly deps: PmAgentDeps,
   ) {
+    this.customGlobalPersona = deps.globalPersona !== undefined || Boolean(process.env.MANDO_PERSONA_FILE);
     this.globalPersona = deps.globalPersona ?? loadGlobalPersona();
     this.summary = deps.db ? new DbSummaryStore(deps.db, project.id) : new MemorySummaryStore();
   }
@@ -286,14 +306,26 @@ export class PmAgent {
    * systemPrompt 组装（顺序钦定）：
    * 全局 persona → 项目 pm_persona → 属主 persona → 属主 memory（属主 = project.owner_user_id）。
    */
-  systemPrompt(): string {
+  systemPrompt(localeOverride?: SupportedLocale): string {
     const s = this.deps.users.getSettings(this.project.ownerUserId);
+    const locale = localeOverride ?? s.locale ?? DEFAULT_LOCALE;
+    const globalPersona = this.customGlobalPersona
+      ? this.globalPersona
+      : promptLanguage(locale) === 'zh'
+        ? DEFAULT_GLOBAL_PERSONA
+        : DEFAULT_GLOBAL_PERSONA_EN;
     return (
-      this.globalPersona +
+      globalPersona +
       (this.project.pmPersona ? `\n\n# 项目 PM 设定\n${this.project.pmPersona}` : '') +
       (s.persona ? `\n\n# 用户附加设定\n${s.persona}` : '') +
-      (s.memory ? `\n\n# 记忆\n${s.memory}` : '')
+      (s.memory ? `\n\n# 记忆\n${s.memory}` : '') +
+      `\n\n${outputLanguageInstruction(locale)}`
     );
+  }
+
+  private localeForIssue(issue: Issue): SupportedLocale {
+    const userId = issue.createdBy ?? this.project.ownerUserId;
+    return this.deps.users.getSettings(userId).locale ?? DEFAULT_LOCALE;
   }
 
   /**
@@ -309,6 +341,7 @@ export class PmAgent {
   ): Promise<string> {
     const branch = issue.branch ?? `issue/${issue.id}`;
     const imgHint = imageReadHint(this.absImages(issue));
+    const locale = this.localeForIssue(issue);
     switch (stage) {
       case 'planning':
         return buildPlanningPrompt({
@@ -316,6 +349,7 @@ export class PmAgent {
           goal: this.project.goal,
           feedback: opts.feedback ?? null,
           imgHint,
+          locale,
         });
       case 'implementing': {
         if (opts.reworkSource) {
@@ -324,19 +358,20 @@ export class PmAgent {
             feedback: opts.feedback ?? '',
             branch,
             source: opts.reworkSource,
+            locale,
           });
         }
         const subtasks = subtaskTexts(issue);
         if (issue.implMode === 'team') {
-          return buildTeamPrompt({ issue, subtasks, goal: this.project.goal, branch, imgHint });
+          return buildTeamPrompt({ issue, subtasks, goal: this.project.goal, branch, imgHint, locale });
         }
         if (!subtasks[issue.subIndex]) {
           throw new Error(`issue ${issue.id} 无可喂子任务（subIndex=${issue.subIndex}）`);
         }
-        return buildSubtaskPrompt({ issue, subtasks, idx: issue.subIndex, branch });
+        return buildSubtaskPrompt({ issue, subtasks, idx: issue.subIndex, branch, locale });
       }
       case 'testing':
-        return buildTestingPrompt({ issue, branch });
+        return buildTestingPrompt({ issue, branch, locale });
       default:
         throw new Error(`阶段 ${stage} 没有 CC 注入 prompt`);
     }
@@ -350,16 +385,19 @@ export class PmAgent {
    * 与菜单滞留检测负责）；LLM 调用错误上抛（引擎捕获落事件）。
    */
   async judgeDone(issue: Issue, recentOutput: string): Promise<DoneJudgement> {
+    const locale = this.localeForIssue(issue);
     const subs = subtaskTexts(issue);
     const subsText = subs.length
       ? `\n子任务清单：\n${subs.map((s, i) => `${i + 1}. ${s}`).join('\n')}`
       : '';
     const r = await this.deps.llm.chat(
       [
-        { role: 'system', content: JUDGE_DONE_SYS },
+        { role: 'system', content: (promptLanguage(locale) === 'zh' ? JUDGE_DONE_SYS : JUDGE_DONE_SYS_EN) + `\n${outputLanguageInstruction(locale)}` },
         {
           role: 'user',
-          content: `任务：${composeIssueText(issue)}${subsText}\n\n会话最近输出：\n${recentOutput}`,
+          content: promptLanguage(locale) === 'zh'
+            ? `任务：${composeIssueText(issue)}${subsText}\n\n会话最近输出：\n${recentOutput}`
+            : `Task:\n${composeIssueText(issue)}${subsText}\n\nLatest session output:\n${recentOutput}`,
         },
       ],
       { jsonMode: true },
@@ -436,10 +474,11 @@ export class PmAgent {
     const list = candidates
       .map((c) => `#${c.id} ${midTruncate(c.body ? `${c.title}：${c.body}` : c.title, 500)}`)
       .join('\n');
+    const locale = this.deps.users.getSettings(this.project.ownerUserId).locale ?? DEFAULT_LOCALE;
     const r = await this.deps.llm.chat(
       [
-        { role: 'system', content: MERGE_SYS },
-        { role: 'user', content: `模块「${module}」下的待办任务：\n${list}` },
+        { role: 'system', content: (promptLanguage(locale) === 'zh' ? MERGE_SYS : MERGE_SYS_EN) + `\n${outputLanguageInstruction(locale)}` },
+        { role: 'user', content: promptLanguage(locale) === 'zh' ? `模块「${module}」下的待办任务：\n${list}` : `Pending issues in module ${module}:\n${list}` },
       ],
       { jsonMode: true },
     );
@@ -477,12 +516,15 @@ export class PmAgent {
    * 清晰返回 null（引擎据此 skip_clarifying）。解析失败按不含糊处理（不卡流程，引擎另兜 LLM 错误）。
    */
   async generateClarifyingQuestions(issue: Issue): Promise<string[] | null> {
+    const locale = this.localeForIssue(issue);
     const r = await this.deps.llm.chat(
       [
-        { role: 'system', content: CLARIFYING_SYS },
+        { role: 'system', content: (promptLanguage(locale) === 'zh' ? CLARIFYING_SYS : CLARIFYING_SYS_EN) + `\n${outputLanguageInstruction(locale)}` },
         {
           role: 'user',
-          content: `项目目标：${this.project.goal || '(未设)'}\nissue（${issue.category}）：${composeIssueText(issue)}`,
+          content: promptLanguage(locale) === 'zh'
+            ? `项目目标：${this.project.goal || '(未设)'}\nissue（${issue.category}）：${composeIssueText(issue)}`
+            : `Project goal: ${this.project.goal || '(not set)'}\nIssue (${issue.category}): ${composeIssueText(issue)}`,
         },
       ],
       { jsonMode: true },
@@ -507,7 +549,7 @@ export class PmAgent {
    */
   async decideApproval(
     menu: MenuSnapshot,
-    task: { taskText?: string | null } = {},
+    task: { taskText?: string | null; createdBy?: number | null } = {},
     level: AutoApproveLevel = 'medium',
   ): Promise<ApprovalDecision> {
     return gradeApproval(
@@ -515,6 +557,7 @@ export class PmAgent {
       { context: menu.title || menu.raw, options: menu.options, multiSelect: menu.multiSelect },
       { goal: this.project.goal, taskText: task.taskText },
       level,
+      this.deps.users.getSettings(task.createdBy ?? this.project.ownerUserId).locale ?? DEFAULT_LOCALE,
     );
   }
 
@@ -533,6 +576,7 @@ export class PmAgent {
       prev: this.summary.get(),
       activity,
       systemPrefix: this.systemPrompt(),
+      locale: this.deps.users.getSettings(this.project.ownerUserId).locale ?? DEFAULT_LOCALE,
     });
     if (!a.push || !a.headline) return null;
     this.summary.set(a.headline);
@@ -551,6 +595,7 @@ export class PmAgent {
     return new ProgressReporter(this.project.name, this.deps.llm, onPush, this.summary, {
       throttleSeconds: opts.throttleSeconds,
       systemPrefix: () => this.systemPrompt(),
+      locale: this.deps.users.getSettings(this.project.ownerUserId).locale ?? DEFAULT_LOCALE,
     });
   }
 
@@ -559,28 +604,24 @@ export class PmAgent {
    * 工具四件套（tools.ts）项目作用域 + Driver 执行；最多 5 轮工具循环（v1 平移）。
    */
   async answerQuestion(userId: number, question: string): Promise<string> {
+    const locale = this.deps.users.getSettings(userId).locale ?? DEFAULT_LOCALE;
     const convs = this.deps.convs.listByProject(this.project.id);
     const current = this.deps.convs.currentConv(this.project.id);
+    const zh = promptLanguage(locale) === 'zh';
     const snapshot = convs.length
       ? convs
           .map(
             (c, i) =>
-              `${i + 1}. ${c.label ?? c.id}${c.id === current ? '（当前激活）' : ''}${c.archived ? '（已归档）' : ''}`,
+              `${i + 1}. ${c.label ?? c.id}${c.id === current ? (zh ? '（当前激活）' : ' (active)') : ''}${c.archived ? (zh ? '（已归档）' : ' (archived)') : ''}`,
           )
           .join('\n')
-      : '（本项目还没有对话）';
-    const asker = this.deps.users.byId(userId)?.username ?? `用户${userId}`;
+      : zh ? '（本项目还没有对话）' : '(No conversations in this project yet)';
+    const asker = this.deps.users.byId(userId)?.username ?? (zh ? `用户${userId}` : `User ${userId}`);
     // v1 能力段措辞沿用，作用域从「本机所有会话」改写为本项目（评审 §2B）
-    const system =
-      this.systemPrompt() +
-      `\n\n# 你的能力（重要）\n你是项目「${this.project.name}」的 PM 管家，只负责本项目` +
-      `${this.project.goal ? `（项目目标：${this.project.goal}）` : ''}。` +
-      `有工具：list_sessions / read_progress / capture_pane / send_command。` +
-      `需要时主动调用再回答，绝不要说你没有监控能力。` +
-      `send_command 会发进本项目的 Claude Code 会话——改变状态的操作，确认主人意图后再调。` +
-      `\n\n# 排版（飞书 lark_md）\n简洁：关键 **加粗**，多项换行+emoji；不要长段落、不要 markdown 标题(#)。` +
-      `\n\n## 本项目对话快照（可用工具深挖）\n${snapshot}` +
-      `\n\n（当前提问者：${asker}）`;
+    const capability = zh
+      ? `# 你的能力（重要）\n你是项目「${this.project.name}」的 PM 管家，只负责本项目${this.project.goal ? `（项目目标：${this.project.goal}）` : ''}。有工具：list_sessions / read_progress / capture_pane / send_command。需要时主动调用再回答，绝不要说你没有监控能力。send_command 会改变项目会话状态，确认用户意图后再调。\n\n# 排版（飞书 lark_md）\n简洁：关键 **加粗**，多项换行+emoji；不要长段落或 markdown 标题。\n\n## 本项目对话快照\n${snapshot}\n\n（当前提问者：${asker}）`
+      : `# Capabilities\nYou are the PM assistant for project "${this.project.name}" and only this project${this.project.goal ? ` (goal: ${this.project.goal})` : ''}. You can use list_sessions, read_progress, capture_pane, and send_command. Use tools when evidence is needed; never claim you cannot monitor the project. send_command changes session state, so confirm the user's intent first.\n\n# Feishu lark_md format\nBe concise, use **bold** and short emoji-separated lines where useful, and avoid headings or long paragraphs.\n\n## Project conversation snapshot\n${snapshot}\n\nCurrent requester: ${asker}`;
+    const system = `${this.systemPrompt(locale)}\n\n${capability}\n\n${outputLanguageInstruction(locale)}`;
     return this.chatWithTools(system, question);
   }
 

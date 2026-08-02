@@ -5,11 +5,11 @@ import { buildLlmConfigUpdate, llmConfigGuidance } from './llmConfig';
 describe('驱动大模型 UI 状态', () => {
   test('普通用户未配置时只提示联系管理员；管理员得到直达配置路径', () => {
     expect(llmConfigGuidance('user', false)).toEqual({
-      message: '请联系管理员配置驱动大模型',
+      message: 'Ask an administrator to configure the AI model.',
       actionPath: null,
     });
     expect(llmConfigGuidance('admin', false)).toEqual({
-      message: '请联系管理员配置驱动大模型',
+      message: 'Ask an administrator to configure the AI model.',
       actionPath: '/admin/llm',
     });
     expect(llmConfigGuidance('admin', true)).toBeNull();

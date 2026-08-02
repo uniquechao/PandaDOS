@@ -19,7 +19,7 @@ describe('工作台列表：等待澄清醒目化（#110）', () => {
 
   test('「澄清待答」提到 amber 级，且不与「等待你澄清」重复挂两个角标', () => {
     expect(source).toContain('issue.clarifyPending && !issue.awaitingClarify');
-    expect(source).toContain('badge b-amber" title="执行代理分析后有问题想确认');
+    expect(source).toContain("badge b-amber\" title={tr('board.clarifyOptional')}");
   });
 
   test('样式落地：实心橙徽标 + 行左色带', () => {

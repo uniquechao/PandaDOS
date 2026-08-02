@@ -8,6 +8,7 @@ import {
   type IssueGitBranchValue,
 } from '../lib/issuegitbranch';
 import type { GitBranches, Issue } from '../lib/types';
+import { useI18n } from '../i18n/provider';
 
 export function IssueGitBranchFields({
   pid,
@@ -20,6 +21,7 @@ export function IssueGitBranchFields({
   onChange: (value: IssueGitBranchValue) => void;
   onLoadingChange?: (loading: boolean) => void;
 }) {
+  const { t } = useI18n();
   const [branches, setBranches] = useState<GitBranches | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -49,7 +51,7 @@ export function IssueGitBranchFields({
         setLoading(false);
         onLoadingChangeRef.current?.(false);
         if (!result.ok) {
-          setError(result.error ?? '无法读取 Git 分支');
+          setError(result.error ?? t('ui.readGitBranchFailed'));
           return;
         }
         setBranches(result);
@@ -87,11 +89,11 @@ export function IssueGitBranchFields({
   return (
     <div class="issue-git-fields">
       <label class="field">
-        Git 目标分支
+        {t('ui.gitTargetBranch')}
         <input
           value={value.targetBranch}
           spellcheck={false}
-          placeholder={loading ? '正在读取当前分支…' : '输入目标分支名称'}
+          placeholder={loading ? t('ui.readingCurrentBranch') : t('ui.targetBranchPlaceholder')}
           onInput={(event) => {
             targetTouched.current = true;
             emit(changeIssueTargetBranch(valueRef.current, event.currentTarget.value, branches));
@@ -99,16 +101,16 @@ export function IssueGitBranchFields({
         />
         <span class="mut small">
           {loading
-            ? '正在读取 Git 分支…'
+            ? t('ui.readingGitBranches')
             : branches
-              ? `当前分支：${branches.current || '(detached HEAD)'}`
-              : error || '未读取到 Git 分支'}
+              ? t('ui.currentBranch', { branch: branches.current || '(detached HEAD)' })
+              : error || t('ui.noGitBranches')}
         </span>
       </label>
 
       {showSource && branches && (
         <label class="field">
-          源分支（可选）
+          {t('ui.sourceBranchOptional')}
           <select
             value={value.sourceRef}
             disabled={sourceCount === 0 && !value.sourceRef}
@@ -117,21 +119,21 @@ export function IssueGitBranchFields({
               sourceRef: event.currentTarget.value,
             })}
           >
-            <option value="">不指定（仅切换已有目标分支）</option>
+            <option value="">{t('ui.noSourceBranch')}</option>
             {!knownSource && value.sourceRef && (
               <option value={value.sourceRef}>
-                {formatIssueSourceRef(value.sourceRef)}（已保存，当前清单不存在）
+                {t('ui.savedBranchMissing', { branch: formatIssueSourceRef(value.sourceRef) })}
               </option>
             )}
             {branches.local.length > 0 && (
-              <optgroup label="本地分支">
+              <optgroup label={t('ui.localBranches')}>
                 {branches.local.map((branch) => (
                   <option key={branch.ref} value={branch.ref}>{branch.name}</option>
                 ))}
               </optgroup>
             )}
             {branches.remote.length > 0 && (
-              <optgroup label="远程分支">
+              <optgroup label={t('ui.remoteBranches')}>
                 {branches.remote.map((branch) => (
                   <option key={branch.ref} value={branch.ref}>{branch.name}</option>
                 ))}
@@ -139,7 +141,7 @@ export function IssueGitBranchFields({
             )}
           </select>
           {sourceCount === 0 && (
-            <span class="mut small">没有可用的本地或远程跟踪分支</span>
+            <span class="mut small">{t('ui.noTrackingBranches')}</span>
           )}
         </label>
       )}
@@ -152,14 +154,15 @@ export function IssueGitBranchSummary({
 }: {
   issue: Pick<Issue, 'targetBranch' | 'sourceRef'>;
 }) {
+  const { t } = useI18n();
   return (
     <div class="issue-git-summary">
       <span>
-        <b>目标分支</b>
-        <span class="mono">{issue.targetBranch || '当前分支（沿用）'}</span>
+        <b>{t('ui.targetBranch')}</b>
+        <span class="mono">{issue.targetBranch || t('ui.currentBranchInherited')}</span>
       </span>
       <span>
-        <b>源分支</b>
+        <b>{t('ui.sourceBranch')}</b>
         <span class="mono" title={issue.sourceRef ?? undefined}>
           {formatIssueSourceRef(issue.sourceRef)}
         </span>

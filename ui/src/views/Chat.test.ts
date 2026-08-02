@@ -33,7 +33,7 @@ describe('ChatView 对话原生模式', () => {
   });
 
   test('项目页头的原生入口命名为原生 Bash', () => {
-    expect(source).toContain('原生 Bash');
+    expect(source).toContain("t('view.nativeBash')");
     expect(source).not.toContain('>\n              终端\n            </button>');
   });
 });

@@ -24,6 +24,7 @@ import type { AutoApproveLevel, Project } from '../../core/types';
 import { getProject } from '../../issues/engine';
 import type { KeyedMutex } from '../../issues/mutex';
 import { actOnMenu, optionsSigOf, type MenuDriver } from './inject';
+import { userPromptLocale } from '../../agents/prompts/language';
 
 /** 需要巡检的对话（auto_approve 已开、项目在用、对话未归档） */
 export interface ChatApprovalTarget {
@@ -167,6 +168,7 @@ export class ChatApprovalWatcher {
         { context: sel.context || pane, options: sel.options, multiSelect: sel.multiSelect },
         { goal: project.goal, taskText: t.label },
         t.level,
+        userPromptLocale(this.deps.db, project.ownerUserId),
       );
       if (outcome.action !== 'approve') {
         // 需人工：什么都不做（菜单留给网页点）。仍记签名——同一菜单不必每轮重新分级，

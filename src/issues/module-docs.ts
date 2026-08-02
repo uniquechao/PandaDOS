@@ -223,6 +223,19 @@ export class ModuleDocs {
     return rel;
   }
 
+  /** 把 issue 收尾总结持久化到过程页；临时文件哨兵读回后即可安全清理。 */
+  async recordResultSummary(
+    module: ProjectModule,
+    issue: ModuleIssuePageInput,
+    summary: string,
+  ): Promise<void> {
+    const rel = await this.createIssuePage(module, issue);
+    const path = this.abs(rel);
+    const existing = (await readText(this.driver, path)) ?? '';
+    const next = upsertManagedBlock(existing, 'result-summary', summary.trim());
+    if (next !== existing) await this.driver.writeFile(path, next);
+  }
+
   async refreshIssueIndex(module: ProjectModule, issues: ModuleIssueIndexItem[]): Promise<void> {
     const path = this.abs(`${ROOT_REL}/${module.slug}/ISSUES.md`);
     const existing = (await readText(this.driver, path)) ?? `# ${module.displayName} · Issues\n`;

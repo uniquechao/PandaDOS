@@ -33,6 +33,7 @@ MandoAI 不是 AI 模型。它是团队与现有编程代理之间的编排和�
 git clone https://github.com/uniquechao/MandoAI.git
 cd MandoAI
 bun install --frozen-lockfile
+bun run check-i18n
 bun run build-ui
 bun run start
 ```
@@ -42,7 +43,7 @@ bun run start
 首次启动时，MandoAI 会创建管理员账号。仅显示一次的 token 会同时写入
 `~/.mando/admin-token`，文件权限为 `0600`。请妥善保管。
 
-反向代理、环境变量、SSH 执行机和生产服务配置见[部署指南](DEPLOY.md)。
+反向代理、环境变量、SSH 执行机和生产服务配置见[中文部署指南](DEPLOY.zh-CN.md)。
 
 ## 核心特色
 
@@ -58,6 +59,10 @@ bun run start
   运行编程代理。
 - **面向团队的项目管理** —— 按项目和模块组织工作、添加成员、维护项目摘要、订阅通知，
   并让相互独立的项目并行运行。
+- **全球化界面** —— 默认使用英语，可切换 10 种 UI 语言；首次访问按浏览器地区和 IANA
+  时区自动匹配，用户选择会保存到账户。
+- **按收件人本地化** —— AI 澄清、摘要、审批说明、通知和卡片按每位用户的语言及时区渲染；
+  issue、代码、终端输出、Git 内容和已有聊天记录始终保持原文。
 
 ## 工作原理
 
@@ -105,9 +110,10 @@ web / notify
 | `src/notify/` | 订阅、聚合和通知通道 |
 | `src/web/` | HTTP API、WebSocket、终端桥接和服务装配 |
 | `ui/` | Preact 与 Vite 浏览器界面 |
+| `shared/i18n/` | 类型化语言目录、ICU 格式化、地区匹配和时区格式化 |
 
 主要技术栈包括 Bun、TypeScript、SQLite、Preact、Vite、tmux、xterm.js 和 ssh2。
-运行模型和模块边界详见[架构说明](docs/architecture.md)。
+运行模型和模块边界详见[执行模型](docs/execution-model.zh-CN.md)。
 
 ## 部署
 
@@ -115,7 +121,7 @@ MandoAI 默认监听 `127.0.0.1:8802`。本机使用时应保留回环地址默�
 请通过可信反向代理提供 TLS 和身份认证。
 
 配置使用 `MANDO_*` 环境变量。完整变量说明、systemd 示例、反向代理配置和 SSH 执行机
-设置见 [DEPLOY.md](DEPLOY.md)。
+设置见 [DEPLOY.zh-CN.md](DEPLOY.zh-CN.md)。
 
 ## 安全
 
@@ -132,6 +138,7 @@ MandoAI 可以提供终端、文件、Git 操作和编程代理会话。应把 W
 ## 开发
 
 ```bash
+bun run check-i18n
 bun run typecheck
 bun test
 bun run build-ui

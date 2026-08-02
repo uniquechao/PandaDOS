@@ -4,6 +4,7 @@
  * - claude/codex：后台 Agent 认知总结（读历史会话+浏览代码库→更新 README→产出认知），慢、异步。
  */
 import type { AgentKind, SummaryStatus } from './types';
+import { tr } from '../i18n/runtime';
 
 export type SummaryMode = 'llm' | AgentKind; // 'llm' | 'claude' | 'codex'
 
@@ -18,9 +19,9 @@ export interface SummaryModelOption {
 }
 
 export const SUMMARY_MODELS: SummaryModelOption[] = [
-  { mode: 'llm', label: 'README·驱动大模型', hint: '快：只读 README 生成短简介', async: false },
-  { mode: 'claude', label: 'Claude', hint: '慢：读历史会话+代码库，产出认知并更新 README', async: true },
-  { mode: 'codex', label: 'Codex', hint: '慢：读历史会话+代码库，产出认知并更新 README', async: true },
+  { mode: 'llm', get label() { return tr('action.readmeModel'); }, get hint() { return tr('action.readmeHint'); }, async: false },
+  { mode: 'claude', label: 'Claude', get hint() { return tr('action.agentSummaryHint'); }, async: true },
+  { mode: 'codex', label: 'Codex', get hint() { return tr('action.agentSummaryHint'); }, async: true },
 ];
 
 /**
@@ -28,13 +29,13 @@ export const SUMMARY_MODELS: SummaryModelOption[] = [
  * 后端 POST /api/projects/:id/memory 让所选 agent 依对话历史+代码库刷新 CLAUDE.md/AGENTS.md 并产出记忆概要。
  */
 export const MEMORY_MODELS: SummaryModelOption[] = [
-  { mode: 'claude', label: 'Claude', hint: '读历史对话+代码库，更新 CLAUDE.md 并产出记忆概要', async: true },
-  { mode: 'codex', label: 'Codex', hint: '读历史对话+代码库，更新 AGENTS.md 并产出记忆概要', async: true },
+  { mode: 'claude', label: 'Claude', get hint() { return tr('action.claudeMemoryHint'); }, async: true },
+  { mode: 'codex', label: 'Codex', get hint() { return tr('action.codexMemoryHint'); }, async: true },
 ];
 
 /** 「更新记忆」按钮文案：本地提交中或后端 running → 更新中…；否则「更新记忆」 */
 export function memoryBtnLabel(status: SummaryStatus | undefined, busy: boolean): string {
-  return busy || status === 'running' ? '更新中…' : '🧠 更新记忆';
+  return busy || status === 'running' ? tr('action.updating') : tr('action.updateMemory');
 }
 
 /** 该 mode 是否走后台异步任务（claude/codex） */
@@ -49,5 +50,5 @@ export function isSummaryRunning(status: SummaryStatus | undefined): boolean {
 
 /** 「更新简介」按钮文案：本地提交中(busy) 或后端 running → 生成中…；否则「更新简介」 */
 export function summaryBtnLabel(status: SummaryStatus | undefined, busy: boolean): string {
-  return busy || status === 'running' ? '生成中…' : '更新简介';
+  return busy || status === 'running' ? tr('action.generating') : tr('action.updateSummary');
 }

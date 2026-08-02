@@ -207,10 +207,10 @@ describe('projects 路由', () => {
     const s = setup();
     // 建项目带 workBranch
     const created = await j(
-      s.dispatch(req('POST', '/api/projects', s.alice.token, { name: 'wb', executorId: 1, workBranch: 'developer/example-branch' })),
+      s.dispatch(req('POST', '/api/projects', s.alice.token, { name: 'wb', executorId: 1, workBranch: 'developer/dev-20260709' })),
     );
     expect(created.status).toBe(200);
-    expect(created.body.project.workBranch).toBe('developer/example-branch');
+    expect(created.body.project.workBranch).toBe('developer/dev-20260709');
     const pid = created.body.project.id;
 
     // 非法分支名（以 - 开头，防被 git 当参数）→ 400
@@ -293,7 +293,7 @@ function setupImport(sessions: TmuxSession[]) {
 
 describe('POST /api/projects/import', () => {
   const live: TmuxSession[] = [
-    { name: 'demo-session', createdTs: 1, attached: false, command: 'claude', cwd: '/home/developer/onto' },
+    { name: 'sample-app', createdTs: 1, attached: false, command: 'claude', cwd: '/home/developer/sample-app' },
     { name: 'mine', createdTs: 2, attached: false, command: 'bash', cwd: '/ws/u2/mine' },
     { name: 'cc-1', createdTs: 3, attached: false, cwd: '/ws/u9/x' },
     { name: 'nocwd', createdTs: 4, attached: false },
@@ -302,23 +302,23 @@ describe('POST /api/projects/import', () => {
   test('admin 导入任意会话：建项目 + sessions 登记；重复导入幂等返回既有项目', async () => {
     const s = setupImport(live);
     const r = await j(
-      s.dispatch(req('POST', '/api/projects/import', s.admin.token, { executorId: 1, session: 'demo-session', runUser: 'developer' })),
+      s.dispatch(req('POST', '/api/projects/import', s.admin.token, { executorId: 1, session: 'sample-app', runUser: 'developer' })),
     );
     expect(r.status).toBe(200);
     expect(r.body.created).toBe(true);
-    expect(r.body.project.name).toBe('demo-session');
-    expect(r.body.project.cwd).toBe('/home/developer/onto');
+    expect(r.body.project.name).toBe('sample-app');
+    expect(r.body.project.cwd).toBe('/home/developer/sample-app');
     expect(r.body.project.runUser).toBe('developer');
     const reg = s.db
       .query<{ project_id: number; owner_user_id: number }, [string]>(
         'SELECT project_id, owner_user_id FROM sessions WHERE name = ?',
       )
-      .get('demo-session');
+      .get('sample-app');
     expect(reg?.project_id).toBe(r.body.project.id);
 
     // 幂等：再导一次 → created:false，同一项目
     const again = await j(
-      s.dispatch(req('POST', '/api/projects/import', s.admin.token, { executorId: 1, session: 'demo-session' })),
+      s.dispatch(req('POST', '/api/projects/import', s.admin.token, { executorId: 1, session: 'sample-app' })),
     );
     expect(again.status).toBe(200);
     expect(again.body.created).toBe(false);
@@ -340,7 +340,7 @@ describe('POST /api/projects/import', () => {
 
     // 普通用户导 workspace 外 → 403
     const out = await j(
-      s.dispatch(req('POST', '/api/projects/import', s.alice.token, { executorId: 1, session: 'demo-session' })),
+      s.dispatch(req('POST', '/api/projects/import', s.alice.token, { executorId: 1, session: 'sample-app' })),
     );
     expect(out.status).toBe(403);
 
@@ -762,10 +762,10 @@ describe('POST /api/projects/:projectId/readme-summary', () => {
     const p = await newProject(s, s.alice.token);
     const r = await j(s.dispatch(req('POST', `/api/projects/${p.id}/readme-summary`, s.alice.token)));
     expect(r.status).toBe(503);
-    expect(r.body).toEqual({
+    expect(r.body).toMatchObject({
       ok: false,
       code: 'llm_not_configured',
-      error: '请联系管理员配置驱动大模型',
+      error: { code: 'legacy.error', details: '请联系管理员配置驱动大模型' },
     });
   });
 

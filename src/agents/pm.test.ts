@@ -154,7 +154,7 @@ function makeDeps(
     llm,
     users: {
       getSettings: (uid) =>
-        uid === 3 ? { persona: '爱用 emoji', memory: '主人喜欢简短回复' } : { persona: null, memory: null
+        uid === 3 ? { persona: '爱用 emoji', memory: '主人喜欢简短回复', locale: 'zh-Hans' as const } : { persona: null, memory: null, locale: 'zh-Hans' as const
 },
       byId: (id) => (id === 3 ? { username: 'alice' } : undefined),
     },
@@ -190,10 +190,11 @@ describe('systemPrompt 组装（顺序钦定：全局 → pm_persona → 属主 
 
   test('属主按 project.owner_user_id 取（不再 pane cwd 反推）；空段省略', () => {
     const deps = makeDeps(new MockLlm(), {
-      users: { getSettings: () => ({ persona: null, memory: null }), byId: () => undefined },
+      users: { getSettings: () => ({ persona: null, memory: null, locale: 'zh-Hans' }), byId: () => undefined },
     });
     const s = new PmAgent(project(), deps).systemPrompt();
-    expect(s).toBe('GLOBAL-PERSONA');
+    expect(s).toStartWith('GLOBAL-PERSONA');
+    expect(s).toContain('zh-Hans');
     expect(s).not.toContain('# 用户附加设定');
     expect(s).not.toContain('# 记忆');
   });
@@ -224,7 +225,7 @@ describe('judgeDone（v1 fallbackDoneCheck 保守判定平移）', () => {
     const i = issue({ subtasksJson: JSON.stringify([{ text: '写解析', done: true }, { text: '写测试', done: false }]) });
     expect(await pm.judgeDone(i, '……全部测试通过')).toBe('done');
     const call = llm.calls[0]!;
-    expect(call.messages[0]!.content).toBe(JUDGE_DONE_SYS); // 裸 system（v1 唯一裸 system 语义保留）
+    expect(call.messages[0]!.content).toStartWith(JUDGE_DONE_SYS); // 裸 system + language contract
     expect(call.opts?.jsonMode).toBe(true);
     expect(call.messages[1]!.content).toContain('任务：加导出功能：支持 CSV');
     expect(call.messages[1]!.content).toContain('1. 写解析');
@@ -283,7 +284,7 @@ describe('generateClarifyingQuestions', () => {
     const llm = new MockLlm(['{"clear":true}']);
     const pm = new PmAgent(project({ goal: '做个导出模块' }), makeDeps(llm));
     await pm.generateClarifyingQuestions(issue());
-    expect(llm.calls[0]!.messages[0]!.content).toBe(CLARIFYING_SYS);
+    expect(llm.calls[0]!.messages[0]!.content).toStartWith(CLARIFYING_SYS);
     expect(llm.calls[0]!.messages[1]!.content).toContain('项目目标：做个导出模块');
     expect(llm.calls[0]!.messages[1]!.content).toContain('issue（task）：加导出功能：支持 CSV');
   });
@@ -313,7 +314,7 @@ describe('mergeModuleTasks（同模块 pending 交 LLM 归并）', () => {
     const pm = new PmAgent(project(), makeDeps(llm));
     const got = await pm.mergeModuleTasks('web', [cand(1, 'A', 'aa'), cand(2, 'B'), cand(3, 'C')]);
     expect(got).toEqual([{ members: [1, 2], title: '合并A+B', body: '1) A\n2) B' }]);
-    expect(llm.calls[0]!.messages[0]!.content).toBe(MERGE_SYS);
+    expect(llm.calls[0]!.messages[0]!.content).toStartWith(MERGE_SYS);
     expect(llm.calls[0]!.opts?.jsonMode).toBe(true);
     expect(llm.calls[0]!.messages[1]!.content).toContain('模块「web」');
     expect(llm.calls[0]!.messages[1]!.content).toContain('#1 A：aa');

@@ -1,3 +1,7 @@
 [install]
-# Public npm registry mirror.
+# 默认腾讯镜像 404，固定走 npmmirror
 registry = "https://registry.npmmirror.com"
+
+[test]
+# 仓库内的发布副本有独立依赖与测试，不纳入主项目门禁。
+pathIgnorePatterns = ["mando_ai_public/**"]

@@ -12,6 +12,7 @@ import {
   type SummaryModelOption,
 } from '../lib/summaryModes';
 import type { SummaryStatus } from '../lib/types';
+import { useI18n } from '../i18n/provider';
 
 export function SummaryButton({
   status,
@@ -20,7 +21,7 @@ export function SummaryButton({
   btnClass = 'btn sm',
   models = SUMMARY_MODELS,
   renderLabel = summaryBtnLabel,
-  title = '选择模型更新项目简介',
+  title,
 }: {
   status?: SummaryStatus;
   busy: boolean;
@@ -33,6 +34,7 @@ export function SummaryButton({
   /** 按钮 title */
   title?: string;
 }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const running = busy || status === 'running';
   const pick = (e: Event, mode: SummaryMode): void => {
@@ -45,7 +47,7 @@ export function SummaryButton({
       <button
         class={btnClass}
         disabled={running || models.length === 0}
-        title={title}
+        title={title ?? t('ui.pickSummaryModel')}
         onClick={(e) => {
           e.stopPropagation();
           setOpen((o) => !o);

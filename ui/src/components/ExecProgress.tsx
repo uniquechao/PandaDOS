@@ -7,6 +7,7 @@
  */
 import { useEffect, useState } from 'preact/hooks';
 import type { IssueStatus, Subtask } from '../lib/types';
+import { tr } from '../i18n/runtime';
 
 export type StepState = 'done' | 'cur' | 'todo' | 'blocked' | 'cancelled';
 
@@ -115,8 +116,8 @@ export function ExecProgress({
   };
 
   return (
-    <div class="exec-prog" aria-label="子任务进度">
-      <span class={`ep-count${doneN === total ? ' all' : ''}`} title={`已完成 ${doneN}/${total}`}>
+    <div class="exec-prog" aria-label={tr('ui.subtaskProgress')}>
+      <span class={`ep-count${doneN === total ? ' all' : ''}`} title={tr('ui.completedProgress', { done: doneN, total })}>
         {doneN}/{total}
       </span>
       {/* 连线圆点轨道（#113 Apple 化）：状态靠填充色表达，编号/全文在 title/aria/浮层里 */}
@@ -141,7 +142,7 @@ export function ExecProgress({
             }}
           />
         ))}
-        <span class={`ep-end${endDone ? ' done' : ''}`} title={endDone ? '已完成' : '终点'} aria-label="终点" />
+        <span class={`ep-end${endDone ? ' done' : ''}`} title={endDone ? tr('status.done') : tr('ui.endpoint')} aria-label={tr('ui.endpoint')} />
       </div>
       {cur && (
         <span class="ep-title" title={`${cur.n}. ${cur.text}`}>

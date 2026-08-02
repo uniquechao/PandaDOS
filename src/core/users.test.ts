@@ -162,6 +162,9 @@ describe('UserStore 设定（persona/memory/autopilotDefault）', () => {
       memory: null,
       autopilotDefault: false,
       notifyPref: null,
+      locale: null,
+      timezone: null,
+      detectedTimezone: null,
     });
   });
 
@@ -196,6 +199,25 @@ describe('UserStore 设定（persona/memory/autopilotDefault）', () => {
     store.putSettings(user.id, { persona: 'x' });
     const s = store.putSettings(user.id, { persona: null });
     expect(s.persona).toBeNull();
+  });
+
+  test('语言与时区局部更新、自动时区复位和设备时区往返', () => {
+    const { store } = makeStore();
+    const { user } = store.create('u5', 'user');
+    store.putSettings(user.id, {
+      locale: 'de',
+      timezone: 'Europe/Berlin',
+      detectedTimezone: 'Asia/Singapore',
+    });
+    expect(store.getSettings(user.id)).toMatchObject({
+      locale: 'de',
+      timezone: 'Europe/Berlin',
+      detectedTimezone: 'Asia/Singapore',
+    });
+    const automatic = store.putSettings(user.id, { timezone: null });
+    expect(automatic.locale).toBe('de');
+    expect(automatic.timezone).toBeNull();
+    expect(automatic.detectedTimezone).toBe('Asia/Singapore');
   });
 });
 

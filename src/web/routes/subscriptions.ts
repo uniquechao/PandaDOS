@@ -20,7 +20,7 @@ import { json, type RouteDef } from '../middleware';
 
 /** 飞书绑定验证的最小接口（FeishuChannel 结构兼容，直接传实例即可） */
 export interface FeishuBindVerifier {
-  verifyBinding(openid: string): Promise<boolean>;
+  verifyBinding(openid: string, userId?: number): Promise<boolean>;
 }
 
 export interface SubscriptionsRoutesDeps {
@@ -142,7 +142,7 @@ export function subscriptionsRoutes(deps: SubscriptionsRoutesDeps): RouteDef[] {
           return json({ ok: false, error: '该 openid 已被其他用户绑定' }, 409);
         }
         if (!deps.feishu) return json({ ok: false, error: '飞书通道未配置' }, 503);
-        const ok = await deps.feishu.verifyBinding(openid);
+        const ok = await deps.feishu.verifyBinding(openid, user!.id);
         if (!ok) {
           // 发送失败即不落库（保存前验证 = 天然回滚），旧绑定保持不变
           return json({ ok: false, error: '测试消息发送失败，openid 未保存（请核对后重试）' }, 502);

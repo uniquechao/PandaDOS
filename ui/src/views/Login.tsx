@@ -7,8 +7,11 @@
  */
 import { useEffect, useState } from 'preact/hooks';
 import { api, ApiError } from '../lib/api';
+import { LanguageSelect } from '../i18n/LanguageSelect';
+import { useI18n } from '../i18n/provider';
 
 export function LoginView({ onLogin, initErr = '' }: { onLogin: () => void; initErr?: string }) {
+  const { locale, setLocale, t } = useI18n();
   const [username, setUsername] = useState('');
   const [token, setToken] = useState('');
   const [err, setErr] = useState(initErr);
@@ -30,40 +33,75 @@ export function LoginView({ onLogin, initErr = '' }: { onLogin: () => void; init
       await api('/api/login', 'POST', { username: username.trim(), token }, { silent401: true });
       onLogin();
     } catch (x) {
-      setErr(x instanceof ApiError ? x.message : '登录失败');
+      setErr(x instanceof ApiError ? x.message : t('login.failed'));
     }
     setBusy(false);
   };
 
   return (
     <div class="login">
+      <div class="login-art" aria-hidden="true">
+        <i class="login-glow login-glow-tl" />
+        <i class="login-glow login-glow-br" />
+        <i class="login-ring login-ring-left" />
+        <i class="login-ring login-ring-right" />
+        <i class="login-dots login-dots-tl" />
+        <i class="login-dots login-dots-br" />
+        <i class="login-spark login-spark-top">✦</i>
+        <i class="login-spark login-spark-side">✦</i>
+      </div>
+      <div class="login-locale">
+        <LanguageSelect compact value={locale} onChange={setLocale} />
+      </div>
       <form class="login-card" onSubmit={submit}>
         <img class="logo-mark" src="/logo-mark.png" alt="MandoAI" />
         <h1>
           Mando<span class="brand-ai">AI</span>
         </h1>
-        <p class="login-sub">曼拓 · 你的口袋工程管家</p>
+        <p class="login-sub">MandoAI · {t('login.tagline')}</p>
+        <div class="login-divider" aria-hidden="true">
+          <span>✦</span>
+        </div>
         <label class="field">
-          用户名
-          <input
-            value={username}
-            autocomplete="username"
-            autocapitalize="off"
-            onInput={(e) => setUsername(e.currentTarget.value)}
-          />
+          {t('login.username')}
+          <span class="login-input">
+            <span class="login-input-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <circle cx="12" cy="8" r="3.25" />
+                <path d="M5.75 19c.55-3.4 2.65-5.1 6.25-5.1s5.7 1.7 6.25 5.1" />
+              </svg>
+            </span>
+            <input
+              value={username}
+              autocomplete="username"
+              autocapitalize="off"
+              onInput={(e) => setUsername(e.currentTarget.value)}
+            />
+          </span>
         </label>
         <label class="field">
-          Token
-          <input
-            type="password"
-            value={token}
-            autocomplete="current-password"
-            onInput={(e) => setToken(e.currentTarget.value)}
-          />
+          {t('login.token')}
+          <span class="login-input">
+            <span class="login-input-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <rect x="6.5" y="10" width="11" height="9" rx="2" />
+                <path d="M9 10V7.5a3 3 0 0 1 6 0V10M12 13.5v2" />
+              </svg>
+            </span>
+            <input
+              type="password"
+              value={token}
+              autocomplete="current-password"
+              onInput={(e) => setToken(e.currentTarget.value)}
+            />
+          </span>
         </label>
         {err && <div class="err">{err}</div>}
-        <button type="submit" class="btn primary big" disabled={busy || !username.trim() || !token}>
-          {busy ? '登录中…' : '登录'}
+        <button type="submit" class="btn primary big login-submit" disabled={busy || !username.trim() || !token}>
+          <svg class="login-submit-icon" aria-hidden="true" viewBox="0 0 24 24">
+            <path d="M10 5h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-7M4 12h11M11 8l4 4-4 4" />
+          </svg>
+          {busy ? t('login.signingIn') : t('login.signIn')}
         </button>
         {feishuOn && (
           <button
@@ -74,7 +112,7 @@ export function LoginView({ onLogin, initErr = '' }: { onLogin: () => void; init
               location.href = '/api/feishu/oauth/start';
             }}
           >
-            🛩️ 飞书扫码登录
+            🛩️ {t('login.feishuSignIn')}
           </button>
         )}
       </form>

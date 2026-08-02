@@ -85,4 +85,33 @@ describe('/api/me/settings', () => {
     expect((await dispatch(putReq(alice.token, { autopilotDefault: 'yes' })))!.status).toBe(400);
     expect((await dispatch(putReq(alice.token, 'not-an-object')))!.status).toBe(400);
   });
+
+  test('语言、固定时区与设备时区校验后读写往返', async () => {
+    const { dispatch, alice } = makeApp();
+    const put = await dispatch(
+      putReq(alice.token, {
+        locale: 'fr',
+        timezone: 'Europe/Paris',
+        detectedTimezone: 'Europe/Paris',
+      }),
+    );
+    expect(put!.status).toBe(200);
+    expect(((await put!.json()) as { settings: unknown }).settings).toMatchObject({
+      locale: 'fr',
+      timezone: 'Europe/Paris',
+      detectedTimezone: 'Europe/Paris',
+    });
+
+    const automatic = await dispatch(putReq(alice.token, { timezone: null }));
+    expect(automatic!.status).toBe(200);
+    expect(((await automatic!.json()) as { settings: { timezone: string | null } }).settings.timezone).toBeNull();
+  });
+
+  test('拒绝不支持的语言、locale null 和非法 IANA 时区', async () => {
+    const { dispatch, alice } = makeApp();
+    expect((await dispatch(putReq(alice.token, { locale: 'ar' })))!.status).toBe(400);
+    expect((await dispatch(putReq(alice.token, { locale: null })))!.status).toBe(400);
+    expect((await dispatch(putReq(alice.token, { timezone: 'Mars/Olympus' })))!.status).toBe(400);
+    expect((await dispatch(putReq(alice.token, { detectedTimezone: '' })))!.status).toBe(400);
+  });
 });

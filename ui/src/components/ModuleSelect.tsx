@@ -9,6 +9,7 @@
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
 import type { ProjectModule } from '../lib/types';
+import { useI18n } from '../i18n/provider';
 
 /** 过滤（导出供测试）：空查询给全量；否则按显示名/slug 包含匹配（不分大小写） */
 export function filterModules(modules: ProjectModule[], query: string): ProjectModule[] {
@@ -30,6 +31,7 @@ export function ModuleSelect({
   onChange: (value: string) => void;
   placeholder?: string;
 }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
 
@@ -74,7 +76,7 @@ export function ModuleSelect({
         type="button"
         class="msel-caret"
         tabIndex={-1}
-        aria-label="展开模块列表"
+        aria-label={t('ui.expandModules')}
         onClick={() => setOpen(!open)}
       >
         ▾
@@ -83,7 +85,7 @@ export function ModuleSelect({
         <div class="msel-panel">
           {trimmed !== '' && (
             <button type="button" class="msel-opt msel-clear" onClick={() => pick('')}>
-              清空（留空自动归类）
+              {t('ui.clearAutoClassify')}
             </button>
           )}
           {filtered.map((m) => (
@@ -100,7 +102,7 @@ export function ModuleSelect({
           ))}
           {filtered.length === 0 && (
             <div class="msel-empty">
-              无匹配模块——将以「{trimmed}」新建（英文名直接建，中文名自动生成英文 slug）
+              {t('ui.noMatchingModule', { name: trimmed })}
             </div>
           )}
         </div>

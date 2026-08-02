@@ -415,7 +415,7 @@ describe('执行机 CRUD', () => {
       host: 'executor.example.com',
       port: 22,
       sshUser: 'developer',
-      keyRef: '/Users/developer/.ssh/id_ed25519',
+      keyRef: '/Users/operator/.ssh/id_ed25519',
     };
 
     const detected = await call(
