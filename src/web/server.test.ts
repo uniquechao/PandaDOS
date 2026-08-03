@@ -11,7 +11,7 @@ import path from 'node:path';
 import { openDb } from '../core/db';
 import { migrate } from '../core/migrate';
 import { LocalDriver } from '../executor/local';
-import { executorStatusOf, startServer, trustFileOf, type MandoServer } from './server';
+import { executorStatusOf, startServer, trustFileOf, type PandaServer } from './server';
 
 /** tmux 面全部 stub 成内存实现（测试机不真起 tmux/claude）；文件/git 面保持真 LocalDriver */
 class FakeDriver extends LocalDriver {
@@ -44,7 +44,7 @@ afterEach(async () => {
 });
 
 interface Ctx {
-  server: MandoServer;
+  server: PandaServer;
   base: string;
   dir: string;
   ws: string;
@@ -53,9 +53,9 @@ interface Ctx {
 }
 
 async function boot(publicDir?: string): Promise<Ctx> {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-server-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-server-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
-  const dbPath = path.join(dir, 'mando.db');
+  const dbPath = path.join(dir, 'panda.db');
   const ws = path.join(dir, 'ws');
   const claudeDir = path.join(dir, 'home', '.claude', 'projects');
   const tokenFile = path.join(dir, 'admin-token');
@@ -70,18 +70,18 @@ async function boot(publicDir?: string): Promise<Ctx> {
   db0.close();
 
   const driver = new FakeDriver();
-  // LLM 指到本地不可达地址、单次重试：开发机/CI 环境常带真 MANDO_LLM_API_KEY，
+  // LLM 指到本地不可达地址、单次重试：开发机/CI 环境常带真 PANDA_LLM_API_KEY，
   // 不摘会让冒烟真调 驱动大模型（模块起名不定、耗时不定甚至超时）。配置在 startServer
   // 装配时一次性捕获（createLlmClient），随后立刻恢复 env，不影响同进程其它测试文件。
   const LLM_ENV: Record<string, string> = {
-    MANDO_LLM_BASE_URL: 'http://127.0.0.1:1',
-    MANDO_LLM_API_KEY: 'test-disabled',
-    MANDO_LLM_RETRIES: '1',
-    MANDO_LLM_TIMEOUT_MS: '500',
+    PANDA_LLM_BASE_URL: 'http://127.0.0.1:1',
+    PANDA_LLM_API_KEY: 'test-disabled',
+    PANDA_LLM_RETRIES: '1',
+    PANDA_LLM_TIMEOUT_MS: '500',
   };
   const savedEnv = Object.fromEntries(Object.keys(LLM_ENV).map((k) => [k, process.env[k]]));
   Object.assign(process.env, LLM_ENV);
-  let server: MandoServer;
+  let server: PandaServer;
   try {
     server = await startServer({
       port: 0,
@@ -123,9 +123,9 @@ async function api(
 
 describe('server 集成冒烟（完整装配）', () => {
   test('空数据库启动自动创建唯一系统本机执行机，重启保持幂等', async () => {
-    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-local-bootstrap-'));
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-local-bootstrap-'));
     cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
-    const dbPath = path.join(dir, 'mando.db');
+    const dbPath = path.join(dir, 'panda.db');
     const defaults = {
       workspaceRoot: path.join(dir, 'workspace'),
       // 非标准测试路径：避免服务启动时的 best-effort 技能安装后台任务干扰幂等断言。
@@ -175,12 +175,12 @@ describe('server 集成冒烟（完整装配）', () => {
   test('healthz → admin 登录 → 建用户/项目/issue → 属主隔离 → 优雅停机', async () => {
     const ctx = await boot();
 
-    // ---- healthz：迁移链全量（001-016/030-038/040/060）+ executor online + engine running ----
+    // ---- healthz：迁移链全量（001-017/030-038/040/060）+ executor online + engine running ----
     const h = await api(ctx, 'GET', '/healthz');
     expect(h.status).toBe(200);
     expect(h.body.ok).toBe(true);
     expect(h.body.db.latest).toBe(60);
-    expect(h.body.db.applied).toBe(27);
+    expect(h.body.db.applied).toBe(28);
     expect(h.body.executors).toEqual([{ id: 1, name: 'local', status: 'online' }]);
     expect(h.body.engine.running).toBe(true);
     expect(h.body.feishu).toBe(false);
@@ -196,15 +196,15 @@ describe('server 集成冒烟（完整装配）', () => {
     const login = await api(ctx, 'POST', '/api/login', undefined, { username: 'admin', token: adminToken });
     expect(login.status).toBe(200);
     expect(login.body.role).toBe('admin');
-    expect(login.headers.get('set-cookie')).toContain('mando_token=');
+    expect(login.headers.get('set-cookie')).toContain('panda_token=');
 
-    // ---- 建用户：workspace 经 Driver 落到执行机（u<id> 目录 + .mando/keep） ----
+    // ---- 建用户：workspace 经 Driver 落到执行机（u<id> 目录 + .panda/keep） ----
     const alice = await api(ctx, 'POST', '/api/admin/users', adminToken, { username: 'alice' });
     expect(alice.status).toBe(200);
     expect(alice.body.token).toMatch(/^[0-9a-f]{48}$/);
     expect(alice.body.workspace.warnings).toEqual([]);
     const aliceId = alice.body.user.id as number;
-    const keep = await fsp.readFile(path.join(ctx.ws, `u${aliceId}`, '.mando/keep'), 'utf8');
+    const keep = await fsp.readFile(path.join(ctx.ws, `u${aliceId}`, '.panda/keep'), 'utf8');
     expect(keep).toContain('alice');
     const bob = await api(ctx, 'POST', '/api/admin/users', adminToken, { username: 'bob' });
     expect(bob.status).toBe(200);
@@ -333,7 +333,7 @@ describe('server 集成冒烟（完整装配）', () => {
 
     const server2 = await startServer({
       port: 0,
-      dbPath: path.join(ctx.dir, 'mando.db'),
+      dbPath: path.join(ctx.dir, 'panda.db'),
       adminTokenFile: path.join(ctx.dir, 'admin-token-2'), // 若误重建会写到这里
       driverFactory: () => ctx.driver,
       feishu: null,
@@ -354,7 +354,7 @@ describe('server 集成冒烟（完整装配）', () => {
 
 describe('serveStatic 静态服务（缓存头 + 缺失资源 404）', () => {
   test('/assets immutable、缺失404不回退HTML、index no-cache、无扩展名导航回退', async () => {
-    const pub = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-pub-'));
+    const pub = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-pub-'));
     cleanups.push(() => fsp.rm(pub, { recursive: true, force: true }));
     await fsp.mkdir(path.join(pub, 'assets'), { recursive: true });
     await fsp.writeFile(path.join(pub, 'index.html'), '<!doctype html><title>t</title><body>HOME_MARKER</body>');

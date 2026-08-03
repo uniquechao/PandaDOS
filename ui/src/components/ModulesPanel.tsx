@@ -4,17 +4,20 @@
  *   产出整理方案（合并 / 改 slug / 新建模块 / 挪 issue）；面板轮询进度，方案逐项「执行」
  *   （服务端按当前事实重校验 + 防重放），或「忽略本批」（localStorage 同批不再提示）。
  * - 模块列表：显示名 · slug · 代理 · 来源 · issue 数；行内改名（PATCH displayName）、
- *   归档（PATCH status=archived，有未完结 issue 服务端会拒绝并给中文原因）。
+ *   归档（PATCH status=archived，有未完结 issue 时服务端会拒绝）。
  */
 import { useEffect, useState } from 'preact/hooks';
 import { api, ApiError } from '../lib/api';
 import type { AgentKind, Issue, ProjectModule } from '../lib/types';
 import {
-  actionKindLabel,
-  actionLabel,
+  actionKindMessage,
+  actionMessage,
   dismissOrganizeSuggestion,
+  failureMessage,
   readOrganizeDismissedTs,
+  resultMessage,
   visibleSuggestion,
+  type OrganizeApplyResult,
   type OrganizeStatus,
 } from '../lib/organize';
 import { Modal } from './Modal';
@@ -94,12 +97,13 @@ export function ModulesPanel({
     if (applying !== null) return;
     setApplying(index);
     try {
-      const r = await api<{ ok: boolean; summary: string }>(
+      const r = await api<{ ok: boolean; result: OrganizeApplyResult }>(
         `/api/projects/${pid}/modules/organize/apply`,
         'POST',
         { index },
       );
-      toast.success(r.summary);
+      const message = resultMessage(r.result);
+      toast.success(t(message.key, message.values));
       load();
       onChanged();
     } catch (e) {
@@ -199,7 +203,11 @@ export function ModulesPanel({
         )}
         {!org?.running && org?.failed && (
           <div class="org-note fail">
-            {t('ui.lastAnalysisFailed', { reason: org.failed.reason, error: org.failed.error ? `: ${org.failed.error}` : '' })}
+            {(() => {
+              const message = failureMessage(org.failed.reason);
+              return t(message.key, message.values);
+            })()}
+            {org.failed.error && <span class="org-failure-detail"> {t('ui.organizeFailureDetail', { detail: org.failed.error })}</span>}
           </div>
         )}
 
@@ -218,9 +226,19 @@ export function ModulesPanel({
             </div>
             {sugg.actions.map((a, i) => (
               <div class={`org-item${a.applied ? ' done' : ''}`} key={i}>
-                <span class={`badge ${a.kind === 'merge' ? 'b-ai' : 'b-gray'}`}>{actionKindLabel(a.kind)}</span>
+                <span class={`badge ${a.kind === 'merge' ? 'b-ai' : 'b-gray'}`}>
+                  {(() => {
+                    const message = actionKindMessage(a.kind);
+                    return t(message.key, message.values);
+                  })()}
+                </span>
                 <div class="org-item-tx">
-                  <div class="org-label">{actionLabel(a)}</div>
+                  <div class="org-label">
+                    {(() => {
+                      const message = actionMessage(a);
+                      return t(message.key, message.values);
+                    })()}
+                  </div>
                   {a.reason && <div class="org-reason">{a.reason}</div>}
                 </div>
                 {a.applied ? (
@@ -263,39 +281,42 @@ export function ModulesPanel({
                 ) : (
                   <>
                     <span class="mrow-main">
-                      <span class="mrow-name">{m.displayName}</span>
-                      <span class="mrow-slug">{m.slug}</span>
+                      <span class="mrow-name" title={m.displayName}>{m.displayName}</span>
+                      <span class="mrow-slug" title={m.slug}>{m.slug}</span>
                     </span>
-                    <span class="mrow-src" title={t('ui.moduleSource')}>
-                      {m.source === 'legacy' ? t('ui.migrated') : m.source === 'manual' ? t('ui.manual') : t('ui.automatic')}
-                    </span>
-                    <select
-                      class="mrow-agent"
-                      value={m.agent}
-                      disabled={busy}
-                      title={t('ui.moduleAgent')}
-                      onChange={(e) => void changeAgent(m, e.currentTarget.value as AgentKind)}
-                    >
-                      {!supportedAgents.includes(m.agent) && <option value={m.agent}>{m.agent} ({t('ui.unavailable')})</option>}
-                      {supportedAgents.map((a) => <option key={a} value={a}>{a}</option>)}
-                    </select>
-                    <span class="badge b-gray" title={t('ui.relatedIssueCount')}>
-                      {issueCount(m.id)} issue
-                    </span>
-                    <span class="mrow-acts">
-                      <button
-                        class="mrow-act"
+                    <span class="mrow-meta">
+                      <span class="mrow-src" title={t('ui.moduleSource')}>
+                        {m.source === 'legacy' ? t('ui.migrated') : m.source === 'manual' ? t('ui.manual') : t('ui.automatic')}
+                      </span>
+                      <select
+                        class="mrow-agent"
+                        value={m.agent}
                         disabled={busy}
-                        onClick={() => {
-                          setEditingId(m.id);
-                          setEditName(m.displayName);
-                        }}
+                        title={t('ui.moduleAgent')}
+                        aria-label={`${m.displayName} · ${t('ui.moduleAgent')}`}
+                        onChange={(e) => void changeAgent(m, e.currentTarget.value as AgentKind)}
                       >
-                        {t('ui.rename')}
-                      </button>
-                      <button class="mrow-act danger" disabled={busy} onClick={() => void archive(m)}>
-                        {t('ui.archive')}
-                      </button>
+                        {!supportedAgents.includes(m.agent) && <option value={m.agent}>{m.agent} ({t('ui.unavailable')})</option>}
+                        {supportedAgents.map((a) => <option key={a} value={a}>{a}</option>)}
+                      </select>
+                      <span class="badge b-gray mrow-count" title={t('ui.relatedIssueCount')}>
+                        {t('ui.moduleIssueCount', { count: issueCount(m.id) })}
+                      </span>
+                      <span class="mrow-acts">
+                        <button
+                          class="mrow-act"
+                          disabled={busy}
+                          onClick={() => {
+                            setEditingId(m.id);
+                            setEditName(m.displayName);
+                          }}
+                        >
+                          {t('ui.rename')}
+                        </button>
+                        <button class="mrow-act danger" disabled={busy} onClick={() => void archive(m)}>
+                          {t('ui.archive')}
+                        </button>
+                      </span>
                     </span>
                   </>
                 )}

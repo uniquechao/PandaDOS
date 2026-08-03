@@ -13,7 +13,7 @@
 import { useEffect, useState } from 'preact/hooks';
 
 /** localStorage 键（按设备存，一个用户多设备各自记） */
-export const COLSIZE_KEY = 'mando.gitCols';
+export const COLSIZE_KEY = 'panda.gitCols';
 
 /** 默认三栏比例：提交记录 32% / 文件 22% / Diff 46% */
 export const COL_DEFAULTS: readonly [number, number, number] = [32, 22, 46];

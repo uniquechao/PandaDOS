@@ -20,10 +20,13 @@
  *   files = diff-tree --name-status ∪ --numstat（status/path/oldPath/adds/dels）；
  *   合并提交按第一父 diff（git 惯例），根提交 --root。sha 非 hex → 400，不存在 → 404。
  * GET /api/projects/:projectId/git/commits/:sha/diff?path=&old= → { ok, diff, truncated }
+ * GET /api/projects/:projectId/git/commits/:sha/raw?path=&old=&side=new|old → 图片原始字节
  * GET /api/projects/:projectId/git/worktree/diff?path=&untracked=1 → { ok, diff, truncated }
+ * GET /api/projects/:projectId/git/worktree/raw?path=&old=&side=new|old → 图片原始字节
  *   工作区 diff 对 HEAD（暂存+未暂存都含）；未跟踪文件用 --no-index /dev/null 呈现全新增。
  * GET /api/projects/:projectId/issues/:issueId/git → IssueGitInfo（本 issue 提交/改动范围；
  *   活跃 issue 另附 worktree = 工作区未提交改动，执行现场的「正在进行」部分）。
+ * GET /api/projects/:projectId/issues/:issueId/git/raw?path=&old=&side=new|old → 图片原始字节
  *
  * 非 git 仓库 → 200 + { ok:false, error, cwd }（预期态，前端按 ok 渲染，同 v1）。
  * git 一律经 Driver.git（参数数组无 shell 注入；Local/SSH 同构，60s 限时在实现层）；
@@ -35,6 +38,12 @@ import type { Database } from 'bun:sqlite';
 import type { LlmClient, LlmMessage } from '../../agents/llm';
 import { userPromptLocale, outputLanguageInstruction, promptLanguage } from '../../agents/prompts/language';
 import type { SupportedLocale } from '../../../shared/i18n/locales';
+import {
+  contentTypeForExt,
+  isScriptableType,
+  MAX_RAW_BYTES,
+  resolveProjectPath,
+} from '../../core/files';
 import type { Project } from '../../core/types';
 import type { ExecutorDriver } from '../../executor/driver';
 import { getProject, type ImplCommitsSnapshot } from '../../issues/engine';
@@ -43,7 +52,10 @@ import { json, type RouteCtx, type RouteDef } from '../middleware';
 import { llmErrorResponse } from '../llm-error';
 
 /** 本模块需要的 Driver 子集（结构兼容 ExecutorDriver，测试可传替身） */
-export type GitDriver = Pick<ExecutorDriver, 'git'>;
+export type GitDriver = Pick<
+  ExecutorDriver,
+  'git' | 'readGitBlob' | 'statPath' | 'readFileRange'
+>;
 
 /**
  * 一条 issue 的 git 锚点——per-issue「提交/改动」视图用。
@@ -354,11 +366,102 @@ function sliceDiff(out: string): { diff: string; truncated: boolean } {
 
 const SHA_RE = /^[0-9a-f]{4,40}$/i;
 
+type BlobSide = 'new' | 'old';
+
+function parseBlobSide(url: URL): BlobSide | null {
+  const side = url.searchParams.get('side') ?? 'new';
+  return side === 'new' || side === 'old' ? side : null;
+}
+
+/** blob spec 不能使用 pathspec 的 `--` 防护，因此先严格限定为仓库内相对路径。 */
+function safeRepoPath(raw: string): string | null {
+  if (!raw || raw.length > 4_000 || raw.startsWith('/') || raw.includes('\0')) return null;
+  const parts = raw.replace(/\\/g, '/').split('/');
+  if (parts.some((part) => !part || part === '.' || part === '..')) return null;
+  return parts.join('/');
+}
+
+function inlineDisposition(name: string): string {
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/"/g, "'");
+  return `inline; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
+function imageResponse(data: Uint8Array, path: string): Response {
+  const name = path.split('/').pop() || 'image';
+  const ct = contentTypeForExt(name);
+  const headers: Record<string, string> = {
+    'content-type': ct,
+    'content-disposition': inlineDisposition(name),
+    'x-content-type-options': 'nosniff',
+    'cache-control': 'private, max-age=0, must-revalidate',
+  };
+  if (isScriptableType(ct)) headers['content-security-policy'] = 'sandbox';
+  return new Response(data as BodyInit, { headers });
+}
+
+function ensureImagePath(path: string): Response | null {
+  return contentTypeForExt(path).startsWith('image/')
+    ? null
+    : json({ ok: false, error: '仅支持图片文件预览' }, 415);
+}
+
+/** 不读正文先查 blob 大小；revision 由调用方解析成不可变 commit SHA，避免检查/读取竞态。 */
+async function readImageBlob(
+  driver: GitDriver,
+  cwd: string,
+  rev: string,
+  path: string,
+): Promise<Response> {
+  const imageError = ensureImagePath(path);
+  if (imageError) return imageError;
+  const spec = `${rev}:${path}`;
+  const sr = await driver.git(cwd, ['cat-file', '-s', spec]);
+  if (sr.code !== 0) return json({ ok: false, error: '该版本中无此文件' }, 404);
+  const size = Number(sr.out.trim());
+  if (!Number.isSafeInteger(size) || size < 0) {
+    return json({ ok: false, error: '无法读取文件大小' }, 500);
+  }
+  if (size > MAX_RAW_BYTES) {
+    return json({ ok: false, error: '文件超过 32MB，请下载查看' }, 413);
+  }
+  const br = await driver.readGitBlob(cwd, rev, path);
+  if (br.code !== 0) {
+    return json({ ok: false, error: br.err.slice(0, 200) || '无法读取该版本文件' }, 404);
+  }
+  return imageResponse(br.data, path);
+}
+
+async function readWorktreeImage(
+  driver: GitDriver,
+  cwd: string,
+  path: string,
+): Promise<Response> {
+  const imageError = ensureImagePath(path);
+  if (imageError) return imageError;
+  const full = resolveProjectPath(cwd, path);
+  if (!full) return json({ ok: false, error: '路径越界' }, 400);
+  const st = await driver.statPath(full);
+  if (!st) return json({ ok: false, error: '文件不存在' }, 404);
+  if (!st.isFile) return json({ ok: false, error: '不是文件' }, 400);
+  if (st.size > MAX_RAW_BYTES) {
+    return json({ ok: false, error: '文件超过 32MB，请下载查看' }, 413);
+  }
+  const fr = await driver.readFileRange(full, 0, Math.max(st.size, 1));
+  return imageResponse(fr.data, path);
+}
+
 /** 校验并解析一个候选 sha 为存在的提交对象（不存在/非 hex → null，供固定分支范围锚点降级用） */
 async function resolveRev(driver: GitDriver, cwd: string, rev?: string): Promise<string | null> {
   if (!rev || !SHA_RE.test(rev)) return null;
   const r = await driver.git(cwd, ['rev-parse', '--verify', '--quiet', `${rev}^{commit}`]);
   return r.code === 0 && r.out.trim() ? r.out.trim() : null;
+}
+
+/** 解析服务端已信任的分支/引用为不可变 commit SHA；不接收请求原始 rev。 */
+async function resolveCommitRef(driver: GitDriver, cwd: string, ref: string): Promise<string | null> {
+  const r = await driver.git(cwd, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
+  const sha = r.out.trim();
+  return r.code === 0 && SHA_RE.test(sha) ? sha : null;
 }
 
 /**
@@ -840,6 +943,39 @@ export function gitRoutes(deps: GitRoutesDeps): RouteDef[] {
       },
     },
     {
+      // 提交中文件的新/旧版本原始图片；旧侧按第一父提交（与 diff 端点一致）。
+      method: 'GET',
+      path: '/api/projects/:projectId/git/commits/:sha/raw',
+      auth: 'project-access',
+      handler: async (ctx) => {
+        const sha = ctx.params.sha ?? '';
+        if (!SHA_RE.test(sha)) return json({ ok: false, error: 'sha 非法' }, 400);
+        const path = safeRepoPath(ctx.url.searchParams.get('path') ?? '');
+        if (!path) return json({ ok: false, error: 'path 非法' }, 400);
+        const oldRaw = ctx.url.searchParams.get('old') ?? '';
+        const old = oldRaw ? safeRepoPath(oldRaw) : path;
+        if (!old) return json({ ok: false, error: 'old 非法' }, 400);
+        const side = parseBlobSide(ctx.url);
+        if (!side) return json({ ok: false, error: 'side 仅支持 new/old' }, 400);
+        try {
+          const r = await repoCtx(ctx);
+          if (r instanceof Response) return r;
+          const { driver, cwd } = r;
+          const parentsR = await driver.git(cwd, ['rev-list', '--parents', '-n', '1', sha]);
+          if (parentsR.code !== 0 || !parentsR.out.trim()) {
+            return json({ ok: false, error: '无此提交' }, 404);
+          }
+          const refs = parentsR.out.trim().split(/\s+/);
+          const commitSha = refs[0]!;
+          const rev = side === 'new' ? commitSha : refs[1];
+          if (!rev) return json({ ok: false, error: '该提交没有旧版本' }, 404);
+          return await readImageBlob(driver, cwd, rev, side === 'new' ? path : old);
+        } catch (e) {
+          return json({ ok: false, error: String(e).slice(0, 200) }, 500);
+        }
+      },
+    },
+    {
       method: 'GET',
       path: '/api/projects/:projectId/git/worktree/diff',
       auth: 'project-access',
@@ -864,6 +1000,32 @@ export function gitRoutes(deps: GitRoutesDeps): RouteDef[] {
           if (dr.code !== 0) dr = await driver.git(cwd, ['diff', '-M', '--', ...paths]);
           if (dr.code !== 0) return json({ ok: false, error: dr.err.slice(0, 200) || 'diff 失败' }, 500);
           return json({ ok: true, ...sliceDiff(dr.out) });
+        } catch (e) {
+          return json({ ok: false, error: String(e).slice(0, 200) }, 500);
+        }
+      },
+    },
+    {
+      // 工作区新侧直接读当前文件；旧侧从 HEAD 读取，覆盖删除/重命名前图片。
+      method: 'GET',
+      path: '/api/projects/:projectId/git/worktree/raw',
+      auth: 'project-access',
+      handler: async (ctx) => {
+        const path = safeRepoPath(ctx.url.searchParams.get('path') ?? '');
+        if (!path) return json({ ok: false, error: 'path 非法' }, 400);
+        const oldRaw = ctx.url.searchParams.get('old') ?? '';
+        const old = oldRaw ? safeRepoPath(oldRaw) : path;
+        if (!old) return json({ ok: false, error: 'old 非法' }, 400);
+        const side = parseBlobSide(ctx.url);
+        if (!side) return json({ ok: false, error: 'side 仅支持 new/old' }, 400);
+        try {
+          const r = await repoCtx(ctx);
+          if (r instanceof Response) return r;
+          const { driver, cwd } = r;
+          if (side === 'new') return await readWorktreeImage(driver, cwd, path);
+          const head = await resolveCommitRef(driver, cwd, 'HEAD');
+          if (!head) return json({ ok: false, error: '工作区没有可用的旧版本' }, 404);
+          return await readImageBlob(driver, cwd, head, old);
         } catch (e) {
           return json({ ok: false, error: String(e).slice(0, 200) }, 500);
         }
@@ -981,6 +1143,41 @@ export function gitRoutes(deps: GitRoutesDeps): RouteDef[] {
           const dr = await driver.git(cwd, ['diff', '-M', diffRange, '--', ...paths]);
           if (dr.code !== 0) return json({ ok: false, error: dr.err.slice(0, 200) || 'diff 失败' }, 500);
           return json({ ok: true, ...sliceDiff(dr.out) });
+        } catch (e) {
+          return json({ ok: false, error: String(e).slice(0, 200) }, 500);
+        }
+      },
+    },
+    {
+      // 本 issue 净改动图片：新侧取范围终点，旧侧取固定起点或经典三点 diff 的 merge-base。
+      method: 'GET',
+      path: '/api/projects/:projectId/issues/:issueId/git/raw',
+      auth: 'project-access',
+      handler: async (ctx) => {
+        const ref = resolveIssueRef(ctx);
+        if (ref instanceof Response) return ref;
+        const path = safeRepoPath(ctx.url.searchParams.get('path') ?? '');
+        if (!path) return json({ ok: false, error: 'path 非法' }, 400);
+        const oldRaw = ctx.url.searchParams.get('old') ?? '';
+        const old = oldRaw ? safeRepoPath(oldRaw) : path;
+        if (!old) return json({ ok: false, error: 'old 非法' }, 400);
+        const side = parseBlobSide(ctx.url);
+        if (!side) return json({ ok: false, error: 'side 仅支持 new/old' }, 400);
+        try {
+          const r = await repoCtx(ctx);
+          if (r instanceof Response) return r;
+          const { driver, cwd } = r;
+          const range = await issueRange(driver, cwd, ref);
+          const end = await resolveCommitRef(driver, cwd, range.end);
+          if (!end) return json({ ok: false, error: 'issue 改动范围不存在' }, 404);
+          if (side === 'new') return await readImageBlob(driver, cwd, end, path);
+          let start = range.start;
+          if (!start) {
+            const mr = await driver.git(cwd, ['merge-base', ref.base, end]);
+            start = mr.code === 0 && SHA_RE.test(mr.out.trim()) ? mr.out.trim() : null;
+          }
+          if (!start) return json({ ok: false, error: 'issue 改动范围没有旧版本' }, 404);
+          return await readImageBlob(driver, cwd, start, old);
         } catch (e) {
           return json({ ok: false, error: String(e).slice(0, 200) }, 500);
         }

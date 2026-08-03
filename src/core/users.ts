@@ -335,7 +335,7 @@ export function userWorkspaceDir(workspaceRoot: string, user: Pick<User, 'id'>):
 }
 
 /**
- * 在执行机上建用户 workspace：写一个 .mando/keep 占位文件，
+ * 在执行机上建用户 workspace：写一个 .panda/keep 占位文件，
  * Driver.writeFile 会自动创建父目录（driver.ts 契约）。返回 workspace 绝对路径。
  */
 export async function provisionUserWorkspace(
@@ -345,7 +345,7 @@ export async function provisionUserWorkspace(
 ): Promise<string> {
   const dir = userWorkspaceDir(workspaceRoot, user);
   await driver.writeFile(
-    `${dir}/.mando/keep`,
+    `${dir}/.panda/keep`,
     `workspace of ${user.username} (user ${user.id})\n`,
     0o600,
   );

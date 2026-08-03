@@ -8,6 +8,8 @@
  * #/p/:pid/files       文件浏览
  * #/p/:pid/git         git 提交图
  * #/p/:pid/skills      技能（全局/项目 + 市场）
+ * #/p/:pid/settings    项目配置
+ * #/p/:pid/external-issues 外部 issue 导入
  * #/settings          我的设定
  * #/admin            admin 后台
  */
@@ -24,7 +26,9 @@ export type Route =
   | { name: 'term'; pid: number }
   | { name: 'files'; pid: number }
   | { name: 'git'; pid: number }
-  | { name: 'skills'; pid: number };
+  | { name: 'skills'; pid: number }
+  | { name: 'external-issues'; pid: number }
+  | { name: 'project-settings'; pid: number };
 
 export function parseHash(hash: string): Route {
   const parts = hash.replace(/^#/, '').split('/').filter((s) => s.length > 0);
@@ -43,6 +47,8 @@ export function parseHash(hash: string): Route {
       if (parts[2] === 'term') return { name: 'term', pid };
       if (parts[2] === 'files') return { name: 'files', pid };
       if (parts[2] === 'git') return { name: 'git', pid };
+      if (parts[2] === 'external-issues') return { name: 'external-issues', pid };
+      if (parts[2] === 'settings') return { name: 'project-settings', pid };
       if (parts[2] === 'skills') return { name: 'skills', pid };
       return { name: 'board', pid };
     }

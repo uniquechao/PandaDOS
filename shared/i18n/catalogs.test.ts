@@ -45,4 +45,36 @@ describe('launch catalogs', () => {
       expect(identical).toEqual([...identicalEnglishAllowlist[locale]].sort());
     }
   });
+
+  test('Issue #7 导入流程的简体中文文案明确 cwd 隔离与可导入来源', () => {
+    expect(catalogs['zh-Hans']['view.importLocalHistory']).toBe('导入本地历史');
+    expect(catalogs['zh-Hans']['view.localHistoryHelp']).toContain('工作目录与当前项目完全一致');
+    expect(catalogs['zh-Hans']['project.importTmuxSource']).toBe('tmux 会话');
+    expect(catalogs['zh-Hans']['project.importClaudeSource']).toBe('Claude 项目');
+    expect(catalogs['zh-Hans']['project.importCodexSource']).toBe('Codex 项目');
+  });
+
+  test('Issue #7 的四类数量文案在十种语言中使用 ICU 复数规则', () => {
+    const keys = [
+      'view.historySelected',
+      'view.localHistoryImported',
+      'project.historySessions',
+      'project.linkedHistory',
+    ] as const;
+    for (const locale of SUPPORTED_LOCALES) {
+      for (const key of keys) {
+        const message = catalogs[locale][key];
+        expect(message).toContain('{count, plural,');
+        for (const count of [1, 2, 5]) {
+          expect(new IntlMessageFormat(message, locale).format({ count })).toBeString();
+        }
+      }
+    }
+    expect(new IntlMessageFormat(catalogs.ru['project.historySessions'], 'ru').format({ count: 1 }))
+      .toBe('1 сеанс истории');
+    expect(new IntlMessageFormat(catalogs.ru['project.historySessions'], 'ru').format({ count: 2 }))
+      .toBe('2 сеанса истории');
+    expect(new IntlMessageFormat(catalogs.ru['project.historySessions'], 'ru').format({ count: 5 }))
+      .toBe('5 сеансов истории');
+  });
 });

@@ -6,7 +6,7 @@
  * 纯展示：数据来自详情接口的 subtasks + issue.subIndex/status，自己不发请求。
  */
 import { useEffect, useState } from 'preact/hooks';
-import type { IssueStatus, Subtask } from '../lib/types';
+import type { ImplMode, IssueStatus, Subtask } from '../lib/types';
 import { tr } from '../i18n/runtime';
 
 export type StepState = 'done' | 'cur' | 'todo' | 'blocked' | 'cancelled';
@@ -35,6 +35,22 @@ export interface ProgState {
  * 那时高亮一条没在跑的子任务是误导——与详情 tab 的 `.plan-i.cur` 同一套判据（i === subIndex 且未完成）。
  */
 const RUNNING_STATES: readonly IssueStatus[] = ['implementing', 'testing'];
+
+/**
+ * 与 issue 引擎的派发边界保持一致：计划确认阶段尚未派发；顺序执行时只有游标之后的项尚未派发。
+ * 团队模式开工后会并行派发全部子任务，因此不开放编辑。
+ */
+export function canEditSubtask(
+  subtask: Subtask,
+  index: number,
+  subIndex: number,
+  status: IssueStatus,
+  implMode: ImplMode,
+): boolean {
+  if (subtask.done) return false;
+  if (status === 'plan_review') return true;
+  return implMode === 'seq' && (status === 'implementing' || status === 'blocked') && index > subIndex;
+}
 
 /** 纯函数：把 subtasks + subIndex + status 折成进度链（组件只管画）。
  * blocked：卡在的那条（i === subIndex 且未完成）标 blocked——subIndex 就是受阻现场，有信息量；

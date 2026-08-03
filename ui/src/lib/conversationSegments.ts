@@ -32,3 +32,35 @@ export function groupConversationMessages(
   });
   return groups;
 }
+
+/**
+ * 只保留指定 issue 持久化时间区间内的消息。带时间的消息严格按 startTs/endTs 判定；
+ * 无时间消息延续上一条带时间消息所属的分段，避免把相邻 issue 的工具续帧混入当前执行页。
+ */
+export function messagesForIssue(
+  msgs: ChatMessage[],
+  inputSegments: ConversationSegment[],
+  issueId: number,
+): ChatMessage[] {
+  const segments = [...inputSegments].sort((a, b) => a.startTs - b.startTs || a.issueId - b.issueId);
+  const out: ChatMessage[] = [];
+  let owner: ConversationSegment | undefined;
+
+  for (const msg of msgs) {
+    if (msg.ts !== undefined) {
+      owner = undefined;
+      for (const segment of segments) {
+        if (segment.startTs > msg.ts) break;
+        if (segment.endTs === null || msg.ts <= segment.endTs) owner = segment;
+        else owner = undefined;
+      }
+    }
+    if (owner?.issueId === issueId) out.push(msg);
+  }
+  return out;
+}
+
+export function issueStartTs(segments: ConversationSegment[], issueId: number): number | undefined {
+  const starts = segments.filter((s) => s.issueId === issueId).map((s) => s.startTs);
+  return starts.length ? Math.min(...starts) : undefined;
+}

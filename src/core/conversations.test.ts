@@ -63,7 +63,7 @@ class RecDriver implements ConvDriver {
 
 let dir: string;
 beforeAll(async () => {
-  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-conv-'));
+  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-conv-'));
 });
 afterAll(async () => {
   await fsp.rm(dir, { recursive: true, force: true });
@@ -125,8 +125,8 @@ describe('ConversationManager', () => {
     expect(driver.sent).toHaveLength(1);
     expect(driver.sent[0]).toEqual({ session: 'cc-1', text: `claude --session-id ${c.id}` });
     expect(convs.currentConv(1)).toBe(c.id);
-    // cwd 不存在 → 模块指南先物化 cwd；无需再写 .mando/keep
-    expect(await fsp.readFile(path.join(cwd, 'AGENTS.md'), 'utf8')).toContain('mando-issue');
+    // cwd 不存在 → 模块指南先物化 cwd；无需再写 .panda/keep
+    expect(await fsp.readFile(path.join(cwd, 'AGENTS.md'), 'utf8')).toContain('panda-issue');
   });
 
   test('Agent 命令不存在时激活立即失败，不创建 tmux 或把后续 prompt 留给 shell', async () => {
@@ -436,7 +436,7 @@ describe('ConversationManager codex 代理', () => {
     expect(driver.sessions.has(session)).toBe(true);
     expect(driver.sent.length).toBe(1);
     // 模拟 codex 自更新后退回 bash（tmux 会话仍活着）
-    driver.paneText = '🎉 Update ran successfully! Please restart Codex.\n[root@VM yuhang_project]#';
+    driver.paneText = '🎉 Update ran successfully! Please restart Codex.\n[root@VM demo_project]#';
     await convs.activate(c.id);
     expect(driver.killed).toContain(session); // 重启 = kill 旧
     expect(driver.sent.length).toBe(2);
@@ -447,7 +447,7 @@ describe('ConversationManager codex 代理', () => {
     const { driver, convs } = setup();
     const c = convs.create(1, 'cx', 'codex', 'chat');
     await convs.activate(c.id);
-    driver.paneText = '› \n  gpt-5.6-sol medium · ~/user_space/users/u12/yuhang_project';
+    driver.paneText = '› \n  gpt-5.6-sol medium · ~/user_space/users/u12/demo_project';
     await convs.activate(c.id);
     expect(driver.sent.length).toBe(1); // 未重启
     expect(driver.killed).toEqual([]);
@@ -528,11 +528,11 @@ describe('ConversationManager codex 代理', () => {
     expect(skill1).toContain('CLAUDE.md');
     const skill2 = await fsp.readFile(path.join(claudeHome, 'skills/agents-md-compat/SKILL.md'), 'utf8');
     expect(skill2).toContain('AGENTS.md');
-    const mandoClaude = await fsp.readFile(path.join(claudeHome, 'skills/mando-issue/SKILL.md'), 'utf8');
-    const mandoCodex = await fsp.readFile(path.join(codexHome, 'skills/mando-issue/SKILL.md'), 'utf8');
-    expect(mandoClaude).toBe(mandoCodex);
-    expect(mandoClaude).toContain('.mando/modules/INDEX.md');
-    expect(await fsp.readFile(path.join(cwd, 'AGENTS.md'), 'utf8')).toContain('mando-issue');
+    const pandaClaude = await fsp.readFile(path.join(claudeHome, 'skills/panda-issue/SKILL.md'), 'utf8');
+    const pandaCodex = await fsp.readFile(path.join(codexHome, 'skills/panda-issue/SKILL.md'), 'utf8');
+    expect(pandaClaude).toBe(pandaCodex);
+    expect(pandaClaude).toContain('.panda/modules/INDEX.md');
+    expect(await fsp.readFile(path.join(cwd, 'AGENTS.md'), 'utf8')).toContain('panda-issue');
     expect(await fsp.readFile(path.join(cwd, 'CLAUDE.md'), 'utf8')).toContain('@AGENTS.md');
 
     // 再激活：trust 段不重复追加、技能不覆盖

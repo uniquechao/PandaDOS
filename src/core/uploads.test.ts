@@ -61,9 +61,9 @@ test('uploadId is a non-empty url-safe id and varies', () => {
 
 test('imageReadHint is empty without images, references Read + abs paths otherwise', () => {
   expect(imageReadHint([])).toBe('');
-  const h = imageReadHint(['/proj/.mando/uploads/x/a.png', '/proj/b.png']);
+  const h = imageReadHint(['/proj/.panda/uploads/x/a.png', '/proj/b.png']);
   expect(h).toContain('Read');
-  expect(h).toContain('/proj/.mando/uploads/x/a.png');
+  expect(h).toContain('/proj/.panda/uploads/x/a.png');
   expect(h).toContain('/proj/b.png');
   expect(h).toContain('2 张');
 });
@@ -72,8 +72,8 @@ test('imageReadHint is empty without images, references Read + abs paths otherwi
 
 // 按 web/ws/chat.ts 的实际拼法造「注入回显的用户消息文本」：cleanHint = hint.replace(/^\n+/, '')，
 // 带正文时 combined = cleanHint + '\n' + 正文；纯图时 combined = cleanHint。测逆函数对着真实生产形态。
-const ABS = ['/proj/.mando/uploads/ab12cd/a.png', '/proj/.mando/uploads/ef34gh/b.jpg'];
-const REL = ['.mando/uploads/ab12cd/a.png', '.mando/uploads/ef34gh/b.jpg'];
+const ABS = ['/proj/.panda/uploads/ab12cd/a.png', '/proj/.panda/uploads/ef34gh/b.jpg'];
+const REL = ['.panda/uploads/ab12cd/a.png', '.panda/uploads/ef34gh/b.jpg'];
 const CLEAN_HINT = imageReadHint(ABS).replace(/^\n+/, '');
 const WITH_TEXT = CLEAN_HINT + '\n' + '看看这两张图';
 const IMAGE_ONLY = CLEAN_HINT;
@@ -125,7 +125,7 @@ test('absImages resolves relative against cwd, keeps absolute', () => {
 
 // ---------- 副作用（经 LocalDriver） ----------
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'mando-uploads-'));
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'panda-uploads-'));
 afterAll(async () => {
   try {
     await fsp.rm(TMP, { recursive: true, force: true });

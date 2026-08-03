@@ -69,7 +69,7 @@ describe('toRunEvents 配对与状态', () => {
   });
 
   test('user 消息带附图 → message 事件透传 images；无图/非 user 不挂 images 字段', () => {
-    const imgs = ['.mando/uploads/a/x.png', '.mando/uploads/b/y.jpg'];
+    const imgs = ['.panda/uploads/a/x.png', '.panda/uploads/b/y.jpg'];
     const evs = toRunEvents([
       msg({ seq: 0, role: 'user', text: '看这两张', images: imgs }),
       msg({ seq: 1, role: 'user', text: '纯文字' }), // 无图

@@ -1,14 +1,15 @@
 /**
  * web/auth —— token 提取 / cookie 收发 / 请求→用户解析（v1 auth.ts 平移改造）。
- * - Cookie 名 mando_token，正则左锚定（防 evil_mando_token 后缀同名 cookie）
+ * - Cookie 名 panda_token，正则左锚定（防 evil_panda_token 后缀同名 cookie）
  * - Bearer 兼容脚本；显式不接受 ?token=（避免泄漏到日志/历史，v1 已还的债不回头）
  * - COOKIE 常量只此一处（v1 auth.ts:3 与 web.ts:24 重复定义是评审点名的雷）
  * - cookie 里放明文 token，DB 只存哈希——resolveUser 先 hashToken 再查
  */
 import { hashToken, type UserStore } from '../core/users';
 import type { User } from '../core/types';
+import { AUTH_COOKIE_NAME } from '../core/branding';
 
-export const COOKIE = 'mando_token';
+export const COOKIE = AUTH_COOKIE_NAME;
 /** 30 天（v1 web.ts:106 平移） */
 export const COOKIE_MAX_AGE = 2592000;
 

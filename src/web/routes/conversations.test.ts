@@ -7,12 +7,18 @@
  * - 当前模型 GET /:convId/model（issue #109）：chat 与 issue 对话都放行，探不到 → model:null。
  */
 import { describe, expect, test } from 'bun:test';
+import { promises as fsp } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { ConversationManager, type ConvDriver } from '../../core/conversations';
+import type { HistoryArchiveFs } from '../../core/conversation-history';
 import { openDb } from '../../core/db';
 import { migrate } from '../../core/migrate';
 import { UserStore } from '../../core/users';
 import { migrateIssueEngine } from '../../issues/engine';
 import { KeyedMutex } from '../../issues/mutex';
+import type { AgentHistoryReader } from '../../executor/agent-history';
+import { LocalDriver } from '../../executor/local';
 import { authDepsFromDb, createDispatcher } from '../middleware';
 import { conversationsRoutes, type ConvModelPort } from './conversations';
 
@@ -42,7 +48,7 @@ class FakeConvDriver implements ConvDriver {
     this.sent.push({ session, text });
   }
   async statPath() {
-    return { size: 1, isDirectory: true }; // cwd 视为已存在，跳过 .mando/keep 物化
+    return { size: 1, isDirectory: true }; // cwd 视为已存在，跳过 .panda/keep 物化
   }
   async readFileRange() {
     return { data: new Uint8Array(), size: 0 };
@@ -50,7 +56,7 @@ class FakeConvDriver implements ConvDriver {
   async writeFile() {}
 }
 
-function setup(models?: ConvModelPort) {
+function setup(models?: ConvModelPort, historyDriver?: AgentHistoryReader & HistoryArchiveFs) {
   const db = openDb(':memory:');
   migrate(db);
   migrateIssueEngine(db);
@@ -71,7 +77,13 @@ function setup(models?: ConvModelPort) {
   const convs = new ConversationManager(db, driver, { locate: async () => null });
   const mutex = new KeyedMutex();
   const dispatch = createDispatcher(
-    conversationsRoutes({ db, convs, mutex, ...(models ? { models } : {}) }),
+    conversationsRoutes({
+      db,
+      convs,
+      mutex,
+      ...(models ? { models } : {}),
+      ...(historyDriver ? { driverForProject: () => historyDriver } : {}),
+    }),
     authDepsFromDb(db, users),
   );
 
@@ -91,6 +103,54 @@ function setup(models?: ConvModelPort) {
   };
 
   return { db, convs, driver, adminToken, aliceToken, bobToken, call };
+}
+
+async function historyFixture() {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-conversation-history-'));
+  const claudeRoot = path.join(root, '.claude', 'projects');
+  const claudeProject = path.join(claudeRoot, '-tmp-repo');
+  const codexRoot = path.join(root, '.codex', 'sessions');
+  const codexDay = path.join(codexRoot, '2026', '08', '02');
+  await Promise.all([fsp.mkdir(claudeProject, { recursive: true }), fsp.mkdir(codexDay, { recursive: true })]);
+  const writeClaude = async (sid: string, cwd: string, title: string, ts: string) => {
+    await fsp.writeFile(
+      path.join(claudeProject, `${sid}.jsonl`),
+      JSON.stringify({
+        type: 'user', cwd, sessionId: sid, timestamp: ts,
+        message: { role: 'user', content: title },
+      }) + '\n',
+    );
+  };
+  await writeClaude('claude-local', '/tmp/repo', 'Claude 本地历史', '2026-08-02T01:00:00Z');
+  await writeClaude('claude-nested', '/tmp/repo/subdir', '子目录历史', '2026-08-02T02:00:00Z');
+  const codexSid = '019-codex-local';
+  await fsp.writeFile(
+    path.join(codexDay, `rollout-2026-08-02T03-00-00-${codexSid}.jsonl`),
+    [
+      JSON.stringify({
+        timestamp: '2026-08-02T03:00:00Z', type: 'session_meta',
+        payload: { id: codexSid, timestamp: '2026-08-02T03:00:00Z', cwd: '/tmp/repo' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-02T03:00:00Z', type: 'response_item',
+        payload: {
+          type: 'message', role: 'user',
+          content: [{ type: 'input_text', text: 'Codex 本地历史' }],
+        },
+      }),
+    ].join('\n') + '\n',
+  );
+  const local = new LocalDriver();
+  const archiveWrites = new Map<string, Uint8Array>();
+  const driver = {
+    listDir: (p: string) => local.listDir(p),
+    statPath: (p: string) => local.statPath(p),
+    readFileRange: (p: string, offset: number, limit: number) => local.readFileRange(p, offset, limit),
+    writeFile: async (p: string, data: Uint8Array | string) => {
+      archiveWrites.set(p, typeof data === 'string' ? new TextEncoder().encode(data) : data.slice());
+    },
+  };
+  return { root, claudeRoot, codexRoot, codexSid, driver, archiveWrites };
 }
 
 const P = '/api/projects/1/conversations';
@@ -141,6 +201,175 @@ describe('conversations 路由：新建/列表', () => {
     const t = setup();
     const c = await t.call('POST', P, t.aliceToken, {});
     expect(c.body.conversation.label).toBe('新对话');
+  });
+});
+
+describe('conversations 路由：导入当前项目本地历史', () => {
+  test('local-history 自身执行项目权限校验，且不存在项目不向普通用户泄露', async () => {
+    const fixture = await historyFixture();
+    try {
+      const t = setup(undefined, fixture.driver);
+      expect((await t.call('GET', `${P}/local-history`, null)).status).toBe(401);
+      expect((await t.call('GET', `${P}/local-history`, t.bobToken)).status).toBe(403);
+      expect((await t.call('POST', `${P}/local-history`, t.bobToken, {
+        sessions: [{ agent: 'claude', sessionId: 'claude-local' }],
+      })).status).toBe(403);
+      expect((await t.call('GET', '/api/projects/999/conversations/local-history', t.bobToken)).status).toBe(403);
+      const missingProject = await t.call(
+        'GET', '/api/projects/999/conversations/local-history', t.adminToken,
+      );
+      expect(missingProject.status).toBe(404);
+      expect(missingProject.body.error.code).toBe('project.not_found');
+    } finally {
+      await fsp.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test('查询严格匹配 cwd，导入后绑定原始元数据并可分别 resume Claude/Codex', async () => {
+    const fixture = await historyFixture();
+    try {
+      const t = setup(undefined, fixture.driver);
+      t.db.query('UPDATE executors SET claude_dir = ?, codex_dir = ? WHERE id = 1')
+        .run(fixture.claudeRoot, fixture.codexRoot);
+
+      const candidates = await t.call('GET', `${P}/local-history`, t.aliceToken);
+      expect(candidates.status).toBe(200);
+      expect(candidates.body.cwd).toBe('/tmp/repo');
+      expect(candidates.body.sessions).toHaveLength(2);
+      expect(candidates.body.sessions.map((session: any) => session.sessionId).sort()).toEqual(
+        ['claude-local', fixture.codexSid].sort(),
+      );
+      expect(JSON.stringify(candidates.body)).not.toContain('claude-nested');
+      expect(JSON.stringify(candidates.body)).not.toContain('jsonlPath');
+
+      const imported = await t.call('POST', `${P}/local-history`, t.aliceToken, {
+        sessions: [
+          { agent: 'claude', sessionId: 'claude-local' },
+          { agent: 'codex', sessionId: fixture.codexSid },
+        ],
+      });
+      expect(imported.status).toBe(200);
+      expect(imported.body).toMatchObject({ imported: 2, existing: 0 });
+      const rows = t.db
+        .query<{
+          id: string;
+          agent: string;
+          agent_session_id: string;
+          agent_jsonl_path: string;
+          agent_launch_ts: number;
+          last_active_ts: number;
+          kind: string;
+        }, []>(
+          `SELECT id, agent, agent_session_id, agent_jsonl_path, agent_launch_ts, last_active_ts, kind
+           FROM conversations ORDER BY agent`,
+        )
+        .all();
+      expect(rows).toHaveLength(2);
+      expect(rows.every((row) => row.kind === 'chat' && row.agent_session_id.length > 0)).toBe(true);
+      expect(rows.every((row) => row.agent_jsonl_path.endsWith('.jsonl'))).toBe(true);
+      expect(rows.every((row) => row.agent_launch_ts > 0 && row.last_active_ts > 0)).toBe(true);
+      expect([...fixture.archiveWrites.keys()].sort()).toEqual([
+        '/tmp/repo/.panda/conversations/claude/claude-local.jsonl',
+        `/tmp/repo/.panda/conversations/codex/${fixture.codexSid}.jsonl`,
+      ]);
+      expect(rows.every((row) => !row.agent_jsonl_path.includes('/.panda/conversations/'))).toBe(true);
+
+      const claude = imported.body.conversations.find((conversation: any) => conversation.agent === 'claude');
+      const codex = imported.body.conversations.find((conversation: any) => conversation.agent === 'codex');
+      expect((await t.call('POST', `${P}/${claude.id}/activate`, t.aliceToken)).status).toBe(200);
+      expect((await t.call('POST', `${P}/${codex.id}/activate`, t.aliceToken)).status).toBe(200);
+      expect(t.driver.sent.find((sent) => sent.session === `chat-${claude.id}`)?.text)
+        .toBe('claude --resume claude-local');
+      expect(t.driver.sent.find((sent) => sent.session === `chat-${codex.id}`)?.text)
+        .toContain(`resume ${fixture.codexSid}`);
+
+      const again = await t.call('POST', `${P}/local-history`, t.aliceToken, {
+        sessions: [{ agent: 'claude', sessionId: 'claude-local' }],
+      });
+      expect(again.body).toMatchObject({ imported: 0, existing: 1 });
+      const after = await t.call('GET', `${P}/local-history`, t.aliceToken);
+      expect(after.body.sessions.find((session: any) => session.sessionId === 'claude-local').importedConversationId)
+        .toBe('claude-local');
+    } finally {
+      await fsp.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test('拒绝伪造、跨 cwd、空批次与被其他项目占用的会话', async () => {
+    const fixture = await historyFixture();
+    try {
+      const t = setup(undefined, fixture.driver);
+      t.db.query('UPDATE executors SET claude_dir = ?, codex_dir = ? WHERE id = 1')
+        .run(fixture.claudeRoot, fixture.codexRoot);
+      const empty = await t.call('POST', `${P}/local-history`, t.aliceToken, { sessions: [] });
+      expect(empty.status).toBe(400);
+      expect(empty.body.error.code).toBe('history.selection_required');
+      const wrongCwd = await t.call('POST', `${P}/local-history`, t.aliceToken, {
+        sessions: [{ agent: 'claude', sessionId: 'claude-nested' }],
+      });
+      expect(wrongCwd.status).toBe(404);
+      expect(wrongCwd.body.error.code).toBe('history.not_found');
+      expect((await t.call('POST', `${P}/local-history`, t.aliceToken, {
+        sessions: [{ agent: 'claude', sessionId: 'not-real', jsonlPath: '/tmp/forged.jsonl' }],
+      })).status).toBe(404);
+
+      t.db.run(
+        `INSERT INTO projects (name, executor_id, cwd, owner_user_id, created_ts)
+         VALUES ('other', 1, '/tmp/repo', 1, 0)`,
+      );
+      t.db.query(
+        `INSERT INTO conversations
+           (id, project_id, label, created_ts, agent, agent_session_id, agent_jsonl_path, kind)
+         VALUES ('claude-local', 2, 'bound', 0, 'claude', 'claude-local', '/history.jsonl', 'chat')`,
+      ).run();
+      const conflict = await t.call('POST', `${P}/local-history`, t.aliceToken, {
+        sessions: [{ agent: 'claude', sessionId: 'claude-local' }],
+      });
+      expect(conflict.status).toBe(409);
+      expect(conflict.body.error.code).toBe('history.assigned');
+      const candidates = await t.call('GET', `${P}/local-history`, t.aliceToken);
+      expect(candidates.body.sessions.some((session: any) => session.sessionId === 'claude-local')).toBe(false);
+    } finally {
+      await fsp.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test('候选查询和导入都排除 PandaDOS issue 引擎发起的会话', async () => {
+    const fixture = await historyFixture();
+    try {
+      const t = setup(undefined, fixture.driver);
+      t.db.query('UPDATE executors SET claude_dir = ?, codex_dir = ? WHERE id = 1')
+        .run(fixture.claudeRoot, fixture.codexRoot);
+      t.db.query(
+        `INSERT INTO conversations
+           (id, project_id, label, created_ts, agent, agent_session_id, agent_jsonl_path, kind)
+         VALUES ('claude-local', 1, 'issue claude', 0, 'claude', 'claude-local', '/issue-claude.jsonl', 'issue')`,
+      ).run();
+      t.db.query(
+        `INSERT INTO conversations
+           (id, project_id, label, created_ts, agent, agent_session_id, agent_jsonl_path, kind)
+         VALUES ('codex-issue', 1, 'issue codex', 0, 'codex', ?, '/issue-codex.jsonl', 'issue')`,
+      ).run(fixture.codexSid);
+
+      const candidates = await t.call('GET', `${P}/local-history`, t.aliceToken);
+      expect(candidates.status).toBe(200);
+      expect(candidates.body.sessions).toEqual([]);
+
+      const rejected = await t.call('POST', `${P}/local-history`, t.aliceToken, {
+        sessions: [{ agent: 'codex', sessionId: fixture.codexSid }],
+      });
+      expect(rejected.status).toBe(404);
+      expect(rejected.body.error.code).toBe('history.not_found');
+    } finally {
+      await fsp.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test('未接历史 Driver 时端点返回 503', async () => {
+    const t = setup();
+    const response = await t.call('GET', `${P}/local-history`, t.aliceToken);
+    expect(response.status).toBe(503);
+    expect(response.body.error.code).toBe('executor.driver_unavailable');
   });
 });
 

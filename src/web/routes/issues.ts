@@ -11,7 +11,15 @@ import type { Database } from 'bun:sqlite';
 import { projectAgentSupport } from '../../core/executors';
 import { parseAutoApproveLevel, type AgentKind, type IssueCategory, type ProjectModule } from '../../core/types';
 import { isUploadRel } from '../../core/uploads';
-import { isEditableStatus, type IssueEngine, type EngineIssue, type ImplMode } from '../../issues/engine';
+import {
+  isEditableStatus,
+  MAX_SUBTASK_TEXT_LENGTH,
+  type IssueEngine,
+  type EngineIssue,
+  type ImplMode,
+  type UpdateUnstartedSubtaskResult,
+} from '../../issues/engine';
+import { apiError } from '../errors';
 import { json, type RouteDef } from '../middleware';
 
 export interface IssuesRoutesDeps {
@@ -48,6 +56,39 @@ function num(v: string | undefined): number | null {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
+function zeroBasedIndex(v: string | undefined): number | null {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+function subtaskUpdateError(result: Extract<UpdateUnstartedSubtaskResult, { ok: false }>): Response {
+  switch (result.reason) {
+    case 'text_required':
+      return json(apiError('issue.subtask_text_required', 'Enter subtask text.', 400), 400);
+    case 'text_too_long':
+      return json(
+        apiError(
+          'issue.subtask_text_too_long',
+          `Subtask text must not exceed ${MAX_SUBTASK_TEXT_LENGTH} characters.`,
+          400,
+          { max: MAX_SUBTASK_TEXT_LENGTH },
+        ),
+        400,
+      );
+    case 'not_found':
+      return json(apiError('issue.subtask_not_found', 'The subtask does not exist.', 404), 404);
+    case 'already_dispatched':
+      return json(
+        apiError(
+          'issue.subtask_already_dispatched',
+          'Only subtasks that have not been dispatched can be edited.',
+          409,
+        ),
+        409,
+      );
+  }
+}
+
 /** 目标分支只收保守 Git 分支字符集；更严格的引用存在性由后续执行阶段在真实仓库确认。 */
 const ISSUE_TARGET_BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 /** 源必须来自分支清单接口的完整本地/远程跟踪 ref，不能保存含糊短名。 */
@@ -61,7 +102,7 @@ function validRefParts(value: string, prefixParts = 0): boolean {
     .every((part) => !!part && !part.startsWith('.') && !part.endsWith('.lock'));
 }
 
-function parseIssueGitPatch(
+export function parseIssueGitPatch(
   body: Record<string, unknown>,
   currentTarget: string | null,
   currentSource: string | null,
@@ -203,7 +244,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
     },
     {
       // 执行整理方案中的一项（用户逐项确认；index 为方案 actions 下标）。
-      // 引擎按当前库内事实重校验 + 防重放；失败给中文原因。
+      // 引擎按当前库内事实重校验 + 防重放；成功返回稳定动作类型与结构化参数。
       method: 'POST',
       path: '/api/projects/:projectId/modules/organize/apply',
       auth: 'project-access',
@@ -378,6 +419,22 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
             ? engine.store.listConversationSegments(issue.convId)
             : [],
         });
+      },
+    },
+    {
+      method: 'PATCH',
+      path: '/api/projects/:projectId/issues/:issueId/subtasks/:subtaskIndex',
+      auth: 'project-access',
+      handler: async ({ req, params, user }) => {
+        const issue = issueOf(engine, params);
+        if (!issue) return json(apiError('issue.not_found', 'The issue does not exist.', 404), 404);
+        const index = zeroBasedIndex(params.subtaskIndex);
+        if (index === null) return json(apiError('issue.subtask_not_found', 'The subtask does not exist.', 404), 404);
+        const body = await readBody(req);
+        const text = typeof body.text === 'string' ? body.text : '';
+        const result = await engine.updateUnstartedSubtask(issue.id, index, text, user!.id);
+        if (!result.ok) return subtaskUpdateError(result);
+        return json({ ok: true, index: result.index, subtask: result.subtask });
       },
     },
     {

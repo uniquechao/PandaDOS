@@ -228,12 +228,12 @@ describe('workspace 供给（经 Driver）', () => {
   });
 
   test('provisionUserWorkspace 用 LocalDriver 在临时目录建出 workspace', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'mando-ws-'));
+    const root = mkdtempSync(join(tmpdir(), 'panda-ws-'));
     const driver = new LocalDriver();
     const dir = await provisionUserWorkspace(driver, root, { id: 42, username: 'alice' });
     expect(dir).toBe(join(root, 'u42'));
     expect(existsSync(dir)).toBe(true);
-    const keep = readFileSync(join(dir, '.mando/keep'), 'utf8');
+    const keep = readFileSync(join(dir, '.panda/keep'), 'utf8');
     expect(keep).toContain('alice');
     expect(keep).toContain('42');
   });

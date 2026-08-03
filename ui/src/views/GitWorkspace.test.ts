@@ -48,8 +48,8 @@ describe('GitView VSCode 式工作区组合', () => {
     expect(source).toContain('error={err}');
     expect(source).toContain('error={fd.err}');
     expect(source).toContain('err: string;');
-    expect(source).toContain('{error ? (');
-    expect(source).toContain('<span class="err">{error}</span>');
+    expect(source).toContain('return <DiffBody d={d} error={error} />;');
+    expect(source).toContain('if (error) return <div class="empty"><span class="err">{error}</span></div>;');
   });
 
   test('项目与 GitInfo 请求接入可执行的生命周期协调器', () => {

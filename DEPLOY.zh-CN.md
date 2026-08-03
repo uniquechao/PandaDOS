@@ -1,4 +1,4 @@
-# mando 部署与运维
+# PandaDOS 部署与运维
 
 [English](DEPLOY.md)
 
@@ -9,7 +9,7 @@
 控制面需要：
 
 - Bun、Git、tmux；
-- 可写的 `~/.mando/`；
+- 可写的 `~/.panda/`；
 - 如需 PM 判断，在 Admin 中配置 OpenAI-compatible 驱动大模型；
 - 如需飞书，配置飞书应用凭据。
 
@@ -30,7 +30,7 @@ bun run start
 ```
 
 服务默认监听 `127.0.0.1:8802`。首次启动会创建 admin 用户，明文 token
-只输出一次，并以 `0600` 写入 `~/.mando/admin-token`。
+只输出一次，并以 `0600` 写入 `~/.panda/admin-token`。
 
 健康检查：
 
@@ -48,15 +48,15 @@ WebSocket 转发。
 
 ```ini
 [Unit]
-Description=mando control plane
+Description=PandaDOS control plane
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/srv/mando
-EnvironmentFile=-/root/.mando/env
+WorkingDirectory=/srv/panda
+EnvironmentFile=-/root/.panda/env
 ExecStart=/root/.bun/bin/bun run start
 Restart=always
 RestartSec=3
@@ -73,14 +73,14 @@ WantedBy=multi-user.target
 
 ```bash
 systemctl daemon-reload
-systemctl enable --now mando
-systemctl status mando
+systemctl enable --now panda
+systemctl status panda
 ```
 
 后端改动需要重启服务：
 
 ```bash
-systemctl restart mando
+systemctl restart panda
 ```
 
 只修改前端时，执行 `bun run build-ui` 即可，不需要重启后端。
@@ -108,12 +108,12 @@ systemctl restart mando
 
 ### SSH 执行机
 
-私钥放在控制面 `~/.mando/keys/<keyRef>`，权限设为 `0600`，不要写入
+私钥放在控制面 `~/.panda/keys/<keyRef>`，权限设为 `0600`，不要写入
 数据库或仓库。首次登记前先手动 SSH 连接，确认 host key、tmux 和代理登录状态。
 
 ```bash
-chmod 600 ~/.mando/keys/<keyRef>
-ssh -i ~/.mando/keys/<keyRef> <user>@<host> 'tmux -V'
+chmod 600 ~/.panda/keys/<keyRef>
+ssh -i ~/.panda/keys/<keyRef> <user>@<host> 'tmux -V'
 ```
 
 随后通过同一个管理员 API 登记真实 `host`、`sshUser`、`keyRef`、
@@ -125,23 +125,23 @@ ssh -i ~/.mando/keys/<keyRef> <user>@<host> 'tmux -V'
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `MANDO_BIND` | `127.0.0.1` | HTTP 绑定地址 |
-| `MANDO_PORT` | `8802` | HTTP 端口 |
-| `MANDO_DB` | `~/.mando/mando.db` | SQLite 数据库 |
-| `MANDO_ADMIN_TOKEN_FILE` | `~/.mando/admin-token` | admin token 文件 |
-| `MANDO_LLM_BASE_URL` | 无 | Admin 尚未保存地址时的部署兜底 |
-| `MANDO_LLM_MODEL` | 无 | Admin 尚未保存模型时的部署兜底 |
-| `MANDO_LLM_API_KEY` | 无 | PM LLM 密钥 |
-| `MANDO_FEISHU_APP_ID` | 无 | 飞书应用 ID |
-| `MANDO_FEISHU_APP_SECRET` | 无 | 飞书应用密钥 |
-| `MANDO_FEISHU_CHANNEL` | `on` | `off` 时关闭飞书事件长连接 |
-| `MANDO_PUBLIC_URL` | 按请求推导 | OAuth 对外基址 |
+| `PANDA_BIND` | `127.0.0.1` | HTTP 绑定地址 |
+| `PANDA_PORT` | `8802` | HTTP 端口 |
+| `PANDA_DB` | `~/.panda/panda.db` | SQLite 数据库 |
+| `PANDA_ADMIN_TOKEN_FILE` | `~/.panda/admin-token` | admin token 文件 |
+| `PANDA_LLM_BASE_URL` | 无 | Admin 尚未保存地址时的部署兜底 |
+| `PANDA_LLM_MODEL` | 无 | Admin 尚未保存模型时的部署兜底 |
+| `PANDA_LLM_API_KEY` | 无 | PM LLM 密钥 |
+| `PANDA_FEISHU_APP_ID` | 无 | 飞书应用 ID |
+| `PANDA_FEISHU_APP_SECRET` | 无 | 飞书应用密钥 |
+| `PANDA_FEISHU_CHANNEL` | `on` | `off` 时关闭飞书事件长连接 |
+| `PANDA_PUBLIC_URL` | 按请求推导 | OAuth 对外基址 |
 
 ## 6. 日常运维
 
 ```bash
-journalctl -u mando -f
-systemctl status mando
+journalctl -u panda -f
+systemctl status panda
 curl --fail http://127.0.0.1:8802/healthz
 ```
 

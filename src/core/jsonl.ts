@@ -390,6 +390,50 @@ export async function tailConversation(
 /** 向后翻页窗口默认字节数（与 baseline 窗口同量级；一页拉这么多旧内容） */
 export const HISTORY_WINDOW_BYTES = 256 * 1024;
 
+export interface RecentConversationPage {
+  msgs: ChatMessage[];
+  /** 已消费到的完整行尾；后续实时 tail 从这里继续。 */
+  offset: number;
+  nextSeq: number;
+  /** 返回的最旧消息之前是否仍有文件内容。 */
+  hasMore: boolean;
+}
+
+/**
+ * 按“可解析消息数”读取会话末页。
+ *
+ * JSONL 的单条工具结果可能远大于常规字节窗口；固定读取末尾 256KB 时，窗口可能落在一条
+ * 超长 JSON 行中间，导致首屏只剩该行之后的少量消息。这里从 initialWindowBytes 开始逐次
+ * 向前翻倍，直到拿到 maxMessages 条可解析消息或抵达文件头，再只返回末尾 maxMessages 条。
+ */
+export async function readRecentConversationPage(
+  r: JsonlReader,
+  jsonl: string,
+  maxMessages: number,
+  initialWindowBytes: number = HISTORY_WINDOW_BYTES,
+): Promise<RecentConversationPage> {
+  const st = await r.statPath(jsonl).catch(() => null);
+  if (!st || st.size === 0 || maxMessages <= 0) {
+    return { msgs: [], offset: st?.size ?? 0, nextSeq: 0, hasMore: false };
+  }
+
+  let windowBytes = Math.max(1, initialWindowBytes);
+  for (;;) {
+    const start = Math.max(0, st.size - windowBytes);
+    const tail = await tailConversation(r, jsonl, start, 0);
+    if (tail.msgs.length >= maxMessages || start === 0) {
+      const msgs = tail.msgs.slice(-maxMessages);
+      return {
+        msgs,
+        offset: tail.offset,
+        nextSeq: tail.nextSeq,
+        hasMore: msgs.length > 0 && (msgs[0]!.off ?? 0) > 0,
+      };
+    }
+    windowBytes *= 2;
+  }
+}
+
 /**
  * 「向后读更早窗口」——给定 endOffset（当前已加载的最旧一行的字节起点，必须落在行边界），
  * 往前读一段、按 '\n' 对齐取出 endOffset 之前的整行消息，供前端向上翻页时前插。

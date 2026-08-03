@@ -76,6 +76,9 @@ function mockDriver(st: MockDriverState): ExecutorDriver {
     async git() {
       return { code: 0, out: '', err: '' };
     },
+    async readGitBlob() {
+      return { code: 0, data: new Uint8Array(), err: '' };
+    },
     async openPty() {
       throw new Error('not implemented');
     },

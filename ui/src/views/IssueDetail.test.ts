@@ -4,6 +4,7 @@ import type { IssueEvent } from '../lib/types';
 import { CLARIFY_ANALYZING_MAX_AGE_MS, clarifyPanelState } from '../lib/issueStatus';
 
 const source = readFileSync(new URL('./IssueDetail.tsx', import.meta.url), 'utf8');
+const styles = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
 
 describe('Issue 工作台信息架构', () => {
   test('执行页复用“对话/原生”切换，原生严格钉住当前 issue 且移除暂停/接管重复动作', () => {
@@ -29,7 +30,7 @@ describe('Issue 工作台信息架构', () => {
     expect(source).toContain('<ChatPane');
   });
 
-  test('模块共享会话把分段和当前 issue 交给 ChatPane，历史 issue 默认折叠', () => {
+  test('模块共享会话把分段和当前 issue 交给 ChatPane，用于严格过滤当前 issue 区间', () => {
     expect(source).toContain('conversationSegments={detail?.conversationSegments ?? []}');
     expect(source).toContain('currentIssueId={issue.id}');
   });
@@ -158,10 +159,31 @@ describe('Issue 工作台信息架构', () => {
   test('详情「计划」清单与执行顶栏进度链同一状态源/配色（#104）：ep-n 圆点替换 emoji', () => {
     // 状态判定收口到 execProgressState（含 blocked/cancelled），圆点字形共用 stepGlyph
     expect(source).toContain('execProgressState(subs, issue.subIndex, issue.status)');
-    expect(source).toContain('ck ep-n ${s.state}');
-    expect(source).toContain('{stepGlyph(s)}');
+    expect(source).toContain('ck ep-n ${step.state}');
+    expect(source).toContain('{stepGlyph(step)}');
     expect(source).not.toContain('▶️');
     expect(source).not.toContain('⬜');
+  });
+
+  test('详情计划只为未派发子任务提供内联编辑，并支持保存、取消与键盘操作', () => {
+    expect(source).toContain('canEditSubtask(');
+    expect(source).toContain('/subtasks/${index}`');
+    expect(source).toContain("api<{ ok: true; index: number; subtask: Subtask }>");
+    expect(source).toContain('class="plan-editor"');
+    expect(source).toContain('onSubmit={(event) =>');
+    expect(source).toContain("event.key === 'Enter'");
+    expect(source).toContain("event.key === 'Escape'");
+    expect(source).toContain("tr('issue.editSubtask', { number: step.n })");
+    expect(source).toContain("tr('issue.subtaskText')");
+    expect(source).toContain("tr('ui.saving')");
+    expect(source).toContain("tr('ui.cancel')");
+  });
+
+  test('当前子任务旋转环使用带居中位移的旋转关键帧，不再依赖负 margin 猜测中心', () => {
+    expect(styles).toContain('transform: translate(-50%, -50%) rotate(360deg)');
+    expect(styles).toContain('.plan-i .ck.ep-n {');
+    expect(styles).toContain('width: 23px');
+    expect(styles).not.toContain('margin: -14.5px 0 0 -14.5px');
   });
 
   test('「分析中」占位与「最新分析」反馈标题已接入渲染', () => {

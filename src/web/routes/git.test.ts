@@ -66,7 +66,7 @@ async function initRepo(dir: string): Promise<void> {
 }
 
 async function setup(opts?: { llm?: LlmClient }) {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-git-route-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-git-route-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
 
   const db = openDb(':memory:');
@@ -148,6 +148,19 @@ function fakeLlm(reply: string | Error = 'AI 结果文本'): {
 async function j(r: Response | Promise<Response> | null): Promise<{ status: number; body: any }> {
   const resp = await r!;
   return { status: resp.status, body: await resp.json() };
+}
+
+async function raw(r: Response | Promise<Response> | null): Promise<{
+  status: number;
+  bytes: Buffer;
+  contentType: string | null;
+}> {
+  const resp = await r!;
+  return {
+    status: resp.status,
+    bytes: Buffer.from(await resp.arrayBuffer()),
+    contentType: resp.headers.get('content-type'),
+  };
 }
 
 /** 概览里按 subject 找提交（date-order 下同刻提交的相对顺序不作强断言） */
@@ -724,6 +737,119 @@ describe('GET /api/projects/:projectId/git/worktree/diff', () => {
   });
 });
 
+describe('Git 原始图片端点', () => {
+  test('提交图片按新旧侧读取，覆盖修改、重命名、删除和历史版本', async () => {
+    const s = await setup();
+    const v1 = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x01]);
+    const v2 = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xfe, 0x02]);
+    await fsp.writeFile(path.join(s.repo, 'image.png'), v1);
+    await driver.git(s.repo, ['add', 'image.png']);
+    await commit(s.repo, 'image v1');
+    await fsp.writeFile(path.join(s.repo, 'image.png'), v2);
+    await driver.git(s.repo, ['add', 'image.png']);
+    await commit(s.repo, 'image v2');
+    const v2Sha = (await driver.git(s.repo, ['rev-parse', 'HEAD'])).out.trim();
+
+    const current = await raw(s.dispatch(get(
+      `/api/projects/1/git/commits/${v2Sha}/raw?path=image.png`,
+      s.alice.token,
+    )));
+    expect(current.status).toBe(200);
+    expect(current.contentType).toBe('image/png');
+    expect(current.bytes).toEqual(v2);
+    const previous = await raw(s.dispatch(get(
+      `/api/projects/1/git/commits/${v2Sha}/raw?path=image.png&side=old`,
+      s.alice.token,
+    )));
+    expect(previous.bytes).toEqual(v1);
+
+    await driver.git(s.repo, ['mv', 'image.png', 'renamed.png']);
+    await commit(s.repo, 'rename image');
+    const renameSha = (await driver.git(s.repo, ['rev-parse', 'HEAD'])).out.trim();
+    const renamed = await raw(s.dispatch(get(
+      `/api/projects/1/git/commits/${renameSha}/raw?path=renamed.png&old=image.png&side=old`,
+      s.alice.token,
+    )));
+    expect(renamed.bytes).toEqual(v2);
+
+    await driver.git(s.repo, ['rm', 'renamed.png']);
+    await commit(s.repo, 'delete image');
+    const deleteSha = (await driver.git(s.repo, ['rev-parse', 'HEAD'])).out.trim();
+    expect((await raw(s.dispatch(get(
+      `/api/projects/1/git/commits/${deleteSha}/raw?path=renamed.png&side=old`,
+      s.alice.token,
+    )))).bytes).toEqual(v2);
+    expect((await raw(s.dispatch(get(
+      `/api/projects/1/git/commits/${deleteSha}/raw?path=renamed.png`,
+      s.alice.token,
+    )))).status).toBe(404);
+  });
+
+  test('工作区图片新侧读当前字节、旧侧读 HEAD，并限制鉴权、路径、类型与大小', async () => {
+    const s = await setup();
+    const oldBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x10]);
+    const newBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x20]);
+    await fsp.writeFile(path.join(s.repo, 'work.png'), oldBytes);
+    await driver.git(s.repo, ['add', 'work.png']);
+    await commit(s.repo, 'work image');
+    await fsp.writeFile(path.join(s.repo, 'work.png'), newBytes);
+
+    expect((await raw(s.dispatch(get(
+      '/api/projects/1/git/worktree/raw?path=work.png', s.alice.token,
+    )))).bytes).toEqual(newBytes);
+    expect((await raw(s.dispatch(get(
+      '/api/projects/1/git/worktree/raw?path=work.png&side=old', s.alice.token,
+    )))).bytes).toEqual(oldBytes);
+    expect((await raw(s.dispatch(get(
+      '/api/projects/1/git/worktree/raw?path=work.png',
+    )))).status).toBe(401);
+    expect((await raw(s.dispatch(get(
+      '/api/projects/1/git/worktree/raw?path=../work.png', s.alice.token,
+    )))).status).toBe(400);
+    expect((await raw(s.dispatch(get(
+      '/api/projects/1/git/worktree/raw?path=f.txt', s.alice.token,
+    )))).status).toBe(415);
+
+    await fsp.writeFile(path.join(s.repo, 'large.png'), '');
+    await fsp.truncate(path.join(s.repo, 'large.png'), 32 * 1024 * 1024 + 1);
+    expect((await raw(s.dispatch(get(
+      '/api/projects/1/git/worktree/raw?path=large.png', s.alice.token,
+    )))).status).toBe(413);
+  });
+
+  test('issue 图片新侧取范围终点、旧侧取 merge-base，新增图片旧侧不存在', async () => {
+    const s = await setupIssue();
+    const baseBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01]);
+    const changedBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x02]);
+    const addedBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xaa, 0xbb]);
+    await fsp.writeFile(path.join(s.repo, 'base.png'), baseBytes);
+    await driver.git(s.repo, ['add', 'base.png']);
+    await commit(s.repo, 'base image');
+    await driver.git(s.repo, ['checkout', '-q', 'issue/7']);
+    await driver.git(s.repo, [
+      '-c', 'user.email=t@t', '-c', 'user.name=t',
+      'merge', '-q', '--no-edit', 'main',
+    ]);
+    await fsp.writeFile(path.join(s.repo, 'base.png'), changedBytes);
+    await fsp.writeFile(path.join(s.repo, 'issue.png'), addedBytes);
+    await driver.git(s.repo, ['add', 'base.png', 'issue.png']);
+    await commit(s.repo, 'issue7: change images');
+    await driver.git(s.repo, ['checkout', '-q', 'main']);
+
+    const current = await raw(s.dispatch(get(
+      '/api/projects/1/issues/7/git/raw?path=base.png', s.alice.token,
+    )));
+    expect(current.status).toBe(200);
+    expect(current.bytes).toEqual(changedBytes);
+    expect((await raw(s.dispatch(get(
+      '/api/projects/1/issues/7/git/raw?path=base.png&side=old', s.alice.token,
+    )))).bytes).toEqual(baseBytes);
+    expect((await raw(s.dispatch(get(
+      '/api/projects/1/issues/7/git/raw?path=issue.png&side=old', s.alice.token,
+    )))).status).toBe(404);
+  });
+});
+
 // ---------- per-issue git（本 issue 的提交历史 + 改动范围） ----------
 
 /**
@@ -774,7 +900,7 @@ const issueRefStub = (projectId: number, issueId: number): IssueGitRef | null =>
 };
 
 async function setupIssue() {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-issgit-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-issgit-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
   const db = openDb(':memory:');
   migrate(db);
@@ -993,7 +1119,7 @@ async function initSharedRepo(dir: string): Promise<{
 }
 
 async function setupShared() {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-sharedgit-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-sharedgit-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
   const db = openDb(':memory:');
   migrate(db);

@@ -32,16 +32,12 @@ import type {
   ProjectMember,
   Subscription,
 } from '../lib/types';
-import { isAsyncMode, SUMMARY_MODELS, type SummaryMode } from '../lib/summaryModes';
 import { pollProjectSummary } from '../lib/pollSummary';
 import { resolveSelIid } from '../lib/seliid';
 import { filterIssueList, pageSlice, sortBoardGroup, type BoardGroupKey } from '../lib/issueOrdering';
-import { SummaryButton } from '../components/SummaryButton';
 import { StatusBadge, WaitingBadge } from '../components/badges';
 import { Modal } from '../components/Modal';
-import { ModulesPanel } from '../components/ModulesPanel';
 import { ModuleSelect } from '../components/ModuleSelect';
-import { hasPendingSuggestion, readOrganizeDismissedTs, type OrganizeStatus } from '../lib/organize';
 import { AutoApproveSwitch } from '../components/AutoApproveSwitch';
 import { readNewIssueAutoApprove, writeNewIssueAutoApprove } from '../lib/newIssuePrefs';
 import { ImageAttach, type AttachedImage } from '../components/ImageAttach';
@@ -87,17 +83,12 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
   const [issues, setIssues] = useState<Issue[] | null>(null);
   const [err, setErr] = useState('');
   const [creating, setCreating] = useState(false);
-  const [membersOpen, setMembersOpen] = useState(false);
-  const [modulesOpen, setModulesOpen] = useState(false);
-  // 整理方案角标：挂载时拉一次（面板内会再拉最新）；忽略过/全执行完的同批不亮
-  const [orgStatus, setOrgStatus] = useState<OrganizeStatus | null>(null);
   const [subscribed, setSubscribed] = useState<boolean | null>(null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ finished: true, cancelled: true });
   // 收尾组分页（#105）按组各记；搜索（#106）：完成组头 🔍 点开，查询作用于全部分组，输入即重置各组页码
   const [groupPage, setGroupPage] = useState<Record<string, number>>({});
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQ, setSearchQ] = useState('');
-  const [summarizing, setSummarizing] = useState(false);
   const [supportedAgents, setSupportedAgents] = useState<AgentKind[]>([]);
   const wide = useWide();
   const listW = useListWidth(); // 宽屏左栏（任务列表）宽度：拖拽持久化，未设则回落 CSS 默认
@@ -120,9 +111,6 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
     }, POLL_MS);
     api<Subscription[]>('/api/me/subscriptions')
       .then((subs) => setSubscribed(subs.some((s) => s.scope === 'project' && s.targetId === pid)))
-      .catch(() => {});
-    api<OrganizeStatus>(`/api/projects/${pid}/modules/organize`)
-      .then(setOrgStatus)
       .catch(() => {});
     void getProjectExecutorAgents(pid).then(setSupportedAgents).catch(() => setSupportedAgents([]));
     return () => clearInterval(t);
@@ -180,31 +168,6 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
     }
   };
 
-  // 手动「更新简介」：llm 同步（驱动大模型 读 README）；claude/codex 启动后台 Agent 认知总结。
-  const updateSummary = async (mode: SummaryMode): Promise<void> => {
-    if (summarizing) return;
-    setSummarizing(true);
-    try {
-      const r = await api<{ ok: boolean; summary?: string; project: Project }>(
-        `/api/projects/${pid}/readme-summary`,
-        'POST',
-        { mode },
-      );
-      if (isAsyncMode(mode)) {
-        // 202 running：落 running 态，下面的 effect 会接管轮询直到收敛
-        setProject(r.project);
-        toast.info(tr('project.startedSummary', { mode }));
-      } else {
-        setProject((prev) => (prev ? { ...prev, readmeSummary: r.summary ?? prev.readmeSummary } : prev));
-        toast.success(tr('project.summaryUpdated'));
-      }
-    } catch (e) {
-      toast.error(e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setSummarizing(false);
-    }
-  };
-
   // 后台任务收敛前一直轮询（自己触发的、或重进页面时发现已在 running 的都能续上）。
   const pollingRef = useRef(false);
   useEffect(() => {
@@ -247,9 +210,10 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
     <div class="wb-issuelist">
       <div class="wb-list-hd">
         <span class="wb-list-t">{tr('board.tasks')}{issues ? ` · ${issues.length}` : ''}</span>
-        <button class="btn sm primary" onClick={() => setCreating(true)}>
-          ＋ {tr('ui.create')}
-        </button>
+        <div class="wb-list-actions">
+          <button class="btn sm" onClick={() => nav(`/p/${pid}/external-issues`)}>{tr('externalImport.title')}</button>
+          <button class="btn sm primary" onClick={() => setCreating(true)}>＋ {tr('ui.create')}</button>
+        </div>
       </div>
       <div class="wb-groups">
         {issues === null && <Loading />}
@@ -361,36 +325,20 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
             <button class="btn sm" onClick={toggleSub} disabled={subscribed === null}>
               {subscribed ? tr('board.subscribedLabel') : tr('board.subscribe')}
             </button>
-            <button class="btn sm" onClick={() => setMembersOpen(true)}>
-              {tr('board.members')}
-            </button>
-            <button class="btn sm" onClick={() => setModulesOpen(true)}>
-              {tr('board.modules')}
-              {hasPendingSuggestion(orgStatus, readOrganizeDismissedTs(pid)) && (
-                <span class="merge-dot" title={tr('board.modulePlanPending')}>
-                  ✨
-                </span>
-              )}
-            </button>
-            <SummaryButton
-              status={project?.summaryStatus}
-              busy={summarizing}
-              onPick={(mode) => void updateSummary(mode)}
-              models={SUMMARY_MODELS.filter(
-                (m) => m.mode === 'llm' || supportedAgents.includes(m.mode as AgentKind),
-              )}
-            />
-            <button class="btn sm" onClick={() => nav(`/p/${pid}/term`)}>
-              {tr('view.nativeBash')}
-            </button>
             <button class="btn sm" onClick={() => nav(`/p/${pid}/files`)}>
               {tr('view.files')}
+            </button>
+            <button class="btn sm" onClick={() => nav(`/p/${pid}/skills`)}>
+              {tr('board.skills')}
+            </button>
+            <button class="btn sm" onClick={() => nav(`/p/${pid}/term`)}>
+              {tr('view.nativeBash')}
             </button>
             <button class="btn sm" onClick={() => nav(`/p/${pid}/git`)}>
               Git
             </button>
-            <button class="btn sm" onClick={() => nav(`/p/${pid}/skills`)}>
-              {tr('board.skills')}
+            <button class="btn sm" onClick={() => nav(`/p/${pid}/settings`)}>
+              {tr('projectSettings.title')}
             </button>
           </div>
         </div>
@@ -441,22 +389,6 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
         />
       )}
 
-      {membersOpen && <MembersModal pid={pid} onClose={() => setMembersOpen(false)} />}
-
-      {modulesOpen && (
-        <ModulesPanel
-          pid={pid}
-          supportedAgents={supportedAgents}
-          issues={issues ?? []}
-          onChanged={() => {
-            load();
-            api<OrganizeStatus>(`/api/projects/${pid}/modules/organize`)
-              .then(setOrgStatus)
-              .catch(() => {});
-          }}
-          onClose={() => setModulesOpen(false)}
-        />
-      )}
     </div>
   );
 }

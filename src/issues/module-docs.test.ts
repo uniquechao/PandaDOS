@@ -12,7 +12,7 @@ afterEach(async () => {
 });
 
 async function setup(): Promise<{ cwd: string; docs: ModuleDocs; module: ProjectModule }> {
-  const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-module-docs-'));
+  const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-module-docs-'));
   cleanups.push(cwd);
   return {
     cwd,
@@ -41,11 +41,11 @@ describe('ModuleDocs', () => {
     await docs.ensureModule(module);
     await docs.refreshIndex([module]);
 
-    const index = await fsp.readFile(path.join(cwd, '.mando/modules/INDEX.md'), 'utf8');
+    const index = await fsp.readFile(path.join(cwd, '.panda/modules/INDEX.md'), 'utf8');
     expect(index).toContain('terminal-runtime/MODULE.md');
     expect(index).toContain('codex');
     const moduleMd = await fsp.readFile(
-      path.join(cwd, '.mando/modules/terminal-runtime/MODULE.md'),
+      path.join(cwd, '.panda/modules/terminal-runtime/MODULE.md'),
       'utf8',
     );
     expect(moduleMd).toContain('module_id: 5');
@@ -53,10 +53,10 @@ describe('ModuleDocs', () => {
     expect(moduleMd).toContain('agent: codex');
     expect(moduleMd).toContain('## 职责边界');
     const issues = await fsp.readFile(
-      path.join(cwd, '.mando/modules/terminal-runtime/ISSUES.md'),
+      path.join(cwd, '.panda/modules/terminal-runtime/ISSUES.md'),
       'utf8',
     );
-    expect(issues).toContain('mando:issues:start');
+    expect(issues).toContain('panda:issues:start');
   });
 
   test('创建 issue 过程页并按状态刷新模块索引', async () => {
@@ -70,7 +70,7 @@ describe('ModuleDocs', () => {
       agent: 'codex',
       createdTs: 100,
     });
-    expect(rel).toBe('.mando/modules/terminal-runtime/issues/72-terminal-process-isolation.md');
+    expect(rel).toBe('.panda/modules/terminal-runtime/issues/72-terminal-process-isolation.md');
 
     await docs.refreshIssueIndex(module, [
       { id: 72, title: 'Terminal Process Isolation', status: 'pending', docPath: rel },
@@ -93,7 +93,7 @@ describe('ModuleDocs', () => {
     expect(updated).toContain('status: implementing');
     expect(updated).toContain('人工过程记录：保留我。');
     const index = await fsp.readFile(
-      path.join(cwd, '.mando/modules/terminal-runtime/ISSUES.md'),
+      path.join(cwd, '.panda/modules/terminal-runtime/ISSUES.md'),
       'utf8',
     );
     expect(index).toContain('## 待办');
@@ -120,21 +120,21 @@ describe('ModuleDocs', () => {
       path.join(cwd, moduleIssueRelPath(module.slug, issue.id, issue.title)),
       'utf8',
     );
-    expect(page).toContain('<!-- mando:result-summary:start -->');
+    expect(page).toContain('<!-- panda:result-summary:start -->');
     expect(page).toContain('最终总结');
     expect(page).not.toContain('第一次总结');
-    expect(page.match(/mando:result-summary:start/g)).toHaveLength(1);
+    expect(page.match(/panda:result-summary:start/g)).toHaveLength(1);
   });
 
   test('幂等刷新只替换管理区块，保留人工与 agent 正文', async () => {
     const { cwd, docs, module } = await setup();
     await docs.ensureModule(module);
-    const modulePath = path.join(cwd, '.mando/modules/terminal-runtime/MODULE.md');
+    const modulePath = path.join(cwd, '.panda/modules/terminal-runtime/MODULE.md');
     await fsp.appendFile(modulePath, '\n## 人工约束\n绝不能覆盖这一段。\n');
     await docs.ensureModule({ ...module, lastUsedTs: 99 });
     const twice = await fsp.readFile(modulePath, 'utf8');
     expect(twice.match(/绝不能覆盖这一段。/g)).toHaveLength(1);
-    expect(twice.match(/mando:module-meta:start/g)).toHaveLength(1);
+    expect(twice.match(/panda:module-meta:start/g)).toHaveLength(1);
   });
 
   test('renameDir：整目录迁移 + meta slug 改写 + 旧目录删除；人工正文原样', async () => {
@@ -148,34 +148,34 @@ describe('ModuleDocs', () => {
       agent: 'codex',
       createdTs: 100,
     });
-    const oldModuleMd = path.join(cwd, '.mando/modules/terminal-runtime/MODULE.md');
+    const oldModuleMd = path.join(cwd, '.panda/modules/terminal-runtime/MODULE.md');
     await fsp.appendFile(oldModuleMd, '\n## 人工约束\n改名后也要在。\n');
 
     await docs.renameDir(module, 'terminal-core');
     const renamed = { ...module, slug: 'terminal-core' };
     // ensureModule 按新 slug 校验身份必须通过（meta slug 已被改写）
     await docs.ensureModule(renamed);
-    const moved = await fsp.readFile(path.join(cwd, '.mando/modules/terminal-core/MODULE.md'), 'utf8');
+    const moved = await fsp.readFile(path.join(cwd, '.panda/modules/terminal-core/MODULE.md'), 'utf8');
     expect(moved).toContain('slug: terminal-core');
     expect(moved).toContain('module_id: 5');
     expect(moved).toContain('改名后也要在。');
     // issue 过程页跟着走；旧目录整体消失
     const movedPage = await fsp.readFile(
-      path.join(cwd, '.mando/modules/terminal-core/issues', path.basename(rel)),
+      path.join(cwd, '.panda/modules/terminal-core/issues', path.basename(rel)),
       'utf8',
     );
     expect(movedPage).toContain('issue_id: 72');
-    await expect(fsp.stat(path.join(cwd, '.mando/modules/terminal-runtime'))).rejects.toThrow();
+    await expect(fsp.stat(path.join(cwd, '.panda/modules/terminal-runtime'))).rejects.toThrow();
   });
 
   test('renameDir：目标目录已存在拒绝；文件 module_id 不符拒绝；旧目录缺失静默返回', async () => {
     const { cwd, docs, module } = await setup();
     await docs.ensureModule(module);
-    await fsp.mkdir(path.join(cwd, '.mando/modules/occupied-slot'), { recursive: true });
+    await fsp.mkdir(path.join(cwd, '.panda/modules/occupied-slot'), { recursive: true });
     await expect(docs.renameDir(module, 'occupied-slot')).rejects.toThrow('已存在');
     await expect(docs.renameDir({ ...module, id: 99 }, 'fresh-slot')).rejects.toThrow('身份冲突');
     // 身份冲突时旧目录未被动过
-    await fsp.stat(path.join(cwd, '.mando/modules/terminal-runtime/MODULE.md'));
+    await fsp.stat(path.join(cwd, '.panda/modules/terminal-runtime/MODULE.md'));
     // 无档可迁：不抛错
     await docs.renameDir({ ...module, id: 6, slug: 'not-exist-mod' }, 'whatever-name');
   });
@@ -185,7 +185,7 @@ describe('ModuleDocs', () => {
     await docs.ensureModule(module);
     await expect(docs.ensureModule({ ...module, id: 6 })).rejects.toThrow('身份冲突');
     const text = await fsp.readFile(
-      path.join(cwd, '.mando/modules/terminal-runtime/MODULE.md'),
+      path.join(cwd, '.panda/modules/terminal-runtime/MODULE.md'),
       'utf8',
     );
     expect(text).toContain('module_id: 5');

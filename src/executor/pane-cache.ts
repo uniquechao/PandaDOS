@@ -19,6 +19,7 @@ import type {
   DirEntry,
   ExecutorDriver,
   FileRange,
+  GitBlobResult,
   GitResult,
   PathStat,
   PtyChannel,
@@ -164,6 +165,10 @@ export class PaneCacheDriver implements ExecutorDriver {
 
   git(cwd: string, args: string[]): Promise<GitResult> {
     return this.inner.git(cwd, args);
+  }
+
+  readGitBlob(cwd: string, rev: string, path: string): Promise<GitBlobResult> {
+    return this.inner.readGitBlob(cwd, rev, path);
   }
 
   openPty(cmd: string, cols: number, rows: number): Promise<PtyChannel> {

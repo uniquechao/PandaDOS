@@ -3,13 +3,20 @@ import { promises as fsp } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { LocalDriver } from '../executor/local';
-import { JsonlLocator, parseLines, readOlder, readRecentMessages, tailConversation } from './jsonl';
+import {
+  JsonlLocator,
+  parseLines,
+  readOlder,
+  readRecentConversationPage,
+  readRecentMessages,
+  tailConversation,
+} from './jsonl';
 
 let dir: string;
 const driver = new LocalDriver();
 
 beforeAll(async () => {
-  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-jsonl-'));
+  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-jsonl-'));
 });
 afterAll(async () => {
   await fsp.rm(dir, { recursive: true, force: true });
@@ -306,6 +313,30 @@ describe('readOlder（向后翻页：读 endOffset 之前的更早整行）', ()
     // 文件不存在：原样返回 endOffset，hasMore 由 endOffset 决定
     const none = await readOlder(driver, path.join(dir, 'nope.jsonl'), 100, 1 << 20);
     expect(none).toEqual({ msgs: [], offset: 100, hasMore: true });
+  });
+});
+
+describe('readRecentConversationPage（baseline 按消息数自适应回溯）', () => {
+  test('超长 JSONL 工具输出不会挤掉末 60 条可解析日志，且可从最旧 off 无重叠翻页', async () => {
+    const f = path.join(dir, 'recent-page-large.jsonl');
+    const earlier = Array.from({ length: 35 }, (_, i) => asst(`early-${i}`));
+    const giant = toolResult('x'.repeat(600 * 1024));
+    const later = Array.from({ length: 45 }, (_, i) => asst(`late-${i}`));
+    await fsp.writeFile(f, [...earlier, giant, ...later].join('\n') + '\n');
+
+    const page = await readRecentConversationPage(driver, f, 60, 256 * 1024);
+    expect(page.msgs).toHaveLength(60);
+    expect(page.msgs[0]!.text).toBe('early-21');
+    expect(page.msgs.at(-1)!.text).toBe('late-44');
+    expect(page.msgs.some((m) => m.role === 'tool_result')).toBe(true);
+    expect(page.hasMore).toBe(true);
+    expect(page.offset).toBe((await fsp.stat(f)).size);
+
+    const older = await readOlder(driver, f, page.msgs[0]!.off!);
+    expect(older.msgs.map((m) => m.text)).toEqual(
+      Array.from({ length: 21 }, (_, i) => `early-${i}`),
+    );
+    expect(older.msgs.every((m) => m.off! < page.msgs[0]!.off!)).toBe(true);
   });
 });
 

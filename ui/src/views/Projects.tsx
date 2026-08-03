@@ -1,13 +1,14 @@
 /**
- * 项目列表 + 建项目（空白/git clone）+ 导入现有 tmux 会话。
+ * 项目列表 + 建项目（空白/git clone）+ 从执行机导入 tmux/Claude/Codex 项目。
  * - GET /api/projects（普通用户只见自己的；admin 全量）
  * - GET /api/executors（登录即可见的极简执行机列表 → 下拉）
  * - GET /api/executors/:id/os-users（admin；Linux 用户下拉）
  * - GET /api/executors/:id/fs?path=（建项目 cwd 目录浏览）
  * - POST /api/executors/:id/fs/mkdir（新建目录）
  * - GET /api/executors/:id/tmux-sessions（导入候选 + 托管/已导入/越权标注）
+ * - GET /api/executors/:id/agent-projects?agent=claude|codex（本地历史项目候选）
  * - POST /api/projects {name?, executorId, gitUrl?, goal?, cwd?, runUser?, withConversation?}
- * - POST /api/projects/import {executorId, session, name?, goal?, runUser?}
+ * - POST /api/projects/import {source, executorId, session|cwd, name?, goal?, runUser?}
  */
 import { useEffect, useState } from 'preact/hooks';
 import { api, ApiError } from '../lib/api';
@@ -21,10 +22,13 @@ import { isAsyncMode, SUMMARY_MODELS, type SummaryMode } from '../lib/summaryMod
 import { pollProjectSummary } from '../lib/pollSummary';
 import { SummaryButton } from '../components/SummaryButton';
 import type {
+  AgentProjectImportCandidate,
+  AgentProjectImportCandidatesResponse,
   ExecutorLite,
   Me,
   OsUser,
   Project,
+  ProjectImportResponse,
   ProjectIssueSummary,
   ProjectsSummary,
   TmuxSessionInfo,
@@ -496,7 +500,7 @@ export function ProjectsView({ me }: { me: Me }) {
         </div>
         <div class="ph-acts">
           <button class="btn sm" onClick={() => setImporting(true)}>
-            {tr('project.importTmuxShort')}
+            {tr('project.importShort')}
           </button>
           <button class="btn primary sm" onClick={() => setCreating(true)}>
             ＋ {tr('project.newProject')}
@@ -546,11 +550,21 @@ export function ProjectsView({ me }: { me: Me }) {
         </div>
       )}
       {projects !== null && all.length === 0 && (
-        <div class="empty">
-          {tr('project.noProjects')}
-          <br />
-          {tr('project.noProjectsHelp')}
-        </div>
+        <section class="ph-onboarding" aria-labelledby="project-first-run-title">
+          <img class="ph-onboarding-logo" src="/logo-mark.png" alt="" aria-hidden="true" />
+          <div class="ph-onboarding-main">
+            <h2 id="project-first-run-title">{tr('project.noProjects')}</h2>
+            <p>{tr('project.noProjectsImportHelp')}</p>
+            <div class="ph-onboarding-actions">
+              <button type="button" class="btn" onClick={() => setImporting(true)}>
+                {tr('project.importExisting')}
+              </button>
+              <button type="button" class="btn primary" onClick={() => setCreating(true)}>
+                ＋ {tr('project.newProject')}
+              </button>
+            </div>
+          </div>
+        </section>
       )}
       {projects !== null &&
         all.length > 0 &&
@@ -577,13 +591,13 @@ export function ProjectsView({ me }: { me: Me }) {
         />
       )}
       {importing && (
-        <ImportTmuxModal
+        <ImportProjectModal
           isAdmin={me.role === 'admin'}
           onClose={() => setImporting(false)}
           onImported={(p) => {
             setImporting(false);
             load();
-            nav(`/p/${p.id}`);
+            nav(p.kind === 'chat' ? `/p/${p.id}/chat` : `/p/${p.id}`);
           }}
         />
       )}
@@ -803,7 +817,7 @@ function CreateProjectModal({
   );
 }
 
-// ---------- 导入现有 tmux 会话 ----------
+// ---------- 从执行机统一导入 tmux / Claude / Codex ----------
 
 function sessionBadge(s: TmuxSessionInfo) {
   if (s.managedProjectId !== null) return <span class="badge b-gray">{tr('project.managed', { id: s.managedProjectId })}</span>;
@@ -813,7 +827,11 @@ function sessionBadge(s: TmuxSessionInfo) {
   return null;
 }
 
-function ImportTmuxModal({
+type ImportSource = 'tmux' | 'claude' | 'codex';
+
+const IMPORT_SOURCES: readonly ImportSource[] = ['tmux', 'claude', 'codex'];
+
+function ImportProjectModal({
   isAdmin,
   onClose,
   onImported,
@@ -824,8 +842,11 @@ function ImportTmuxModal({
 }) {
   const executors = useExecutors();
   const [executorId, setExecutorId] = useState('');
+  const [source, setSource] = useState<ImportSource>('tmux');
   const [sessions, setSessions] = useState<TmuxSessionInfo[] | null>(null);
-  const [picked, setPicked] = useState<TmuxSessionInfo | null>(null);
+  const [agentProjects, setAgentProjects] = useState<AgentProjectImportCandidate[] | null>(null);
+  const [pickedSession, setPickedSession] = useState<TmuxSessionInfo | null>(null);
+  const [pickedAgentProject, setPickedAgentProject] = useState<AgentProjectImportCandidate | null>(null);
   const [name, setName] = useState('');
   const [goal, setGoal] = useState('');
   const [runUser, setRunUser] = useState('');
@@ -841,45 +862,85 @@ function ImportTmuxModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [executors]);
 
+  const selectedExecutor = executors?.find((x) => String(x.id) === executorId);
+
+  useEffect(() => {
+    if (source !== 'tmux' && selectedExecutor && !selectedExecutor.supportedAgents.includes(source)) {
+      setSource('tmux');
+    }
+  }, [selectedExecutor, source]);
+
   useEffect(() => {
     const eid = Number(executorId);
     if (!Number.isInteger(eid) || eid <= 0) return;
+    let cancelled = false;
     setSessions(null);
-    setPicked(null);
+    setAgentProjects(null);
+    setPickedSession(null);
+    setPickedAgentProject(null);
+    setName('');
+    setRunUser('');
     setErr('');
-    api<{ ok: boolean; sessions: TmuxSessionInfo[] }>(`/api/executors/${eid}/tmux-sessions`)
-      .then((r) => setSessions(r.sessions))
+    const request = source === 'tmux'
+      ? api<{ ok: boolean; sessions: TmuxSessionInfo[] }>(`/api/executors/${eid}/tmux-sessions`)
+      : api<AgentProjectImportCandidatesResponse>(
+          `/api/executors/${eid}/agent-projects?agent=${source}`,
+        );
+    request
+      .then((r) => {
+        if (cancelled) return;
+        if ('sessions' in r) setSessions(r.sessions);
+        else setAgentProjects(r.projects);
+      })
       .catch((e: Error) => {
+        if (cancelled) return;
         setSessions([]);
+        setAgentProjects([]);
         setErr(e.message);
       });
-  }, [executorId]);
+    return () => {
+      cancelled = true;
+    };
+  }, [executorId, source]);
 
-  const pick = (s: TmuxSessionInfo): void => {
+  const pickSession = (s: TmuxSessionInfo): void => {
     if (s.managedProjectId !== null || !s.allowed) return;
     if (s.importedProjectId !== null) {
       onImported({ id: s.importedProjectId } as Project); // 已导入 → 直接进项目
       return;
     }
-    setPicked(s);
+    setPickedSession(s);
+    setPickedAgentProject(null);
     setName(s.name);
     // 会话 cwd 落在某 Linux 用户家目录 → 预选该用户
     const owner = s.cwd ? osUsers.find((u) => s.cwd === u.home || s.cwd!.startsWith(u.home + '/')) : undefined;
     setRunUser(owner && owner.uid !== 0 ? owner.name : '');
   };
 
+  const pickAgentProject = (project: AgentProjectImportCandidate): void => {
+    setPickedSession(null);
+    setPickedAgentProject(project);
+    setName(project.name);
+    const owner = osUsers.find((u) => project.cwd === u.home || project.cwd.startsWith(u.home + '/'));
+    setRunUser(owner && owner.uid !== 0 ? owner.name : '');
+  };
+
   const submit = async (): Promise<void> => {
     const eid = Number(executorId);
+    const picked = source === 'tmux' ? pickedSession : pickedAgentProject;
     if (!picked || busy || !Number.isInteger(eid) || eid <= 0) return;
     setBusy(true);
     setErr('');
     try {
-      const r = await api<{ ok: boolean; project: Project; created: boolean; warnings?: string[] }>(
+      const r = await api<ProjectImportResponse>(
         '/api/projects/import',
         'POST',
         {
+          source,
           executorId: eid,
-          session: picked.name,
+          ...(source === 'tmux'
+            ? { session: (picked as TmuxSessionInfo).name }
+            : { cwd: (picked as AgentProjectImportCandidate).cwd }),
           ...(name.trim() && name.trim() !== picked.name ? { name: name.trim() } : {}),
           ...(goal.trim() ? { goal: goal.trim() } : {}),
           ...(runUser ? { runUser } : {}),
@@ -887,6 +948,9 @@ function ImportTmuxModal({
       );
       if (r.warnings?.length) toast.warn(tr('project.importedWarnings', { warnings: r.warnings.join('\n') }));
       if (!r.created) toast.info(tr('project.mergedExisting', { name: r.project.name }));
+      if (source !== 'tmux') {
+        toast.success(tr('project.linkedHistory', { count: r.conversationIds?.length ?? 0 }));
+      }
       onImported(r.project);
     } catch (x) {
       setErr(x instanceof ApiError ? x.message : String(x));
@@ -894,43 +958,108 @@ function ImportTmuxModal({
     }
   };
 
-  const importable = (s: TmuxSessionInfo): boolean => s.managedProjectId === null && s.allowed;
+  const picked = source === 'tmux' ? pickedSession : pickedAgentProject;
+  const sourceLabel = (value: ImportSource): string =>
+    value === 'tmux'
+      ? tr('project.importTmuxSource')
+      : value === 'claude'
+        ? tr('project.importClaudeSource')
+        : tr('project.importCodexSource');
+  const sourceHelp = (value: ImportSource): string =>
+    value === 'tmux'
+      ? tr('project.importTmuxHelp')
+      : value === 'claude'
+        ? tr('project.importClaudeHelp')
+        : tr('project.importCodexHelp');
+  const sourceEnabled = (value: ImportSource): boolean =>
+    value === 'tmux' || !selectedExecutor || selectedExecutor.supportedAgents.includes(value);
 
   return (
-    <Modal title={tr('project.importTmux')} onClose={onClose}>
-      <div class="formcol">
+    <Modal title={tr('project.importTitle')} onClose={onClose} wide>
+      <div class="formcol import-project" aria-busy={busy ? 'true' : 'false'}>
         <label class="field">
           {tr('project.executor')}
           <ExecutorSelect executors={executors} value={executorId} onChange={setExecutorId} />
         </label>
-        {sessions === null && <div class="mut small">{tr('project.readingSessions')}</div>}
-        {sessions !== null && sessions.length === 0 && !err && <div class="empty">{tr('project.noTmuxSessions')}</div>}
-        {sessions !== null && sessions.length > 0 && (
-          <div style={{ maxHeight: '38vh', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {sessions.map((s) => (
-              <div
-                key={s.name}
-                class={`card ${importable(s) || s.importedProjectId !== null ? 'click' : ''}`}
-                style={{
-                  margin: 0,
-                  padding: '8px 10px',
-                  ...(picked?.name === s.name ? { outline: '2px solid var(--accent)' } : {}),
-                  ...(importable(s) || s.importedProjectId !== null ? {} : { opacity: 0.55 }),
-                }}
-                onClick={() => pick(s)}
+        <fieldset class="import-source-group">
+          <legend>{tr('project.importSource')}</legend>
+          <div class="import-source-options">
+            {IMPORT_SOURCES.map((value) => (
+              <button
+                key={value}
+                type="button"
+                class={'import-source-option' + (source === value ? ' on' : '')}
+                aria-pressed={source === value}
+                disabled={!sourceEnabled(value)}
+                onClick={() => setSource(value)}
               >
-                <div class="row">
-                  <b class="grow" style={{ fontSize: 13 }}>
-                    {s.attached ? '🟢 ' : ''}
-                    {s.name}
-                  </b>
-                  {s.command && <span class="badge b-blue">{s.command}</span>}
-                  {sessionBadge(s)}
+                <span class="import-source-name">{sourceLabel(value)}</span>
+                <span class="import-source-help">{sourceHelp(value)}</span>
+              </button>
+            ))}
+          </div>
+        </fieldset>
+        {source === 'tmux' && sessions === null && (
+          <div class="import-status" role="status" aria-live="polite">{tr('project.readingSessions')}</div>
+        )}
+        {source !== 'tmux' && agentProjects === null && (
+          <div class="import-status" role="status" aria-live="polite">{tr('project.readingProjects')}</div>
+        )}
+        {source === 'tmux' && sessions !== null && sessions.length === 0 && !err && (
+          <div class="empty import-empty">{tr('project.noTmuxSessions')}</div>
+        )}
+        {source !== 'tmux' && agentProjects !== null && agentProjects.length === 0 && !err && (
+          <div class="empty import-empty">{tr('project.noAgentProjects', { agent: sourceLabel(source) })}</div>
+        )}
+        {sessions !== null && sessions.length > 0 && (
+          <div class="import-candidate-list" aria-label={tr('project.importCandidates')}>
+            {sessions.map((s) => (
+              <button
+                type="button"
+                key={s.name}
+                class={'import-candidate' + (pickedSession?.name === s.name ? ' on' : '')}
+                aria-pressed={pickedSession?.name === s.name}
+                disabled={s.managedProjectId !== null || !s.allowed}
+                onClick={() => pickSession(s)}
+              >
+                <div class="import-candidate-head">
+                  <b>{s.name}</b>
+                  <span class={'import-live-dot' + (s.attached ? ' on' : '')} aria-hidden="true" />
+                  {s.attached && <span class="sr-only">{tr('project.tmuxAttached')}</span>}
+                  <span class="import-candidate-badges">
+                    {s.command && <span class="badge b-blue">{s.command}</span>}
+                    {sessionBadge(s)}
+                  </span>
                 </div>
-                <div class="mut small" style={{ wordBreak: 'break-all' }}>
+                <span class="import-candidate-meta">
                   {s.cwd ?? tr('project.cwdUnavailable')} · {timeAgo(s.createdTs * 1000)}
-                </div>
-              </div>
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+        {agentProjects !== null && agentProjects.length > 0 && (
+          <div class="import-candidate-list" aria-label={tr('project.importCandidates')}>
+            {agentProjects.map((project) => (
+              <button
+                type="button"
+                key={`${project.agent}:${project.cwd}`}
+                class={'import-candidate' + (pickedAgentProject?.cwd === project.cwd ? ' on' : '')}
+                aria-pressed={pickedAgentProject?.cwd === project.cwd}
+                onClick={() => pickAgentProject(project)}
+              >
+                <span class="import-candidate-head">
+                  <b>{project.name}</b>
+                  <span class="import-candidate-badges">
+                    <span class="badge b-blue">{sourceLabel(project.agent)}</span>
+                    <span class="badge b-gray">{tr('project.historySessions', { count: project.sessionCount })}</span>
+                    {project.sameCwdProjectId !== null && (
+                      <span class="badge b-amber">{tr('project.mergeInto', { id: project.sameCwdProjectId })}</span>
+                    )}
+                  </span>
+                </span>
+                <span class="import-candidate-meta">{project.cwd} · {timeAgo(project.latestTs)}</span>
+              </button>
             ))}
           </div>
         )}
@@ -950,13 +1079,13 @@ function ImportTmuxModal({
             )}
           </>
         )}
-        {err && <div class="err">{err}</div>}
+        {err && <div class="err" role="alert">{err}</div>}
       </div>
       <div class="mbtns">
         <button class="btn" onClick={onClose}>
           {tr('ui.cancel')}
         </button>
-        <button class="btn primary" disabled={busy || !picked || !name.trim()} onClick={submit}>
+        <button class="btn primary" disabled={busy || !picked || !name.trim()} onClick={() => void submit()}>
           {busy ? tr('project.importing') : tr('project.import')}
         </button>
       </div>

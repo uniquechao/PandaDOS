@@ -24,10 +24,12 @@ const EXPECTED_TABLES = [
   'daily_greeting',
   'project_members',
   'user_message_counts',
+  'project_external_issue_sources',
+  'external_issue_records',
 ].sort();
 
 /** core/migrations 当前最新编号（新增迁移文件时同步 +1） */
-const LATEST_MIGRATION = 16;
+const LATEST_MIGRATION = 17;
 
 function tableNames(db: Database): string[] {
   return db
@@ -39,7 +41,7 @@ function tableNames(db: Database): string[] {
 }
 
 describe('migrate', () => {
-  const tmpDb = join(tmpdir(), `mando-migrate-test-${process.pid}-${Date.now()}.db`);
+  const tmpDb = join(tmpdir(), `panda-migrate-test-${process.pid}-${Date.now()}.db`);
 
   afterEach(() => {
     for (const suffix of ['', '-wal', '-shm']) rmSync(tmpDb + suffix, { force: true });
@@ -197,6 +199,62 @@ describe('migrate', () => {
       expect(col?.notnull).toBe(0);
       expect(col?.dflt_value).toBeNull();
     }
+    db.close();
+  });
+
+  test('017 迁移：每项目单一外部来源，导入/忽略记录按来源与远端 id 去重', () => {
+    const db = openDb(':memory:');
+    migrate(db);
+    db.query(
+      `INSERT INTO users (id, username, token_hash, role, created_ts)
+       VALUES (1, 'u', 'h', 'user', 0)`,
+    ).run();
+    db.query(
+      `INSERT INTO executors
+         (id, name, host, port, ssh_user, key_ref, workspace_root, claude_dir)
+       VALUES (1, 'local', '127.0.0.1', 22, '', '', '/ws', '')`,
+    ).run();
+    db.query(
+      `INSERT INTO projects (id, name, executor_id, cwd, owner_user_id, created_ts)
+       VALUES (1, 'p', 1, '/ws/p', 1, 0)`,
+    ).run();
+
+    db.query(
+      `INSERT INTO project_external_issue_sources
+         (project_id, provider, remote_name, remote_url, instance_url, created_ts, updated_ts)
+       VALUES (1, 'github', 'origin', 'git@github.com:o/r.git', 'https://github.com', 0, 0)`,
+    ).run();
+    expect(() =>
+      db
+        .query(
+          `INSERT INTO project_external_issue_sources
+             (project_id, provider, remote_name, remote_url, instance_url, created_ts, updated_ts)
+           VALUES (1, 'gitlab', 'upstream', 'git@gitlab.example:o/r.git', 'https://gitlab.example', 0, 0)`,
+        )
+        .run(),
+    ).toThrow();
+
+    db.query(
+      `INSERT INTO external_issue_records
+         (project_id, provider, source_key, external_id, external_number, external_url,
+          disposition, created_ts, updated_ts)
+       VALUES (1, 'github', 'github.com/o/r', '100', '7', 'https://github.com/o/r/issues/7',
+               'ignored', 0, 0)`,
+    ).run();
+    expect(() =>
+      db
+        .query(
+          `INSERT INTO external_issue_records
+             (project_id, provider, source_key, external_id, external_number, external_url,
+              disposition, created_ts, updated_ts)
+           VALUES (1, 'github', 'github.com/o/r', '100', '7', 'https://github.com/o/r/issues/7',
+                   'ignored', 0, 0)`,
+        )
+        .run(),
+    ).toThrow();
+    expect(
+      db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM external_issue_records').get()?.n,
+    ).toBe(1);
     db.close();
   });
 

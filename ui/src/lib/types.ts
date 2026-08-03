@@ -137,8 +137,48 @@ export interface Project {
   summaryStatus: SummaryStatus;
   /** 任务失败原因（summaryStatus='error' 时有值） */
   summaryError: string | null;
+  /** 开启后在计划与合并评审节点等待人工确认。 */
+  manualReview: boolean;
   /** 项目类型（009）：'issue'=issue 看板；'chat'=纯对话模式 */
   kind: ProjectKind;
+}
+
+export type ExternalIssueProvider = 'github' | 'gitlab';
+
+export interface ExternalIssueRemote {
+  name: string;
+  url: string;
+  host: string;
+  suggestedProvider: ExternalIssueProvider;
+  suggestedInstanceUrl: string;
+}
+
+/** 项目配置页可见的安全摘要；后端不会返回 apiToken 明文。 */
+export interface ExternalIssueSourceSummary {
+  projectId: number;
+  provider: ExternalIssueProvider;
+  remoteName: string;
+  remoteUrl: string;
+  instanceUrl: string;
+  tokenUpdatedTs: number | null;
+  createdTs: number;
+  updatedTs: number;
+  tokenConfigured: boolean;
+  tokenMasked: string | null;
+}
+
+export interface ExternalIssueCandidate {
+  provider: ExternalIssueProvider;
+  sourceKey: string;
+  externalId: string;
+  externalNumber: string;
+  title: string;
+  body: string;
+  url: string;
+  author: string | null;
+  labels: string[];
+  createdAt: string | null;
+  updatedAt: string | null;
 }
 
 /** GET /api/projects/summary 单项目未完结 issue 聚合（看板列口径；无 issue 的项目不出现） */
@@ -220,6 +260,33 @@ export interface TmuxSessionInfo {
   allowed: boolean;
 }
 
+/** GET /api/executors/:id/agent-projects 单条（本地 Claude/Codex 历史聚合视角） */
+export interface AgentProjectImportCandidate {
+  agent: 'claude' | 'codex';
+  cwd: string;
+  name: string;
+  latestTs: number;
+  sessionCount: number;
+  sameCwdProjectId: number | null;
+}
+
+/** GET /api/executors/:id/agent-projects */
+export interface AgentProjectImportCandidatesResponse {
+  ok: boolean;
+  projects: AgentProjectImportCandidate[];
+}
+
+/** POST /api/projects/import；三类导入来源共用的响应契约。 */
+export interface ProjectImportResponse {
+  ok: boolean;
+  project: Project;
+  created: boolean;
+  warnings?: string[];
+  conversationIds?: string[];
+  importedConversations?: number;
+  existingConversations?: number;
+}
+
 // ---------- Issue ----------
 
 export type IssueCategory = 'task' | 'design' | 'debug';
@@ -248,6 +315,29 @@ export interface Conversation {
   lastActiveTs: number | null;
   /** 本对话的弹窗自动批准档位（默认 cautious = 全部等人点） */
   autoApprove: AutoApproveLevel;
+}
+
+/** GET /api/projects/:projectId/conversations/local-history 单条可信摘要 */
+export interface LocalHistorySession {
+  agent: AgentKind;
+  sessionId: string;
+  title: string | null;
+  createdTs: number;
+  updatedTs: number;
+  importedConversationId: string | null;
+}
+
+/** GET /api/projects/:projectId/conversations/local-history */
+export interface LocalHistoryResponse {
+  cwd: string;
+  sessions: LocalHistorySession[];
+}
+
+/** POST /api/projects/:projectId/conversations/local-history */
+export interface LocalHistoryImportResponse {
+  imported: number;
+  existing: number;
+  conversations: Conversation[];
 }
 
 export type IssueStatus =
@@ -648,7 +738,7 @@ export interface ChatSelection {
 }
 
 export type ChatServerFrame =
-  | { type: 'baseline'; msgs: ChatMessage[]; selection?: ChatSelection | null }
+  | { type: 'baseline'; msgs: ChatMessage[]; hasMore: boolean; selection?: ChatSelection | null }
   | { type: 'msg'; m: ChatMessage }
   | { type: 'selection'; sel: ChatSelection | null }
   | { type: 'mode'; live: boolean }
@@ -672,7 +762,7 @@ export type ChatClientFrame =
   | { type: 'key'; key: string }
   | { type: 'select'; index: number; sig: string }
   // 请求更早历史（向上翻页）
-  | { type: 'history' }
+  | { type: 'history'; before?: number }
   // 请求解读当前菜单（issue #112「解释一下」，点了才生成）
   | { type: 'explain'; sig: string };
 

@@ -9,7 +9,7 @@
 import type { AutoApproveLevel } from './types';
 
 /** localStorage 键（按设备存，一个用户多设备各自记） */
-export const NEW_ISSUE_AA_KEY = 'mando.newIssueAutoApprove';
+export const NEW_ISSUE_AA_KEY = 'panda.newIssueAutoApprove';
 
 /** 没记录时的默认档位 = 后端默认，也是现有审批管道行为 */
 export const NEW_ISSUE_AA_DEFAULT: AutoApproveLevel = 'medium';

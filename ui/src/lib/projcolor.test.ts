@@ -13,7 +13,7 @@ describe('projInitial', () => {
     expect(projInitial('  yubin')).toBe('Y');
   });
   test('中文取首字（不改动）', () => {
-    expect(projInitial('曼拓项目')).toBe('曼');
+    expect(projInitial('熊猫项目')).toBe('熊');
   });
   test('数字/符号取首字符', () => {
     expect(projInitial('3d-engine')).toBe('3');

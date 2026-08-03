@@ -5,6 +5,8 @@ import { commonUiMessages } from '../domains/common-ui';
 import { statusMessages } from '../domains/status';
 import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
+import { projectSettingsMessages } from '../domains/project-settings';
+import { externalImportMessages } from '../domains/external-import';
 
 export const koCatalog = {
   ...shellMessages.ko,
@@ -13,6 +15,13 @@ export const koCatalog = {
   ...statusMessages.ko,
   ...errorMessages.ko,
   ...notifyMessages.ko,
+  ...projectSettingsMessages.ko,
+  ...externalImportMessages.ko,
+  'issue.editSubtask': '하위 작업 {number} 편집', 'issue.subtaskText': '하위 작업 내용',
+  'view.importLocalHistory':'로컬 기록 가져오기','view.localHistoryHelp':'작업 디렉터리가 현재 프로젝트와 정확히 일치하는 Claude/Codex 기록만 표시합니다.','view.localHistoryAgentFilter':'에이전트별 기록 필터','view.historySelected':'{count, plural, other {#개 선택됨}}','view.selectAllHistory':'모두 선택','view.clearHistorySelection':'지우기','view.readingLocalHistory':'로컬 기록 읽는 중…','view.noLocalHistory':'현재 프로젝트와 일치하는 로컬 기록이 없습니다.','view.noFilteredLocalHistory':'이 에이전트 필터와 일치하는 기록이 없습니다.','view.localHistoryCandidates':'로컬 기록 세션','view.untitledHistory':'제목 없는 기록 세션','view.historyAlreadyImported':'가져옴','view.noImportedConversation':'가져온 뒤 사용할 수 있는 대화가 반환되지 않았습니다.','view.localHistoryImported':'{count, plural, other {기록 #개를 가져왔습니다}}','view.importSelectedHistory':'선택 항목 가져오기',
+  'project.importTitle':'가져오기','project.importShort':'가져오기','project.importSource':'가져올 대상','project.importTmuxSource':'tmux 세션','project.importClaudeSource':'Claude 프로젝트','project.importCodexSource':'Codex 프로젝트',
+  'project.importTmuxHelp':'실행 중인 tmux 세션 등록','project.importClaudeHelp':'로컬 프로젝트와 대화 기록 가져오기','project.importCodexHelp':'로컬 프로젝트와 대화 기록 가져오기','project.readingProjects':'로컬 프로젝트 읽는 중…',
+  'project.noAgentProjects':'이 실행기에 가져올 수 있는 {agent}가 없습니다','project.importCandidates':'가져오기 후보','project.historySessions':'{count, plural, other {기록 #개}}','project.tmuxAttached':'연결됨','project.linkedHistory':'{count, plural, other {기록 #개를 연결했습니다}}','project.noProjectsImportHelp':'프로젝트를 만들거나 실행기에서 기존 프로젝트 또는 세션을 가져오세요.','project.importExisting':'기존 Claude/Codex/tmux 프로젝트 가져오기',
   'common.cancel': '취소',
   'common.close': '닫기',
   'common.loading': '불러오는 중…',
@@ -20,7 +29,6 @@ export const koCatalog = {
   'common.issueCount': 'issue {count}개',
   'locale.loadFailed': '선택한 언어를 불러올 수 없어 영어로 표시합니다.',
   'locale.languageAria': '언어',
-  'login.tagline': '내 손안의 엔지니어링 집사',
   'login.username': '사용자 이름',
   'login.token': 'Token',
   'login.signingIn': '로그인 중…',
@@ -141,7 +149,7 @@ export const koCatalog = {
   'project.chatModeHelp': '채팅 모드: issue 없이 질문하거나 프로젝트 디렉터리에 파일을 만들 수 있으며, 프로젝트마다 여러 대화를 둘 수 있습니다.',
   'project.projectName': '프로젝트 이름', 'project.repoNameDefault': ' (비워 두면 저장소 이름 사용)', 'project.cloneTo': '복제 위치',
   'project.selectedUserHome': '선택한 사용자의 홈', 'project.yourWorkspace': '내 작업 공간', 'project.pickDirectory': '디렉터리 선택',
-  'project.branchFallbackHelp': '작업은 현재 브랜치에서 진행됩니다. MandoAI는 브랜치를 만들거나 전환하거나 병합하지 않으며, 현재 브랜치를 읽을 수 없을 때만 이 값을 대신 사용합니다.',
+  'project.branchFallbackHelp': '작업은 현재 브랜치에서 진행됩니다. PandaDOS는 브랜치를 만들거나 전환하거나 병합하지 않으며, 현재 브랜치를 읽을 수 없을 때만 이 값을 대신 사용합니다.',
   'project.cloning': '복제 중…', 'project.cloneCreate': '복제 후 생성', 'project.managed': '관리됨 #{id}', 'project.imported': '가져옴 #{id}',
   'project.noPermission': '권한 없음', 'project.mergeInto': '#{id}에 병합', 'project.importedWarnings': '경고와 함께 가져옴:\n{warnings}',
   'project.importTmux': 'tmux 세션 가져오기', 'project.readingSessions': '세션 읽는 중…',
@@ -339,7 +347,7 @@ export const koCatalog = {
   'admin.executorRegistered': '실행기 {name}을(를) 등록했습니다', 'admin.name': '이름',
   'admin.host': '호스트(비워 두면 로컬 실행기)', 'admin.sshPort': 'SSH 포트',
   'admin.sshUser': 'SSH 사용자(로컬 실행기는 선택 사항)',
-  'admin.keyRef': '비밀 키 경로 또는 참조(참조는 ~/.mando/keys/에서 불러옴, 로컬은 비워 둠)',
+  'admin.keyRef': '비밀 키 경로 또는 참조(참조는 ~/.panda/keys/에서 불러옴, 로컬은 비워 둠)',
   'admin.chooseDirectory': '디렉터리 선택',
   'admin.connectionFirst': '원격 디렉터리를 감지하거나 탐색하기 전에 이름과 올바른 연결 정보를 입력하세요.',
   'admin.suggestion': '제안:', 'admin.useSuggestion': '제안 사용', 'admin.editExecutor': '실행기 {name} 편집',
@@ -368,4 +376,9 @@ export const koCatalog = {
   'notify.gateUnavailable': '게이트를 처리할 수 없습니다. 웹 앱을 사용하세요', 'notify.failed': '작업을 완료하지 못했습니다',
   'notify.approved': '✅ 승인됨', 'notify.rejected': '❌ 거절됨. 자세한 피드백은 웹 앱에서 추가하세요',
   'notify.invalidSelection': '잘못된 선택 콜백', 'notify.selectedOption': '옵션 {index} 선택됨',
+  'ui.organizeKindCreate':'만들기','ui.organizeKindRename':'이름 바꾸기','ui.organizeKindMerge':'병합','ui.organizeKindMove':'issue 이동',
+  'ui.organizeDescriptionCreate':'모듈 “{name}” 만들기({slug} · {agent})','ui.organizeDescriptionRename':'“{name}” 이름 변경: {fromSlug} → {slug}','ui.organizeDescriptionRenameWithName':'“{name}” 이름 변경: {fromSlug} → {slug}(표시 이름 → “{displayName}”)','ui.organizeDescriptionMerge':'{sources}을(를) “{target}”에 병합','ui.organizeDescriptionMove':'{issues}을(를) “{target}”로 이동',
+  'ui.moduleIssueCount':'{count, plural, other {issue #개}}','ui.organizeResultCreate':'모듈 “{name}”을(를) 만들었습니다({slug} · {agent})','ui.organizeResultRename':'모듈 이름을 “{name}”(으)로 바꿨습니다({slug})','ui.organizeResultMerge':'{count, plural, other {“{target}”에 병합하고 issue #개를 이동했습니다}}','ui.organizeResultMove':'{count, plural, other {issue #개를 “{target}”로 이동했습니다}}',
+  'ui.organizeFailureTimeout':'마지막 분석 시간이 초과되었습니다. 다시 실행할 수 있습니다.','ui.organizeFailureNoOutput':'마지막 분석에서 정리 계획을 반환하지 않았습니다. 다시 실행할 수 있습니다.','ui.organizeFailureError':'마지막 분석에 실패했습니다. 다시 실행할 수 있습니다.','ui.organizeFailureDetail':'기술 세부 정보: {detail}',
+  'git.imageBefore':'변경 전','git.imageAfter':'변경 후','git.openImage':'{name} 열기','git.viewImage':'{name} 이미지 보기','git.downloadImage':'{name} 다운로드',
 } as const satisfies MessageCatalog;

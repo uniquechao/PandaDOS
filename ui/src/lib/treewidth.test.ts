@@ -1,7 +1,7 @@
 /**
  * treewidth 单测：文件页左侧文件树栏像素宽的纯逻辑（夹取/归一/未设回落）+ 存储层持久化。
  * bun test 无 DOM/localStorage —— 用内存 shim 顶上，只测脱离 Preact 的部分。
- * 另验独立 key（mando.filesTreeW）不与 issuelist 的 mando.wbListW 串台。
+ * 另验独立 key（panda.filesTreeW）不与 issuelist 的 panda.wbListW 串台。
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
@@ -84,7 +84,7 @@ describe('存储层 read/write/clear 持久化', () => {
 
 describe('独立 key（不与 issuelist 串台）', () => {
   test('用独立键名，且写文件树宽不污染 issuelist 键', () => {
-    expect(TREEWIDTH_KEY).toBe('mando.filesTreeW');
+    expect(TREEWIDTH_KEY).toBe('panda.filesTreeW');
     expect(TREEWIDTH_KEY).not.toBe(LISTWIDTH_KEY);
     writeTreeWidth(300);
     expect(localStorage.getItem(LISTWIDTH_KEY)).toBeNull(); // issuelist 键未被写入

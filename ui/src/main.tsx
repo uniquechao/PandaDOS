@@ -1,5 +1,5 @@
 /**
- * MandoAI（曼拓）v2 前端壳（spec §9）：
+ * PandaDOS v2 前端壳（spec §9）：
  * 登录（POST /api/login → GET /api/me）→ hash 路由分发到
  * 项目列表 / 看板 / issue 详情 / 对话 / 终端 / 我的设定 / admin。
  * 401（cookie 失效）任意请求触发全局回登录页。
@@ -25,8 +25,13 @@ import { FilesView } from './views/Files';
 import { GitView } from './views/Git';
 import { SkillsView } from './views/Skills';
 import { SettingsView } from './views/Settings';
+import { ProjectSettingsView } from './views/ProjectSettings';
+import { ExternalIssuesView } from './views/ExternalIssues';
 import { AdminView } from './views/Admin';
 import { I18nProvider, useI18n } from './i18n/provider';
+import packageInfo from '../../package.json';
+
+const APP_VERSION = `v${packageInfo.version}`;
 
 /** 终端视图懒加载（xterm ~300KB，别拖累手机首屏；vite 自动 code-split） */
 function LazyTerm({ pid }: { pid: number }) {
@@ -59,8 +64,8 @@ function SideProjectsNav({
   collapsed: boolean;
 }) {
   const { t } = useI18n();
-  const [open, setOpen] = useState(() => localStorage.getItem('mando.sideProjOpen') !== '0');
-  const [showAll, setShowAll] = useState(() => localStorage.getItem('mando.sideProjShowAll') === '1');
+  const [open, setOpen] = useState(() => localStorage.getItem('panda.sideProjOpen') !== '0');
+  const [showAll, setShowAll] = useState(() => localStorage.getItem('panda.sideProjShowAll') === '1');
   const [q, setQ] = useState('');
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [sum, setSum] = useState<Record<string, ProjectIssueSummary>>({});
@@ -86,13 +91,13 @@ function SideProjectsNav({
   const toggle = (e: Event): void => {
     e.stopPropagation();
     setOpen((o) => {
-      localStorage.setItem('mando.sideProjOpen', o ? '0' : '1');
+      localStorage.setItem('panda.sideProjOpen', o ? '0' : '1');
       return !o;
     });
   };
   const toggleShowAll = (): void => {
     setShowAll((s) => {
-      localStorage.setItem('mando.sideProjShowAll', s ? '0' : '1');
+      localStorage.setItem('panda.sideProjShowAll', s ? '0' : '1');
       return !s;
     });
   };
@@ -462,6 +467,12 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
     case 'skills':
       view = <SkillsView pid={route.pid} me={me} />;
       break;
+    case 'project-settings':
+      view = <ProjectSettingsView key={route.pid} pid={route.pid} me={me} />;
+      break;
+    case 'external-issues':
+      view = <ExternalIssuesView key={route.pid} pid={route.pid} />;
+      break;
     case 'settings':
       view = <SettingsView me={me} onLogout={onLogout} />;
       break;
@@ -482,10 +493,10 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
   ];
 
   // 宽屏侧栏折叠 248⇄72（记 localStorage；窄屏顶部条不受影响，CSS 里限定 min-width:720px）
-  const [collapsed, setCollapsed] = useState(() => localStorage.getItem('mando.sideCollapsed') === '1');
+  const [collapsed, setCollapsed] = useState(() => localStorage.getItem('panda.sideCollapsed') === '1');
   const toggleCollapsed = (): void => {
     setCollapsed((c) => {
-      localStorage.setItem('mando.sideCollapsed', c ? '0' : '1');
+      localStorage.setItem('panda.sideCollapsed', c ? '0' : '1');
       return !c;
     });
   };
@@ -497,12 +508,15 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
         <i class="dc1" /><i class="dc2" /><i class="dc3" /><i class="dc4" /><i class="dc5" />
       </div>
       <aside class={'sidebar' + (collapsed ? ' collapsed' : '')}>
-        <div class="brand" title="MandoAI" onClick={() => nav('/')}>
-          <img class="brand-logo" src="/logo-mark.png" alt="MandoAI" />
-          <span class="brand-tx">
-            Mando<span class="brand-ai">AI</span>
+        <button type="button" class="brand" title="PandaDOS" onClick={() => nav('/')}>
+          <img class="brand-logo" src="/logo-mark.png" alt="PandaDOS" />
+          <span class="brand-copy">
+            <span class="brand-tx">
+              Panda<span class="brand-ai">DOS</span>
+            </span>
+            <span class="brand-version">{APP_VERSION}</span>
           </span>
-        </div>
+        </button>
         <nav class="snav">
           <SideProjectsNav routeName={route.name} curPid={curPid} collapsed={collapsed} />
         </nav>

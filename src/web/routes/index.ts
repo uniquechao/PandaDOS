@@ -31,6 +31,7 @@ import { adminRoutes } from './admin';
 import { authRoutes } from './auth';
 import { conversationsRoutes, type ConvManagerPort, type ConvModelPort } from './conversations';
 import { executorsRoutes } from './executors';
+import { externalIssuesRoutes } from './external-issues';
 import { feishuOauthRoutes } from './feishu-oauth';
 import { filesRoutes, type FilesDriver } from './files';
 import { gitRoutes, type GitDriver } from './git';
@@ -85,7 +86,7 @@ export interface ApiDeps {
   sessions: SessionStore;
   /** 飞书 OAuth 客户端（未配置 app 凭据传 null → 扫码接口 503/按钮不显示） */
   feishuOauth: FeishuOauthPort | null;
-  /** 对外基址（MANDO_PUBLIC_URL；缺省按请求 Host 推导 OAuth 回调地址） */
+  /** 对外基址（PANDA_PUBLIC_URL；缺省按请求 Host 推导 OAuth 回调地址） */
   publicUrl?: string | undefined;
   /** 通知钩子：建项目自动订阅属主（NotifyRouter 结构兼容） */
   notify?: { ensureOwnerSubscription(projectId: number, ownerUserId: number): unknown };
@@ -139,12 +140,19 @@ export function allRoutes(deps: ApiDeps): RouteDef[] {
       usernameById: (id) => deps.users.byId(id)?.username ?? null,
       ...(deps.waitingInput ? { waitingInput: deps.waitingInput } : {}),
     }),
+    ...externalIssuesRoutes({
+      db: deps.db,
+      engine: deps.engine,
+      driverForProject: deps.driverForProject,
+      ...(deps.modules ? { modules: deps.modules } : {}),
+    }),
     // 对话模式：chat 对话列表/新建/激活/归档/重命名（convs+mutex 齐全才挂，离线/测试装配可缺）
     ...(deps.convs && deps.mutex
       ? conversationsRoutes({
           db: deps.db,
           convs: deps.convs,
           mutex: deps.mutex,
+          driverForProject: deps.driverForProject,
           ...(deps.models ? { models: deps.models } : {}),
         })
       : []),

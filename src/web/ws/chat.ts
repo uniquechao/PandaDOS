@@ -2,7 +2,7 @@
  * web/ws/chat —— WS 聊天流（/ws/chat/:projectId，Wave3 任务 B）。
  *
  * 帧协议（与 UI 工程师的共同契约）：
- * - 服→客：{type:'baseline',msgs,selection?}（建连即发；活跃对话被切换/新 jsonl 落地时会重发）
+ * - 服→客：{type:'baseline',msgs,hasMore,selection?}（建连即发；活跃对话被切换/新 jsonl 落地时会重发）
  *          {type:'msg',m}（tail 增量气泡）
  *          {type:'selection',sel}（菜单出现/变化=帧带 {context,options,sig}；消失=sel:null）
  *          {type:'explanation',sig,optionsSig,text}（issue #112：菜单解读，仅「解释一下」点了才发）
@@ -27,7 +27,13 @@
  * 轮询 1.2s（v1 平移，可配）：tail 增量 + 菜单签名变化推送。
  */
 import type { ServerWebSocket } from 'bun';
-import { readOlder, tailConversation, type ChatMessage, type JsonlReader } from '../../core/jsonl';
+import {
+  readOlder,
+  readRecentConversationPage,
+  tailConversation,
+  type ChatMessage,
+  type JsonlReader,
+} from '../../core/jsonl';
 import { detectSelection, selectionSig } from '../../core/screen';
 import { judgeAgentLiveness, paneHasAgentUi, type AgentLiveness } from '../../core/agent-liveness';
 import type { AgentKind } from '../../core/types';
@@ -132,7 +138,8 @@ export interface ChatWsData {
   nextSeq: number;
   /**
    * 向上翻页游标：当前已加载的最旧一条 baseline 消息的源行字节 offset（= 稳定标识 off）。
-   * 收到 history 请求就从这里往前 readOlder 一页、回帧并把它前移到更早处；0 = 已到文件头/无更早。
+   * 收到 history 请求就从这里（或客户端携带的更早 before）往前 readOlder 一页、回帧并把它前移；
+   * 0 = 已到文件头/无更早。
    * 每次 (重)baseline 都重置为新 baseline 的最旧一条（前端已加载的更早历史由前端合并保留，见子任务3）。
    */
   historyHead: number;
@@ -155,7 +162,7 @@ export interface ChatWsData {
   closed?: boolean;
 }
 
-/** baseline 从 jsonl 尾部最多读多少字节（够装下最近 60 条气泡） */
+/** baseline 自适应回溯的初始窗口；消息不足时会翻倍向前读取。 */
 export const BASELINE_BYTES = 256 * 1024;
 /** baseline 最多带多少条气泡（任务钦定 60） */
 export const BASELINE_MSGS = 60;
@@ -332,16 +339,13 @@ async function sendBaseline(ws: ServerWebSocket<ChatWsData>, deps: ChatWsDeps): 
   d.offset = 0;
   d.nextSeq = 0;
   let msgs: ChatMessage[] = [];
+  let hasMore = false;
   if (d.jsonl) {
-    const st = await deps.reader.statPath(d.jsonl).catch(() => null);
-    if (st) {
-      // 从尾部窗口起 tail：脏头（可能落在行中间）由 parseLine 容忍，offset 精确推进到行边界
-      const start = Math.max(0, st.size - BASELINE_BYTES);
-      const t = await tailConversation(deps.reader, d.jsonl, start, 0);
-      msgs = t.msgs.slice(-BASELINE_MSGS);
-      d.offset = t.offset;
-      d.nextSeq = t.nextSeq;
-    }
+    const page = await readRecentConversationPage(deps.reader, d.jsonl, BASELINE_MSGS, BASELINE_BYTES);
+    msgs = page.msgs;
+    d.offset = page.offset;
+    d.nextSeq = page.nextSeq;
+    hasMore = page.hasMore;
   }
   // 翻页游标 = 本次 baseline 最旧一条的源行字节（其之前的都能 readOlder 拉到，含窗口内没进 60 的那些）
   d.historyHead = msgs.length ? (msgs[0]!.off ?? 0) : 0;
@@ -352,7 +356,12 @@ async function sendBaseline(ws: ServerWebSocket<ChatWsData>, deps: ChatWsDeps): 
     sel = detectSelection(pane);
   }
   d.lastSelSig = sel ? selectionSig(sel) : '';
-  send(ws, { type: 'baseline', msgs: msgs.map(enrichUserImages), selection: sel ? selectionFrameOf(sel) : null });
+  send(ws, {
+    type: 'baseline',
+    msgs: msgs.map(enrichUserImages),
+    hasMore,
+    selection: sel ? selectionFrameOf(sel) : null,
+  });
 }
 
 async function chatTick(ws: ServerWebSocket<ChatWsData>, deps: ChatWsDeps): Promise<void> {
@@ -514,11 +523,17 @@ async function handleFrame(
   const idPart = msgId ? { id: msgId } : {};
   // history 是纯读历史（向上翻页），与 live/只读无关，先于注入门控处理——只读回看也能翻页
   if (f.type === 'history') {
-    if (!d.jsonl || d.historyHead <= 0) {
+    const requestedBefore =
+      typeof f.before === 'number' && Number.isFinite(f.before) && f.before > 0
+        ? Math.floor(f.before)
+        : d.historyHead;
+    // 重连后服务端游标会回到 baseline；客户端携带自己已加载的最旧 off，可直接从其前面续拉。
+    const historyHead = Math.min(d.historyHead, requestedBefore);
+    if (!d.jsonl || historyHead <= 0) {
       send(ws, { type: 'history', msgs: [], hasMore: false });
       return;
     }
-    const r = await readOlder(deps.reader, d.jsonl, d.historyHead);
+    const r = await readOlder(deps.reader, d.jsonl, historyHead);
     d.historyHead = r.offset; // 前移游标到更早处（0 = 到顶）
     send(ws, { type: 'history', msgs: r.msgs.map(enrichUserImages), hasMore: r.hasMore });
     return;

@@ -4,7 +4,7 @@
  *      进度摘要节流 / 项目内问答（工具四件套改走 Driver）。
  *
  * systemPrompt 组装顺序（钦定，改序要过测试）：
- *   全局 persona（v1 persona/管家.md 平移，MANDO_PERSONA_FILE 可配路径覆盖）
+ *   全局 persona（v1 persona/管家.md 平移，PANDA_PERSONA_FILE 可配路径覆盖）
  *   → project.pm_persona → 属主 user_settings.persona → 属主 memory（经 UserStore/DB 读）
  *
  * v1 修债点：
@@ -72,7 +72,7 @@ export function migratePmAgent(db: Database): MigrationStatus {
 
 // ---------- 全局 persona（v1 persona/管家.md 平移；可配路径覆盖） ----------
 
-/** v1 persona/管家.md 全文平移（v2 内置默认；MANDO_PERSONA_FILE 指定文件可整体替换） */
+/** v1 persona/管家.md 全文平移（v2 内置默认；PANDA_PERSONA_FILE 指定文件可整体替换） */
 export const DEFAULT_GLOBAL_PERSONA = `# 人设：tmux 远程操作管家
 
 你是「tmux 远程操作管家」。你不亲自写代码、不替 Claude Code 干活。你的职责是：**替主人看着、管着
@@ -102,9 +102,9 @@ You supervise Claude Code sessions running in tmux. Do not implement code yourse
 
 Be concise and conversational. Avoid noisy updates, identify the project when multiple sessions exist, state uncertainty plainly, never invent intent, never reveal secrets, and do not reproduce long code or terminal logs. Do not approve decisions for the user unless their configured automatic policy permits it.`;
 
-/** 读全局 persona：显式路径 > MANDO_PERSONA_FILE > 内置默认（读失败也回默认） */
+/** 读全局 persona：显式路径 > PANDA_PERSONA_FILE > 内置默认（读失败也回默认） */
 export function loadGlobalPersona(path?: string): string {
-  const p = path ?? process.env.MANDO_PERSONA_FILE;
+  const p = path ?? process.env.PANDA_PERSONA_FILE;
   if (p) {
     try {
       const t = readFileSync(p, 'utf8').trim();
@@ -244,7 +244,7 @@ export interface PmAgentDeps {
   locator: ToolLocator;
   /** 与 issue 引擎共用同一实例（tmuxLockKey 同一把锁才有互斥意义） */
   mutex: KeyedMutex;
-  /** 全局管家 persona；缺省 loadGlobalPersona()（MANDO_PERSONA_FILE 可配） */
+  /** 全局管家 persona；缺省 loadGlobalPersona()（PANDA_PERSONA_FILE 可配） */
   globalPersona?: string;
   /** 给 DbSummaryStore 用（进度滚动摘要入库）；缺省内存存 */
   db?: Database;
@@ -293,7 +293,7 @@ export class PmAgent {
     public project: Project,
     private readonly deps: PmAgentDeps,
   ) {
-    this.customGlobalPersona = deps.globalPersona !== undefined || Boolean(process.env.MANDO_PERSONA_FILE);
+    this.customGlobalPersona = deps.globalPersona !== undefined || Boolean(process.env.PANDA_PERSONA_FILE);
     this.globalPersona = deps.globalPersona ?? loadGlobalPersona();
     this.summary = deps.db ? new DbSummaryStore(deps.db, project.id) : new MemorySummaryStore();
   }

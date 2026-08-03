@@ -3,7 +3,7 @@
  * 只测纯函数 execProgressState——渲染部分 bun test 无 DOM，按仓库惯例不测。
  */
 import { describe, expect, test } from 'bun:test';
-import { execProgressState, stepGlyph, type ProgStep } from './ExecProgress';
+import { canEditSubtask, execProgressState, stepGlyph, type ProgStep } from './ExecProgress';
 import type { Subtask } from '../lib/types';
 
 const subs = (...done: boolean[]): Subtask[] => done.map((d, i) => ({ text: `子任务 ${i + 1} 正文`, done: d }));
@@ -79,5 +79,28 @@ describe('execProgressState', () => {
     const st = execProgressState([], 0, 'implementing');
     expect(st.steps).toEqual([]);
     expect(st.cur).toBeNull();
+  });
+});
+
+describe('canEditSubtask', () => {
+  test('计划待确认时所有未完成项可编辑，已完成项不可编辑', () => {
+    expect(canEditSubtask({ text: '待确认', done: false }, 0, 0, 'plan_review', 'team')).toBe(true);
+    expect(canEditSubtask({ text: '已完成', done: true }, 0, 0, 'plan_review', 'seq')).toBe(false);
+  });
+
+  test('顺序执行只开放当前游标之后的项，blocked 保留同一边界', () => {
+    const future = { text: '后续项', done: false };
+    for (const status of ['implementing', 'blocked'] as const) {
+      expect(canEditSubtask(future, 0, 0, status, 'seq')).toBe(false);
+      expect(canEditSubtask(future, 1, 0, status, 'seq')).toBe(true);
+    }
+  });
+
+  test('并行执行开工后及其他阶段都不开放编辑', () => {
+    const subtask = { text: '未完成', done: false };
+    expect(canEditSubtask(subtask, 1, 0, 'implementing', 'team')).toBe(false);
+    for (const status of ['planning', 'testing', 'merging', 'done', 'cancelled'] as const) {
+      expect(canEditSubtask(subtask, 1, 0, status, 'seq')).toBe(false);
+    }
   });
 });

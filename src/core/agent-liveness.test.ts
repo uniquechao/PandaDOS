@@ -30,17 +30,17 @@ const CLAUDE_EXITED = `[root@VM-0-6-opencloudos livetest]# claude --session-id 1
 /** codex 在跑：`›` 输入行 + 状态栏 */
 const CODEX_LIVE = `╭─ OpenAI Codex (v0.145.0) ─╮
 ›
-  gpt-5.6-sol medium · ~/user_space/users/u12/yuhang_project`;
+  gpt-5.6-sol medium · ~/user_space/users/u12/demo_project`;
 
 /** codex 自更新后退回 shell：横幅还留在屏上，提示符不一定在末行 */
 const CODEX_UPDATED_OUT = `╭─ OpenAI Codex (v0.144.6) ─╮
 ==> Updating Codex CLI from 0.144.6 to 0.145.0
 🎉 Update ran successfully! Please restart Codex.
-[root@VM yuhang_project]#`;
+[root@VM demo_project]#`;
 
 /** 注入被 bash 当命令跑掉的现场（本 issue 要根治的症状） */
 const BASH_AFTER_INJECT = `-bash: 请继续执行子任务: command not found
-[root@VM-0-6-opencloudos mando]#`;
+[root@VM-0-6-opencloudos panda]#`;
 
 /** 空闲 bash */
 const BASH_IDLE = `[root@VM-0-6-opencloudos livetest]#
@@ -48,7 +48,7 @@ const BASH_IDLE = `[root@VM-0-6-opencloudos livetest]#
 
 /** macOS zsh + Starship：`❯` 前面有 cwd/git 状态；不能和 Claude 的独立 composer 光标混为一谈。 */
 const MAC_STARSHIP_IDLE =
-  '~/Documents/codes/tmux_kits on codex/v2-root-cleanup ⇡3 ✗5 ?4 ❯';
+  '~/Documents/codes/PandaDOS on codex/v2-root-cleanup ⇡3 ✗5 ?4 ❯';
 
 describe('shellPromptTail', () => {
   test('末条非空行以 # / $ / % 收尾 → true（尾随空白/空行要回溯）', () => {
@@ -83,7 +83,7 @@ describe('codexExitedToShell（原 screen.ts 同名函数，归并后语义不�
   });
 
   test('末行提示符 → true；codex TUI 在跑 / 全空 → false', () => {
-    expect(codexExitedToShell('[root@VM yuhang_project]# ')).toBe(true);
+    expect(codexExitedToShell('[root@VM demo_project]# ')).toBe(true);
     expect(codexExitedToShell(CODEX_LIVE)).toBe(false);
     expect(codexExitedToShell('')).toBe(false);
   });

@@ -1,8 +1,12 @@
 import { describe, expect, test } from 'bun:test';
+import { promises as fsp } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { openDb } from '../../core/db';
 import { migrate } from '../../core/migrate';
 import { UserStore } from '../../core/users';
 import { migrateIssueEngine } from '../../issues/engine';
+import { LocalDriver } from '../../executor/local';
 import { authDepsFromDb, createDispatcher } from '../middleware';
 import { projectsRoutes, projectSlug } from './projects';
 
@@ -282,6 +286,7 @@ function setupImport(sessions: TmuxSession[]) {
         readFileRange: async () => ({ data: new Uint8Array(), size: 0 }),
         statPath: async () => null,
         listDir: async () => [],
+        writeFile: async () => {},
         mkdirp: async () => {},
         git: async () => ({ code: 0, out: '', err: '' }),
       }),
@@ -291,9 +296,86 @@ function setupImport(sessions: TmuxSession[]) {
   return { db, admin, alice, dispatch };
 }
 
+async function setupAgentImport() {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-project-import-'));
+  const claudeDir = path.join(root, '.claude', 'projects');
+  const codexDir = path.join(root, '.codex', 'sessions');
+  const claudeProject = path.join(claudeDir, '-ws-u2-app');
+  const codexDay = path.join(codexDir, '2026', '08', '02');
+  await Promise.all([
+    fsp.mkdir(claudeProject, { recursive: true }),
+    fsp.mkdir(codexDay, { recursive: true }),
+  ]);
+  const writeClaude = async (sid: string, cwd: string, prompt: string, ts: string) => {
+    await fsp.writeFile(
+      path.join(claudeProject, `${sid}.jsonl`),
+      JSON.stringify({
+        type: 'user',
+        cwd,
+        sessionId: sid,
+        timestamp: ts,
+        message: { role: 'user', content: prompt },
+      }) + '\n',
+    );
+  };
+  await writeClaude('claude-history-a', '/ws/u2/app', '第一条历史', '2026-08-02T01:00:00.000Z');
+  await writeClaude('claude-history-b', '/ws/u2/app', '第二条历史', '2026-08-02T02:00:00.000Z');
+  await writeClaude('claude-outside', '/outside/private', '外部历史', '2026-08-02T03:00:00.000Z');
+  const codexSid = '019codex-history';
+  await fsp.writeFile(
+    path.join(codexDay, `rollout-2026-08-02T04-00-00-${codexSid}.jsonl`),
+    [
+      JSON.stringify({
+        timestamp: '2026-08-02T04:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: codexSid, timestamp: '2026-08-02T04:00:00.000Z', cwd: '/ws/u2/app' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-02T04:00:00.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'Codex 历史' }],
+        },
+      }),
+    ].join('\n') + '\n',
+  );
+
+  const db = openDb(':memory:');
+  migrate(db);
+  migrateIssueEngine(db);
+  const users = new UserStore(db);
+  const admin = users.create('admin', 'admin');
+  const alice = users.create('alice');
+  db.query(
+    `INSERT INTO executors
+       (name, host, port, ssh_user, key_ref, workspace_root, claude_dir, codex_dir)
+     VALUES ('local', '127.0.0.1', 22, 'root', 'k', '/ws', ?, ?)`,
+  ).run(claudeDir, codexDir);
+  const local = new LocalDriver();
+  const archiveWrites = new Map<string, Uint8Array>();
+  const driver = {
+    listSessions: () => local.listSessions(),
+    readFileRange: (p: string, offset: number, limit: number) => local.readFileRange(p, offset, limit),
+    statPath: (p: string) => local.statPath(p),
+    listDir: (p: string) => local.listDir(p),
+    writeFile: async (p: string, data: Uint8Array | string) => {
+      archiveWrites.set(p, typeof data === 'string' ? new TextEncoder().encode(data) : data.slice());
+    },
+    mkdirp: (p: string) => local.mkdirp(p),
+    git: (cwd: string, args: string[]) => local.git(cwd, args),
+  };
+  const dispatch = createDispatcher(
+    projectsRoutes({ db, driverFor: () => driver }),
+    authDepsFromDb(db, users),
+  );
+  return { root, db, admin, alice, dispatch, codexSid, archiveWrites };
+}
+
 describe('POST /api/projects/import', () => {
   const live: TmuxSession[] = [
-    { name: 'sample-app', createdTs: 1, attached: false, command: 'claude', cwd: '/home/developer/sample-app' },
+    { name: 'ontology', createdTs: 1, attached: false, command: 'claude', cwd: '/home/developer/onto' },
     { name: 'mine', createdTs: 2, attached: false, command: 'bash', cwd: '/ws/u2/mine' },
     { name: 'cc-1', createdTs: 3, attached: false, cwd: '/ws/u9/x' },
     { name: 'nocwd', createdTs: 4, attached: false },
@@ -302,23 +384,23 @@ describe('POST /api/projects/import', () => {
   test('admin 导入任意会话：建项目 + sessions 登记；重复导入幂等返回既有项目', async () => {
     const s = setupImport(live);
     const r = await j(
-      s.dispatch(req('POST', '/api/projects/import', s.admin.token, { executorId: 1, session: 'sample-app', runUser: 'developer' })),
+      s.dispatch(req('POST', '/api/projects/import', s.admin.token, { executorId: 1, session: 'ontology', runUser: 'developer' })),
     );
     expect(r.status).toBe(200);
     expect(r.body.created).toBe(true);
-    expect(r.body.project.name).toBe('sample-app');
-    expect(r.body.project.cwd).toBe('/home/developer/sample-app');
+    expect(r.body.project.name).toBe('ontology');
+    expect(r.body.project.cwd).toBe('/home/developer/onto');
     expect(r.body.project.runUser).toBe('developer');
     const reg = s.db
       .query<{ project_id: number; owner_user_id: number }, [string]>(
         'SELECT project_id, owner_user_id FROM sessions WHERE name = ?',
       )
-      .get('sample-app');
+      .get('ontology');
     expect(reg?.project_id).toBe(r.body.project.id);
 
     // 幂等：再导一次 → created:false，同一项目
     const again = await j(
-      s.dispatch(req('POST', '/api/projects/import', s.admin.token, { executorId: 1, session: 'sample-app' })),
+      s.dispatch(req('POST', '/api/projects/import', s.admin.token, { executorId: 1, session: 'ontology' })),
     );
     expect(again.status).toBe(200);
     expect(again.body.created).toBe(false);
@@ -340,23 +422,190 @@ describe('POST /api/projects/import', () => {
 
     // 普通用户导 workspace 外 → 403
     const out = await j(
-      s.dispatch(req('POST', '/api/projects/import', s.alice.token, { executorId: 1, session: 'sample-app' })),
+      s.dispatch(req('POST', '/api/projects/import', s.alice.token, { executorId: 1, session: 'ontology' })),
     );
     expect(out.status).toBe(403);
+    expect(out.body.error.code).toBe('project.import_workspace_forbidden');
+    expect(out.body.error.params).toEqual({ root: '/ws/u2' });
 
     // 托管命名空间：项目 1 存在（上面 INSERT 的 id=1）→ 拒绝
     const managed = await j(
       s.dispatch(req('POST', '/api/projects/import', s.admin.token, { executorId: 1, session: 'cc-1' })),
     );
     expect(managed.status).toBe(400);
+    expect(managed.body.error.code).toBe('project.import_managed_session');
+    expect(managed.body.error.params).toEqual({ projectId: 1 });
 
     // 执行机上没有的会话 → 404；拿不到 cwd → 502
-    expect(
-      (await j(s.dispatch(req('POST', '/api/projects/import', s.admin.token, { executorId: 1, session: 'ghost' })))).status,
-    ).toBe(404);
-    expect(
-      (await j(s.dispatch(req('POST', '/api/projects/import', s.admin.token, { executorId: 1, session: 'nocwd' })))).status,
-    ).toBe(502);
+    const missing = await j(
+      s.dispatch(req('POST', '/api/projects/import', s.admin.token, { executorId: 1, session: 'ghost' })),
+    );
+    expect(missing.status).toBe(404);
+    expect(missing.body.error.code).toBe('project.import_tmux_not_found');
+    const noCwd = await j(
+      s.dispatch(req('POST', '/api/projects/import', s.admin.token, { executorId: 1, session: 'nocwd' })),
+    );
+    expect(noCwd.status).toBe(502);
+    expect(noCwd.body.error.code).toBe('project.import_tmux_cwd_unavailable');
+  });
+
+  test('Claude/Codex 项目：登记 cwd、批量创建可恢复 chat 对话，并在重复导入时幂等', async () => {
+    const s = await setupAgentImport();
+    try {
+      const claude = await j(
+        s.dispatch(req('POST', '/api/projects/import', s.alice.token, {
+          source: 'claude',
+          executorId: 1,
+          cwd: '/ws/u2/app/',
+        })),
+      );
+      expect(claude.status).toBe(200);
+      expect(claude.body.created).toBe(true);
+      expect(claude.body.project).toMatchObject({ name: 'app', cwd: '/ws/u2/app', kind: 'chat' });
+      expect(claude.body.importedConversations).toBe(2);
+      expect(claude.body.existingConversations).toBe(0);
+      const claudeRows = s.db
+        .query<{
+          id: string;
+          label: string;
+          agent: string;
+          agent_session_id: string | null;
+          agent_jsonl_path: string;
+          kind: string;
+        }, [number]>(
+          `SELECT id, label, agent, agent_session_id, agent_jsonl_path, kind
+           FROM conversations WHERE project_id = ? ORDER BY created_ts`,
+        )
+        .all(claude.body.project.id);
+      expect(claudeRows.map((row) => row.id)).toEqual(['claude-history-a', 'claude-history-b']);
+      expect(claudeRows.every((row) => row.agent === 'claude' && row.kind === 'chat')).toBe(true);
+      expect(claudeRows.every((row) => row.agent_session_id === row.id && row.agent_jsonl_path.endsWith('.jsonl'))).toBe(true);
+      expect([...s.archiveWrites.keys()].sort()).toEqual([
+        '/ws/u2/app/.panda/conversations/claude/claude-history-a.jsonl',
+        '/ws/u2/app/.panda/conversations/claude/claude-history-b.jsonl',
+      ]);
+      expect(claudeRows.every((row) => !row.agent_jsonl_path.includes('/.panda/conversations/'))).toBe(true);
+
+      const again = await j(
+        s.dispatch(req('POST', '/api/projects/import', s.alice.token, {
+          source: 'claude', executorId: 1, cwd: '/ws/u2/app',
+        })),
+      );
+      expect(again.body).toMatchObject({
+        created: false,
+        importedConversations: 0,
+        existingConversations: 2,
+      });
+
+      const codex = await j(
+        s.dispatch(req('POST', '/api/projects/import', s.alice.token, {
+          source: 'codex', executorId: 1, cwd: '/ws/u2/app',
+        })),
+      );
+      expect(codex.status).toBe(200);
+      expect(codex.body).toMatchObject({ created: false, importedConversations: 1 });
+      const codexRow = s.db
+        .query<{ id: string; agent_session_id: string; kind: string }, [string]>(
+          `SELECT id, agent_session_id, kind FROM conversations
+           WHERE agent = 'codex' AND agent_session_id = ?`,
+        )
+        .get(s.codexSid);
+      expect(codexRow).toMatchObject({ agent_session_id: s.codexSid, kind: 'chat' });
+      expect(codexRow!.id).not.toBe(s.codexSid); // Codex 内部 conversation id 与原生 session id 分离
+
+      // 原项目归档后不能把同一批原生会话复制到新项目；失败不得残留空项目。
+      s.db.query("UPDATE projects SET status = 'archived' WHERE id = ?").run(claude.body.project.id);
+      const conflict = await j(
+        s.dispatch(req('POST', '/api/projects/import', s.admin.token, {
+          source: 'claude', executorId: 1, cwd: '/ws/u2/app',
+        })),
+      );
+      expect(conflict.status).toBe(409);
+      expect(conflict.body.error.code).toBe('project.import_history_assigned');
+      expect(s.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM projects').get()!.n).toBe(1);
+    } finally {
+      await fsp.rm(s.root, { recursive: true, force: true });
+    }
+  });
+
+  test('Agent 项目导入排除已绑定的 PandaDOS issue 会话', async () => {
+    const s = await setupAgentImport();
+    try {
+      s.db.run(
+        `INSERT INTO projects (name, executor_id, cwd, owner_user_id, created_ts)
+         VALUES ('existing', 1, '/ws/u2/app', 2, 0)`,
+      );
+      s.db.query(
+        `INSERT INTO conversations
+           (id, project_id, label, created_ts, agent, agent_session_id, kind)
+         VALUES ('claude-history-a', 1, 'issue claude', 0, 'claude', 'claude-history-a', 'issue')`,
+      ).run();
+      s.db.query(
+        `INSERT INTO conversations
+           (id, project_id, label, created_ts, agent, agent_session_id, kind)
+         VALUES ('codex-issue', 1, 'issue codex', 0, 'codex', ?, 'issue')`,
+      ).run(s.codexSid);
+
+      const claude = await j(
+        s.dispatch(req('POST', '/api/projects/import', s.alice.token, {
+          source: 'claude', executorId: 1, cwd: '/ws/u2/app',
+        })),
+      );
+      expect(claude.status).toBe(200);
+      expect(claude.body).toMatchObject({ created: false, importedConversations: 1 });
+      expect(
+        s.db.query<{ n: number }, []>(
+          "SELECT COUNT(*) AS n FROM conversations WHERE agent = 'claude' AND kind = 'chat'",
+        ).get()!.n,
+      ).toBe(1);
+
+      const codex = await j(
+        s.dispatch(req('POST', '/api/projects/import', s.alice.token, {
+          source: 'codex', executorId: 1, cwd: '/ws/u2/app',
+        })),
+      );
+      expect(codex.status).toBe(404);
+      expect(codex.body.error.code).toBe('project.import_project_not_found');
+    } finally {
+      await fsp.rm(s.root, { recursive: true, force: true });
+    }
+  });
+
+  test('Agent 项目导入：服务端历史核验、workspace 隔离与参数错误', async () => {
+    const s = await setupAgentImport();
+    try {
+      const outside = await j(
+        s.dispatch(req('POST', '/api/projects/import', s.alice.token, {
+          source: 'claude', executorId: 1, cwd: '/outside/private',
+        })),
+      );
+      expect(outside.status).toBe(403);
+      expect(outside.body.error.code).toBe('project.import_workspace_forbidden');
+      expect(outside.body.error.params).toEqual({ root: '/ws/u2' });
+      const missingExecutor = await j(
+        s.dispatch(req('POST', '/api/projects/import', s.admin.token, {
+          source: 'claude', cwd: '/ws/u2/app',
+        })),
+      );
+      expect(missingExecutor.status).toBe(400);
+      expect(missingExecutor.body.error.code).toBe('executor.id_required');
+      const missing = await j(
+        s.dispatch(req('POST', '/api/projects/import', s.admin.token, {
+          source: 'claude', executorId: 1, cwd: '/not-in-history',
+        })),
+      );
+      expect(missing.status).toBe(404);
+      expect(missing.body.error.code).toBe('project.import_project_not_found');
+      const badSource = await j(
+        s.dispatch(req('POST', '/api/projects/import', s.admin.token, {
+          source: 'local', executorId: 1, cwd: '/ws/u2/app',
+        })),
+      );
+      expect(badSource.status).toBe(400);
+      expect(badSource.body.error.code).toBe('project.import_source_invalid');
+    } finally {
+      await fsp.rm(s.root, { recursive: true, force: true });
+    }
   });
 
   test('summary：按看板列聚合未完结 issue；属主隔离；不被 :projectId 路由吞掉', async () => {
@@ -538,6 +787,7 @@ function setupClone(opts: { existingDirs?: Record<string, string[]> } = {}) {
         statPath: async (p: string) =>
           dirs.has(p) ? { size: 0, mtimeMs: 0, isDirectory: true, isFile: false, mode: 0o755 } : null,
         listDir: async (p: string) => (dirs.get(p) ?? []).map((n) => ({ name: n, type: 'dir' as const })),
+        writeFile: async () => {},
         mkdirp: async () => {},
         git: async (cwd: string, args: string[]) => {
           gitCalls.push({ cwd, args });

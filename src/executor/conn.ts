@@ -83,7 +83,7 @@ export interface SshConnConfig {
   host: string;
   port: number;
   username: string;
-  /** 私钥文件绝对路径（控制面本地 ~/.mando/keys/<keyRef>，0600，不进 DB） */
+  /** 私钥文件绝对路径（控制面本地 ~/.panda/keys/<keyRef>，0600，不进 DB） */
   privateKeyPath: string;
   /** 首次重连退避基数（ms），指数递增至 maxBackoffMs；默认 1000 */
   baseBackoffMs?: number;
@@ -98,6 +98,12 @@ export interface SshConnConfig {
 export interface ExecOutcome {
   code: number;
   out: string;
+  err: string;
+}
+
+export interface ExecBytesOutcome {
+  code: number;
+  out: Uint8Array;
   err: string;
 }
 
@@ -234,6 +240,73 @@ export class SshConn {
           clearTimer();
           const c = typeof code === 'number' ? code : exitCode;
           const sig = typeof signal === 'string' ? signal : exitSignal;
+          if (c !== null && c !== undefined) {
+            resolve({ code: c, out, err: errOut });
+          } else if (sig) {
+            resolve({ code: -1, out, err: `${errOut}\n[被信号终止: ${sig}]`.trim() });
+          } else {
+            reject(new Error(`ssh exec 通道无退出码即关闭（连接可能中断）: ${command.slice(0, 120)}`));
+          }
+        });
+      });
+    });
+  }
+
+  /** 与 exec 同一退出/超时语义，但 stdout 保持原始字节。 */
+  async execBytes(command: string, timeoutMs?: number): Promise<ExecBytesOutcome> {
+    const client = await this.ensure();
+    return await new Promise<ExecBytesOutcome>((resolve, reject) => {
+      client.exec(command, {}, (err, stream) => {
+        if (err || !stream) {
+          reject(err ?? new Error('ssh exec 打开通道失败'));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let errOut = '';
+        let exitCode: number | null = null;
+        let exitSignal: string | null = null;
+        let settled = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        if (timeoutMs && timeoutMs > 0) {
+          timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            try {
+              stream.close();
+            } catch {
+              /* 关闭失败不掩盖超时错误 */
+            }
+            reject(new Error(`ssh exec 超时（>${timeoutMs}ms）: ${command.slice(0, 120)}`));
+          }, timeoutMs);
+        }
+        const clearTimer = () => {
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+        };
+        stream.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+        stream.stderr.on('data', (chunk: Buffer) => {
+          errOut += chunk.toString('utf8');
+        });
+        stream.on('exit', (code: number | null, signal?: string | null) => {
+          if (typeof code === 'number') exitCode = code;
+          if (typeof signal === 'string') exitSignal = signal;
+        });
+        stream.on('error', (e: Error) => {
+          if (settled) return;
+          settled = true;
+          clearTimer();
+          reject(e);
+        });
+        stream.on('close', (code?: number | null, signal?: string | null) => {
+          if (settled) return;
+          settled = true;
+          clearTimer();
+          const c = typeof code === 'number' ? code : exitCode;
+          const sig = typeof signal === 'string' ? signal : exitSignal;
+          const joined = Buffer.concat(chunks);
+          const out = new Uint8Array(joined.buffer, joined.byteOffset, joined.byteLength);
           if (c !== null && c !== undefined) {
             resolve({ code: c, out, err: errOut });
           } else if (sig) {

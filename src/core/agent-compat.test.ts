@@ -6,7 +6,7 @@ import { LocalDriver } from '../executor/local';
 import {
   ensureArtifactSkill,
   ensureCompatSkills,
-  ensureMandoIssueSkill,
+  ensurePandaIssueSkill,
   ensureModuleGuideBlocks,
   ensureProjectBridge,
 } from './agent-compat';
@@ -15,7 +15,7 @@ let dir: string;
 const driver = new LocalDriver();
 
 beforeAll(async () => {
-  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-compat-'));
+  dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-compat-'));
 });
 afterAll(async () => {
   await fsp.rm(dir, { recursive: true, force: true });
@@ -56,38 +56,63 @@ describe('ensureArtifactSkill', () => {
   });
 });
 
-describe('ensureMandoIssueSkill', () => {
-  test('Claude/Codex 安装同源 mando-issue，全局幂等且不覆盖人工修改', async () => {
+describe('ensurePandaIssueSkill', () => {
+  test('Claude/Codex 安装同源 panda-issue，全局幂等且不覆盖人工修改', async () => {
     const claudeHome = path.join(dir, 'm1', '.claude');
     const codexHome = path.join(dir, 'm1', '.codex');
-    expect(await ensureMandoIssueSkill(driver, { claudeHome, codexHome })).toHaveLength(2);
-    const clPath = path.join(claudeHome, 'skills/mando-issue/SKILL.md');
-    const cxPath = path.join(codexHome, 'skills/mando-issue/SKILL.md');
+    expect(await ensurePandaIssueSkill(driver, { claudeHome, codexHome })).toHaveLength(2);
+    const clPath = path.join(claudeHome, 'skills/panda-issue/SKILL.md');
+    const cxPath = path.join(codexHome, 'skills/panda-issue/SKILL.md');
     const cl = await fsp.readFile(clPath, 'utf8');
     expect(cl).toBe(await fsp.readFile(cxPath, 'utf8'));
-    expect(cl).toContain('name: mando-issue');
-    expect(cl).toContain('.mando/modules/INDEX.md');
-    expect(await ensureMandoIssueSkill(driver, { claudeHome, codexHome })).toHaveLength(0);
+    expect(cl).toContain('name: panda-issue');
+    expect(cl).toContain('.panda/modules/INDEX.md');
+    expect(await ensurePandaIssueSkill(driver, { claudeHome, codexHome })).toHaveLength(0);
 
     await fsp.writeFile(clPath, '# 人工版本');
-    expect(await ensureMandoIssueSkill(driver, { claudeHome, codexHome })).toHaveLength(0);
+    expect(await ensurePandaIssueSkill(driver, { claudeHome, codexHome })).toHaveLength(0);
     expect(await fsp.readFile(clPath, 'utf8')).toBe('# 人工版本');
+  });
+
+  test('升级时清除自动生成的 mando-issue，但保留人工同名技能', async () => {
+    const claudeHome = path.join(dir, 'm2', '.claude');
+    const codexHome = path.join(dir, 'm2', '.codex');
+    const generated = `---\nname: mando-issue\n---\n# Mando（mando 自动生成）\n读取 .mando/modules/INDEX.md。\n`;
+    await fsp.mkdir(path.join(claudeHome, 'skills/mando-issue'), { recursive: true });
+    await fsp.mkdir(path.join(codexHome, 'skills/mando-issue'), { recursive: true });
+    await fsp.writeFile(path.join(claudeHome, 'skills/mando-issue/SKILL.md'), generated);
+    await fsp.writeFile(path.join(codexHome, 'skills/mando-issue/SKILL.md'), '# 人工版本');
+
+    expect(await ensurePandaIssueSkill(driver, { claudeHome, codexHome })).toHaveLength(3);
+    await expect(fsp.stat(path.join(claudeHome, 'skills/mando-issue'))).rejects.toThrow();
+    expect(await fsp.readFile(path.join(codexHome, 'skills/mando-issue/SKILL.md'), 'utf8')).toBe('# 人工版本');
+    expect(await ensurePandaIssueSkill(driver, { claudeHome, codexHome })).toHaveLength(0);
   });
 });
 
 describe('ensureModuleGuideBlocks', () => {
-  test('保留人工根指南，只幂等维护 mando-issue 区块', async () => {
+  test('保留人工根指南、清除旧品牌区块，只幂等维护 panda-issue 区块', async () => {
     const cwd = path.join(dir, 'module-guides');
     await fsp.mkdir(cwd, { recursive: true });
-    await fsp.writeFile(path.join(cwd, 'AGENTS.md'), '# 人工 AGENTS\n');
-    await fsp.writeFile(path.join(cwd, 'CLAUDE.md'), '# 人工 CLAUDE\n');
+    const legacy = `
+<!-- mando:module-guide:start -->
+## 旧模块入口
+
+读取 .mando/modules/INDEX.md，并使用 mando-issue。
+<!-- mando:module-guide:end -->
+`;
+    await fsp.writeFile(path.join(cwd, 'AGENTS.md'), `# 人工 AGENTS\n${legacy}`);
+    await fsp.writeFile(path.join(cwd, 'CLAUDE.md'), `# 人工 CLAUDE\n${legacy}`);
     expect(await ensureModuleGuideBlocks(driver, cwd)).toHaveLength(2);
     expect(await ensureModuleGuideBlocks(driver, cwd)).toHaveLength(0);
     for (const name of ['AGENTS.md', 'CLAUDE.md']) {
       const text = await fsp.readFile(path.join(cwd, name), 'utf8');
       expect(text).toContain(`# 人工 ${name === 'AGENTS.md' ? 'AGENTS' : 'CLAUDE'}`);
-      expect(text.match(/mando:module-guide:start/g)).toHaveLength(1);
-      expect(text).toContain('.mando/modules/INDEX.md');
+      expect(text.match(/panda:module-guide:start/g)).toHaveLength(1);
+      expect(text).toContain('.panda/modules/INDEX.md');
+      expect(text).not.toContain('mando:module-guide');
+      expect(text).not.toContain('.mando/modules');
+      expect(text).not.toContain('mando-issue');
     }
   });
 
@@ -98,7 +123,7 @@ describe('ensureModuleGuideBlocks', () => {
       path.join(cwd, 'AGENTS.md'),
       path.join(cwd, 'CLAUDE.md'),
     ]);
-    expect(await fsp.readFile(path.join(cwd, 'AGENTS.md'), 'utf8')).toContain('mando-issue');
+    expect(await fsp.readFile(path.join(cwd, 'AGENTS.md'), 'utf8')).toContain('panda-issue');
     expect(await fsp.readFile(path.join(cwd, 'CLAUDE.md'), 'utf8')).toContain('@AGENTS.md');
   });
 });

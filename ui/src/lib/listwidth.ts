@@ -13,7 +13,7 @@
 import { useEffect, useState } from 'preact/hooks';
 
 /** localStorage 键（按设备存，一个用户多设备各自记） */
-export const LISTWIDTH_KEY = 'mando.wbListW';
+export const LISTWIDTH_KEY = 'panda.wbListW';
 
 /** 左栏最小像素宽（沿用现有 .wb-list-col min-width，防拖没） */
 export const LISTW_MIN = 260;

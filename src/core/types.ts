@@ -47,7 +47,7 @@ export interface Executor {
   host: string;
   port: number;
   sshUser: string;
-  /** 控制面私钥绝对路径，或 ~/.mando/keys/ 下的引用名；私钥内容不进 DB */
+  /** 控制面私钥绝对路径，或 ~/.panda/keys/ 下的引用名；私钥内容不进 DB */
   keyRef: string;
   workspaceRoot: string;
   claudeDir: string;
@@ -138,8 +138,58 @@ export interface Project {
   kind: ProjectKind;
 }
 
+// ---------- 外部 issue 来源 / 导入记录 ----------
+
+/** 项目绑定的远端 issue provider；GitLab 包含 GitLab.com 与 Self-Managed 实例。 */
+export type ExternalIssueProvider = 'github' | 'gitlab';
+
+/** 远端 issue 被用户确认后的耐久处理结果。 */
+export type ExternalIssueDisposition = 'imported' | 'ignored';
+
+/**
+ * 后端持久化配置。apiToken 是敏感字段，只允许远端 API 客户端读取；路由响应必须改用
+ * ExternalIssueSourceSummary，不能直接序列化本类型。
+ */
+export interface ExternalIssueSourceConfig {
+  projectId: number;
+  provider: ExternalIssueProvider;
+  remoteName: string;
+  remoteUrl: string;
+  instanceUrl: string;
+  apiToken: string | null;
+  tokenUpdatedTs: number | null;
+  createdTs: number;
+  updatedTs: number;
+}
+
+/** 可安全返回给项目配置页的来源摘要，不包含凭据明文。 */
+export interface ExternalIssueSourceSummary
+  extends Omit<ExternalIssueSourceConfig, 'apiToken'> {
+  tokenConfigured: boolean;
+  tokenMasked: string | null;
+}
+
+/** 已导入/已忽略的远端 issue tombstone，用于后续手动获取时过滤候选。 */
+export interface ExternalIssueRecord {
+  id: number;
+  projectId: number;
+  provider: ExternalIssueProvider;
+  /** 实例 + 仓库的稳定规范化键；改绑仓库后旧记录不会误伤新来源。 */
+  sourceKey: string;
+  /** provider 返回的全局 id，按字符串保存以兼容不同实例。 */
+  externalId: string;
+  /** 仓库内展示编号，例如 GitHub number / GitLab iid。 */
+  externalNumber: string;
+  externalUrl: string;
+  disposition: ExternalIssueDisposition;
+  localIssueId: number | null;
+  createdBy: number | null;
+  createdTs: number;
+  updatedTs: number;
+}
+
 export interface Conversation {
-  /** claude：= session-id；codex：仅内部 id（真实 session id 启动后发现，见 agent_session_id 列） */
+  /** claude：= session-id；codex：仅内部 id（两者原生绑定均记录于 agent_session_id 列） */
   id: string;
   projectId: number;
   label: string | null;

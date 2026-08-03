@@ -22,7 +22,7 @@ afterEach(async () => {
 });
 
 async function setup() {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-files-route-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-files-route-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
 
   const db = openDb(':memory:');

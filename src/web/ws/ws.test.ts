@@ -18,7 +18,7 @@ import { migrate } from '../../core/migrate';
 import { imageReadHint } from '../../core/uploads';
 import { LocalDriver } from '../../executor/local';
 import { KEY_WHITELIST, type PtyChannel } from '../../executor/driver';
-import { startServer, type MandoServer } from '../server';
+import { startServer, type PandaServer } from '../server';
 
 // ---------- 假 Driver（tmux/PTY 面 stub，文件/git 面真 LocalDriver） ----------
 
@@ -98,7 +98,7 @@ afterEach(async () => {
 });
 
 interface Ctx {
-  server: MandoServer;
+  server: PandaServer;
   base: string;
   wsBase: string;
   dir: string;
@@ -111,9 +111,9 @@ interface Ctx {
 }
 
 async function boot(): Promise<Ctx> {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-ws-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-ws-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
-  const dbPath = path.join(dir, 'mando.db');
+  const dbPath = path.join(dir, 'panda.db');
   const claudeDir = path.join(dir, 'home', '.claude', 'projects');
   await fsp.mkdir(claudeDir, { recursive: true });
 
@@ -317,7 +317,7 @@ describe('WS 鉴权矩阵（/ws/term /ws/chat 同一套 upgrade 前鉴权）', (
     expect(await get(`/ws/chat/${t.pid}`, t.bobToken)).toBe(403);
 
     // 关联 bob 为项目成员（成员 API 尚未接线，WAL 下另开连接直接写库）
-    const db = openDb(path.join(t.dir, 'mando.db'));
+    const db = openDb(path.join(t.dir, 'panda.db'));
     const bobId = db.query<{ id: number }, []>("SELECT id FROM users WHERE username = 'bob'").get()!.id;
     db.query('INSERT INTO project_members (project_id, user_id, created_ts) VALUES (?, ?, 0)').run(
       t.pid,
@@ -655,26 +655,26 @@ describe('WS chat：baseline → msg 增量 → selection → stale → 注入',
       type: 'text',
       text: '看这个',
       images: [
-        '.mando/uploads/x/a.png', // 合法
+        '.panda/uploads/x/a.png', // 合法
         'evil.png', // 非上传目录 → 丢
-        '.mando/uploads/../secret', // 越界 → 丢
+        '.panda/uploads/../secret', // 越界 → 丢
       ],
     });
     await waitFor(() => t.driver.sent.length === 1);
     const inj1 = t.driver.sent[0]!.text;
     expect(inj1).toContain('请先用 Read'); // imageReadHint 提示
-    expect(inj1).toContain(`${cwd}/.mando/uploads/x/a.png`); // 合法图 → 执行机绝对路径
+    expect(inj1).toContain(`${cwd}/.panda/uploads/x/a.png`); // 合法图 → 执行机绝对路径
     expect(inj1).not.toContain('evil.png');
     expect(inj1).not.toContain('secret');
     expect(inj1).toContain('看这个'); // 用户文本保留
     expect(inj1.indexOf('请先用 Read')).toBeLessThan(inj1.indexOf('看这个')); // 提示在前、文本在后
 
     // 只发图（文本空但有图）：仍注入（纯提示 + 路径）
-    c.send({ type: 'text', text: '', images: ['.mando/uploads/y/b.png'] });
+    c.send({ type: 'text', text: '', images: ['.panda/uploads/y/b.png'] });
     await waitFor(() => t.driver.sent.length === 2);
     const inj2 = t.driver.sent[1]!.text;
     expect(inj2).toContain('请先用 Read');
-    expect(inj2).toContain(`${cwd}/.mando/uploads/y/b.png`);
+    expect(inj2).toContain(`${cwd}/.panda/uploads/y/b.png`);
 
     // 纯空帧（无文本无图）→ bad_frame，不注入
     c.send({ type: 'text', text: '   ' });
@@ -687,7 +687,7 @@ describe('WS chat：baseline → msg 增量 → selection → stale → 注入',
     const t = await chatCtx();
     // 覆盖 chatCtx 默认 jsonl：一条 assistant（非 user，应原样）+ 一条带图 user（应富化）
     const combined = injected(
-      ['/x/.mando/uploads/aa/a.png', '/x/.mando/uploads/bb/b.jpg'],
+      ['/x/.panda/uploads/aa/a.png', '/x/.panda/uploads/bb/b.jpg'],
       '看这两张',
     );
     await fsp.writeFile(t.jsonl, asst('欢迎') + user(combined));
@@ -701,16 +701,16 @@ describe('WS chat：baseline → msg 增量 → selection → stale → 注入',
     expect(m0.images).toBeUndefined();
     // 带图 user：images = cwd 相对路径数组、正文剥掉 AI 向提示
     expect(m1.role).toBe('user');
-    expect(m1.images).toEqual(['.mando/uploads/aa/a.png', '.mando/uploads/bb/b.jpg']);
+    expect(m1.images).toEqual(['.panda/uploads/aa/a.png', '.panda/uploads/bb/b.jpg']);
     expect(m1.text).toBe('看这两张');
     expect(m1.text).not.toContain('请先用 Read');
 
     // tail 增量：再来一条纯图 user（无正文）→ msg 帧同样富化、正文为空串
-    await fsp.appendFile(t.jsonl, user(injected(['/x/.mando/uploads/cc/c.webp'])));
+    await fsp.appendFile(t.jsonl, user(injected(['/x/.panda/uploads/cc/c.webp'])));
     const inc = await c.next();
     expect(inc.type).toBe('msg');
     expect(inc.m.role).toBe('user');
-    expect(inc.m.images).toEqual(['.mando/uploads/cc/c.webp']);
+    expect(inc.m.images).toEqual(['.panda/uploads/cc/c.webp']);
     expect(inc.m.text).toBe('');
 
     // 无图 user → 原样透传（不挂 images、正文不动）
@@ -962,7 +962,7 @@ describe('WS chat ?conv= chat 独立对话：自身会话 + 恒可注入（无�
     await fsp.writeFile(path.join(sub, `${convC}.jsonl`), asst('你好'));
 
     // codex 已自更新退回 bash（tmux 会话仍活着，pane 是 shell 提示符）
-    t.driver.pane = '🎉 Update ran successfully! Please restart Codex.\n[root@VM yuhang_project]#';
+    t.driver.pane = '🎉 Update ran successfully! Please restart Codex.\n[root@VM demo_project]#';
 
     const c = await connect(`${t.wsBase}/ws/chat/${t.pid}?conv=${convC}`, t.aliceToken);
     expect(await c.next()).toEqual({ type: 'mode', live: true });
@@ -1011,6 +1011,7 @@ describe('WS chat 向上翻页历史', () => {
       Array.from({ length: 60 }, (_, i) => `m${90 + i}`), // 末 60 = m90..m149
     );
     expect(baseline.msgs.every((m: any) => typeof m.off === 'number')).toBe(true); // 带稳定标识
+    expect(baseline.hasMore).toBe(true);
 
     // 第一次翻页：更早的 m0..m89 一窗即可装下（256KB ≫ 90 行）→ 一页拿全、到顶
     c.send({ type: 'history' });
@@ -1028,6 +1029,44 @@ describe('WS chat 向上翻页历史', () => {
     c.close();
     await c.closed;
   });
+
+  test('超长工具输出超过初始字节窗时 baseline 仍按消息数回溯', async () => {
+    const t = await boot();
+    const convId = crypto.randomUUID();
+    t.server.db
+      .query(
+        'INSERT INTO conversations (id, project_id, label, created_ts, agent, kind) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run(convId, t.pid, '超长日志', Date.now(), 'claude', 'chat');
+    const sub = path.join(t.claudeDir, 'proj-demo');
+    await fsp.mkdir(sub, { recursive: true });
+    const earlier = Array.from({ length: 30 }, (_, i) => asst(`before-${i}`));
+    const giant = JSON.stringify({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', content: 'x'.repeat(600 * 1024) }] },
+    });
+    const later = Array.from({ length: 40 }, (_, i) => asst(`after-${i}`));
+    await fsp.writeFile(path.join(sub, `${convId}.jsonl`), [...earlier, giant, ...later].join('\n') + '\n');
+
+    const c = await connect(`${t.wsBase}/ws/chat/${t.pid}?conv=${convId}`, t.aliceToken);
+    expect(await c.next()).toEqual({ type: 'mode', live: true });
+    const baseline = await c.next();
+    expect(baseline.type).toBe('baseline');
+    expect(baseline.msgs).toHaveLength(60);
+    expect(baseline.msgs[0].text).toBe('before-11');
+    expect(baseline.msgs.at(-1).text).toBe('after-39');
+    expect(baseline.hasMore).toBe(true);
+
+    c.send({ type: 'history', before: baseline.msgs[0].off });
+    const history = await c.next();
+    expect(history.msgs.map((m: any) => m.text)).toEqual(
+      Array.from({ length: 11 }, (_, i) => `before-${i}`),
+    );
+    expect(history.msgs.every((m: any) => m.off < baseline.msgs[0].off)).toBe(true);
+    expect(history.hasMore).toBe(false);
+    c.close();
+    await c.closed;
+  });
 });
 
 // ---------- gated：真 tmux + script 的 LocalDriver.openPty 回环 ----------
@@ -1040,9 +1079,9 @@ if (!tmuxOk || !scriptOk) {
 
 describe.if(tmuxOk && scriptOk)('WS term 集成（真 tmux attach）', () => {
   test('对真 tmux 会话 attach：收到终端字节流', async () => {
-    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-ws-real-'));
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-ws-real-'));
     cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
-    const dbPath = path.join(dir, 'mando.db');
+    const dbPath = path.join(dir, 'panda.db');
     const claudeDir = path.join(dir, 'claude');
     const db0 = openDb(dbPath);
     migrate(db0);

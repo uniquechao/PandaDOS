@@ -222,7 +222,7 @@ describe('网页菜单解读（issue #112「解释一下」）', () => {
   test('LLM 成功 → trim 后的文案；systemPrefix 拼在网页版 prompt 前；上下文与选项进 user', async () => {
     const llm = new MockLlm(['  这一步要跑 build-ui 并看 git 状态，只读不动数据，建议选 1。  ']);
     const r = await explainMenuForHuman(llm, {
-      label: 'mando',
+      label: 'panda',
       context: 'Bash command: bun run build-ui — Do you want to proceed?',
       options: ['Yes', "Yes, and don't ask again", 'No'],
       systemPrefix: 'PERSONA',
@@ -233,7 +233,7 @@ describe('网页菜单解读（issue #112「解释一下」）', () => {
     expect(sys.startsWith('PERSONA\n\n')).toBe(true);
     expect(sys).toContain(EXPLAIN_MENU_WEB_SYS);
     const user = llm.calls[0]!.messages[1]!.content!;
-    expect(user).toContain('会话 @mando');
+    expect(user).toContain('会话 @panda');
     expect(user).toContain('build-ui');
     expect(user).toContain("1. Yes\n2. Yes, and don't ask again\n3. No");
     expect(user).not.toContain('多选表单'); // 单选不提多选语义
@@ -361,10 +361,10 @@ describe('本地兜底分级（issue #91，LLM 不可用时）', () => {
       'Bash command\nrm -rf node_modules',
       'Bash command\ngit push --force origin main',
       'Bash command\ngit reset --hard HEAD~3',
-      'Bash command\nsqlite3 mando.db "DROP TABLE issues;"',
-      'Bash command\nsystemctl restart mando',
+      'Bash command\nsqlite3 panda.db "DROP TABLE issues;"',
+      'Bash command\nsystemctl restart panda',
       'Bash command\nsudo chown -R root /etc',
-      'Edit file\n/root/.mando/env\nUpdate MANDO_LLM_API_KEY',
+      'Edit file\n/root/.panda/env\nUpdate PANDA_LLM_API_KEY',
       'Bash command\n./deploy.sh prod',
     ];
     for (const context of danger) {
@@ -468,8 +468,8 @@ describe('自动批准档位（issue #108）', () => {
       'rm -rf node_modules',
       'git push --force origin main',
       'git reset --hard HEAD~3',
-      'sqlite3 mando.db "DROP TABLE issues;"',
-      'systemctl restart mando',
+      'sqlite3 panda.db "DROP TABLE issues;"',
+      'systemctl restart panda',
       './deploy.sh prod',
     ];
     for (const cmd of danger) {
@@ -480,7 +480,7 @@ describe('自动批准档位（issue #108）', () => {
     // 改生产密钥这类非 Bash 弹窗同样拦住
     const env = await decideApproval(
       llm,
-      { context: 'Edit file\n/root/.mando/env\nUpdate MANDO_LLM_API_KEY', options: CC },
+      { context: 'Edit file\n/root/.panda/env\nUpdate PANDA_LLM_API_KEY', options: CC },
       {},
       'auto',
     );

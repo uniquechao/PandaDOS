@@ -6,7 +6,7 @@ import {
   type SupportedLocale,
 } from '../../../shared/i18n/locales';
 
-export const DEVICE_LOCALE_KEY = 'mando.locale';
+export const DEVICE_LOCALE_KEY = 'panda.locale';
 
 export interface StorageLike {
   getItem(key: string): string | null;

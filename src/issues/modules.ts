@@ -37,7 +37,7 @@ export interface ResolveModuleInput {
 export interface ModuleDocsPort {
   ensureModule(module: ProjectModule): Promise<void>;
   refreshIndex(modules: ProjectModule[]): Promise<void>;
-  /** slug 改名时把 .mando/modules/<旧slug>/ 目录整体迁到新 slug 并改写 meta；缺省 = 不支持改 slug。 */
+  /** slug 改名时把 .panda/modules/<旧slug>/ 目录整体迁到新 slug 并改写 meta；缺省 = 不支持改 slug。 */
   renameDir?(module: ProjectModule, newSlug: string): Promise<void>;
   createIssuePage?(module: ProjectModule, issue: {
     id: number;

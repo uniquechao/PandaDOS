@@ -24,7 +24,7 @@ import type { TermStatus } from '../components/TermPane';
 import { AutoApproveSwitch } from '../components/AutoApproveSwitch';
 import { reconcileAgent } from '../components/AgentPicker';
 import { NativeModeSwitch, type NativeMode } from '../components/NativeModeSwitch';
-import { ExecProgress, execProgressState, stepGlyph } from '../components/ExecProgress';
+import { canEditSubtask, ExecProgress, execProgressState, stepGlyph } from '../components/ExecProgress';
 import type {
   AgentKind,
   AutoApproveLevel,
@@ -39,6 +39,7 @@ import type {
   MergeGatePayload,
   PlanGatePayload,
   ProjectModule,
+  Subtask,
 } from '../lib/types';
 import { CatBadge, ModelBadge, StatusBadge, WaitingBadge } from '../components/badges';
 import { useConvModel } from '../lib/useConvModel';
@@ -54,9 +55,10 @@ import {
 } from '../components/IssueGitBranchFields';
 import { ImageLightbox } from '../components/ImageLightbox';
 import { ImgThumb } from '../components/ImgThumb';
+import { gitImageUrls } from '../components/GitImagePreview';
 import {
   CommitPanel,
-  DiffBody,
+  DiffContent,
   PathText,
   PlusMinus,
   RefBadges,
@@ -267,6 +269,27 @@ export function IssueWorkbench({
   const subs = detail?.subtasks ?? [];
   const doneN = subs.filter((s) => s.done).length;
 
+  const saveSubtask = async (index: number, text: string): Promise<void> => {
+    try {
+      const result = await api<{ ok: true; index: number; subtask: Subtask }>(
+        `/api/projects/${pid}/issues/${iid}/subtasks/${index}`,
+        'PATCH',
+        { text },
+      );
+      setDetail((current) =>
+        current
+          ? {
+              ...current,
+              subtasks: current.subtasks.map((subtask, i) => (i === result.index ? result.subtask : subtask)),
+            }
+          : current,
+      );
+    } catch (error) {
+      load();
+      throw error;
+    }
+  };
+
   const closed = issue !== null && ['done', 'cancelled'].includes(issue.status);
   const needGateBar =
     issue !== null &&
@@ -439,6 +462,7 @@ export function IssueWorkbench({
             analyzing={analyzing}
             approvals={approvals}
             onOpenImage={setLightbox}
+            onSaveSubtask={saveSubtask}
           />
         )}
         {issue && tab === 'exec' && (
@@ -779,16 +803,47 @@ function DetailTab({
   analyzing,
   approvals,
   onOpenImage,
+  onSaveSubtask,
 }: {
   issue: Issue;
   pid: number;
   images: string[];
-  subs: { text: string; done: boolean }[];
+  subs: Subtask[];
   doneN: number;
   analyzing: boolean;
   approvals: ApprovalLogRow[];
   onOpenImage: (path: string) => void;
+  onSaveSubtask: (index: number, text: string) => Promise<void>;
 }) {
+  const [editIndex, setEditIndex] = useState<number | null>(null);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [editError, setEditError] = useState('');
+
+  const cancelSubtaskEdit = (): void => {
+    if (saving) return;
+    setEditIndex(null);
+    setDraft('');
+    setEditError('');
+  };
+
+  const saveSubtaskText = async (): Promise<void> => {
+    if (editIndex === null || saving) return;
+    const text = draft.trim();
+    if (!text) return;
+    setSaving(true);
+    setEditError('');
+    try {
+      await onSaveSubtask(editIndex, text);
+      setEditIndex(null);
+      setDraft('');
+    } catch (error) {
+      setEditError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <div class="id-scroll wb-detail">
       <IssueGitBranchSummary issue={issue} />
@@ -828,12 +883,69 @@ function DetailTab({
             {tr('issue.planProgress', { done: doneN, total: subs.length })}
           </div>
           {/* 与执行顶栏进度链同一状态源/同一套配色（#104）：done/cur/blocked/cancelled 圆点齐平 */}
-          {execProgressState(subs, issue.subIndex, issue.status).steps.map((s) => (
-            <div key={s.n} class={`plan-i ${s.state}`}>
-              <span class={`ck ep-n ${s.state}`}>{stepGlyph(s)}</span>
-              <span class="tx">{s.text}</span>
-            </div>
-          ))}
+          {execProgressState(subs, issue.subIndex, issue.status).steps.map((step, index) => {
+            const editable = canEditSubtask(subs[index]!, index, issue.subIndex, issue.status, issue.implMode);
+            const editingSubtask = editIndex === index && editable;
+            return (
+              <div key={step.n} class={`plan-i ${step.state}`}>
+                <span class={`ck ep-n ${step.state}`}>{stepGlyph(step)}</span>
+                {editingSubtask ? (
+                  <form
+                    class="plan-editor"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void saveSubtaskText();
+                    }}
+                  >
+                    <input
+                      autoFocus
+                      maxLength={500}
+                      aria-label={tr('issue.subtaskText')}
+                      value={draft}
+                      onInput={(event) => setDraft(event.currentTarget.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                          event.preventDefault();
+                          void saveSubtaskText();
+                        } else if (event.key === 'Escape') {
+                          event.preventDefault();
+                          cancelSubtaskEdit();
+                        }
+                      }}
+                    />
+                    <div class="plan-editor-actions">
+                      <button class="btn sm primary" type="submit" disabled={saving || !draft.trim()}>
+                        {saving ? tr('ui.saving') : tr('ui.save')}
+                      </button>
+                      <button class="btn sm ghost" type="button" disabled={saving} onClick={cancelSubtaskEdit}>
+                        {tr('ui.cancel')}
+                      </button>
+                    </div>
+                    {editError && <div class="err small plan-edit-error">{editError}</div>}
+                  </form>
+                ) : (
+                  <>
+                    <span class="tx">{step.text}</span>
+                    {editable && (
+                      <button
+                        class="btn sm ghost plan-edit"
+                        type="button"
+                        title={tr('issue.editSubtask', { number: step.n })}
+                        aria-label={tr('issue.editSubtask', { number: step.n })}
+                        onClick={() => {
+                          setEditIndex(index);
+                          setDraft(step.text);
+                          setEditError('');
+                        }}
+                      >
+                        {tr('issue.edit')}
+                      </button>
+                    )}
+                  </>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
       <ApprovalLog rows={approvals} />
@@ -1101,7 +1213,21 @@ function IssueChangesTab({
           <PathText path={s.leaf.path} oldPath={s.leaf.oldPath} />
           {s.kind === 'wt' && <span class="mut small">{tr('issue.uncommitted')}</span>}
         </div>
-        <DiffBody d={fd.diff} error={fd.err} />
+        <DiffContent
+          code={s.leaf.code}
+          path={s.leaf.path}
+          oldPath={s.leaf.oldPath}
+          imageUrls={gitImageUrls(
+            s.kind === 'wt'
+              ? `/api/projects/${pid}/git/worktree/raw`
+              : `/api/projects/${pid}/issues/${iid}/git/raw`,
+            s.leaf.path,
+            s.leaf.oldPath,
+            s.leaf.code,
+          )}
+          d={fd.diff}
+          error={fd.err}
+        />
       </div>
     );
   }
@@ -1201,7 +1327,21 @@ function IssueChangesTab({
                   ✕
                 </button>
               </div>
-              <DiffBody d={fd.diff} error={fd.err} />
+              <DiffContent
+                code={fd.file.leaf.code}
+                path={fd.file.leaf.path}
+                oldPath={fd.file.leaf.oldPath}
+                imageUrls={gitImageUrls(
+                  fd.file.kind === 'wt'
+                    ? `/api/projects/${pid}/git/worktree/raw`
+                    : `/api/projects/${pid}/issues/${iid}/git/raw`,
+                  fd.file.leaf.path,
+                  fd.file.leaf.oldPath,
+                  fd.file.leaf.code,
+                )}
+                d={fd.diff}
+                error={fd.err}
+              />
             </div>
           ) : (
             <div class="gd-empty">← {tr('issue.chooseChange')}</div>

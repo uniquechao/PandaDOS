@@ -144,7 +144,7 @@ describe('generateProjectReadmeSummary', () => {
     const db = setupDb();
     const id = addProject(db, '/p', { name: '曼拓' });
     const llm = fakeLlm('曼拓：AI 编码项目管家，定位团队协作。');
-    const driver = fakeDriver({ '/p/README.md': '# Mando\n多用户 AI 编码平台' });
+    const driver = fakeDriver({ '/p/README.md': '# PandaDOS\n多用户 AI 编码平台' });
 
     const r = await generateProjectReadmeSummary(
       { db, llm, driver, now: () => NOW },
@@ -161,7 +161,7 @@ describe('generateProjectReadmeSummary', () => {
 
     const row = projRow(db, id);
     expect(row.readme_summary).toBe('曼拓：AI 编码项目管家，定位团队协作。');
-    expect(row.readme_md5).toBe(md5hex('# Mando\n多用户 AI 编码平台'));
+    expect(row.readme_md5).toBe(md5hex('# PandaDOS\n多用户 AI 编码平台'));
     expect(row.readme_checked_ts).toBe(NOW);
   });
 

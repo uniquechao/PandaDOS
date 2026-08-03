@@ -52,3 +52,34 @@ describe('新建 issue：批准档位（#115）', () => {
     expect(source).toContain('<div class="nia-aa">');
   });
 });
+
+describe('项目配置入口（Issue #10）', () => {
+  test('看板头部只保留项目工作入口并转到独立配置页', () => {
+    const start = source.indexOf('<div class="bacts">');
+    const end = source.indexOf('{project?.goal', start);
+    const headerActions = source.slice(start, end);
+    const routes = ['/chat', '/files', '/skills', '/term', '/git', '/settings'];
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    expect(headerActions.match(/<button class="btn sm"/g)).toHaveLength(7);
+    expect(headerActions).toContain("subscribed ? tr('board.subscribedLabel') : tr('board.subscribe')");
+    for (const route of routes) expect(headerActions).toContain(`nav(\`/p/\${pid}${route}\`)`);
+    for (let index = 1; index < routes.length; index += 1) {
+      expect(headerActions.indexOf(routes[index])).toBeGreaterThan(headerActions.indexOf(routes[index - 1]));
+    }
+    expect(headerActions).not.toContain('setMembersOpen');
+    expect(headerActions).not.toContain('setModulesOpen');
+    expect(headerActions).not.toContain('SummaryButton');
+  });
+
+  test('Issue 列表顶部提供外部 issue 导入和新建入口', () => {
+    const start = source.indexOf('class="wb-list-hd"');
+    const end = source.indexOf('class="wb-groups"', start);
+    const listHeader = source.slice(start, end);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    expect(listHeader).toContain("tr('externalImport.title')");
+    expect(listHeader).toContain('nav(`/p/${pid}/external-issues`)');
+    expect(listHeader).toContain('setCreating(true)');
+  });
+});

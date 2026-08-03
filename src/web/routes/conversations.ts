@@ -18,16 +18,30 @@
  * （评审 H9 单一驾驶员）。
  */
 import type { Database } from 'bun:sqlite';
-import { projectAgentSupport } from '../../core/executors';
+import {
+  archiveHistoryConversations,
+  findBoundHistoryConversation,
+  type HistoryArchiveFs,
+  importableHistorySessions,
+  importHistoryConversations,
+} from '../../core/conversation-history';
+import { getExecutor, projectAgentSupport } from '../../core/executors';
 import {
   parseAutoApproveLevel,
   type AgentKind,
   type AutoApproveLevel,
   type Conversation,
+  type Project,
   type ProjectKind,
 } from '../../core/types';
+import {
+  discoverExecutorAgentHistory,
+  type AgentHistoryReader,
+  type AgentHistorySession,
+} from '../../executor/agent-history';
 import { getProject } from '../../issues/engine';
 import { type KeyedMutex, tmuxLockKey } from '../../issues/mutex';
+import { apiError } from '../errors';
 import { json, type RouteDef } from '../middleware';
 
 /** ConversationManager 最小面（core/conversations.ts 结构兼容） */
@@ -54,6 +68,8 @@ export interface ConversationsRoutesDeps {
   mutex: KeyedMutex;
   /** 当前模型探测（读会话 jsonl，见 core/model-probe）；缺省 = model 恒 null（前端不显示） */
   models?: ConvModelPort;
+  /** 项目所在执行机的只读 Driver；本地历史查询/导入使用。缺省时相关端点返回 503。 */
+  driverForProject?(project: Project): AgentHistoryReader & HistoryArchiveFs;
 }
 
 async function readBody(req: Request): Promise<Record<string, unknown>> {
@@ -63,6 +79,44 @@ async function readBody(req: Request): Promise<Record<string, unknown>> {
 
 export function conversationsRoutes(deps: ConversationsRoutesDeps): RouteDef[] {
   const { db, convs, mutex, models } = deps;
+
+  const discoverProjectHistory = async (
+    project: Project,
+  ): Promise<{ sessions: AgentHistorySession[] } | { error: Response }> => {
+    if (!deps.driverForProject) {
+      return {
+        error: json(apiError(
+          'executor.driver_unavailable',
+          'Executor operations are unavailable because no driver is configured.',
+          503,
+        ), 503),
+      };
+    }
+    const executor = getExecutor(db, project.executorId);
+    if (!executor) {
+      return { error: json(apiError('executor.not_found', 'The executor does not exist.', 409), 409) };
+    }
+    const projectCwd = project.cwd === '/' ? '/' : project.cwd.replace(/\/+$/, '');
+    try {
+      const history = await discoverExecutorAgentHistory(deps.driverForProject(project), executor);
+      return {
+        sessions: importableHistorySessions(
+          db,
+          history.sessions.filter((session) => session.cwd === projectCwd),
+        ),
+      };
+    } catch (e) {
+      return {
+        error: json(apiError(
+          'history.read_failed',
+          'Could not read local agent history.',
+          502,
+          {},
+          String(e).slice(0, 200),
+        ), 502),
+      };
+    }
+  };
 
   /** 取一条属于本项目的 chat 对话（跨项目/非 chat/不存在 → 错误响应） */
   const chatConvOf = (
@@ -88,6 +142,134 @@ export function conversationsRoutes(deps: ConversationsRoutesDeps): RouteDef[] {
         const iaw = url.searchParams.get('includeArchived');
         const includeArchived = iaw === '1' || iaw === 'true';
         return json({ ok: true, conversations: convs.listChats(pid, includeArchived) });
+      },
+    },
+    {
+      /** 当前项目 cwd 的本地 Claude/Codex 历史候选；不向浏览器暴露执行机 JSONL 路径。 */
+      method: 'GET',
+      path: '/api/projects/:projectId/conversations/local-history',
+      auth: 'project-access',
+      handler: async ({ params }) => {
+        const project = getProject(db, Number(params.projectId));
+        if (!project) return json(apiError('project.not_found', 'The project does not exist.', 404), 404);
+        const found = await discoverProjectHistory(project);
+        if ('error' in found) return found.error;
+        const sessions = found.sessions.flatMap((session) => {
+          const bound = findBoundHistoryConversation(db, session);
+          if (bound && bound.projectId !== project.id) return [];
+          return [{
+            agent: session.agent,
+            sessionId: session.sessionId,
+            title: session.title,
+            createdTs: session.createdTs,
+            updatedTs: session.updatedTs,
+            importedConversationId: bound?.id ?? null,
+          }];
+        });
+        return json({ ok: true, cwd: project.cwd, sessions });
+      },
+    },
+    {
+      /**
+       * 选取当前 cwd 的原生会话并绑定为 chat 对话。请求只携带 agent+sessionId；路径、时间、
+       * 标题全部以本轮执行机扫描结果为准，防止跨 cwd 或伪造文件导入。
+       */
+      method: 'POST',
+      path: '/api/projects/:projectId/conversations/local-history',
+      auth: 'project-access',
+      handler: async ({ req, params }) => {
+        const project = getProject(db, Number(params.projectId));
+        if (!project) return json(apiError('project.not_found', 'The project does not exist.', 404), 404);
+        const historyFs = deps.driverForProject?.(project);
+        if (!historyFs) {
+          return json(apiError(
+            'executor.driver_unavailable',
+            'Executor operations are unavailable because no driver is configured.',
+            503,
+          ), 503);
+        }
+        const body = await readBody(req);
+        if (!Array.isArray(body.sessions) || body.sessions.length === 0 || body.sessions.length > 200) {
+          return json(apiError(
+            'history.selection_required',
+            'Select between 1 and 200 history sessions.',
+            400,
+          ), 400);
+        }
+        const selections: Array<{ agent: AgentKind; sessionId: string }> = [];
+        const requested = new Set<string>();
+        for (const raw of body.sessions) {
+          if (!raw || typeof raw !== 'object') {
+            return json(apiError(
+              'history.selection_invalid',
+              'The selected history sessions are invalid.',
+              400,
+            ), 400);
+          }
+          const value = raw as { agent?: unknown; sessionId?: unknown };
+          if (
+            (value.agent !== 'claude' && value.agent !== 'codex') ||
+            typeof value.sessionId !== 'string' || !value.sessionId.trim()
+          ) {
+            return json(apiError(
+              'history.selection_invalid',
+              'The selected history sessions are invalid.',
+              400,
+            ), 400);
+          }
+          const key = `${value.agent}\0${value.sessionId}`;
+          if (requested.has(key)) continue;
+          requested.add(key);
+          selections.push({ agent: value.agent, sessionId: value.sessionId });
+        }
+        const found = await discoverProjectHistory(project);
+        if ('error' in found) return found.error;
+        const byKey = new Map(found.sessions.map((session) => [`${session.agent}\0${session.sessionId}`, session]));
+        const selected = selections.map((selection) => byKey.get(`${selection.agent}\0${selection.sessionId}`));
+        if (selected.some((session) => !session)) {
+          return json(apiError(
+            'history.not_found',
+            'A selected history session was not found or does not match this project’s working directory.',
+            404,
+          ), 404);
+        }
+        const sessions = selected as AgentHistorySession[];
+        const conflict = sessions
+          .map((session) => ({ session, bound: findBoundHistoryConversation(db, session) }))
+          .find(({ bound }) => bound && bound.projectId !== project.id);
+        if (conflict?.bound) {
+          return json(apiError(
+            'history.assigned',
+            'A selected history session belongs to another project.',
+            409,
+          ), 409);
+        }
+        try {
+          await archiveHistoryConversations(historyFs, project.cwd, sessions);
+          const result = importHistoryConversations(db, project.id, sessions);
+          if (result.conflicts.length > 0) {
+            return json(apiError(
+              'history.assigned',
+              'A selected history session belongs to another project.',
+              409,
+            ), 409);
+          }
+          const ids = [...result.importedIds, ...result.existingIds];
+          return json({
+            ok: true,
+            imported: result.importedIds.length,
+            existing: result.existingIds.length,
+            conversations: ids.map((id) => convs.get(id)).filter(Boolean),
+          });
+        } catch (e) {
+          return json(apiError(
+            'history.import_failed',
+            'Could not import local history.',
+            500,
+            {},
+            String(e).slice(0, 200),
+          ), 500);
+        }
       },
     },
     {

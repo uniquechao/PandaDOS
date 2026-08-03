@@ -16,6 +16,7 @@ import { ChatPane } from '../components/ChatPane';
 import { ListSplitter } from '../components/ListSplitter';
 import { Loading } from '../components/Loaders';
 import { NativeModeSwitch, type NativeMode } from '../components/NativeModeSwitch';
+import { Modal } from '../components/Modal';
 import { SummaryButton } from '../components/SummaryButton';
 import { TermPane } from '../components/TermPane';
 import { api, ApiError, getProjectExecutorAgents, setConvAutoApprove } from '../lib/api';
@@ -33,6 +34,9 @@ import type {
   FsFile,
   FsList,
   FsUploadResult,
+  LocalHistoryImportResponse,
+  LocalHistoryResponse,
+  LocalHistorySession,
   Project,
 } from '../lib/types';
 import { useConvModel } from '../lib/useConvModel';
@@ -50,6 +54,7 @@ export function ChatView({ pid }: { pid: number }) {
   const [newAgent, setNewAgent] = useState<AgentKind>('claude');
   const [supportedAgents, setSupportedAgents] = useState<AgentKind[]>([]);
   const [busy, setBusy] = useState(false);
+  const [importingHistory, setImportingHistory] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameText, setRenameText] = useState('');
   const [err, setErr] = useState('');
@@ -57,7 +62,7 @@ export function ChatView({ pid }: { pid: number }) {
   const [produced, setProduced] = useState<string[]>([]);
   const [memBusy, setMemBusy] = useState(false);
   const wide = useWide();
-  const listW = useListWidth(); // 宽屏对话列表栏宽度：拖拽持久化，未设则回落 CSS 默认（与工作台共用 mando.wbListW）
+  const listW = useListWidth(); // 宽屏对话列表栏宽度：拖拽持久化，未设则回落 CSS 默认（与工作台共用 panda.wbListW）
   const splitRef = useRef<HTMLDivElement>(null); // .wb-split 容器 ref，供分隔条换算左栏像素宽
 
   useEffect(() => {
@@ -111,6 +116,25 @@ export function ChatView({ pid }: { pid: number }) {
       toast.error(e instanceof ApiError ? e.message : String(e));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const enterImportedHistory = async (conversation: Conversation): Promise<void> => {
+    setImportingHistory(false);
+    setConvs((current) => [conversation, ...(current ?? []).filter((item) => item.id !== conversation.id)]);
+    setSelected(conversation.id);
+    setMode('chat');
+    activate(conversation.id);
+    try {
+      const r = await api<{ conversations: Conversation[] }>(`/api/projects/${pid}/conversations`);
+      setConvs(r.conversations);
+      const target = r.conversations.some((item) => item.id === conversation.id)
+        ? conversation.id
+        : (r.conversations[0]?.id ?? null);
+      setSelected(target);
+      if (target && target !== conversation.id) activate(target);
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : String(e));
     }
   };
 
@@ -257,6 +281,9 @@ export function ChatView({ pid }: { pid: number }) {
       <div class="conv-list-hd">
         <span class="conv-list-t">{t('view.conversation')}{convs ? ` · ${convs.length}` : ''}</span>
         <div class="conv-new">
+          <button class="btn sm" onClick={() => setImportingHistory(true)}>
+            {t('view.importLocalHistory')}
+          </button>
           <div class="seg sm" role="tablist">
             {supportedAgents.map((agent) => (
               <button
@@ -284,6 +311,13 @@ export function ChatView({ pid }: { pid: number }) {
         )}
         {(convs ?? []).map(convRow)}
       </div>
+      {importingHistory && (
+        <ImportLocalHistoryModal
+          pid={pid}
+          onClose={() => setImportingHistory(false)}
+          onImported={(conversation) => void enterImportedHistory(conversation)}
+        />
+      )}
     </div>
   );
 
@@ -397,6 +431,190 @@ export function ChatView({ pid }: { pid: number }) {
         <div class="wb-list-full">{list}</div>
       )}
     </div>
+  );
+}
+
+type HistoryAgentFilter = 'all' | AgentKind;
+
+const historySessionKey = (session: Pick<LocalHistorySession, 'agent' | 'sessionId'>): string =>
+  `${session.agent}\0${session.sessionId}`;
+
+function ImportLocalHistoryModal({
+  pid,
+  onClose,
+  onImported,
+}: {
+  pid: number;
+  onClose: () => void;
+  onImported: (conversation: Conversation) => void;
+}) {
+  const { t } = useI18n();
+  const [sessions, setSessions] = useState<LocalHistorySession[] | null>(null);
+  const [cwd, setCwd] = useState('');
+  const [filter, setFilter] = useState<HistoryAgentFilter>('all');
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let disposed = false;
+    setSessions(null);
+    setError('');
+    void api<LocalHistoryResponse>(
+      `/api/projects/${pid}/conversations/local-history`,
+    )
+      .then((result) => {
+        if (disposed) return;
+        setCwd(result.cwd);
+        setSessions(result.sessions);
+      })
+      .catch((e: Error) => {
+        if (disposed) return;
+        setSessions([]);
+        setError(e.message);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [pid]);
+
+  const visible = (sessions ?? []).filter((session) => filter === 'all' || session.agent === filter);
+  const selectableVisible = visible.filter((session) => session.importedConversationId === null);
+  const selectable = (sessions ?? []).filter((session) => session.importedConversationId === null);
+
+  const toggle = (session: LocalHistorySession): void => {
+    if (session.importedConversationId !== null) return;
+    const key = historySessionKey(session);
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const selectVisible = (): void => {
+    setSelected((current) => {
+      const next = new Set(current);
+      selectableVisible.forEach((session) => next.add(historySessionKey(session)));
+      return next;
+    });
+  };
+
+  const submit = async (): Promise<void> => {
+    if (busy || selected.size === 0) return;
+    const chosen = selectable
+      .filter((session) => selected.has(historySessionKey(session)))
+      .map((session) => ({ agent: session.agent, sessionId: session.sessionId }));
+    if (chosen.length === 0) return;
+    setBusy(true);
+    setError('');
+    try {
+      const result = await api<LocalHistoryImportResponse>(
+        `/api/projects/${pid}/conversations/local-history`,
+        'POST',
+        { sessions: chosen },
+      );
+      const target = result.conversations[0];
+      if (!target) throw new Error(t('view.noImportedConversation'));
+      toast.success(t('view.localHistoryImported', { count: result.imported + result.existing }));
+      onImported(target);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title={t('view.importLocalHistory')} onClose={onClose} wide>
+      <div class="history-import" aria-busy={busy ? 'true' : 'false'}>
+        <div class="history-import-help">
+          <span>{t('view.localHistoryHelp')}</span>
+          {cwd && <code>{cwd}</code>}
+        </div>
+        <div class="history-import-toolbar">
+          <div class="seg sm history-import-filter" aria-label={t('view.localHistoryAgentFilter')}>
+            {(['all', 'claude', 'codex'] as const).map((agent) => (
+              <button
+                type="button"
+                key={agent}
+                class={'seg-btn' + (filter === agent ? ' on' : '')}
+                aria-pressed={filter === agent}
+                disabled={busy}
+                onClick={() => setFilter(agent)}
+              >
+                {agent === 'all' ? t('shell.all') : agent}
+              </button>
+            ))}
+          </div>
+          <div class="history-import-selection" aria-live="polite">
+            {t('view.historySelected', { count: selected.size })}
+          </div>
+          <button
+            type="button"
+            class="btn sm"
+            disabled={busy || selectableVisible.length === 0}
+            onClick={selectVisible}
+          >
+            {t('view.selectAllHistory')}
+          </button>
+          <button
+            type="button"
+            class="btn sm"
+            disabled={busy || selected.size === 0}
+            onClick={() => setSelected(new Set())}
+          >
+            {t('view.clearHistorySelection')}
+          </button>
+        </div>
+        {sessions === null && (
+          <div class="history-import-status" role="status" aria-live="polite">
+            {t('view.readingLocalHistory')}
+          </div>
+        )}
+        {sessions !== null && sessions.length === 0 && !error && (
+          <div class="empty history-import-empty">{t('view.noLocalHistory')}</div>
+        )}
+        {sessions !== null && sessions.length > 0 && visible.length === 0 && (
+          <div class="empty history-import-empty">{t('view.noFilteredLocalHistory')}</div>
+        )}
+        {visible.length > 0 && (
+          <div class="history-import-list" aria-label={t('view.localHistoryCandidates')}>
+            {visible.map((session) => {
+              const key = historySessionKey(session);
+              const imported = session.importedConversationId !== null;
+              return (
+                <label class={'history-import-item' + (selected.has(key) ? ' on' : '') + (imported ? ' imported' : '')} key={key}>
+                  <input
+                    type="checkbox"
+                    checked={selected.has(key)}
+                    disabled={imported || busy}
+                    onChange={() => toggle(session)}
+                  />
+                  <span class={'conv-agent ' + (session.agent === 'codex' ? 'cx' : 'cl')} aria-hidden="true">
+                    {session.agent === 'codex' ? 'CX' : 'CL'}
+                  </span>
+                  <span class="history-import-copy">
+                    <span class="history-import-title">{session.title || t('view.untitledHistory')}</span>
+                    <span class="history-import-meta">
+                      {session.agent} · {timeAgo(session.updatedTs || session.createdTs)}
+                    </span>
+                  </span>
+                  {imported && <span class="badge b-green">{t('view.historyAlreadyImported')}</span>}
+                </label>
+              );
+            })}
+          </div>
+        )}
+        {error && <div class="err" role="alert">{error}</div>}
+      </div>
+      <div class="mbtns">
+        <button class="btn" disabled={busy} onClick={onClose}>{t('ui.cancel')}</button>
+        <button class="btn primary" disabled={busy || selected.size === 0} onClick={() => void submit()}>
+          {busy ? t('project.importing') : t('view.importSelectedHistory')}
+        </button>
+      </div>
+    </Modal>
   );
 }
 

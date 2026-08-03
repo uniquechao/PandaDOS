@@ -3,7 +3,7 @@
  *
  * 市场 = 一个 git 仓库（agentskills 格式：目录 + SKILL.md，claude/codex 通用）。
  * - 源注册在 DB skill_markets（004 迁移内置 4 个，admin 可增删）；
- * - 同步 = 控制面浅克隆/拉取到 `~/.mando/skill-markets/<name>`（离线可浏览，v1 语义）；
+ * - 同步 = 控制面浅克隆/拉取到 `~/.panda/skill-markets/<name>`（离线可浏览，v1 语义）；
  * - 扫描 = 递归找「含 SKILL.md 的目录」（深度 ≤3，命中即技能、不再下钻）；
  * - 富化 = 驱动大模型 中文描述/标签/推荐，缓存 DB skill_i18n（描述指纹变更才重译，
  *   每条完成即落库——客户端断流也不浪费 token；v1 market-cache.json 平移进 DB）。
@@ -18,6 +18,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import type { LlmClient } from '../agents/llm';
+import { RUNTIME_DATA_DIR_NAME } from './branding';
 import { parseSkillMd } from './skills';
 
 const pExecFile = promisify(execFile);
@@ -74,9 +75,9 @@ export interface MarketRow {
 
 // ---------- 基础 ----------
 
-/** 市场缓存根目录（MANDO_SKILL_MARKETS_DIR 供测试注入） */
+/** 市场缓存根目录（PANDA_SKILL_MARKETS_DIR 供测试注入） */
 export function marketsBaseDir(): string {
-  return process.env.MANDO_SKILL_MARKETS_DIR ?? path.join(homedir(), '.mando', 'skill-markets');
+  return process.env.PANDA_SKILL_MARKETS_DIR ?? path.join(homedir(), RUNTIME_DATA_DIR_NAME, 'skill-markets');
 }
 
 export const MARKET_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;

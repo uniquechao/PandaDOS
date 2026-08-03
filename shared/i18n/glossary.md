@@ -1,4 +1,4 @@
-# MandoAI localization glossary
+# PandaDOS localization glossary
 
 [简体中文](glossary.zh-CN.md)
 

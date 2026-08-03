@@ -5,6 +5,8 @@ import { commonUiMessages } from '../domains/common-ui';
 import { statusMessages } from '../domains/status';
 import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
+import { projectSettingsMessages } from '../domains/project-settings';
+import { externalImportMessages } from '../domains/external-import';
 
 export const esCatalog = {
   ...shellMessages.es,
@@ -13,6 +15,13 @@ export const esCatalog = {
   ...statusMessages.es,
   ...errorMessages.es,
   ...notifyMessages.es,
+  ...projectSettingsMessages.es,
+  ...externalImportMessages.es,
+  'issue.editSubtask': 'Editar subtarea {number}', 'issue.subtaskText': 'Contenido de la subtarea',
+  'view.importLocalHistory':'Importar historial local','view.localHistoryHelp':'Solo se muestran sesiones de Claude/Codex cuyo directorio de trabajo coincide exactamente con este proyecto.','view.localHistoryAgentFilter':'Filtrar historial por agente','view.historySelected':'{count, plural, one {# sesión seleccionada} other {# sesiones seleccionadas}}','view.selectAllHistory':'Seleccionar todo','view.clearHistorySelection':'Limpiar','view.readingLocalHistory':'Leyendo historial local…','view.noLocalHistory':'No se encontró historial local para este proyecto.','view.noFilteredLocalHistory':'No hay historial para este filtro de agente.','view.localHistoryCandidates':'Sesiones del historial local','view.untitledHistory':'Sesión del historial sin título','view.historyAlreadyImported':'Importada','view.noImportedConversation':'La importación no devolvió una conversación disponible.','view.localHistoryImported':'{count, plural, one {Se importó # sesión del historial} other {Se importaron # sesiones del historial}}','view.importSelectedHistory':'Importar selección',
+  'project.importTitle':'Importar','project.importShort':'Importar','project.importSource':'Origen de importación','project.importTmuxSource':'Sesión de tmux','project.importClaudeSource':'Proyecto de Claude','project.importCodexSource':'Proyecto de Codex',
+  'project.importTmuxHelp':'Registrar una sesión de tmux activa','project.importClaudeHelp':'Importar proyectos locales y su historial','project.importCodexHelp':'Importar proyectos locales y su historial','project.readingProjects':'Leyendo proyectos locales…',
+  'project.noAgentProjects':'No hay proyectos de {agent} para importar en este ejecutor','project.importCandidates':'Elementos para importar','project.historySessions':'{count, plural, one {# sesión del historial} other {# sesiones del historial}}','project.tmuxAttached':'Conectada','project.linkedHistory':'{count, plural, one {Se vinculó # sesión del historial} other {Se vincularon # sesiones del historial}}','project.noProjectsImportHelp':'Crea un proyecto o importa un proyecto o una sesión existente desde un ejecutor.','project.importExisting':'Importar un proyecto existente de Claude/Codex/tmux',
   'common.cancel': 'Cancelar',
   'common.close': 'Cerrar',
   'common.loading': 'Cargando…',
@@ -20,7 +29,6 @@ export const esCatalog = {
   'common.issueCount': '{count, plural, one {# incidencia} other {# incidencias}}',
   'locale.loadFailed': 'No se pudo cargar el idioma seleccionado. Se usará inglés.',
   'locale.languageAria': 'Idioma',
-  'login.tagline': 'Tu asistente de ingeniería de bolsillo',
   'login.username': 'Nombre de usuario',
   'login.token': 'Token',
   'login.signingIn': 'Iniciando sesión…',
@@ -97,7 +105,7 @@ export const esCatalog = {
   'project.gitRequired':'Introduce una URL de repositorio Git','project.clonedCreated':'Repositorio clonado y proyecto creado','project.createdWarnings':'Creado con advertencias:\n{warnings}','project.newProject':'Nuevo proyecto',
   'project.chatModeHelp':'Modo chat: haz preguntas y crea archivos en el directorio del proyecto sin issues; cada proyecto puede tener varias conversaciones.','project.projectName':'Nombre del proyecto',
   'project.repoNameDefault':' (déjalo vacío para usar el nombre del repositorio)','project.cloneTo':'Clonar en','project.selectedUserHome':'carpeta personal del usuario seleccionado','project.yourWorkspace':'tu espacio de trabajo',
-  'project.pickDirectory':'Elegir un directorio','project.branchFallbackHelp':'El trabajo se realiza en la rama actual. MandoAI no crea, cambia ni fusiona ramas; este valor solo se usa si no se puede leer la rama actual.',
+  'project.pickDirectory':'Elegir un directorio','project.branchFallbackHelp':'El trabajo se realiza en la rama actual. PandaDOS no crea, cambia ni fusiona ramas; este valor solo se usa si no se puede leer la rama actual.',
   'project.cloning':'Clonando…','project.cloneCreate':'Clonar y crear','project.managed':'Gestionado n.º {id}','project.imported':'Importado n.º {id}','project.noPermission':'Sin permiso',
   'project.mergeInto':'Fusionar con n.º {id}','project.importedWarnings':'Importado con advertencias:\n{warnings}','project.importTmux':'Importar sesión de tmux','project.readingSessions':'Leyendo sesiones…',
   'project.noTmuxSessions':'No hay sesiones de tmux en este ejecutor','project.cwdUnavailable':'El directorio de trabajo no está disponible','project.sameDirectory':'Ya hay un proyecto que usa este directorio (n.º {id}); al importarlo se fusionará con él.',
@@ -189,7 +197,7 @@ export const esCatalog = {
   'admin.settings':'Ajustes','admin.remove':'Eliminar','admin.username':'Nombre de usuario (letras, números, _ y -)','admin.userSettings':'Ajustes de {name}','admin.autopilotDefault':'Activar el piloto automático por defecto en conversaciones nuevas','admin.notificationPref':'Preferencias de notificación (JSON)',
   'admin.settingsSaved':'Ajustes de {name} guardados','admin.deleteExecutorConfirm':'¿Eliminar el ejecutor {name}?','admin.executorDeleted':'Ejecutor {name} eliminado','admin.executorCount':'{count, plural, one {# ejecutor} other {# ejecutores}}','admin.registerExecutor':'Registrar ejecutor',
   'admin.agent':'Agente','admin.systemLocal':'Local del sistema','admin.noExecutors':'Todavía no hay ejecutores','admin.executorUpdated':'Ejecutor {name} actualizado','admin.executorRegistered':'Ejecutor {name} registrado','admin.name':'Nombre','admin.host':'Host (vacío significa ejecutor local)',
-  'admin.sshPort':'Puerto SSH','admin.sshUser':'Usuario SSH (opcional para el ejecutor local)','admin.keyRef':'Ruta o referencia de la clave privada (las referencias se cargan desde ~/.mando/keys/; vacío para local)','admin.chooseDirectory':'Elegir directorio',
+  'admin.sshPort':'Puerto SSH','admin.sshUser':'Usuario SSH (opcional para el ejecutor local)','admin.keyRef':'Ruta o referencia de la clave privada (las referencias se cargan desde ~/.panda/keys/; vacío para local)','admin.chooseDirectory':'Elegir directorio',
   'admin.connectionFirst':'Introduce un nombre y datos de conexión válidos antes de detectar o explorar directorios remotos.','admin.suggestion':'Sugerencia:','admin.useSuggestion':'Usar sugerencia','admin.editExecutor':'Editar ejecutor {name}',
   'admin.localFixed':'El ejecutor local del sistema siempre usa el host local y ajustes SSH fijos.','admin.availableAgents':'Agentes disponibles','admin.detecting':'Detectando…','admin.autoDetect':'Detección automática','admin.commandDetected':'Comando detectado','admin.directoryExists':'El directorio existe','admin.notDetected':'No detectado',
   'admin.workspaceRoot':'Raíz del espacio de trabajo','admin.advanced':'Ajustes avanzados (directorios de sesión de agentes)','admin.claudeDir':'Directorio de proyectos de Claude','admin.codexDir':'Directorio de sesiones de Codex','admin.project':'Proyecto','admin.status':'Estado','admin.owner':'Propietario',
@@ -200,4 +208,9 @@ export const esCatalog = {
   'notify.planGateTitle':'🚦 Plan pendiente de confirmación · issue n.º {id}','notify.mergeGateTitle':'🔍 Revisión previa a la fusión · issue n.º {id}','notify.oneTimeFooter':'Los botones funcionan una sola vez; añade comentarios de rechazo detallados en la aplicación web.',
   'notify.rejectNote':'Rechazada desde la tarjeta de Feishu; añade comentarios detallados en la aplicación web.','notify.invalidCard':'Callback de tarjeta no válido','notify.cardExpired':'Esta tarjeta ha caducado','notify.cardHandled':'Esta tarjeta ya se procesó','notify.cardNotYours':'Esta tarjeta no se te envió',
   'notify.gateUnavailable':'No se puede gestionar el punto de control; usa la aplicación web','notify.failed':'No se pudo completar la acción','notify.approved':'✅ Aprobada','notify.rejected':'❌ Rechazada; añade comentarios detallados en la aplicación web','notify.invalidSelection':'Callback de selección no válido','notify.selectedOption':'Opción {index} seleccionada',
+  'ui.organizeKindCreate':'Crear','ui.organizeKindRename':'Renombrar','ui.organizeKindMerge':'Fusionar','ui.organizeKindMove':'Mover issues',
+  'ui.organizeDescriptionCreate':'Crear el módulo “{name}” ({slug} · {agent})','ui.organizeDescriptionRename':'Cambiar “{name}”: {fromSlug} → {slug}','ui.organizeDescriptionRenameWithName':'Cambiar “{name}”: {fromSlug} → {slug} (nombre visible → “{displayName}”)','ui.organizeDescriptionMerge':'Fusionar {sources} en “{target}”','ui.organizeDescriptionMove':'Mover {issues} a “{target}”',
+  'ui.moduleIssueCount':'{count, plural, one {# issue relacionada} other {# issues relacionadas}}','ui.organizeResultCreate':'Se creó el módulo “{name}” ({slug} · {agent})','ui.organizeResultRename':'El módulo se renombró como “{name}” ({slug})','ui.organizeResultMerge':'{count, plural, one {Se fusionó en “{target}” y se movió # issue} other {Se fusionó en “{target}” y se movieron # issues}}','ui.organizeResultMove':'{count, plural, one {Se movió # issue a “{target}”} other {Se movieron # issues a “{target}”}}',
+  'ui.organizeFailureTimeout':'El último análisis agotó el tiempo de espera. Puedes volver a ejecutarlo.','ui.organizeFailureNoOutput':'El último análisis no devolvió un plan de organización. Puedes volver a ejecutarlo.','ui.organizeFailureError':'El último análisis falló. Puedes volver a ejecutarlo.','ui.organizeFailureDetail':'Detalles técnicos: {detail}',
+  'git.imageBefore':'Antes','git.imageAfter':'Después','git.openImage':'Abrir {name}','git.viewImage':'Ver imagen {name}','git.downloadImage':'Descargar {name}',
 } as const satisfies MessageCatalog;

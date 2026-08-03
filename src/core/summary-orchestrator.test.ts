@@ -56,7 +56,7 @@ describe('deriveShortSummary', () => {
     expect(s).not.toContain('*');
   });
   test('保留连字符（项目名不被切）', () => {
-    expect(deriveShortSummary('mando 是一个工具')).toBe('mando 是一个工具');
+    expect(deriveShortSummary('PandaDOS 是一个工具')).toBe('PandaDOS 是一个工具');
   });
   test('超 max 截断补省略号，长度不超 max', () => {
     const long = '很长的内容'.repeat(100);

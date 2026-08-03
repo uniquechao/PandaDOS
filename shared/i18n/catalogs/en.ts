@@ -4,6 +4,8 @@ import { commonUiMessages } from '../domains/common-ui';
 import { statusMessages } from '../domains/status';
 import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
+import { projectSettingsMessages } from '../domains/project-settings';
+import { externalImportMessages } from '../domains/external-import';
 
 export const enCatalog = {
   ...shellMessages.en,
@@ -12,6 +14,8 @@ export const enCatalog = {
   ...statusMessages.en,
   ...errorMessages.en,
   ...notifyMessages.en,
+  ...projectSettingsMessages.en,
+  ...externalImportMessages.en,
   'common.cancel': 'Cancel',
   'common.close': 'Close',
   'common.loading': 'Loading…',
@@ -19,7 +23,6 @@ export const enCatalog = {
   'common.issueCount': '{count, plural, one {# issue} other {# issues}}',
   'locale.loadFailed': 'Could not load the selected language. English is being used.',
   'locale.languageAria': 'Language',
-  'login.tagline': 'Your pocket engineering command center',
   'login.username': 'Username',
   'login.token': 'Token',
   'login.signingIn': 'Signing in…',

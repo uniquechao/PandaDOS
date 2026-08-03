@@ -13,7 +13,9 @@ import path from 'node:path';
 import { getExecutor, listExecutors, supportedAgents } from '../../core/executors';
 import { MAX_LIST_ENTRIES } from '../../core/files';
 import type { Executor, User } from '../../core/types';
+import { discoverExecutorAgentHistory } from '../../executor/agent-history';
 import type { DirEntry, PathStat, TmuxSession } from '../../executor/driver';
+import { apiError } from '../errors';
 import { json, type RouteDef } from '../middleware';
 
 // ---------- 依赖（与 ExecutorDriver 结构兼容的最小探查接口） ----------
@@ -99,7 +101,7 @@ export function safeDirName(name: string): string | null {
 
 // ---------- tmux 会话导入视角标注 ----------
 
-/** Mando 托管会话名（cc-<projectId> 及其 -console 等子命名空间） */
+/** PandaDOS 托管会话名（cc-<projectId> 及其 -console 等子命名空间） */
 export function managedProjectIdOf(name: string): number | null {
   const m = /^cc-(\d+)(?:-|$)/.exec(name);
   return m ? Number(m[1]) : null;
@@ -111,7 +113,7 @@ export interface TmuxSessionInfo {
   attached: boolean;
   cwd: string | null;
   command: string | null;
-  /** Mando 托管会话（cc-<pid> 命名空间且项目存在）→ 项目 id */
+  /** PandaDOS 托管会话（cc-<pid> 命名空间且项目存在）→ 项目 id */
   managedProjectId: number | null;
   /** 已经由 sessions 登记表导入 → 项目 id */
   importedProjectId: number | null;
@@ -226,6 +228,83 @@ export function executorsRoutes(deps: ExecutorsRoutesDeps): RouteDef[] {
           };
         });
         return json({ ok: true, sessions });
+      },
+    },
+    {
+      /**
+       * Claude/Codex 历史项目候选。普通用户只返回自己 workspace 内的 cwd，避免把执行机上
+       * 其他用户的项目路径、会话标题或数量泄露给浏览器；admin 可查看全部。
+       */
+      method: 'GET',
+      path: '/api/executors/:id/agent-projects',
+      auth: 'user',
+      handler: async ({ url, params, user }) => {
+        const u = user!;
+        const ex = execFromParams(params);
+        if (!ex) return json(apiError('executor.not_found', 'The executor does not exist.', 404), 404);
+        const agent = url.searchParams.get('agent');
+        if (agent !== 'claude' && agent !== 'codex') {
+          return json(apiError(
+            'executor.agent_invalid',
+            'Choose Claude or Codex as the agent.',
+            400,
+          ), 400);
+        }
+        if (agent === 'claude' ? !ex.supportsClaude : !ex.supportsCodex) {
+          return json(apiError(
+            'executor.agent_unavailable',
+            `${agent === 'claude' ? 'Claude' : 'Codex'} is not enabled on this executor.`,
+            409,
+            { agent: agent === 'claude' ? 'Claude' : 'Codex' },
+          ), 409);
+        }
+        const driver = deps.driverFor(ex);
+        if (!driver) {
+          return json(apiError(
+            'executor.connection_unavailable',
+            'The executor has no available connection.',
+            503,
+          ), 503);
+        }
+        const myRoot = `${ex.workspaceRoot.replace(/\/+$/, '')}/u${u.id}`;
+        const activeByCwd = new Map(
+          db
+            .query<{ id: number; cwd: string }, [number]>(
+              `SELECT id, cwd FROM projects
+               WHERE executor_id = ? AND status = 'active' ORDER BY id`,
+            )
+            .all(ex.id)
+            .map((project) => [project.cwd, project.id]),
+        );
+        try {
+          const history = await discoverExecutorAgentHistory(driver, {
+            ...ex,
+            supportsClaude: agent === 'claude',
+            supportsCodex: agent === 'codex',
+          });
+          const projects = history.projects
+            .filter((project) =>
+              project.agent === agent &&
+              (u.role === 'admin' || project.cwd === myRoot || project.cwd.startsWith(myRoot + '/')),
+            )
+            .map((project) => ({
+              agent: project.agent,
+              cwd: project.cwd,
+              name: project.name,
+              latestTs: project.latestTs,
+              sessionCount: project.sessions.length,
+              sameCwdProjectId: activeByCwd.get(project.cwd) ?? null,
+            }));
+          return json({ ok: true, projects });
+        } catch (e) {
+          return json(apiError(
+            'history.read_failed',
+            'Could not read local agent history.',
+            502,
+            {},
+            String(e).slice(0, 200),
+          ), 502);
+        }
       },
     },
     {

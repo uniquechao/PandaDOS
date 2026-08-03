@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  actionKindLabel,
-  actionLabel,
+  actionKindMessage,
+  actionMessage,
+  failureMessage,
   hasPendingSuggestion,
+  resultMessage,
   visibleSuggestion,
   type OrganizeActionView,
   type OrganizeStatus,
@@ -24,19 +26,27 @@ const act = (over: Partial<OrganizeActionView>): OrganizeActionView => ({
   ...over,
 });
 
-describe('actionLabel / actionKindLabel', () => {
-  test('四种动作各有人话描述（模块名用事件快照）', () => {
-    expect(actionKindLabel('move')).toBe('挪 issue');
+describe('organize 本地化消息描述', () => {
+  test('四种动作使用语义化消息键与原始结构化参数', () => {
+    expect(actionKindMessage('move')).toEqual({ key: 'ui.organizeKindMove' });
     expect(
-      actionLabel(act({ kind: 'create', slug: 'file-preview', displayName: '文件预览', agent: 'claude' })),
-    ).toBe('新建模块「文件预览」（file-preview · claude）');
+      actionMessage(act({ kind: 'create', slug: 'file-preview', displayName: '文件预览', agent: 'claude' })),
+    ).toEqual({
+      key: 'ui.organizeDescriptionCreate',
+      values: { name: '文件预览', slug: 'file-preview', agent: 'claude' },
+    });
     expect(
-      actionLabel(
+      actionMessage(
         act({ kind: 'rename', moduleId: 3, moduleName: 'Git 页面', fromSlug: 'legacy-module-01', slug: 'git-pages' }),
       ),
-    ).toBe('「Git 页面」：legacy-module-01 → git-pages');
+    ).toEqual({
+      key: 'ui.organizeDescriptionRename',
+      values: {
+        name: 'Git 页面', fromSlug: 'legacy-module-01', slug: 'git-pages', displayName: '?',
+      },
+    });
     expect(
-      actionLabel(
+      actionMessage(
         act({
           kind: 'rename',
           moduleName: '旧名',
@@ -45,16 +55,28 @@ describe('actionLabel / actionKindLabel', () => {
           displayName: '执行流',
         }),
       ),
-    ).toContain('显示名改为「执行流」');
+    ).toEqual({
+      key: 'ui.organizeDescriptionRenameWithName',
+      values: { name: '旧名', fromSlug: 'legacy-module-02', slug: 'exec-flow', displayName: '执行流' },
+    });
     expect(
-      actionLabel(act({ kind: 'merge', targetName: '执行', sourceNames: ['执行页面', '控制台'] })),
-    ).toBe('「执行页面」「控制台」 并入「执行」');
+      actionMessage(act({ kind: 'merge', targetName: '执行', sourceNames: ['执行页面', '控制台'] })),
+    ).toEqual({
+      key: 'ui.organizeDescriptionMerge',
+      values: { sources: '“执行页面” “控制台”', target: '执行' },
+    });
     expect(
-      actionLabel(act({ kind: 'move', issueIds: [3, 7], toName: '文件预览' })),
-    ).toBe('#3 #7 挪入「文件预览」');
-    expect(actionLabel(act({ kind: 'move', issueIds: [1], to: { slug: 'file-preview' } }))).toBe(
-      '#1 挪入「file-preview」',
-    );
+      actionMessage(act({ kind: 'move', issueIds: [3, 7], toName: '文件预览' })),
+    ).toEqual({ key: 'ui.organizeDescriptionMove', values: { issues: '#3 #7', target: '文件预览' } });
+  });
+
+  test('执行结果和失败原因只选择消息键，原始参数保持不变', () => {
+    expect(resultMessage({ kind: 'merge', params: { target: '执行', count: 2 } })).toEqual({
+      key: 'ui.organizeResultMerge',
+      values: { target: '执行', count: 2 },
+    });
+    expect(failureMessage('timeout')).toEqual({ key: 'ui.organizeFailureTimeout' });
+    expect(failureMessage('AI 原始 reason')).toEqual({ key: 'ui.organizeFailureError' });
   });
 });
 

@@ -96,7 +96,7 @@ describe('GET /api/me', () => {
     const { user, token } = users.create('alice', 'user');
     const login = await dispatch(post('/api/login', { username: 'alice', token }));
     const setCookie = login!.headers.get('set-cookie')!;
-    const cookiePair = setCookie.split(';')[0]!; // mando_token=<tok>
+    const cookiePair = setCookie.split(';')[0]!; // panda_token=<tok>
 
     const me = await dispatch(new Request('http://x/api/me', { headers: { cookie: cookiePair } }));
     expect(me!.status).toBe(200);

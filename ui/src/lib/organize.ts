@@ -2,8 +2,10 @@
  * ui/lib/organize —— 模块智能整理的展示/忽略纯函数。
  * 服务端 GET modules/organize 返回 running + 最近一次方案（动作已带模块名快照与 applied
  * 标记）。这里只管两件事：动作 → 人话一行描述；「忽略本批」语义（localStorage 按项目记
- * 方案 ts，同批不再打扰，新方案 ts 更大会重新出现）。
+ * 方案 ts，同批不再打扰，新方案 ts 更大会重新出现）。动作和结果只生成语义化消息描述，
+ * 模块名、slug、issue 标识与 AI reason 始终作为原始参数展示。
  */
+import type { MessageKey, MessageValues } from '../../../shared/i18n/messages';
 
 export type OrganizeActionKind = 'create' | 'rename' | 'merge' | 'move';
 
@@ -41,28 +43,76 @@ export interface OrganizeStatus {
   failed: { ts: number; reason: string; error?: string } | null;
 }
 
-/** 动作类型徽标文案 */
-export function actionKindLabel(kind: OrganizeActionKind): string {
-  return kind === 'create' ? '新建' : kind === 'rename' ? '改名' : kind === 'merge' ? '合并' : '挪 issue';
+export interface OrganizeApplyResult {
+  kind: OrganizeActionKind;
+  params: Readonly<Record<string, string | number>>;
 }
 
-/** 动作 → 一行人话（模块名用事件里的快照，改名/归档后仍可读） */
-export function actionLabel(a: OrganizeActionView): string {
+export interface LocalizedOrganizeMessage {
+  key: MessageKey;
+  values?: MessageValues;
+}
+
+/** 动作类型徽标消息。 */
+export function actionKindMessage(kind: OrganizeActionKind): LocalizedOrganizeMessage {
+  const keys: Record<OrganizeActionKind, MessageKey> = {
+    create: 'ui.organizeKindCreate',
+    rename: 'ui.organizeKindRename',
+    merge: 'ui.organizeKindMerge',
+    move: 'ui.organizeKindMove',
+  };
+  return { key: keys[kind] };
+}
+
+/** 动作 → 语义化消息与原始参数（模块名用事件里的快照，改名/归档后仍可读）。 */
+export function actionMessage(a: OrganizeActionView): LocalizedOrganizeMessage {
   if (a.kind === 'create') {
-    return `新建模块「${a.displayName ?? a.slug ?? '?'}」（${a.slug ?? '?'} · ${a.agent ?? '?'}）`;
+    return {
+      key: 'ui.organizeDescriptionCreate',
+      values: { name: a.displayName ?? a.slug ?? '?', slug: a.slug ?? '?', agent: a.agent ?? '?' },
+    };
   }
   if (a.kind === 'rename') {
     const name = a.moduleName ?? String(a.moduleId ?? '?');
-    const base = `「${name}」：${a.fromSlug ?? '?'} → ${a.slug ?? '?'}`;
-    return a.displayName && a.displayName !== a.moduleName ? `${base}（显示名改为「${a.displayName}」）` : base;
+    const values = { name, fromSlug: a.fromSlug ?? '?', slug: a.slug ?? '?', displayName: a.displayName ?? '?' };
+    return {
+      key: a.displayName && a.displayName !== a.moduleName
+        ? 'ui.organizeDescriptionRenameWithName'
+        : 'ui.organizeDescriptionRename',
+      values,
+    };
   }
   if (a.kind === 'merge') {
-    const sources = (a.sourceNames ?? a.sourceIds?.map(String) ?? []).map((n) => `「${n}」`).join('');
-    return `${sources} 并入「${a.targetName ?? a.targetId ?? '?'}」`;
+    const sources = (a.sourceNames ?? a.sourceIds?.map(String) ?? []).map((name) => `“${name}”`).join(' ');
+    return {
+      key: 'ui.organizeDescriptionMerge',
+      values: { sources, target: a.targetName ?? a.targetId ?? '?' },
+    };
   }
   const to = a.toName ?? (a.to && 'slug' in a.to ? a.to.slug : undefined) ?? '?';
   const ids = (a.issueIds ?? []).map((id) => `#${id}`).join(' ');
-  return `${ids} 挪入「${to}」`;
+  return { key: 'ui.organizeDescriptionMove', values: { issues: ids, target: to } };
+}
+
+/** 后端结构化执行结果 → 本地化消息。 */
+export function resultMessage(result: OrganizeApplyResult): LocalizedOrganizeMessage {
+  const keys: Record<OrganizeActionKind, MessageKey> = {
+    create: 'ui.organizeResultCreate',
+    rename: 'ui.organizeResultRename',
+    merge: 'ui.organizeResultMerge',
+    move: 'ui.organizeResultMove',
+  };
+  return {
+    key: keys[result.kind],
+    values: result.params,
+  };
+}
+
+/** 已知失败原因本地化；诊断详情由调用方原样追加。 */
+export function failureMessage(reason: string): LocalizedOrganizeMessage {
+  if (reason === 'timeout') return { key: 'ui.organizeFailureTimeout' };
+  if (reason === 'no-output') return { key: 'ui.organizeFailureNoOutput' };
+  return { key: 'ui.organizeFailureError' };
 }
 
 /**
@@ -87,7 +137,7 @@ export function hasPendingSuggestion(status: OrganizeStatus | null, dismissedTs:
   return !!s && s.actions.some((a) => !a.applied);
 }
 
-const DISMISS_KEY = 'mando.organizeDismiss';
+const DISMISS_KEY = 'panda.organizeDismiss';
 
 export function readOrganizeDismissedTs(pid: number): number | null {
   try {

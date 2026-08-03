@@ -14,7 +14,7 @@
  * capture-pane 会回显我们敲进去的内容，抓屏必误命中）。菜单（信任/权限弹窗）自动过，
  * codex 更新弹窗选 Skip——逻辑与 clarify-runner 一致。
  *
- * scratch 按项目隔离（.mando/tmp/organize/<projectId>/）；每项目单飞由引擎保证。
+ * scratch 按项目隔离（.panda/tmp/organize/<projectId>/）；每项目单飞由引擎保证。
  */
 import { DEFAULT_CODEX_ARGS } from '../core/conversations';
 import {
@@ -33,7 +33,7 @@ import { normalizeModuleSlug } from './modules';
 export type OrganizeDriver = SummaryDriver;
 
 /** scratch 根目录名（挂在项目 cwd 下；子目录按 projectId 隔离） */
-export const ORGANIZE_SCRATCH_BASE = '.mando/tmp/organize';
+export const ORGANIZE_SCRATCH_BASE = '.panda/tmp/organize';
 
 /** plan.json 读取上限（模块+issue 都很多时也远用不满） */
 const MAX_PLAN_BYTES = 128 * 1024;

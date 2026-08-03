@@ -11,12 +11,25 @@ import path from 'node:path';
 import type { LlmClient } from '../../agents/llm';
 import { userPromptLocale } from '../../agents/prompts/language';
 import type { SummaryTarget } from '../../core/agent-summary';
+import { PRODUCT_NAME } from '../../core/branding';
+import {
+  archiveHistoryConversations,
+  findBoundHistoryConversation,
+  type HistoryArchiveFs,
+  importableHistorySessions,
+  importHistoryConversations,
+} from '../../core/conversation-history';
 import { projectAgentSupport, supportedAgents } from '../../core/executors';
 import { ProjectMemberStore } from '../../core/members';
 import { generateProjectReadmeSummary, type ReadmeDriver } from '../../core/readme-summary';
 import type { AgentKind, Conversation, Executor, Project, ProjectKind, User } from '../../core/types';
+import {
+  discoverExecutorAgentHistory,
+  type AgentHistorySession,
+} from '../../executor/agent-history';
 import { getProject, mapProject } from '../../issues/engine';
 import { BUSY_STATES } from '../../issues/queue';
+import { apiError } from '../errors';
 import { json, type RouteDef } from '../middleware';
 import { llmErrorResponse } from '../llm-error';
 import {
@@ -41,7 +54,7 @@ export interface ProjectsRoutesDeps {
    * 可选：按执行机取 Driver（server.ts driverForExecutor）——导入现有 tmux 会话时
    * 到执行机上现查会话与 cwd。缺省 = 导入接口 503（测试/离线装配可不接）。
    */
-  driverFor?(executor: Executor): ExecutorProbe | null;
+  driverFor?(executor: Executor): (ExecutorProbe & HistoryArchiveFs) | null;
   /**
    * 可选：LLM 客户端（手动「更新简介」调 驱动大模型 用；与 PM 池共享并发闸）。
    * 缺省 = 更新简介接口 503（离线/测试装配可不接）。
@@ -305,6 +318,13 @@ async function cloneInto(
   }
 }
 
+type ProjectImportSource = 'tmux' | AgentKind;
+
+function parseImportSource(value: unknown): ProjectImportSource | null {
+  if (value === undefined || value === null || value === '') return 'tmux';
+  return value === 'tmux' || value === 'claude' || value === 'codex' ? value : null;
+}
+
 export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
   const { db } = deps;
   const members = new ProjectMemberStore(db);
@@ -502,82 +522,198 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
     },
     {
       /**
-       * 导入现有 tmux 会话为项目：到执行机现查会话拿 cwd（绝不信客户端报的路径），
-       * - 同执行机同 cwd 已有活跃项目 → 并入该项目（只补 sessions 登记，不重复建）；
-       * - 会话已登记 → 幂等返回既有项目；
-       * - cc-<pid> 托管命名空间 → 拒绝（本来就是 Mando 的会话）。
-       * 导入后项目控制台可直接 attach 该会话（ws/index.ts 按 sessions 登记放行）。
+       * 统一项目导入：
+       * - tmux：执行机现查 session/cwd 后登记终端 attach 权限；
+       * - claude/codex：执行机现扫 Agent 历史，以服务端候选核对 cwd，登记项目并批量绑定
+       *   kind=chat 的可恢复 conversations。
+       * 同执行机同 cwd 的活跃项目一律合并；会话标识重复时幂等，不复制历史或覆盖归属。
        */
       method: 'POST',
       path: '/api/projects/import',
       auth: 'user',
       handler: async ({ req, user }) => {
         const u = user!;
-        if (!deps.driverFor) return json({ ok: false, error: '未接入执行机驱动，无法导入' }, 503);
-        const b = await readBody(req);
-        const executorId = Number(b.executorId);
-        const sessionName = str(b, 'session');
-        if (!Number.isInteger(executorId) || executorId <= 0) {
-          return json({ ok: false, error: '缺 executorId' }, 400);
+        if (!deps.driverFor) {
+          return json(apiError(
+            'executor.driver_unavailable',
+            'Executor operations are unavailable because no driver is configured.',
+            503,
+          ), 503);
         }
-        // 与 ws/index.ts 终端会话名同一白名单
-        if (!sessionName || !/^[\w.-]+$/.test(sessionName)) {
-          return json({ ok: false, error: '缺 session 或含非法字符' }, 400);
+        const b = await readBody(req);
+        const source = parseImportSource(b.source);
+        if (!source) {
+          return json(apiError(
+            'project.import_source_invalid',
+            'Choose tmux, Claude, or Codex as the import source.',
+            400,
+          ), 400);
+        }
+        const executorId = Number(b.executorId);
+        if (!Number.isInteger(executorId) || executorId <= 0) {
+          return json(apiError('executor.id_required', 'An executor ID is required.', 400), 400);
         }
         const ex = getExecutorById(db, executorId);
-        if (!ex) return json({ ok: false, error: '无此执行机' }, 400);
-
-        const managed = managedProjectIdOf(sessionName);
-        if (managed !== null && getProject(db, managed)) {
-          return json(
-            { ok: false, error: `这是 Mando 托管会话（项目 #${managed}），无需导入`, projectId: managed },
-            400,
-          );
-        }
-
+        if (!ex) return json(apiError('executor.not_found', 'The executor does not exist.', 400), 400);
         const driver = deps.driverFor(ex);
-        if (!driver) return json({ ok: false, error: '执行机暂无可用连接' }, 503);
-        let live;
-        try {
-          live = await driver.listSessions();
-        } catch (e) {
-          return json({ ok: false, error: `读取 tmux 会话失败：${String(e).slice(0, 200)}` }, 502);
-        }
-        const s = live.find((x) => x.name === sessionName);
-        if (!s) return json({ ok: false, error: '执行机上无此 tmux 会话' }, 404);
-        const cwd = s.cwd;
-        if (!cwd || !cwd.startsWith('/')) {
-          return json({ ok: false, error: '拿不到会话工作目录（执行机 tmux 版本过旧？）' }, 502);
+        if (!driver) {
+          return json(apiError(
+            'executor.connection_unavailable',
+            'The executor has no available connection.',
+            503,
+          ), 503);
         }
 
-        // 已登记 → 幂等返回既有项目（他人已导入则拒绝，不改归属）
-        const reg = db
-          .query<{ project_id: number }, [string]>('SELECT project_id FROM sessions WHERE name = ?')
-          .get(sessionName);
-        if (reg) {
-          const p = getProject(db, reg.project_id);
-          if (p) {
-            if (u.role !== 'admin' && p.ownerUserId !== u.id) {
-              return json({ ok: false, error: '该会话已被其他用户导入' }, 403);
-            }
-            return json({ ok: true, project: p, created: false });
+        let cwd: string;
+        let defaultName: string;
+        let sessionName: string | null = null;
+        let historySessions: AgentHistorySession[] = [];
+
+        if (source === 'tmux') {
+          sessionName = str(b, 'session') ?? null;
+          // 与 ws/index.ts 终端会话名同一白名单
+          if (!sessionName || !/^[\w.-]+$/.test(sessionName)) {
+            return json(apiError(
+              'project.import_session_invalid',
+              'Enter a valid tmux session name.',
+              400,
+            ), 400);
           }
-          // 登记指向的项目已被真删 → 视同未登记，下面重建并覆盖登记
+          const managed = managedProjectIdOf(sessionName);
+          if (managed !== null && getProject(db, managed)) {
+            return json(
+              {
+                ...apiError(
+                  'project.import_managed_session',
+                  `This tmux session is managed by ${PRODUCT_NAME} as project #${managed} and does not need to be imported.`,
+                  400,
+                  { projectId: managed },
+                ),
+                projectId: managed,
+              },
+              400,
+            );
+          }
+          let live;
+          try {
+            live = await driver.listSessions();
+          } catch (e) {
+            return json(apiError(
+              'project.import_tmux_read_failed',
+              'Could not read tmux sessions from the executor.',
+              502,
+              {},
+              String(e).slice(0, 200),
+            ), 502);
+          }
+          const tmux = live.find((item) => item.name === sessionName);
+          if (!tmux) {
+            return json(apiError(
+              'project.import_tmux_not_found',
+              'The tmux session does not exist on this executor.',
+              404,
+            ), 404);
+          }
+          if (!tmux.cwd || !tmux.cwd.startsWith('/')) {
+            return json(apiError(
+              'project.import_tmux_cwd_unavailable',
+              'Could not determine the tmux session’s working directory. The executor may be using an older tmux version.',
+              502,
+            ), 502);
+          }
+          cwd = tmux.cwd.length > 1 ? tmux.cwd.replace(/\/+$/, '') : tmux.cwd;
+          defaultName = sessionName;
+
+          // 已登记 → 幂等返回既有项目（他人已导入则拒绝，不改归属）
+          const reg = db
+            .query<{ project_id: number }, [string]>('SELECT project_id FROM sessions WHERE name = ?')
+            .get(sessionName);
+          if (reg) {
+            const project = getProject(db, reg.project_id);
+            if (project) {
+              if (u.role !== 'admin' && project.ownerUserId !== u.id) {
+                return json(apiError(
+                  'project.import_session_assigned',
+                  'This session was imported by another user.',
+                  403,
+                ), 403);
+              }
+              return json({ ok: true, project, created: false });
+            }
+          }
+        } else {
+          if (source === 'claude' ? !ex.supportsClaude : !ex.supportsCodex) {
+            const agent = source === 'claude' ? 'Claude' : 'Codex';
+            return json(apiError(
+              'executor.agent_unavailable',
+              `${agent} is not enabled on this executor.`,
+              409,
+              { agent },
+            ), 409);
+          }
+          const requestedCwd = str(b, 'cwd');
+          if (!requestedCwd || !requestedCwd.startsWith('/')) {
+            return json(apiError(
+              'project.import_cwd_invalid',
+              'Enter an absolute working directory.',
+              400,
+            ), 400);
+          }
+          const normalizedCwd = requestedCwd.length > 1 ? requestedCwd.replace(/\/+$/, '') : requestedCwd;
+          let history;
+          try {
+            history = await discoverExecutorAgentHistory(driver, {
+              ...ex,
+              supportsClaude: source === 'claude',
+              supportsCodex: source === 'codex',
+            });
+          } catch (e) {
+            return json(apiError(
+              'history.read_failed',
+              'Could not read local agent history.',
+              502,
+              {},
+              String(e).slice(0, 200),
+            ), 502);
+          }
+          const candidate = history.projects.find(
+            (project) => project.agent === source && project.cwd === normalizedCwd,
+          );
+          const importableSessions = candidate
+            ? importableHistorySessions(db, candidate.sessions)
+            : [];
+          if (!candidate || importableSessions.length === 0) {
+            return json(apiError(
+              'project.import_project_not_found',
+              'No matching project was found in the executor’s agent history.',
+              404,
+            ), 404);
+          }
+          cwd = candidate.cwd;
+          defaultName = candidate.name;
+          historySessions = importableSessions;
         }
 
         // 归属：默认自己；admin 可代建（与建项目同一纪律）
         let ownerUserId = u.id;
         if (b.ownerUserId !== undefined) {
-          if (u.role !== 'admin') return json({ ok: false, error: '仅 admin 可指定归属' }, 403);
+          if (u.role !== 'admin') {
+            return json(apiError('auth.admin_required', 'Administrator access is required.', 403), 403);
+          }
           const oid = Number(b.ownerUserId);
           const owner = db.query<{ id: number }, [number]>('SELECT id FROM users WHERE id = ?').get(oid);
-          if (!owner) return json({ ok: false, error: '无此用户' }, 400);
+          if (!owner) return json(apiError('user.not_found', 'The user does not exist.', 400), 400);
           ownerUserId = oid;
         }
         // 越权面与建项目一致：普通用户只能导入自己 workspace 内的会话
         const myRoot = `${ex.workspaceRoot.replace(/\/+$/, '')}/u${ownerUserId}`;
         if (u.role !== 'admin' && cwd !== myRoot && !cwd.startsWith(myRoot + '/')) {
-          return json({ ok: false, error: `只能导入自己 workspace（${myRoot}）内的会话` }, 403);
+          return json(apiError(
+            'project.import_workspace_forbidden',
+            `Only sessions in your workspace (${myRoot}) can be imported.`,
+            403,
+            { root: myRoot },
+          ), 403);
         }
         const ru = parseRunUser(b, u);
         if (ru.error) return ru.error;
@@ -595,41 +731,109 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
         if (same) {
           project = mapProject(same);
           if (u.role !== 'admin' && project.ownerUserId !== u.id) {
-            return json({ ok: false, error: '该目录已有其他用户的项目，无法并入' }, 403);
+            return json(apiError(
+              'project.import_directory_owned',
+              'Another user already has a project in this directory.',
+              403,
+            ), 403);
           }
         } else {
-          const name = (str(b, 'name') ?? sessionName).slice(0, 100);
+          if (
+            source !== 'tmux' &&
+            historySessions.every((session) => findBoundHistoryConversation(db, session) !== null)
+          ) {
+            return json(apiError(
+              'project.import_history_assigned',
+              'All history sessions for this project already belong to other projects.',
+              409,
+            ), 409);
+          }
+          const name = (str(b, 'name') ?? defaultName).slice(0, 100);
           const row = db
             .query<
               ProjectRowRaw,
-              [string, number, string, number, string | null, number, string]
+              [string, number, string, number, string | null, number, string, ProjectKind]
             >(
-              `INSERT INTO projects (name, executor_id, cwd, owner_user_id, goal, created_ts, run_user)
-               VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+              `INSERT INTO projects
+                 (name, executor_id, cwd, owner_user_id, goal, created_ts, run_user, kind)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
             )
-            .get(name, executorId, cwd, ownerUserId, str(b, 'goal')?.slice(0, 2000) ?? null, Date.now(), ru.value ?? '');
-          if (!row) return json({ ok: false, error: '创建失败' }, 500);
+            .get(
+              name,
+              executorId,
+              cwd,
+              ownerUserId,
+              str(b, 'goal')?.slice(0, 2000) ?? null,
+              Date.now(),
+              ru.value ?? '',
+              source === 'tmux' ? 'issue' : 'chat',
+            );
+          if (!row) {
+            return json(apiError(
+              'project.import_create_failed',
+              'Could not create the imported project.',
+              500,
+            ), 500);
+          }
           project = mapProject(row);
           created = true;
-          if (deps.notify) {
+        }
+
+        if (source === 'tmux') {
+          // 登记 tmux 会话（name 主键 upsert）——ws 终端据此放行该项目 attach 此会话
+          db.query(
+            `INSERT INTO sessions (name, executor_id, project_id, owner_user_id) VALUES (?, ?, ?, ?)
+             ON CONFLICT(name) DO UPDATE SET
+               executor_id = excluded.executor_id,
+               project_id = excluded.project_id,
+               owner_user_id = excluded.owner_user_id`,
+          ).run(sessionName!, executorId, project.id, ownerUserId);
+          if (created && deps.notify) {
             try {
               deps.notify.ensureOwnerSubscription(project.id, ownerUserId);
             } catch (e) {
               warnings.push(`属主自动订阅失败：${String(e).slice(0, 200)}`);
             }
           }
+          return json({ ok: true, project, created, ...(warnings.length ? { warnings } : {}) });
         }
 
-        // 登记 tmux 会话（name 主键 upsert）——ws 终端据此放行该项目 attach 此会话
-        db.query(
-          `INSERT INTO sessions (name, executor_id, project_id, owner_user_id) VALUES (?, ?, ?, ?)
-           ON CONFLICT(name) DO UPDATE SET
-             executor_id = excluded.executor_id,
-             project_id = excluded.project_id,
-             owner_user_id = excluded.owner_user_id`,
-        ).run(sessionName, executorId, project.id, ownerUserId);
-
-        return json({ ok: true, project, created, ...(warnings.length ? { warnings } : {}) });
+        let historyResult;
+        try {
+          const archivableSessions = historySessions.filter((session) => {
+            const bound = findBoundHistoryConversation(db, session);
+            return !bound || bound.projectId === project.id;
+          });
+          await archiveHistoryConversations(driver, project.cwd, archivableSessions);
+          historyResult = importHistoryConversations(db, project.id, historySessions);
+        } catch (e) {
+          // 本请求新建的空项目可以安全回滚；合并既有项目时事务已回滚所有会话插入。
+          if (created) db.query('DELETE FROM projects WHERE id = ?').run(project.id);
+          return json(apiError(
+            'project.import_history_failed',
+            'Could not register the project’s history sessions.',
+            500,
+            {},
+            String(e).slice(0, 200),
+          ), 500);
+        }
+        if (created && deps.notify) {
+          try {
+            deps.notify.ensureOwnerSubscription(project.id, ownerUserId);
+          } catch (e) {
+            warnings.push(`属主自动订阅失败：${String(e).slice(0, 200)}`);
+          }
+        }
+        return json({
+          ok: true,
+          project,
+          created,
+          importedConversations: historyResult.importedIds.length,
+          existingConversations: historyResult.existingIds.length,
+          skippedConversations: historyResult.conflicts.length,
+          conversationIds: [...historyResult.importedIds, ...historyResult.existingIds],
+          ...(warnings.length ? { warnings } : {}),
+        });
       },
     },
     {

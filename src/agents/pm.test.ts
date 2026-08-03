@@ -73,6 +73,7 @@ const noopDriver = {
   mkdirp: async () => {},
   movePath: async () => {},
   git: async () => ({ code: 0, out: '', err: '' }),
+  readGitBlob: async () => ({ code: 0, data: new Uint8Array(), err: '' }),
   openPty: async () => {
     throw new Error('nope');
   },

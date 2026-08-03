@@ -38,7 +38,7 @@ export function createMockChat(onFrame: (raw: string) => void): MockHandle {
   const emit = (obj: unknown, delay = 0): void => {
     timers.push(window.setTimeout(() => onFrame(JSON.stringify(obj)), delay));
   };
-  emit({ type: 'baseline', msgs: BASE_MSGS, selection: MENU }, 200);
+  emit({ type: 'baseline', msgs: BASE_MSGS, hasMore: false, selection: MENU }, 200);
   return {
     send(data) {
       if (typeof data !== 'string') return;

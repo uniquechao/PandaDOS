@@ -19,6 +19,8 @@ export interface CompatDriver {
   statPath(path: string): Promise<object | null>;
   readFileRange(path: string, offset: number, limit: number): Promise<{ data: Uint8Array; size: number }>;
   writeFile(path: string, data: Uint8Array | string, mode?: number): Promise<void>;
+  /** 升级时仅用于清除带自动生成标记的旧品牌技能目录。 */
+  removeTree?(path: string): Promise<void>;
 }
 
 export interface CompatHomes {
@@ -28,18 +30,21 @@ export interface CompatHomes {
   codexHome?: string;
 }
 
-const GEN_MARK = 'mando 自动生成';
-const MODULE_GUIDE_START = '<!-- mando:module-guide:start -->';
-const MODULE_GUIDE_END = '<!-- mando:module-guide:end -->';
+const GEN_MARK = 'panda 自动生成';
+const LEGACY_GEN_MARK = 'mando 自动生成';
+const MODULE_GUIDE_START = '<!-- panda:module-guide:start -->';
+const MODULE_GUIDE_END = '<!-- panda:module-guide:end -->';
+const LEGACY_MODULE_GUIDE_START = '<!-- mando:module-guide:start -->';
+const LEGACY_MODULE_GUIDE_END = '<!-- mando:module-guide:end -->';
 
-export const MANDO_ISSUE_SKILL = `---
-name: mando-issue
-description: Use whenever working on an issue or module in a repository containing .mando/modules/INDEX.md, or when a prompt provides a Mando module or issue process-page path.
+export const PANDA_ISSUE_SKILL = `---
+name: panda-issue
+description: Use whenever working on an issue or module in a repository containing .panda/modules/INDEX.md, or when a prompt provides a PandaDOS module or issue process-page path.
 ---
 
-# Mando Issue 模块记忆（${GEN_MARK}）
+# PandaDOS Issue 模块记忆（${GEN_MARK}）
 
-1. 从当前工作目录向上定位项目根目录，先读 \`.mando/modules/INDEX.md\`。
+1. 从当前工作目录向上定位项目根目录，先读 \`.panda/modules/INDEX.md\`。
 2. 读取当前模块的 \`MODULE.md\`，再读 prompt 指定的 issue 过程页。
 3. 实施中只记录关键设计、决策、文件和测试，不写逐条终端流水。
 4. 完成前更新 issue 过程页；只有长期仍有效的知识才提炼回 \`MODULE.md\`。
@@ -47,10 +52,10 @@ description: Use whenever working on an issue or module in a repository containi
 `;
 
 const MODULE_GUIDE_BLOCK = `${MODULE_GUIDE_START}
-## Mando issue 模块记忆
+## PandaDOS issue 模块记忆
 
-处理 issue 或修改代码前，先读取 \`.mando/modules/INDEX.md\`，再读取当前模块的
-\`MODULE.md\` 和当前 issue 过程页。遵循全局技能 \`mando-issue\`：实施中维护过程页，
+处理 issue 或修改代码前，先读取 \`.panda/modules/INDEX.md\`，再读取当前模块的
+\`MODULE.md\` 和当前 issue 过程页。遵循全局技能 \`panda-issue\`：实施中维护过程页，
 完成时只把长期有效的知识提炼回模块文档，不记录逐条终端流水。
 ${MODULE_GUIDE_END}`;
 
@@ -197,22 +202,34 @@ export async function ensureArtifactSkill(d: CompatDriver, homes: CompatHomes): 
 }
 
 /** Claude/Codex 双侧安装同源的模块 issue 工作流技能。人工文件不覆盖。 */
-export async function ensureMandoIssueSkill(d: CompatDriver, homes: CompatHomes): Promise<string[]> {
+export async function ensurePandaIssueSkill(d: CompatDriver, homes: CompatHomes): Promise<string[]> {
   const wrote: string[] = [];
-  const rel = 'skills/mando-issue/SKILL.md';
+  const rel = 'skills/panda-issue/SKILL.md';
   for (const home of [homes.claudeHome, homes.codexHome]) {
     if (!home) continue;
-    const path = `${home.replace(/\/+$/, '')}/${rel}`;
+    const normalizedHome = home.replace(/\/+$/, '');
+    const legacyDir = `${normalizedHome}/skills/mando-issue`;
+    const legacySkill = await readText(d, `${legacyDir}/SKILL.md`);
+    if (
+      d.removeTree &&
+      legacySkill?.includes(LEGACY_GEN_MARK) &&
+      legacySkill.includes('name: mando-issue') &&
+      legacySkill.includes('.mando/modules/INDEX.md')
+    ) {
+      await d.removeTree(legacyDir);
+      wrote.push(legacyDir);
+    }
+    const path = `${normalizedHome}/${rel}`;
     const existing = await readText(d, path);
-    if (existing === MANDO_ISSUE_SKILL) continue;
+    if (existing === PANDA_ISSUE_SKILL) continue;
     if (existing !== null && !existing.includes(GEN_MARK)) continue;
-    await d.writeFile(path, MANDO_ISSUE_SKILL);
+    await d.writeFile(path, PANDA_ISSUE_SKILL);
     wrote.push(path);
   }
   return wrote;
 }
 
-/** 在已存在的根指南中幂等维护模块入口；只动本系统标记区块。 */
+/** 在已存在的根指南中幂等维护模块入口；清除旧品牌托管区块，只保留 PandaDOS 入口。 */
 export async function ensureModuleGuideBlocks(d: CompatDriver, cwd: string): Promise<string[]> {
   const root = cwd.replace(/\/+$/, '');
   const wrote: string[] = [];
@@ -222,16 +239,21 @@ export async function ensureModuleGuideBlocks(d: CompatDriver, cwd: string): Pro
     if (existing === null) {
       const heading =
         name === 'CLAUDE.md'
-          ? '# CLAUDE.md —— Mando 项目入口\n\n@AGENTS.md\n'
-          : '# AGENTS.md —— Mando 项目入口\n';
+          ? '# CLAUDE.md —— PandaDOS 项目入口\n\n@AGENTS.md\n'
+          : '# AGENTS.md —— PandaDOS 项目入口\n';
       await d.writeFile(path, `${heading}\n${MODULE_GUIDE_BLOCK}\n`);
       wrote.push(path);
       continue;
     }
+    const legacyRe = new RegExp(
+      `\\n?${LEGACY_MODULE_GUIDE_START}[\\s\\S]*?${LEGACY_MODULE_GUIDE_END}\\n?`,
+      'g',
+    );
+    const cleaned = existing.replace(legacyRe, '\n');
     const re = new RegExp(`${MODULE_GUIDE_START}[\\s\\S]*?${MODULE_GUIDE_END}`);
-    const next = re.test(existing)
-      ? existing.replace(re, MODULE_GUIDE_BLOCK)
-      : `${existing}${existing.endsWith('\n') ? '' : '\n'}\n${MODULE_GUIDE_BLOCK}\n`;
+    const next = re.test(cleaned)
+      ? cleaned.replace(re, MODULE_GUIDE_BLOCK)
+      : `${cleaned}${cleaned.endsWith('\n') ? '' : '\n'}\n${MODULE_GUIDE_BLOCK}\n`;
     if (next === existing) continue;
     await d.writeFile(path, next);
     wrote.push(path);

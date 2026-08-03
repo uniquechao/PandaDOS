@@ -51,7 +51,7 @@ async function setup(opts: {
   modules?: boolean;
   organize?: EngineDeps['organize'];
 } = {}) {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-routes-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-routes-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
   const db = openDb(':memory:');
   migrate(db);
@@ -351,6 +351,42 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     expect(['pending', 'planning']).toContain(ub.body.issue.status);
   });
 
+  test('PATCH 子任务只修改未派发项，并返回稳定错误码', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(1, { title: '编辑子任务', implMode: 'seq' });
+    s.engine.store.setSubtasks(issue.id, ['当前项', '后续项']);
+    await s.engine.applyEvent(issue.id, 'plan_ready');
+    const gate = s.engine.store.listGates(issue.id).find((candidate) => candidate.kind === 'plan')!;
+    await s.engine.decideGate(gate.id, s.alice.user.id, 'approve');
+    const base = `/api/projects/1/issues/${issue.id}/subtasks`;
+
+    const updated = await j(s.dispatch(req('PATCH', `${base}/1`, s.alice.token, { text: '更新后的后续项' })));
+    expect(updated.status).toBe(200);
+    expect(updated.body.subtask).toEqual({ text: '更新后的后续项', done: false });
+
+    const current = await j(s.dispatch(req('PATCH', `${base}/0`, s.alice.token, { text: '偷改当前项' })));
+    expect(current.status).toBe(409);
+    expect(current.body.error.code).toBe('issue.subtask_already_dispatched');
+
+    const empty = await j(s.dispatch(req('PATCH', `${base}/1`, s.alice.token, { text: '   ' })));
+    expect(empty.status).toBe(400);
+    expect(empty.body.error.code).toBe('issue.subtask_text_required');
+
+    const tooLong = await j(s.dispatch(req('PATCH', `${base}/1`, s.alice.token, { text: '字'.repeat(501) })));
+    expect(tooLong.status).toBe(400);
+    expect(tooLong.body.error.code).toBe('issue.subtask_text_too_long');
+    expect(tooLong.body.error.params).toEqual({ max: 500 });
+
+    const missing = await j(s.dispatch(req('PATCH', `${base}/9`, s.alice.token, { text: '不存在' })));
+    expect(missing.status).toBe(404);
+    expect(missing.body.error.code).toBe('issue.subtask_not_found');
+    expect(
+      (await j(s.dispatch(req('PATCH', `/api/projects/2/issues/${issue.id}/subtasks/1`, s.alice.token, {
+        text: '跨项目',
+      })))).status,
+    ).toBe(404);
+  });
+
   test('#93 编辑守卫放宽到 cancelled：取消的可改内容，done/blocked/驱动中仍拒', async () => {
     const s = await setup();
     // #1 建完即开跑（驱动态），#2 留在 pending
@@ -434,7 +470,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     expect(calls[2]!.title).toBe('B2');
 
     // 截图变（加图）→ 重析
-    const img = '.mando/uploads/x/shot.png';
+    const img = '.panda/uploads/x/shot.png';
     await j(s.dispatch(req('PATCH', `/api/projects/1/issues/${iid}`, s.alice.token, { images: [img] })));
     await s.engine.waitClarify();
     expect(calls.length).toBe(4);
@@ -694,20 +730,20 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
         req('POST', '/api/projects/1/issues', s.alice.token, {
           title: 'B',
           images: [
-            '.mando/uploads/abc/a.png', // 合法：上传目录内
+            '.panda/uploads/abc/a.png', // 合法：上传目录内
             7, // 非字符串
             '', // 空串
             'b.png', // 不在上传目录
-            '.mando/uploads/../secret', // 越界
+            '.panda/uploads/../secret', // 越界
             '/etc/passwd', // 绝对路径伪造
-            './.mando/uploads/def/b.png', // 合法：./ 前缀归一
+            './.panda/uploads/def/b.png', // 合法：./ 前缀归一
           ],
         }),
       ),
     );
     expect(JSON.parse(created.body.issue.imagesJson)).toEqual([
-      '.mando/uploads/abc/a.png',
-      './.mando/uploads/def/b.png',
+      '.panda/uploads/abc/a.png',
+      './.panda/uploads/def/b.png',
     ]);
   });
 
@@ -941,27 +977,27 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
       s.dispatch(
         req('PATCH', `/api/projects/1/issues/${iid}`, s.alice.token, {
           images: [
-            '.mando/uploads/abc/a.png',
+            '.panda/uploads/abc/a.png',
             7, // 非字符串
             'x.png', // 不在上传目录
-            '.mando/uploads/../secret', // 越界
-            './.mando/uploads/def/b.png', // ./ 前缀归一
+            '.panda/uploads/../secret', // 越界
+            './.panda/uploads/def/b.png', // ./ 前缀归一
           ],
         }),
       ),
     );
     expect(p1.status).toBe(200);
     expect(JSON.parse(p1.body.issue.imagesJson)).toEqual([
-      '.mando/uploads/abc/a.png',
-      './.mando/uploads/def/b.png',
+      '.panda/uploads/abc/a.png',
+      './.panda/uploads/def/b.png',
     ]);
 
     // 不带 images 的 PATCH：旧图原样保留（缺省不碰）
     const p2 = await j(s.dispatch(req('PATCH', `/api/projects/1/issues/${iid}`, s.alice.token, { title: 'B2' })));
     expect(p2.status).toBe(200);
     expect(JSON.parse(p2.body.issue.imagesJson)).toEqual([
-      '.mando/uploads/abc/a.png',
-      './.mando/uploads/def/b.png',
+      '.panda/uploads/abc/a.png',
+      './.panda/uploads/def/b.png',
     ]);
 
     // 清图：images: [] → images_json 置 null
@@ -1112,7 +1148,10 @@ describe('模块管理路由：智能整理 / 执行合并 / 改名归档', () =
     expect((await j(s.dispatch(req('POST', '/api/projects/1/modules/organize/apply', s.alice.token, {})))).status).toBe(400);
     const ap = await j(s.dispatch(req('POST', '/api/projects/1/modules/organize/apply', s.alice.token, { index: 0 })));
     expect(ap.status).toBe(200);
-    expect(ap.body.summary).toContain('git-pages');
+    expect(ap.body.result).toEqual({
+      kind: 'rename',
+      params: { name: 'Git 页面', slug: 'git-pages' },
+    });
     expect(s.moduleStore.get(m1.id)!.slug).toBe('git-pages');
     // 防重放 + applied 标记
     expect((await j(s.dispatch(req('POST', '/api/projects/1/modules/organize/apply', s.alice.token, { index: 0 })))).status).toBe(400);

@@ -19,6 +19,7 @@
  */
 import type { Database } from 'bun:sqlite';
 import type { I18nApi } from '../../shared/i18n/formatter';
+import { PRODUCT_NAME } from '../core/branding';
 import { buildGateCard, gateSummary } from './cards';
 import {
   GateRequestStore,
@@ -114,7 +115,7 @@ export const CARD_REJECT_NOTE = 'Rejected from the Feishu card; add detailed fee
 
 /** 绑定验证的测试消息文案 */
 export const BIND_TEST_TEXT =
-  '✅ MandoAI connection test: this message confirms that notifications can reach you.';
+  `✅ ${PRODUCT_NAME} connection test: this message confirms that notifications can reach you.`;
 
 /**
  * 卡点决定转发（issue-engine decideGate 骨架签名的结构化镜像；

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { IntlMessageFormat } from 'intl-messageformat';
 import { unlinkSync } from 'node:fs';
 import { catalogs } from './catalogs';
-import { assertCatalogParity, scanUserVisibleLiterals } from './guard';
+import { assertCatalogParity, scanApiErrorExits, scanUserVisibleLiterals } from './guard';
 import { shellMessages } from './domains/shell';
 import { SUPPORTED_LOCALES } from './locales';
 import { pseudoCatalog, pseudoMessage } from './pseudo';
@@ -29,6 +29,14 @@ describe('i18n guardrails', () => {
       '{count, plural, one {# task} other {# tasks}}',
       '{count, plural, one {# задача} other {# задач}}',
     ), SUPPORTED_LOCALES)).toThrow(/ru:message: ICU plural count categories/);
+  });
+
+  test('new count messages must use ICU plural syntax', () => {
+    const plainCountCatalogs = Object.fromEntries(
+      SUPPORTED_LOCALES.map((locale) => [locale, { 'new.itemTotal': '{count} items' }]),
+    ) as unknown as Parameters<typeof assertCatalogParity>[0];
+    expect(() => assertCatalogParity(plainCountCatalogs, SUPPORTED_LOCALES))
+      .toThrow(/en:new\.itemTotal: count must use ICU plural/);
   });
 
   test('Russian shell counts use one, few, many, and other forms', () => {
@@ -86,16 +94,71 @@ describe('i18n guardrails', () => {
     }
   });
 
+  test('literal scanner catches user-visible helper returns and fixed-language default labels', () => {
+    const file = new URL('./__guard_helpers_fixture.ts', import.meta.url).pathname;
+    Bun.write(file, `
+      export function actionLabel(kind: boolean): string {
+        return kind ? '新建' : \`挪入 \${kind}\`;
+      }
+      const fallbackLabel = agent === 'claude' ? 'Claude 历史会话' : 'Codex 历史会话';
+      export function actionMessage() { return { key: 'ui.action', values: { fallbackLabel } }; }
+    `);
+    try {
+      expect(scanUserVisibleLiterals([file])).toEqual([
+        expect.objectContaining({ kind: 'helper-return', text: '新建' }),
+        expect.objectContaining({ kind: 'helper-return', text: '挪入 ${kind}' }),
+        expect.objectContaining({ kind: 'default-label', text: 'Claude 历史会话' }),
+        expect.objectContaining({ kind: 'default-label', text: 'Codex 历史会话' }),
+      ]);
+    } finally {
+      unlinkSync(file);
+    }
+  });
+
+  test('API scanner rejects legacy error bodies and fixed-language fallbacks in protected routes', () => {
+    const file = new URL('./__guard_api_fixture.ts', import.meta.url).pathname;
+    Bun.write(file, `
+      const routes = [{
+        path: '/api/import',
+        handler() {
+          if (legacy) return json({ ok: false, error: '导入失败' }, 400);
+          return json(apiError('import.failed', '导入失败', 500), 500);
+        },
+      }];
+    `);
+    try {
+      expect(scanApiErrorExits([file], ['/api/import'])).toEqual([
+        expect.objectContaining({ kind: 'api-error', text: '导入失败' }),
+        expect.objectContaining({ kind: 'api-error', text: '导入失败' }),
+      ]);
+    } finally {
+      unlinkSync(file);
+    }
+  });
+
   test('application UI contains no direct user-visible copy', async () => {
     const files: string[] = [];
     for await (const file of new Bun.Glob('ui/src/**/*.{ts,tsx}').scan('.')) {
       if (!file.endsWith('.test.ts') && !file.endsWith('.test.tsx')) files.push(file);
     }
     expect(scanUserVisibleLiterals(files, { values: [
-      'Mando', 'MandoAI', 'MandoAI ·', 'AI', 'Git', 'codex', 'issue', 'Issue #', 'DEBUG', 'admin', 'user',
+      'PandaDOS', 'PandaDOS ·', 'Panda', 'DOS', 'AI', 'Git', 'codex', 'issue', 'Issue #', 'DEBUG', 'admin', 'user',
       'persona', 'memory', 'ws:', '· claude:', '±0', '&lt;', '&gt;',
       '{"quiet":"23:00-08:00"}', 'https://example.com/v1', 'model-name',
     ] })).toEqual([]);
+  });
+
+  test('history import defaults and structured API routes contain no fixed-language exits', () => {
+    expect(scanUserVisibleLiterals(['src/core/conversation-history.ts'])).toEqual([]);
+    expect(scanApiErrorExits([
+      'src/web/routes/conversations.ts',
+      'src/web/routes/executors.ts',
+      'src/web/routes/projects.ts',
+    ], [
+      '/api/projects/:projectId/conversations/local-history',
+      '/api/executors/:id/agent-projects',
+      '/api/projects/import',
+    ])).toEqual([]);
   });
 
   test('backend notifications and cards contain no direct summary copy', async () => {
@@ -108,7 +171,10 @@ describe('i18n guardrails', () => {
       if (!file.endsWith('.test.ts')) files.push(file);
     }
     expect(scanUserVisibleLiterals(files, {
-      patterns: [/^\$\{base\}\/summary\.md$/],
+      patterns: [
+        /^\$\{base\}\/summary\.md$/,
+        /^🚦 \[issue #\$\{e\.issueId\}\] \$\{eventSummary\(e, i18n\)\}$/,
+      ],
     })).toEqual([]);
   });
 });

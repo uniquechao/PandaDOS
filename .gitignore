@@ -1,6 +1,6 @@
 # Dependencies and build output
 node_modules/
-public/
+/public/
 dist/
 coverage/
 .turbo/
@@ -40,7 +40,7 @@ id_ed25519.*
 *.sqlite-*
 *.wal
 *.shm
-.mando/
+.panda/
 .deploy-backups/
 
 # Logs, temporary files, and backups

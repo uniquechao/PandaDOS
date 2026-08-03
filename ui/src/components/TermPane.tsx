@@ -76,10 +76,22 @@ export function TermPane({ pid, target, onStatus, closedMessage }: TermPaneProps
         if (disposed) return;
         const term = new Terminal({
           fontSize: 13,
-          fontFamily: 'Menlo, Consolas, monospace',
+          fontFamily: "'SF Mono', Menlo, Consolas, monospace",
           cursorBlink: true,
           scrollback: 5000,
-          theme: { background: '#000000', foreground: '#e6e6e6', cursor: '#e6e6e6' },
+          theme: {
+            background: '#1f1f1f',
+            foreground: '#f5f5f5',
+            cursor: '#ffb629',
+            cursorAccent: '#1f1f1f',
+            selectionBackground: '#5a461f',
+            black: '#1f1f1f',
+            brightBlack: '#6b6b68',
+            yellow: '#ffb629',
+            brightYellow: '#ffe9b3',
+            green: '#22c55e',
+            blue: '#388bff',
+          },
         });
         const fit = new FitAddon();
         term.loadAddon(fit);

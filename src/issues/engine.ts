@@ -169,6 +169,15 @@ export interface Subtask {
   done: boolean;
 }
 
+export const MAX_SUBTASK_TEXT_LENGTH = 500;
+
+export type UpdateUnstartedSubtaskResult =
+  | { ok: true; index: number; subtask: Subtask }
+  | {
+      ok: false;
+      reason: 'not_found' | 'text_required' | 'text_too_long' | 'already_dispatched';
+    };
+
 /** 同一模块永久会话中的一次 issue 工作片段；UI 据此折叠历史、标出任务切换。 */
 export interface ConversationSegment {
   /** 稳定键：显式边界事件 id；老数据回退为 legacy-<issueId>。 */
@@ -286,7 +295,7 @@ export type EngineClarifyResult =
 // ---------- 执行结果总结（文件哨兵；与 clarify-runner/agent-summary 同理，抓屏必误命中） ----------
 
 /** 总结 scratch 根目录名（挂在项目 cwd 下；子目录按 issueId 隔离） */
-export const RESULT_SUMMARY_SCRATCH_BASE = '.mando/tmp/result';
+export const RESULT_SUMMARY_SCRATCH_BASE = '.panda/tmp/result';
 
 /** 给 cwd + issueId 算出总结 scratch 各绝对路径 */
 export function resultSummaryPaths(cwd: string, issueId: number): {
@@ -737,7 +746,7 @@ export class IssueStore {
   /**
    * 悬空创建时澄清（重启恢复扫描的判据）：最后一条 clarify_started 之后无终态事件
    * —— clarify_done / clarify_discarded / error@where=clarify。分析链与轮询 runner
-   * 是进程内存态，mando 重启即蒸发，只留下这种「有头无尾」的事件形状。
+   * 是进程内存态，PandaDOS 重启即蒸发，只留下这种「有头无尾」的事件形状。
    * 不看 issue 状态（pending 重跑还是补收口由引擎分流）；只扫 active 项目。
    */
   listDanglingClarify(): EngineIssue[] {
@@ -891,10 +900,47 @@ export class IssueStore {
   }
 
   setSubtasks(id: number, texts: string[]): void {
-    const subs: Subtask[] = texts.map((t) => ({ text: t.slice(0, 500), done: false }));
+    const subs: Subtask[] = texts.map((t) => ({ text: t.slice(0, MAX_SUBTASK_TEXT_LENGTH), done: false }));
     this.db
       .query('UPDATE issues SET subtasks_json = ?, sub_index = 0, plan_json = ? WHERE id = ?')
       .run(JSON.stringify(subs), JSON.stringify({ subtasks: texts, ts: Date.now() }), id);
+  }
+
+  /** 保留完成进度地替换计划文本；plan_review 时同步待确认卡点，避免详情与卡点显示两版计划。 */
+  replaceSubtasks(id: number, subs: Subtask[], syncWaitingPlanGate: boolean): void {
+    const issue = this.get(id);
+    if (!issue) return;
+    const texts = subs.map((subtask) => subtask.text);
+    let plan: Record<string, unknown> = {};
+    try {
+      plan = issue.planJson ? (JSON.parse(issue.planJson) as Record<string, unknown>) : {};
+    } catch {
+      plan = {};
+    }
+    const update = this.db.transaction(() => {
+      this.db
+        .query('UPDATE issues SET subtasks_json = ?, plan_json = ? WHERE id = ?')
+        .run(JSON.stringify(subs), JSON.stringify({ ...plan, subtasks: texts }), id);
+      if (!syncWaitingPlanGate) return;
+      const gate = this.db
+        .query<GateRow, [number]>(
+          `SELECT * FROM gates
+           WHERE issue_id = ? AND kind = 'plan' AND status = 'waiting'
+           ORDER BY id DESC LIMIT 1`,
+        )
+        .get(id);
+      if (!gate) return;
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = gate.payload_json ? (JSON.parse(gate.payload_json) as Record<string, unknown>) : {};
+      } catch {
+        payload = {};
+      }
+      this.db
+        .query("UPDATE gates SET payload_json = ? WHERE id = ? AND status = 'waiting'")
+        .run(JSON.stringify({ ...payload, subtasks: texts }), gate.id);
+    });
+    update();
   }
 
   /** 标记当前子任务完成、前进一个；返回是否全部完成（v1 advanceSubtask 平移） */
@@ -1606,8 +1652,17 @@ export class IssueEngine {
 
   // ---- 对外 API ----
 
-  /** 建 issue + （项目空闲时）自动开跑接力 + （仍在排队时）后台创建时澄清分析 */
-  async createIssue(projectId: number, input: IssueInput, autoStart = true): Promise<EngineIssue> {
+  /**
+   * 建 issue + （项目空闲时）自动开跑接力 + （仍在排队时）后台创建时澄清分析。
+   * onCreatedInTransaction 供外部 issue 导入等需要“本地 issue + 去重记录”原子落库的入口使用；
+   * 回调抛错会连同 issues 行和 created 事件一起回滚，提交后才继续模块文档与调度副作用。
+   */
+  async createIssue(
+    projectId: number,
+    input: IssueInput,
+    autoStart = true,
+    onCreatedInTransaction?: (issue: EngineIssue) => void,
+  ): Promise<EngineIssue> {
     const proj = this.project(projectId);
     if (!proj) throw new Error(`项目 ${projectId} 不存在`);
     if (proj.kind === 'chat') throw new Error('对话模式项目不支持创建 issue');
@@ -1623,12 +1678,17 @@ export class IssueEngine {
           createdBy: input.createdBy,
         })
       : null;
-    const issue = this.store.create(projectId, {
-      ...input,
-      ...(resolved
-        ? { module: resolved.slug, moduleId: resolved.id, agent: resolved.agent }
-        : {}),
-    });
+    const create = (): EngineIssue => {
+      const issue = this.store.create(projectId, {
+        ...input,
+        ...(resolved
+          ? { module: resolved.slug, moduleId: resolved.id, agent: resolved.agent }
+          : {}),
+      });
+      onCreatedInTransaction?.(issue);
+      return issue;
+    };
+    const issue = onCreatedInTransaction ? this.deps.db.transaction(create)() : create();
     if (resolved && modules) {
       await modules.recordIssue(resolved, issue, this.store.listByProject(projectId));
     }
@@ -1737,6 +1797,50 @@ export class IssueEngine {
       });
     }
     return updated;
+  }
+
+  /**
+   * 修改尚未派发的子任务文本。锁内重读执行游标，防止保存请求排队时任务已推进：
+   * - plan_review 尚未派发，所有未完成项可改；
+   * - 顺序 implementing/blocked 只允许当前游标之后的项；
+   * - 并行模式开工即全量派发，其余阶段也不开放修改。
+   */
+  async updateUnstartedSubtask(
+    issueId: number,
+    index: number,
+    text: string,
+    actor?: number,
+  ): Promise<UpdateUnstartedSubtaskResult> {
+    if (!text.trim()) return { ok: false, reason: 'text_required' };
+    if (text.length > MAX_SUBTASK_TEXT_LENGTH) return { ok: false, reason: 'text_too_long' };
+    const initial = this.store.get(issueId);
+    if (!initial) return { ok: false, reason: 'not_found' };
+
+    return this.deps.mutex.runExclusive(issueMetaLockKey(initial.projectId), () => {
+      const fresh = this.store.get(issueId);
+      if (!fresh) return { ok: false, reason: 'not_found' };
+      const subtasks = this.store.subtasksOf(fresh);
+      const subtask = subtasks[index];
+      if (!Number.isInteger(index) || index < 0 || !subtask) {
+        return { ok: false, reason: 'not_found' };
+      }
+      const editableBeforeDispatch =
+        !subtask.done &&
+        (fresh.status === 'plan_review' ||
+          (fresh.implMode === 'seq' &&
+            (fresh.status === 'implementing' || fresh.status === 'blocked') &&
+            index > fresh.subIndex));
+      if (!editableBeforeDispatch) return { ok: false, reason: 'already_dispatched' };
+
+      const updated = { ...subtask, text };
+      subtasks[index] = updated;
+      this.store.replaceSubtasks(issueId, subtasks, fresh.status === 'plan_review');
+      this.store.logEvent(issueId, 'subtask_edited', {
+        idx: index,
+        ...(actor !== undefined ? { actor } : {}),
+      });
+      return { ok: true, index, subtask: updated };
+    });
   }
 
   /**
@@ -2097,7 +2201,10 @@ export class IssueEngine {
     projectId: number,
     index: number,
     userId?: number,
-  ): Promise<{ ok: true; summary: string } | { ok: false; error: string }> {
+  ): Promise<{
+    ok: true;
+    result: { kind: OrganizeAction['kind']; params: Record<string, string | number> };
+  } | { ok: false; error: string }> {
     const project = this.project(projectId);
     if (!project) return { ok: false, error: '项目不存在' };
     const modules = this.deps.modulesFor?.(project);
@@ -2123,7 +2230,7 @@ export class IssueEngine {
     });
     if (already) return { ok: false, error: '该项已执行过' };
 
-    let summary: string;
+    let result: { kind: OrganizeAction['kind']; params: Record<string, string | number> };
     try {
       if (action.kind === 'create') {
         if (!modules.createManual) throw new Error('装配不支持新建模块');
@@ -2134,7 +2241,10 @@ export class IssueEngine {
           agent: action.agent,
           createdBy: userId ?? null,
         });
-        summary = `已创建模块「${m.displayName}」（${m.slug} · ${m.agent}）`;
+        result = {
+          kind: 'create',
+          params: { name: m.displayName, slug: m.slug, agent: m.agent },
+        };
       } else if (action.kind === 'rename') {
         const updated = await this.renameModuleSlug(
           projectId,
@@ -2142,10 +2252,16 @@ export class IssueEngine {
           action.slug,
           action.displayName,
         );
-        summary = `已改名为「${updated.displayName}」（${updated.slug}）`;
+        result = {
+          kind: 'rename',
+          params: { name: updated.displayName, slug: updated.slug },
+        };
       } else if (action.kind === 'merge') {
         const r = await this.mergeModules(projectId, action.sourceIds, action.targetId);
-        summary = `已合并入「${r.target.displayName}」，${r.movedIssueIds.length} 条 issue 移入`;
+        result = {
+          kind: 'merge',
+          params: { target: r.target.displayName, count: r.movedIssueIds.length },
+        };
       } else if (action.kind === 'move') {
         let targetId: number;
         if ('moduleId' in action.to) {
@@ -2157,7 +2273,10 @@ export class IssueEngine {
           targetId = found.id;
         }
         const r = await this.moveIssuesToModule(projectId, action.issueIds, targetId);
-        summary = `已把 ${r.movedIssueIds.length} 条 issue 挪入「${r.target.displayName}」`;
+        result = {
+          kind: 'move',
+          params: { target: r.target.displayName, count: r.movedIssueIds.length },
+        };
       } else {
         throw new Error('未知动作类型');
       }
@@ -2170,7 +2289,7 @@ export class IssueEngine {
       kind: action.kind,
       ...(userId !== undefined ? { userId } : {}),
     });
-    return { ok: true, summary };
+    return { ok: true, result };
   }
 
   /**
@@ -2292,7 +2411,7 @@ export class IssueEngine {
    * 重启恢复扫描（start() 一次性）：悬空分析按状态分流——仍 pending 的重新
    * scheduleClarify 全新重跑（runner 步骤 0 自清残留会话与 scratch，天然幂等）；
    * 已开跑/完结的补不回也无意义，只补记 clarify_discarded 收口事件，并清掉
-   * 本该由 runner finally 清理的残留 clr-<id> 会话与 .mando/tmp/clarify/<id>。
+   * 本该由 runner finally 清理的残留 clr-<id> 会话与 .panda/tmp/clarify/<id>。
    */
   private async recoverClarify(): Promise<void> {
     if (!this.deps.clarify) return;

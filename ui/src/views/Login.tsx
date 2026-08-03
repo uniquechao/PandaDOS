@@ -54,14 +54,10 @@ export function LoginView({ onLogin, initErr = '' }: { onLogin: () => void; init
         <LanguageSelect compact value={locale} onChange={setLocale} />
       </div>
       <form class="login-card" onSubmit={submit}>
-        <img class="logo-mark" src="/logo-mark.png" alt="MandoAI" />
+        <img class="logo-mark" src="/logo-mark.png" alt="PandaDOS" />
         <h1>
-          Mando<span class="brand-ai">AI</span>
+          Panda<span class="brand-ai">DOS</span>
         </h1>
-        <p class="login-sub">MandoAI · {t('login.tagline')}</p>
-        <div class="login-divider" aria-hidden="true">
-          <span>✦</span>
-        </div>
         <label class="field">
           {t('login.username')}
           <span class="login-input">

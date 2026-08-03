@@ -6,14 +6,14 @@
  * 未拖过（无存储）→ width=null，Files 页不落 inline 宽，沿用默认响应式 CSS 宽度。
  * 改动即写 localStorage（按设备）；同页多处 useTreeWidth 广播同步、跨标签页监听 storage。
  *
- * 与 lib/listwidth 同一套路（那是工作台/对话列表栏，共用 mando.wbListW），但**独立 key**，
+ * 与 lib/listwidth 同一套路（那是工作台/对话列表栏，共用 panda.wbListW），但**独立 key**，
  * 拖文件树不牵动任务列表宽度；纯逻辑（clampTreeWidth/normalizeTreeWidth）与存储层
  * （readTreeWidth/writeTreeWidth/clearTreeWidth）均可脱离 DOM 单测，useTreeWidth 是其上的 Preact hook。
  */
 import { useEffect, useState } from 'preact/hooks';
 
-/** localStorage 键（按设备存，一个用户多设备各自记；与 issuelist 的 mando.wbListW 分开） */
-export const TREEWIDTH_KEY = 'mando.filesTreeW';
+/** localStorage 键（按设备存，一个用户多设备各自记；与 issuelist 的 panda.wbListW 分开） */
+export const TREEWIDTH_KEY = 'panda.filesTreeW';
 
 /** 文件树栏最小像素宽（同 issuelist 下限，防拖没） */
 export const TREEW_MIN = 260;

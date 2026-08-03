@@ -18,7 +18,7 @@ import type { Database } from 'bun:sqlite';
 import {
   ensureArtifactSkill,
   ensureCompatSkills,
-  ensureMandoIssueSkill,
+  ensurePandaIssueSkill,
   ensureModuleGuideBlocks,
   ensureProjectBridge,
 } from './agent-compat';
@@ -111,7 +111,7 @@ export interface ConversationManagerOpts {
   /** 执行机上的 ~/.codex/config.toml（codex trust_level 预置；缺省跳过，兜底=启动参数直接 bypass） */
   codexConfigFile?: string;
   /**
-   * codex 启动附加参数。默认 bypass 审批+沙箱：mando 无人守屏全自动驱动，codex 的
+   * codex 启动附加参数。默认 bypass 审批+沙箱：PandaDOS 无人守屏全自动驱动，codex 的
    * 审批弹窗不走 CC 菜单协议（screen.ts 检不到），滞留即卡死——与 claude 侧
    * 「PM 自动过菜单」对齐的等效选择。
    */
@@ -402,7 +402,21 @@ export class ConversationManager {
     const executable = await this.driver.findExecutable(c.agent);
     if (!executable) throw new AgentExecutableNotFoundError(c.agent);
     const command = quoteShellWord(executable);
+    const row = this.db
+      .query<{ agent_session_id: string | null; agent_jsonl_path: string | null }, [string]>(
+        'SELECT agent_session_id, agent_jsonl_path FROM conversations WHERE id = ?',
+      )
+      .get(c.id);
     if (c.agent !== 'codex') {
+      // 导入的 Claude 历史以 agent_session_id 标记原生绑定，并保留发现时的绝对路径。
+      // 路径仍存在即可确定原会话可恢复，不应像 reclaim 临时覆盖那样先清掉再猜。
+      if (
+        row?.agent_session_id === c.id &&
+        row.agent_jsonl_path &&
+        await this.driver.statPath(row.agent_jsonl_path).catch(() => null)
+      ) {
+        return `${command} --resume ${c.id}`;
+      }
       // 清掉 reclaim 期间可能绑上的手动会话覆盖（agent_jsonl_path）：重启后 pane 里
       // 跑的是 --resume/--session-id 的原生会话，覆盖不清会让引擎继续 tail 死文件
       this.db.query('UPDATE conversations SET agent_jsonl_path = NULL WHERE id = ?').run(c.id);
@@ -410,11 +424,6 @@ export class ConversationManager {
       return exists ? `${command} --resume ${c.id}` : `${command} --session-id ${c.id}`;
     }
     const args = this.opts.codexArgs ?? DEFAULT_CODEX_ARGS;
-    const row = this.db
-      .query<{ agent_session_id: string | null }, [string]>(
-        'SELECT agent_session_id FROM conversations WHERE id = ?',
-      )
-      .get(c.id);
     const sid = row?.agent_session_id;
     // fresh 与 resume 都重盖 launch_ts 并清 path 缓存（issue #48：旧绑定粘连是卡死元凶）：
     // resume 后按 sid 回扫重定位（resume 若换了文件，缓存路径已是死的）；fresh 后按新
@@ -439,7 +448,7 @@ export class ConversationManager {
       const homes = { claudeHome: this.opts.claudeHome, codexHome: this.opts.codexHome };
       await ensureCompatSkills(this.driver, homes);
       await ensureArtifactSkill(this.driver, homes); // 产物落 cwd 内置技能（缺失才写）
-      await ensureMandoIssueSkill(this.driver, homes);
+      await ensurePandaIssueSkill(this.driver, homes);
       await ensureProjectBridge(this.driver, cwd);
       await ensureModuleGuideBlocks(this.driver, cwd);
     } catch {
@@ -449,7 +458,7 @@ export class ConversationManager {
     // 确保项目 cwd 在执行机上存在（writeFile 会建父目录；已存在则跳过，不污染项目目录）
     const cwdStat = await this.driver.statPath(cwd).catch(() => null);
     if (!cwdStat) {
-      await this.driver.writeFile(`${cwd.replace(/\/+$/, '')}/.mando/keep`, '');
+      await this.driver.writeFile(`${cwd.replace(/\/+$/, '')}/.panda/keep`, '');
     }
 
     const cmd = await this.buildCommand(c);

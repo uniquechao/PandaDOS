@@ -12,6 +12,7 @@ import {
   type DirEntry,
   type ExecutorDriver,
   type FileRange,
+  type GitBlobResult,
   type GitResult,
   type PathStat,
   type PtyChannel,
@@ -105,8 +106,8 @@ export function ptySpawnEnv(
 }
 
 const EXPECT_PTY_PROGRAM = [
-  'set stty_init "rows $env(MANDO_PTY_ROWS) columns $env(MANDO_PTY_COLS)"',
-  'spawn -noecho /bin/sh -c $env(MANDO_PTY_COMMAND)',
+  'set stty_init "rows $env(PANDA_PTY_ROWS) columns $env(PANDA_PTY_COLS)"',
+  'spawn -noecho /bin/sh -c $env(PANDA_PTY_COMMAND)',
   'interact',
 ].join('; ');
 
@@ -125,9 +126,9 @@ export function ptySpawnSpec(
         command: '/usr/bin/expect',
         args: ['-c', EXPECT_PTY_PROGRAM],
         extraEnv: {
-          MANDO_PTY_COMMAND: inner,
-          MANDO_PTY_COLS: String(cols),
-          MANDO_PTY_ROWS: String(rows),
+          PANDA_PTY_COMMAND: inner,
+          PANDA_PTY_COLS: String(cols),
+          PANDA_PTY_ROWS: String(rows),
         },
       }
     : {
@@ -340,6 +341,39 @@ export class LocalDriver implements ExecutorDriver {
     return runCommand('git', args, cwd, this.gitTimeoutMs);
   }
 
+  async readGitBlob(cwd: string, rev: string, path: string): Promise<GitBlobResult> {
+    return await new Promise<GitBlobResult>((resolve, reject) => {
+      execFile(
+        'git',
+        ['cat-file', 'blob', `${rev}:${path}`],
+        {
+          cwd,
+          maxBuffer: 32 * 1024 * 1024 + 64 * 1024,
+          encoding: 'buffer',
+          timeout: this.gitTimeoutMs,
+          killSignal: 'SIGKILL',
+        },
+        (error, stdout, stderr) => {
+          if (error && (error as { killed?: boolean }).killed) {
+            reject(new Error(`本地 Git blob 读取超时（>${this.gitTimeoutMs}ms）`));
+            return;
+          }
+          const rawCode = error
+            ? (error as NodeJS.ErrnoException & { code?: unknown }).code
+            : 0;
+          const code = typeof rawCode === 'number' ? rawCode : error ? 1 : 0;
+          const out = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout ?? '');
+          const errBuf = Buffer.isBuffer(stderr) ? stderr : Buffer.from(stderr ?? '');
+          resolve({
+            code,
+            data: new Uint8Array(out.buffer, out.byteOffset, out.byteLength),
+            err: errBuf.toString('utf8'),
+          });
+        },
+      );
+    });
+  }
+
   // ---- 终端流 ----
 
   /**
@@ -353,7 +387,7 @@ export class LocalDriver implements ExecutorDriver {
   async openPty(cmd: string, cols: number, rows: number): Promise<PtyChannel> {
     const c = Number.isFinite(cols) ? Math.max(1, Math.trunc(cols)) : 80;
     const r = Number.isFinite(rows) ? Math.max(1, Math.trunc(rows)) : 24;
-    const dir = await fsp.mkdtemp(join(tmpdir(), 'mando-pty-'));
+    const dir = await fsp.mkdtemp(join(tmpdir(), 'panda-pty-'));
     const ttyFile = join(dir, 'tty');
     const inner = `stty cols ${c} rows ${r} 2>/dev/null; tty > ${ttyFile} 2>/dev/null; exec ${cmd}`;
     const spec = ptySpawnSpec(inner, c, r);

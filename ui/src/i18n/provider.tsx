@@ -72,7 +72,6 @@ export function I18nProvider({ me, children }: { me: Me | null | undefined; chil
       setLocaleState(next);
       localeRef.current = next;
       writeDeviceLocale(undefined, next);
-      document.documentElement.lang = next;
       return next;
     } catch (error) {
       if (!activation.current.isCurrent(generation)) return null;
@@ -80,7 +79,6 @@ export function I18nProvider({ me, children }: { me: Me | null | undefined; chil
       setLocaleState('en');
       localeRef.current = 'en';
       writeDeviceLocale(undefined, 'en');
-      document.documentElement.lang = 'en';
       if (!warnedLoad.current) {
         warnedLoad.current = true;
         toast.error(enCatalog['locale.loadFailed']);
@@ -153,6 +151,9 @@ export function I18nProvider({ me, children }: { me: Me | null | undefined; chil
     () => createI18n({ locale, timeZone: effectiveTimeZone, catalog }),
     [locale, effectiveTimeZone, catalog],
   );
+  useEffect(() => {
+    document.documentElement.lang = locale;
+  }, [locale]);
   const value = useMemo<BrowserI18n>(
     () => ({
       ...base,

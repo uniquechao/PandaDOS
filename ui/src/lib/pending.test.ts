@@ -50,7 +50,7 @@ describe('lib/pending（issue #116 本地乐观气泡）', () => {
   test('纯图消息按张数匹配；张数不符不撤', () => {
     const list = [pend({ id: 'p1', text: '', imgCount: 2 })];
     const img = (n: number): ChatMessage =>
-      userMsg({ text: '', images: Array.from({ length: n }, (_, i) => `.mando/uploads/x/${i}.png`) });
+      userMsg({ text: '', images: Array.from({ length: n }, (_, i) => `.panda/uploads/x/${i}.png`) });
     expect(prunePending(list, [img(1)])).toBe(list);
     expect(prunePending(list, [img(2)])).toEqual([]);
   });

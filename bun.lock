@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "mando",
+      "name": "panda",
       "dependencies": {
         "@larksuiteoapi/node-sdk": "^1.68.0",
         "@xterm/addon-fit": "^0.11.0",

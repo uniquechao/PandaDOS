@@ -1,16 +1,17 @@
 /**
  * core/db —— bun:sqlite 封装。
- * 职责：打开单文件 DB（默认 ~/.mando/mando.db），统一 PRAGMA（WAL / 外键 / busy_timeout）。
+ * 职责：打开单文件 DB（默认 ~/.panda/panda.db），统一 PRAGMA（WAL / 外键 / busy_timeout）。
  */
 import { Database } from 'bun:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { PRODUCT_SLUG, RUNTIME_DATA_DIR_NAME } from './branding';
 
-export const DEFAULT_DB_PATH = join(homedir(), '.mando', 'mando.db');
+export const DEFAULT_DB_PATH = join(homedir(), RUNTIME_DATA_DIR_NAME, `${PRODUCT_SLUG}.db`);
 
 export function defaultDbPath(): string {
-  return process.env.MANDO_DB ?? DEFAULT_DB_PATH;
+  return process.env.PANDA_DB ?? DEFAULT_DB_PATH;
 }
 
 /**

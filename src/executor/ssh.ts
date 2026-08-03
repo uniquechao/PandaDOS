@@ -27,6 +27,7 @@ import type {
   DirEntry,
   ExecutorDriver,
   FileRange,
+  GitBlobResult,
   GitResult,
   PathStat,
   PtyChannel,
@@ -400,6 +401,12 @@ export class SshDriver implements ExecutorDriver {
   /** git -C cwd <args>；非零退出不抛错（契约：交调用方判断 code），传输层错误/超时才抛。 */
   async git(cwd: string, args: string[]): Promise<GitResult> {
     return this.exec('git', ['-C', cwd, ...args], this.gitTimeoutMs);
+  }
+
+  async readGitBlob(cwd: string, rev: string, path: string): Promise<GitBlobResult> {
+    const args = ['-C', cwd, 'cat-file', 'blob', `${rev}:${path}`].map(shq).join(' ');
+    const r = await this.conn.execBytes(`git ${args}`, this.gitTimeoutMs);
+    return { code: r.code, data: r.out, err: r.err };
   }
 
   // ---- 终端流（exec channel + PTY 分配，resize 走 setWindow）----

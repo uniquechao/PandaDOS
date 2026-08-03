@@ -5,7 +5,7 @@
  */
 import { createIdListStore } from './idlist';
 
-const store = createIdListStore('mando.favProjects');
+const store = createIdListStore('panda.favProjects');
 
 export function getFavorites(): number[] {
   return store.read();

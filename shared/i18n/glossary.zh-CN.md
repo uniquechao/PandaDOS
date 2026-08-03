@@ -1,4 +1,4 @@
-# MandoAI 本地化术语表
+# PandaDOS 本地化术语表
 
 [English](glossary.md)
 

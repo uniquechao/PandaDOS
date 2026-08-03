@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 
 const source = readFileSync(new URL('./Chat.tsx', import.meta.url), 'utf8');
+const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
 
 describe('ChatView 对话原生模式', () => {
   test('选中的对话通过共享对话/原生开关维护模式', () => {
@@ -46,5 +47,54 @@ describe('ChatView 当前模型徽标（issue #109）', () => {
     const idxSwitch = source.indexOf('<AutoApproveSwitch level={autoApprove}');
     expect(idxSwitch).toBeGreaterThan(0);
     expect(source.indexOf('<ModelBadge model={model} />')).toBeGreaterThan(idxSwitch); // 同一 switcher 行内
+  });
+});
+
+describe('ChatView 导入当前项目本地历史（issue #7）', () => {
+  const modal = source.match(/function ImportLocalHistoryModal[\s\S]*?\n}\n\n\/\*\* 选中对话/)?.[0] ?? '';
+
+  test('对话列表提供导入入口，并查询当前项目可信历史摘要', () => {
+    expect(source).toContain("t('view.importLocalHistory')");
+    expect(source).toContain('setImportingHistory(true)');
+    expect(modal).toContain('/api/projects/${pid}/conversations/local-history');
+    expect(modal).toContain("const [filter, setFilter] = useState<HistoryAgentFilter>('all')");
+  });
+
+  test('只提交 agent 与 sessionId，导入后重新拉取列表并进入可继续聊天的对话', () => {
+    expect(source).toContain('LocalHistoryResponse');
+    expect(source).toContain('LocalHistoryImportResponse');
+    expect(modal).toContain('.map((session) => ({ agent: session.agent, sessionId: session.sessionId }))');
+    expect(modal).toMatch(/'POST',\s*\{ sessions: chosen \}/);
+    expect(source).toContain('const enterImportedHistory = async (conversation: Conversation)');
+    expect(source).toContain('setSelected(conversation.id)');
+    expect(source).toContain('activate(conversation.id)');
+    expect(source).toContain('setConvs(r.conversations)');
+    expect(source).toContain("setMode('chat')");
+    expect(source).toContain('if (target && target !== conversation.id) activate(target)');
+  });
+
+  test('当前 cwd 与历史导入响应使用共享类型契约，不暴露执行机历史路径', () => {
+    expect(modal).toContain('api<LocalHistoryResponse>');
+    expect(modal).toContain('api<LocalHistoryImportResponse>');
+    expect(modal).toContain("t('view.localHistoryHelp')");
+    expect(modal).toContain('{cwd}');
+    expect(modal).not.toContain('jsonlPath');
+  });
+
+  test('候选支持批量选择，并公开加载、错误、已导入与选择数量状态', () => {
+    expect(modal).toContain('type="checkbox"');
+    expect(modal).toContain('disabled={imported || busy}');
+    expect(modal).toContain('role="status" aria-live="polite"');
+    expect(modal).toContain('role="alert"');
+    expect(modal).toContain("t('view.historyAlreadyImported')");
+    expect(modal).toContain("t('view.historySelected', { count: selected.size })");
+  });
+
+  test('PandaDOS 样式覆盖键盘焦点、窄屏、触屏、Hover 与禁用项', () => {
+    expect(css).toContain('.history-import-item:focus-within { outline: 2px solid var(--accent);');
+    expect(css).toContain('@media (hover: hover) {\n  .history-import-item:hover:not(.imported)');
+    expect(css).toContain('.history-import-item.imported { opacity: 0.62; cursor: default; transition: none; }');
+    expect(css).toContain('@media (max-width: 559px) {\n  .history-import-toolbar');
+    expect(css).toContain('@media (pointer: coarse) {\n  .history-import-item { min-height: 68px; }');
   });
 });

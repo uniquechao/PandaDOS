@@ -154,9 +154,9 @@ class MockStream extends Emitter implements ExecStreamLike {
 }
 
 /** 让 mock stream 像真 exec channel 一样回吐结果并关闭。 */
-function respond(stream: MockStream, r: { code?: number; out?: string; err?: string }): void {
+function respond(stream: MockStream, r: { code?: number; out?: string | Uint8Array; err?: string }): void {
   queueMicrotask(() => {
-    if (r.out) stream.emit('data', Buffer.from(r.out, 'utf8'));
+    if (r.out) stream.emit('data', typeof r.out === 'string' ? Buffer.from(r.out, 'utf8') : Buffer.from(r.out));
     if (r.err) stream.stderr.emit('data', Buffer.from(r.err, 'utf8'));
     stream.emit('exit', r.code ?? 0);
     stream.emit('close', r.code ?? 0);
@@ -418,6 +418,20 @@ describe('SshDriver（mock ssh2）', () => {
     await driver.close();
   });
 
+  it('readGitBlob：stdout 按原始字节返回，rev/path 仍严格转义', async () => {
+    const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xfe]);
+    const { driver, clients } = mkDriver({
+      onExec: (_cmd, _opts, stream) => respond(stream, { out: bytes }),
+    });
+    const r = await driver.readGitBlob(`/tmp/a'b`, 'abc123', `图 片/a'b.png`);
+    expect(r.code).toBe(0);
+    expect(r.data).toEqual(bytes);
+    expect(clients[0]!.execCalls[0]!.cmd).toBe(
+      `git '-C' '/tmp/a'\\''b' 'cat-file' 'blob' 'abc123:图 片/a'\\''b.png'`,
+    );
+    await driver.close();
+  });
+
   it('readFileRange：SFTP 短读（每次最多 3 字节）循环读满，size=文件总字节数', async () => {
     const sftp = new MockSftp();
     const content = Buffer.from('0123456789中文尾巴', 'utf8');
@@ -583,7 +597,7 @@ describe('SshDriver 集成（localhost 回环）', () => {
     '全接口回环：文件读写/短读循环/目录/建会话/注入/capture/git/pty/杀会话',
     async () => {
       const rand = Math.random().toString(36).slice(2, 8);
-      const tmp = `/tmp/mando-sshdrv-${rand}`;
+      const tmp = `/tmp/panda-sshdrv-${rand}`;
       const session = `bt2-sshdrv-${rand}`;
       const driver = new SshDriver({
         host: 'localhost',
@@ -625,6 +639,12 @@ describe('SshDriver 集成（localhost 回环）', () => {
         // ---- git（确定性操作走 Driver）----
         expect((await driver.git(tmp, ['init', '-q'])).code).toBe(0);
         expect((await driver.git(tmp, ['status', '--porcelain'])).code).toBe(0);
+        const blobBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff]);
+        await driver.writeFile(`${tmp}/blob.png`, blobBytes);
+        await driver.git(tmp, ['add', 'blob.png']);
+        await driver.git(tmp, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'blob']);
+        const blob = await driver.readGitBlob(tmp, 'HEAD', 'blob.png');
+        expect(Buffer.from(blob.data)).toEqual(blobBytes);
         const bad = await driver.git('/tmp/绝不存在的目录xx', ['status']);
         expect(bad.code).not.toBe(0); // 非零不抛错
 

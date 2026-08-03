@@ -22,7 +22,7 @@ import { LocalDriver, ptySpawnEnv, ptySpawnSpec, runCommand, sttyResizeArgs } fr
 
 describe('I5 本地命令超时', () => {
   test('findExecutable 只从 PATH 探测固定 Agent 命令', async () => {
-    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-agent-path-'));
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-agent-path-'));
     const previous = process.env.PATH;
     try {
       const claude = path.join(dir, 'claude');
@@ -53,11 +53,28 @@ describe('I5 本地命令超时', () => {
   });
 
   test('LocalDriver.git 带默认 60s 限时仍正常工作（真 git）', async () => {
-    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-local-'));
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-local-'));
     try {
       const d = new LocalDriver();
       expect((await d.git(dir, ['init', '-q'])).code).toBe(0);
       expect((await d.git(dir, ['status', '--porcelain'])).code).toBe(0);
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('LocalDriver.readGitBlob 保留 NUL 与非法 UTF-8 原始字节', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-local-blob-'));
+    try {
+      const d = new LocalDriver();
+      const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xfe, 0x7f]);
+      await d.git(dir, ['init', '-q']);
+      await fsp.writeFile(path.join(dir, 'x.png'), bytes);
+      await d.git(dir, ['add', 'x.png']);
+      await d.git(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'image']);
+      const r = await d.readGitBlob(dir, 'HEAD', 'x.png');
+      expect(r.code).toBe(0);
+      expect(Buffer.from(r.data)).toEqual(bytes);
     } finally {
       await fsp.rm(dir, { recursive: true, force: true });
     }
@@ -71,7 +88,7 @@ describe('I5 本地命令超时', () => {
   });
 
   test('movePath：跨平台最终路径语义——整目录改址成功，dst 已存在时抛错', async () => {
-    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-local-mv-'));
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-local-mv-'));
     try {
       const d = new LocalDriver();
       await fsp.mkdir(path.join(dir, 'src/sub'), { recursive: true });
@@ -94,7 +111,7 @@ describe('I5 本地命令超时', () => {
 
 describe('LocalDriver.listSessions', () => {
   test('使用可打印分隔符并右锚定解析，cwd 含冒号也不破坏会话名', async () => {
-    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-tmux-path-'));
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-tmux-path-'));
     const previous = process.env.PATH;
     try {
       const tmux = path.join(dir, 'tmux');
@@ -133,16 +150,16 @@ describe('LocalDriver.listSessions', () => {
 
 describe('本地 PTY 跨平台命令参数', () => {
   test('macOS launchd 无 locale 时补 UTF-8，已有 locale 配置不被覆盖', () => {
-    expect(ptySpawnEnv({ MANDO_PTY_COMMAND: 'echo ok' }, { PATH: '/bin' }, 'darwin')).toEqual({
+    expect(ptySpawnEnv({ PANDA_PTY_COMMAND: 'echo ok' }, { PATH: '/bin' }, 'darwin')).toEqual({
       PATH: '/bin',
       LANG: 'en_US.UTF-8',
       TERM: 'xterm-256color',
-      MANDO_PTY_COMMAND: 'echo ok',
+      PANDA_PTY_COMMAND: 'echo ok',
     });
 
     expect(
       ptySpawnEnv(
-        { MANDO_PTY_COMMAND: 'echo ok' },
+        { PANDA_PTY_COMMAND: 'echo ok' },
         { LANG: 'zh_CN.UTF-8', LC_CTYPE: 'UTF-8', TERM: 'screen-256color' },
         'darwin',
       ),
@@ -150,7 +167,7 @@ describe('本地 PTY 跨平台命令参数', () => {
       LANG: 'zh_CN.UTF-8',
       LC_CTYPE: 'UTF-8',
       TERM: 'xterm-256color',
-      MANDO_PTY_COMMAND: 'echo ok',
+      PANDA_PTY_COMMAND: 'echo ok',
     });
 
     expect(ptySpawnEnv({}, { LC_ALL: 'C', PATH: '/usr/bin' }, 'darwin')).toEqual({
@@ -178,9 +195,9 @@ describe('本地 PTY 跨平台命令参数', () => {
     expect(mac.args[0]).toBe('-c');
     expect(mac.args[1]).toContain('spawn -noecho /bin/sh -c');
     expect(mac.extraEnv).toEqual({
-      MANDO_PTY_COMMAND: 'echo ok',
-      MANDO_PTY_COLS: '100',
-      MANDO_PTY_ROWS: '40',
+      PANDA_PTY_COMMAND: 'echo ok',
+      PANDA_PTY_COLS: '100',
+      PANDA_PTY_ROWS: '40',
     });
   });
 

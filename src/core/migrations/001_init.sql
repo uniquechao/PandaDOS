@@ -25,7 +25,7 @@ CREATE TABLE executors (
   host           TEXT NOT NULL,
   port           INTEGER NOT NULL DEFAULT 22,
   ssh_user       TEXT NOT NULL,
-  key_ref        TEXT NOT NULL,                -- ~/.mando/keys/<key_ref>，私钥不进 DB
+  key_ref        TEXT NOT NULL,                -- ~/.panda/keys/<key_ref>，私钥不进 DB
   workspace_root TEXT NOT NULL,
   claude_dir     TEXT NOT NULL,
   status         TEXT NOT NULL DEFAULT 'unknown' CHECK (status IN ('unknown', 'online', 'offline'))

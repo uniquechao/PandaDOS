@@ -49,6 +49,13 @@ export interface GitResult {
   err: string;
 }
 
+/** Git blob 原始字节读取结果；非零退出不抛错，与 git() 契约一致。 */
+export interface GitBlobResult {
+  code: number;
+  data: Uint8Array;
+  err: string;
+}
+
 /** 终端流通道：tmux attach（或任意命令）经 PTY 代理到 xterm.js。 */
 export interface PtyChannel {
   write(data: string | Uint8Array): void;
@@ -147,6 +154,12 @@ export interface ExecutorDriver {
 
   /** 在 cwd 下执行 git 子命令，返回退出码与输出（不抛错，交调用方判断 code）。 */
   git(cwd: string, args: string[]): Promise<GitResult>;
+
+  /**
+   * 读取某个 revision 下的仓库文件原始字节。调用方须先用 `git cat-file -s`
+   * 校验存在性与大小，避免无界缓冲；实现不得把 stdout 经 UTF-8 字符串转换。
+   */
+  readGitBlob(cwd: string, rev: string, path: string): Promise<GitBlobResult>;
 
   // ---- 终端流 ----
 

@@ -183,7 +183,7 @@ describe('用户 CRUD', () => {
 
   test('建用户经 Driver 在执行机 workspace_root 下建出 u<id> 目录', async () => {
     const { db, dispatch, admin } = makeApp();
-    const root = mkdtempSync(join(tmpdir(), 'mando-admin-ws-'));
+    const root = mkdtempSync(join(tmpdir(), 'panda-admin-ws-'));
     db.query(
       `INSERT INTO executors (name, host, ssh_user, key_ref, workspace_root, claude_dir)
        VALUES ('e1', 'h', 'root', 'k', ?, '/c')`,
@@ -411,11 +411,11 @@ describe('执行机 CRUD', () => {
       authDepsFromDb(app.db, app.users),
     );
     const connection = {
-      name: 'example-executor',
-      host: 'executor.example.com',
+      name: 'jimi',
+      host: 'jimi.chaoa.xyz',
       port: 22,
       sshUser: 'developer',
-      keyRef: '/Users/operator/.ssh/id_ed25519',
+      keyRef: '/Users/developer/.ssh/id_ed25519',
     };
 
     const detected = await call(

@@ -41,6 +41,6 @@ export function promptReload(): void {
 
 /** 懒加载 import() 的 .catch 兜底：记日志 + 弹刷新提示。 */
 export function onLazyLoadError(err: unknown): void {
-  console.error('[mando] 懒加载组件失败（多半是发版后旧 chunk 失效）：', err);
+  console.error('[PandaDOS] 懒加载组件失败（多半是发版后旧 chunk 失效）：', err);
   promptReload();
 }

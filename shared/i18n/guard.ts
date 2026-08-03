@@ -8,7 +8,7 @@ export interface LiteralFinding {
   file: string;
   line: number;
   text: string;
-  kind: 'jsx-text' | 'attribute' | 'dialog' | 'summary';
+  kind: 'jsx-text' | 'attribute' | 'dialog' | 'summary' | 'helper-return' | 'default-label' | 'api-error';
 }
 
 export interface LiteralAllowlist {
@@ -31,6 +31,24 @@ interface IcuControl {
   categories: string[];
   pluralType?: Intl.PluralRulesOptions['type'];
 }
+
+// These messages predate the ICU guard. Keep the debt explicit so any newly
+// introduced `{count}` message must use plural rules instead of extending a
+// broad pattern allowlist.
+const LEGACY_NON_PLURAL_COUNT_KEYS = new Set([
+  'shell.expandAll',
+  'ui.expandCount',
+  'project.archivedCount',
+  'project.closedSessions',
+  'project.reviewAttention',
+  'project.tasksRunning',
+  'issue.commitHistory',
+  'issue.approvalLog',
+  'skills.translateCount',
+  'skills.matchLimit',
+  'notify.planMore',
+  'notify.planHeading',
+]);
 
 function controlsOf(message: string, locale: SupportedLocale): IcuControl[] {
   const controls: IcuControl[] = [];
@@ -77,6 +95,16 @@ export function assertCatalogParity(
   const englishMessages = english as Readonly<Record<string, string>>;
   const englishKeys = Object.keys(english).sort();
   const problems: string[] = [];
+  for (const key of englishKeys) {
+    const message = englishMessages[key]!;
+    if (
+      argumentsOf(message).includes('count') &&
+      !controlsOf(message, 'en').some((control) => control.kind === 'plural' && control.argument === 'count') &&
+      !LEGACY_NON_PLURAL_COUNT_KEYS.has(key)
+    ) {
+      problems.push(`en:${key}: count must use ICU plural`);
+    }
+  }
   for (const locale of locales) {
     const catalog = catalogs[locale];
     const keys = Object.keys(catalog).sort();
@@ -156,6 +184,67 @@ function literalExpressionText(expression: ts.Expression, source: ts.SourceFile)
   return undefined;
 }
 
+function literalLeaves(
+  expression: ts.Expression,
+  source: ts.SourceFile,
+): Array<{ node: ts.Expression; text: string }> {
+  const direct = literalExpressionText(expression, source);
+  if (direct !== undefined) return [{ node: expression, text: direct }];
+  if (ts.isParenthesizedExpression(expression) || ts.isAsExpression(expression) || ts.isNonNullExpression(expression)) {
+    return literalLeaves(expression.expression, source);
+  }
+  if (ts.isConditionalExpression(expression)) {
+    return [
+      ...literalLeaves(expression.whenTrue, source),
+      ...literalLeaves(expression.whenFalse, source),
+    ];
+  }
+  if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    return [
+      ...literalLeaves(expression.left, source),
+      ...literalLeaves(expression.right, source),
+    ];
+  }
+  return [];
+}
+
+function functionName(node: ts.Node, source: ts.SourceFile): string | undefined {
+  if (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isGetAccessorDeclaration(node)) {
+    return node.name ? propertyName(node.name, source) : undefined;
+  }
+  if ((ts.isArrowFunction(node) || ts.isFunctionExpression(node)) && ts.isVariableDeclaration(node.parent)) {
+    return ts.isIdentifier(node.parent.name) ? node.parent.name.text : undefined;
+  }
+  return undefined;
+}
+
+function enclosingFunctionName(node: ts.Node, source: ts.SourceFile): string | undefined {
+  let current = node.parent;
+  while (current) {
+    if (ts.isFunctionLike(current)) return functionName(current, source);
+    current = current.parent;
+  }
+  return undefined;
+}
+
+function routePathOf(node: ts.ObjectLiteralExpression, source: ts.SourceFile): string | undefined {
+  for (const property of node.properties) {
+    if (!ts.isPropertyAssignment(property) || propertyName(property.name, source) !== 'path') continue;
+    return ts.isStringLiteral(property.initializer) ? property.initializer.text : undefined;
+  }
+  return undefined;
+}
+
+function objectProperty(
+  node: ts.ObjectLiteralExpression,
+  name: string,
+  source: ts.SourceFile,
+): ts.PropertyAssignment | undefined {
+  return node.properties.find((property): property is ts.PropertyAssignment => (
+    ts.isPropertyAssignment(property) && propertyName(property.name, source) === name
+  ));
+}
+
 /** Scan source files for new, directly embedded user-visible literals. */
 export function scanUserVisibleLiterals(
   paths: readonly string[],
@@ -182,6 +271,71 @@ export function scanUserVisibleLiterals(
       if (ts.isPropertyAssignment(node) && propertyName(node.name, source) === 'summary') {
         const text = literalExpressionText(node.initializer, source);
         if (text !== undefined) add(node, text, 'summary');
+      }
+      if (ts.isReturnStatement(node) && node.expression) {
+        const name = enclosingFunctionName(node, source);
+        if (name && /(?:Label|Text|Message|Description|Title)$/i.test(name)) {
+          for (const literal of literalLeaves(node.expression, source)) {
+            add(literal.node, literal.text, 'helper-return');
+          }
+        }
+      }
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+        if (/^(?:default|fallback).*Label$/i.test(node.name.text)) {
+          for (const literal of literalLeaves(node.initializer, source)) {
+            add(literal.node, literal.text, 'default-label');
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+  return findings;
+}
+
+/** Scan selected API routes for legacy error bodies and fixed-language fallbacks. */
+export function scanApiErrorExits(
+  paths: readonly string[],
+  routePaths: readonly string[],
+  allowlist: LiteralAllowlist = {},
+): LiteralFinding[] {
+  const findings: LiteralFinding[] = [];
+  const protectedPaths = new Set(routePaths);
+  for (const file of paths) {
+    const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const add = (node: ts.Node, text: string): void => {
+      const normalized = text.replace(/\s+/g, ' ').trim();
+      if (allowed(normalized, allowlist)) return;
+      const { line } = source.getLineAndCharacterOfPosition(node.getStart(source));
+      findings.push({ file, line: line + 1, text: normalized, kind: 'api-error' });
+    };
+    const scanRoute = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && calleeName(node.expression) === 'json') {
+        const body = node.arguments[0];
+        if (body && ts.isObjectLiteralExpression(body)) {
+          const ok = objectProperty(body, 'ok', source);
+          const error = objectProperty(body, 'error', source);
+          if (ok && ok.initializer.kind === ts.SyntaxKind.FalseKeyword && error) {
+            add(error.initializer, literalExpressionText(error.initializer, source) ?? error.initializer.getText(source));
+          }
+        }
+      }
+      if (ts.isCallExpression(node) && calleeName(node.expression) === 'apiError') {
+        const fallback = node.arguments[1];
+        if (fallback) {
+          const text = literalExpressionText(fallback, source);
+          if (text === undefined || /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Cyrillic}]/u.test(text)) {
+            add(fallback, text ?? fallback.getText(source));
+          }
+        }
+      }
+      ts.forEachChild(node, scanRoute);
+    };
+    const visit = (node: ts.Node): void => {
+      if (ts.isObjectLiteralExpression(node) && protectedPaths.has(routePathOf(node, source) ?? '')) {
+        scanRoute(node);
+        return;
       }
       ts.forEachChild(node, visit);
     };

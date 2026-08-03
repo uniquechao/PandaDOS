@@ -2,7 +2,7 @@
 
 [English](execution-model.md)
 
-> 本文讲清 MandoAI v2 里最容易混淆的一组概念——**issue / 模块 / 对话 / tmux 会话 / 执行代理 / 终端**——各自是什么、谁归谁、以什么节拍互动、出故障怎么自愈。
+> 本文讲清 PandaDOS v2 里最容易混淆的一组概念——**issue / 模块 / 对话 / tmux 会话 / 执行代理 / 终端**——各自是什么、谁归谁、以什么节拍互动、出故障怎么自愈。
 > 依据代码快照：分支 `feat/screenshot-preview`（`a61c1b9` 之后），2026-07-25 通读 `src/executor` / `src/core/conversations.ts` / `src/issues/engine.ts` / `src/web/ws` 得出。行号会随改动漂移，认函数名。
 
 ## 0. 一句话链条
@@ -145,7 +145,7 @@ issue → (模块) → 对话(session-id，持久)
 | --- | --- | --- |
 | 切对话 | 旧进程该让位 | `activate` = kill 旧 + new + resume（持 tmux 锁） |
 | 模块休眠 | 省资源 | `sleepIssue` 只回收 tmux，保留 conversation/session id |
-| mando 重启 | tmux 被连坐杀、内存态蒸发 | tick 里会话自愈重建；`start()` 一次性恢复扫描（悬空澄清）；事件溯源判断状态 |
+| panda 重启 | tmux 被连坐杀、内存态蒸发 | tick 里会话自愈重建；`start()` 一次性恢复扫描（悬空澄清）；事件溯源判断状态 |
 | 宿主重启 / 外力 kill tmux | `project_active_conv` 还在，往死会话 send-keys 刷错 | pane 空 → 判活 → `activateConv` 重建 + `session_recovered`（60s 冷却） |
 | codex 自更新退回 shell | tmux 活着但代理死了，消息全打进 bash（command not found） | `ensureCodexChatLive` 抓屏识别（`Please restart Codex` / shell 提示符）后重启；启动参数关掉 startup update check |
 | codex 升级弹窗 | 新版本一出全员卡死 | tick 里自动选「1. Update now」，30s 冷却 |
@@ -153,7 +153,7 @@ issue → (模块) → 对话(session-id，持久)
 | 弹窗无人管 | 静默黑洞 | 5min 落 `menu_stuck` + 通知 + UI「等你选择」角标 |
 | tick 卡死 | 执行机调用挂住 | 5min 打告警，**不重置**（避免双驾驶员）；Driver 层限时：tmux 类 10s、git 类 60s |
 
-运维提醒：改后端要 `systemctl restart mando`，而重启会打断在跑 issue 的注入与分析——**部署重启放低峰，别在 issue 执行中从执行会话里触发**（#76→#77→#78 事故链的根因）。
+运维提醒：改后端要 `systemctl restart panda`，而重启会打断在跑 issue 的注入与分析——**部署重启放低峰，别在 issue 执行中从执行会话里触发**（#76→#77→#78 事故链的根因）。
 
 ## 9. 关键常量与默认值
 
@@ -198,5 +198,5 @@ issue → (模块) → 对话(session-id，持久)
 | 对话流与注入原语 | `src/web/ws/chat.ts`、`inject.ts` |
 | 前端终端 / 执行页 | `ui/src/components/TermPane.tsx`、`ui/src/views/Term.tsx`、`ui/src/views/IssueDetail.tsx` |
 
-延伸阅读：`README.zh-CN.md`（项目结构与运行方式）、`DEPLOY.zh-CN.md`（部署与运维）和
-`docs/i18n-contributing.zh-CN.md`（国际化贡献指南）。
+延伸阅读：`README.zh-CN.md`（项目结构与运行方式）、`DEPLOY.zh-CN.md`（部署与运维）、
+`docs/superpowers/specs/2026-07-02-panda-v2-redesign-design.md`（V2 总体设计）。

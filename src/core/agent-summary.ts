@@ -3,11 +3,11 @@
  *
  * 语义：用户为某项目选 claude/codex 时，本 runner 在**独立** tmux 会话 `sum-<projectId>`
  * 里拉起该 CLI 代理（绝不碰驱动 issue 的 `cc-<projectId>`），让它：
- *   1) 读历史会话摘要文件（子任务 2 的 buildHistoryDigest 产物，写在 .mando/tmp/summary/history.md）；
+ *   1) 读历史会话摘要文件（子任务 2 的 buildHistoryDigest 产物，写在 .panda/tmp/summary/history.md）；
  *   2) 浏览项目代码库，理解定位/结构/现状；
  *   3) 更新项目根目录 README.md；
- *   4) 把「给用户看的认知总结」写到 .mando/tmp/summary/understanding.md；
- *   5) 最后创建标记文件 .mando/tmp/summary/done。
+ *   4) 把「给用户看的认知总结」写到 .panda/tmp/summary/understanding.md；
+ *   5) 最后创建标记文件 .panda/tmp/summary/done。
  * runner 轮询 done 标记直到出现或超时，读回 understanding.md，清理 scratch 与会话。
  *
  * 为什么用「文件标记」当哨兵而非抓屏找 SUMMARY_DONE：注入提示词本身含指令文字，
@@ -44,7 +44,7 @@ export type SummaryDriver = Pick<
 >;
 
 /** scratch 目录名（挂在项目 cwd 下；README.md 在仓库根，不在此，故清理不误伤） */
-export const SCRATCH_DIR = '.mando/tmp/summary';
+export const SCRATCH_DIR = '.panda/tmp/summary';
 const REL_HISTORY = `${SCRATCH_DIR}/history.md`;
 const REL_UNDERSTANDING = `${SCRATCH_DIR}/understanding.md`;
 const REL_DONE = `${SCRATCH_DIR}/done`;

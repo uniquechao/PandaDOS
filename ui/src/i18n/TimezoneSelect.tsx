@@ -36,7 +36,7 @@ export function TimezoneSelect() {
       <div class="row">
         <input
           class="grow"
-          list="mando-timezones"
+          list="panda-timezones"
           value={draft}
           disabled={busy}
           placeholder={t('settings.timezoneAutomatic', { zone: detectedTimeZone })}
@@ -55,7 +55,7 @@ export function TimezoneSelect() {
           {t('settings.timezoneAutoButton')}
         </button>
       </div>
-      <datalist id="mando-timezones">
+      <datalist id="panda-timezones">
         {zones.map((zone) => <option key={zone} value={zone} />)}
       </datalist>
     </label>

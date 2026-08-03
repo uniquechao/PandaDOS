@@ -13,10 +13,10 @@ import { markPending, maxOffOf, prunePending, type PendingMsg } from '../lib/pen
 import { ImageAttach, type AttachedImage } from './ImageAttach';
 import { ImageLightbox } from './ImageLightbox';
 import { RunStream } from './runstream';
-import { ConversationSegments } from './ConversationSegments';
 import { RunControls } from './RunControls';
 import { isDriving, retryPlan } from '../lib/issueStatus';
 import { lastToolErrored, producedFilesOf } from '../lib/runstream';
+import { issueStartTs, messagesForIssue } from '../lib/conversationSegments';
 import type {
   ChatClientFrame,
   ChatMessage,
@@ -105,7 +105,23 @@ export function ChatPane({
   const stick = useRef(true);
   const seenBaseline = useRef(false); // 首个 baseline 才贴底；重连的 baseline 只合并、不打断阅读位置
   const histInFlight = useRef(false); // history 请求在途守卫：防滚动连发/重复请求
+  const historyExhausted = useRef(false); // 真正读到文件头后，重连 baseline 不得把它重新变成“还有更早”
   const pendingAnchor = useRef<number | null>(null); // 前插前记录的 scrollHeight，用于补 scrollTop 保锚点
+
+  const targetStart =
+    currentIssueId !== undefined && conversationSegments?.length
+      ? issueStartTs(conversationSegments, currentIssueId)
+      : undefined;
+  const issueScoped = currentIssueId !== undefined && targetStart !== undefined;
+  const visibleMsgs = issueScoped
+    ? messagesForIssue(msgs, conversationSegments ?? [], currentIssueId)
+    : msgs;
+  const loadedTimestamps = msgs.flatMap((m) => (m.ts === undefined ? [] : [m.ts]));
+  const earliestLoadedTs = loadedTimestamps.length ? Math.min(...loadedTimestamps) : undefined;
+  // 当前 issue 起点之前已经读到一条消息，即已覆盖完整 issue；再向前只会拿到前一个 issue。
+  const reachedIssueStart =
+    !issueScoped || (earliestLoadedTs !== undefined && earliestLoadedTs <= targetStart);
+  const canLoadOlder = hasMore && (!issueScoped || !reachedIssueStart);
 
   useEffect(() => {
     setMsgs([]);
@@ -120,6 +136,7 @@ export function ChatPane({
     setLoadingHistory(false);
     seenBaseline.current = false; // 切对话才重置（唯一清空点）
     histInFlight.current = false;
+    historyExhausted.current = false;
     pendingAnchor.current = null;
     setExplain(null);
     setExplaining(false);
@@ -146,6 +163,7 @@ export function ChatPane({
       if (f.type === 'baseline') {
         // 合并而非整表替换：重连只补末段、不清空已加载的更早历史（修「重连缩回 60 条」）
         setMsgs((prev) => mergeMessages(prev, f.msgs ?? []));
+        setHasMore(historyExhausted.current ? false : f.hasMore);
         applySelection(f.selection ?? null);
         setStaleHint(false);
         setNotReady(null);
@@ -164,6 +182,7 @@ export function ChatPane({
           setMsgs((p) => mergeMessages(p, f.msgs));
         }
         setHasMore(f.hasMore); // 到顶 → false → 顶部显示「已到最早」
+        historyExhausted.current = !f.hasMore;
         setLoadingHistory(false);
         histInFlight.current = false;
       } else if (f.type === 'selection') {
@@ -248,7 +267,7 @@ export function ChatPane({
   // 产出文件上报（仅在集合变化时触发；回调用 ref 存，避免父层重渲染导致重订阅）
   const onProdRef = useRef(onProducedFiles);
   onProdRef.current = onProducedFiles;
-  const producedKey = producedFilesOf(msgs).join('\n');
+  const producedKey = producedFilesOf(visibleMsgs).join('\n');
   useEffect(() => {
     onProdRef.current?.(producedKey ? producedKey.split('\n') : []);
   }, [producedKey]);
@@ -257,11 +276,21 @@ export function ChatPane({
 
   // 向上翻页拉更早历史：baseline 之后才允许（否则会在 historyHead 未定时误判到顶）；在途/到顶时短路。
   const loadOlder = (): void => {
-    if (!seenBaseline.current || histInFlight.current || !hasMore) return;
+    if (!seenBaseline.current || histInFlight.current || !canLoadOlder) return;
     histInFlight.current = true;
     setLoadingHistory(true);
-    send({ type: 'history' });
+    const offs = msgs.map((m) => m.off).filter((off): off is number => off !== undefined);
+    const before = offs.length ? Math.min(...offs) : undefined;
+    send({ type: 'history', ...(before !== undefined && before > 0 ? { before } : {}) });
   };
+
+  // 当前 issue 不在首屏时自动逐页向前，直到覆盖它的起点；普通对话首屏不足一屏时也自动补满。
+  useEffect(() => {
+    const el = listRef.current;
+    const needsIssueBoundary = issueScoped && !reachedIssueStart;
+    const needsViewportFill = !issueScoped && el !== null && el.scrollHeight <= el.clientHeight + 40;
+    if ((needsIssueBoundary || needsViewportFill) && canLoadOlder && !loadingHistory) loadOlder();
+  }, [msgs, canLoadOlder, issueScoped, reachedIssueStart, loadingHistory]);
 
   // 有图还没上传完（rel 未回）→ 暂不能发，避免漏图
   const uploading = images.some((im) => im.rel === null && !im.error);
@@ -321,10 +350,11 @@ export function ChatPane({
           ? `🧪 ${t('ui.mockMode')}`
           : null;
   // 流式活动：同步显示 AI 当前步骤（执行某工具 / 思考中）——菜单弹出时是用户回合，不显示。
-  const activity = live && !menuUp ? activityOf(msgs.length > 0 ? msgs[msgs.length - 1] : undefined) : null;
+  const activity =
+    live && !menuUp ? activityOf(visibleMsgs.length > 0 ? visibleMsgs[visibleMsgs.length - 1] : undefined) : null;
   // 运行操作栏：仅 issue 驱动中 + live（可注入）时于顶部常驻；重试走 WS，终止/解阻走父层。
   const showRunCtl = runCtl !== undefined && live && isDriving(runCtl.status);
-  const plan = runCtl ? retryPlan(runCtl.status, lastToolErrored(msgs)) : null;
+  const plan = runCtl ? retryPlan(runCtl.status, lastToolErrored(visibleMsgs)) : null;
   const doRetry = (): void => {
     if (!plan || !plan.enabled || !runCtl) return;
     if (plan.action === 'unblock') runCtl.onUnblock();
@@ -346,14 +376,16 @@ export function ChatPane({
         headerLeading && <div class="runctl">{headerLeading}</div>
       )}
       <div class="chat-msgs runstream" ref={listRef} onScroll={onScroll}>
-        {msgs.length === 0 && pending.length === 0 && <div class="empty">{t('ui.noChatMessages')}</div>}
-        {msgs.length > 0 && (
+        {visibleMsgs.length === 0 && pending.length === 0 && !loadingHistory && (
+          <div class="empty">{t('ui.noChatMessages')}</div>
+        )}
+        {(visibleMsgs.length > 0 || loadingHistory) && (
           <div class="chat-hist-top">
             {loadingHistory ? (
               <span class="chat-hist-hint">
                 <span class="tool-spin" /> {t('ui.loadingEarlier')}
               </span>
-            ) : hasMore ? (
+            ) : canLoadOlder ? (
               <button class="chat-hist-more" onClick={loadOlder}>
                 ↑ {t('ui.loadingEarlier')}
               </button>
@@ -362,17 +394,7 @@ export function ChatPane({
             )}
           </div>
         )}
-        {conversationSegments?.length && currentIssueId !== undefined ? (
-          <ConversationSegments
-            msgs={msgs}
-            segments={conversationSegments}
-            currentIssueId={currentIssueId}
-            pid={pid}
-            onOpenImage={setLightbox}
-          />
-        ) : (
-          <RunStream msgs={msgs} pid={pid} onOpenImage={setLightbox} />
-        )}
+        <RunStream msgs={visibleMsgs} pid={pid} onOpenImage={setLightbox} />
         {/* 我刚发出去、还没从 jsonl 回流的消息（issue #116）：恒在流的末尾，带送达状态 */}
         {pending.map((p) => (
           <div key={p.id} class={`rs-msg user pending ${p.state}`}>

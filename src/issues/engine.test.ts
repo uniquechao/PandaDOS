@@ -143,7 +143,7 @@ async function setup(opts: {
   modulesFor?: EngineDeps['modulesFor'];
   onNotify?: (event: EngineNotifyEvent) => void | Promise<void>;
 } = {}) {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mando-engine-'));
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-engine-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
 
   const db = openDb(':memory:');
@@ -607,6 +607,90 @@ describe('默认自动流：manual_review 关闭时计划卡点自动放行', ()
   });
 });
 
+describe('未执行子任务编辑', () => {
+  test('计划待确认时可改任一未执行项，并同步 waiting gate 与审计事件', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: '可改计划' });
+    s.engine.store.setSubtasks(issue.id, ['第一项', '第二项']);
+    await s.engine.applyEvent(issue.id, 'plan_ready');
+
+    const result = await s.engine.updateUnstartedSubtask(issue.id, 0, '调整后的第一项', s.admin.id);
+
+    expect(result).toEqual({ ok: true, index: 0, subtask: { text: '调整后的第一项', done: false } });
+    const fresh = s.engine.store.get(issue.id)!;
+    expect(s.engine.store.subtasksOf(fresh).map((subtask) => subtask.text)).toEqual([
+      '调整后的第一项',
+      '第二项',
+    ]);
+    expect(JSON.parse(fresh.planJson ?? '{}').subtasks).toEqual(['调整后的第一项', '第二项']);
+    const gate = s.engine.store.listGates(issue.id).find((candidate) => candidate.status === 'waiting')!;
+    expect(JSON.parse(gate.payloadJson ?? '{}').subtasks).toEqual(['调整后的第一项', '第二项']);
+    const event = s.engine.store.listEvents(issue.id).find((candidate) => candidate.kind === 'subtask_edited');
+    expect(JSON.parse(event?.dataJson ?? '{}')).toEqual({ idx: 0, actor: s.admin.id });
+  });
+
+  test('顺序执行只允许修改当前游标之后的项，排队期间推进游标后会按最新状态拒绝', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: '顺序任务', implMode: 'seq' });
+    s.engine.store.setSubtasks(issue.id, ['当前项', '下一项', '最后一项']);
+    await s.engine.applyEvent(issue.id, 'plan_ready');
+    const gate = s.engine.store.listGates(issue.id).find((candidate) => candidate.kind === 'plan')!;
+    await s.engine.decideGate(gate.id, s.admin.id, 'approve');
+
+    expect(await s.engine.updateUnstartedSubtask(issue.id, 0, '不能改当前项')).toEqual({
+      ok: false,
+      reason: 'already_dispatched',
+    });
+    expect(await s.engine.updateUnstartedSubtask(issue.id, 2, '可修改的最后一项')).toEqual({
+      ok: true,
+      index: 2,
+      subtask: { text: '可修改的最后一项', done: false },
+    });
+
+    let release!: () => void;
+    let entered!: () => void;
+    const lockEntered = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const held = s.mutex.runExclusive(`issue-meta:${s.projectId}`, async () => {
+      entered();
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    });
+    await lockEntered;
+    const queued = s.engine.updateUnstartedSubtask(issue.id, 1, '竞态中的修改');
+    s.engine.store.advanceSubtask(issue.id);
+    release();
+    await held;
+
+    expect(await queued).toEqual({ ok: false, reason: 'already_dispatched' });
+    expect(s.engine.store.subtasksOf(s.engine.store.get(issue.id)!).map((subtask) => subtask.text)).toEqual([
+      '当前项',
+      '下一项',
+      '可修改的最后一项',
+    ]);
+  });
+
+  test('并行执行开始后所有子任务都已派发，索引越界也会明确拒绝', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: '并行任务', implMode: 'team' });
+    s.engine.store.setSubtasks(issue.id, ['甲', '乙']);
+    await s.engine.applyEvent(issue.id, 'plan_ready');
+    const gate = s.engine.store.listGates(issue.id).find((candidate) => candidate.kind === 'plan')!;
+    await s.engine.decideGate(gate.id, s.admin.id, 'approve');
+
+    expect(await s.engine.updateUnstartedSubtask(issue.id, 1, '不能改')).toEqual({
+      ok: false,
+      reason: 'already_dispatched',
+    });
+    expect(await s.engine.updateUnstartedSubtask(issue.id, 9, '不存在')).toEqual({
+      ok: false,
+      reason: 'not_found',
+    });
+  });
+});
+
 describe('正式模块绑定', () => {
   const mod = (id: number, slug: string, agent: 'claude' | 'codex'): ProjectModule => ({
     id,
@@ -848,7 +932,7 @@ describe('正式模块绑定', () => {
         },
         async createIssuePage(module, issue) {
           pages.push(`${module.slug}#${issue.id}`);
-          return `.mando/modules/${module.slug}/issues/${issue.id}-x.md`;
+          return `.panda/modules/${module.slug}/issues/${issue.id}-x.md`;
         },
         async refreshIssueIndex() {},
       },
@@ -941,7 +1025,7 @@ describe('正式模块绑定', () => {
         async ensureModule() {},
         async refreshIndex() {},
         async createIssuePage(module, issue) {
-          return `.mando/modules/${module.slug}/issues/${issue.id}-x.md`;
+          return `.panda/modules/${module.slug}/issues/${issue.id}-x.md`;
         },
         async refreshIssueIndex() {},
         async renameDir(module, newSlug) {
@@ -1001,7 +1085,10 @@ describe('正式模块绑定', () => {
     expect(s.notifications.some((n) => n.summaryCode === 'module_organization')).toBe(true);
 
     // 逐项执行：rename → slug 三处同步（模块行 / 文档目录 / issues.module 文本列）
-    expect((await s.engine.applyOrganizeAction(s.projectId, 0)).ok).toBe(true);
+    expect(await s.engine.applyOrganizeAction(s.projectId, 0)).toMatchObject({
+      ok: true,
+      result: { kind: 'rename', params: { name: 'Git 页面', slug: 'git-pages' } },
+    });
     expect(renameDirs).toEqual([{ from: 'legacy-module-01', to: 'git-pages' }]);
     expect(moduleStore.get(m1.id)!.slug).toBe('git-pages');
     expect(s.engine.store.get(a.id)!).toMatchObject({ module: 'git-pages', moduleId: m1.id });
@@ -1012,7 +1099,10 @@ describe('正式模块绑定', () => {
     });
 
     // merge：沿用 mergeModules 全套语义（来源归档、issue 重指）
-    expect((await s.engine.applyOrganizeAction(s.projectId, 1)).ok).toBe(true);
+    expect(await s.engine.applyOrganizeAction(s.projectId, 1)).toMatchObject({
+      ok: true,
+      result: { kind: 'merge', params: { target: '执行', count: 1 } },
+    });
     expect(moduleStore.get(m3.id)!.status).toBe('archived');
     expect(s.engine.store.get(c.id)!.moduleId).toBe(m2.id);
 
@@ -1021,10 +1111,18 @@ describe('正式模块绑定', () => {
       ok: false,
       error: expect.stringContaining('file-preview'),
     });
-    expect((await s.engine.applyOrganizeAction(s.projectId, 2)).ok).toBe(true);
+    expect(await s.engine.applyOrganizeAction(s.projectId, 2)).toMatchObject({
+      ok: true,
+      result: {
+        kind: 'create', params: { name: '文件预览', slug: 'file-preview', agent: 'claude' },
+      },
+    });
     const created = moduleStore.listByProject(s.projectId).find((m) => m.slug === 'file-preview')!;
     expect(created).toMatchObject({ displayName: '文件预览', agent: 'claude', source: 'manual' });
-    expect((await s.engine.applyOrganizeAction(s.projectId, 3)).ok).toBe(true);
+    expect(await s.engine.applyOrganizeAction(s.projectId, 3)).toMatchObject({
+      ok: true,
+      result: { kind: 'move', params: { target: '文件预览', count: 1 } },
+    });
     expect(s.engine.store.get(b.id)!).toMatchObject({
       module: 'file-preview',
       moduleId: created.id,
@@ -1174,18 +1272,18 @@ describe('ISSUE_BLOCKED 哨兵 / clarifying / 手动旁路封死', () => {
     const s = await setup();
     const issue = await s.engine.createIssue(
       s.projectId,
-      { title: '带图任务', imagesJson: JSON.stringify(['.mando/uploads/a/1.png']) },
+      { title: '带图任务', imagesJson: JSON.stringify(['.panda/uploads/a/1.png']) },
       false,
     );
-    expect(JSON.parse(s.engine.store.get(issue.id)!.imagesJson!)).toEqual(['.mando/uploads/a/1.png']);
+    expect(JSON.parse(s.engine.store.get(issue.id)!.imagesJson!)).toEqual(['.panda/uploads/a/1.png']);
 
     // 覆盖为新的一组
     s.engine.store.patchMeta(issue.id, {
-      imagesJson: JSON.stringify(['.mando/uploads/b/2.png', '.mando/uploads/b/3.png']),
+      imagesJson: JSON.stringify(['.panda/uploads/b/2.png', '.panda/uploads/b/3.png']),
     });
     expect(JSON.parse(s.engine.store.get(issue.id)!.imagesJson!)).toEqual([
-      '.mando/uploads/b/2.png',
-      '.mando/uploads/b/3.png',
+      '.panda/uploads/b/2.png',
+      '.panda/uploads/b/3.png',
     ]);
 
     // 清空：null → images_json 置空
@@ -3144,7 +3242,7 @@ describe('历史 issue 未配置目标分支（沿用开发者分支且不做本
     await s.g(['commit', '-m', 'work 分支改了 README（与 main 不同）']);
     await fsp.writeFile(path.join(s.repo, 'README.md'), 'dirty 未提交改动\n'); // 未提交本地改动
 
-    const issue = await engine.createIssue(s.projectId, { title: 'v2mando 首页按图例改', module: 'ui' });
+    const issue = await engine.createIssue(s.projectId, { title: 'PandaDOS 首页按图例改', module: 'ui' });
     const jl = await s.bindJsonl(issue.id);
     await engine.tick();
     await s.appendOutput(jl, asst('SUBTASKS_BEGIN\n1. 改首页\nSUBTASKS_END'));
@@ -4239,7 +4337,7 @@ describe('start() 恢复扫描：被重启打断的创建时澄清', () => {
     st.logEvent(c.id, 'clarify_done', { questions: 0 });
     // A 的中断残留现场：clr 会话还挂着 + scratch 没清（runner finally 没机会跑）
     s.driver.tmuxSessions.add(`clr-${a.id}`);
-    const aScratch = path.join(s.repo, '.mando/tmp/clarify', String(a.id));
+    const aScratch = path.join(s.repo, '.panda/tmp/clarify', String(a.id));
     await fsp.mkdir(aScratch, { recursive: true });
     await fsp.writeFile(path.join(aScratch, 'task.md'), 'x');
 

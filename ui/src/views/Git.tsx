@@ -54,9 +54,15 @@ import { Loading } from '../components/Loaders';
 import { ChangeTree } from '../components/ChangeTree';
 import { FileTree } from '../components/FileTree';
 import { FileViewer } from '../components/FileViewer';
+import {
+  GitImagePreview,
+  gitImageUrls,
+  type GitImageUrls,
+} from '../components/GitImagePreview';
 import { ListSplitter } from '../components/ListSplitter';
 import { Splitter } from '../components/Splitter';
 import { tr } from '../i18n/runtime';
+import { isImagePath } from '../lib/preview';
 
 // ---------- 绘图常量 ----------
 
@@ -306,6 +312,28 @@ export function DiffBody({ d, error }: { d: GitDiff | null; error?: string }) {
   );
 }
 
+/** 图片改动走原图预览，其余文件保持 unified diff；供 Git 页和 issue 改动页共用。 */
+export function DiffContent({
+  code,
+  path,
+  oldPath,
+  imageUrls,
+  d,
+  error,
+}: {
+  code: string;
+  path: string;
+  oldPath?: string;
+  imageUrls: GitImageUrls;
+  d: GitDiff | null;
+  error?: string;
+}) {
+  if (isImagePath(path) || (oldPath ? isImagePath(oldPath) : false)) {
+    return <GitImagePreview path={path} oldPath={oldPath} urls={imageUrls} />;
+  }
+  return <DiffBody d={d} error={error} />;
+}
+
 // ---------- 数据 hooks / URL ----------
 
 /** 提交详情拉取（抽屉、右栏与工作区树共用；reloadToken 用于手动刷新当前上下文）。 */
@@ -386,6 +414,15 @@ export function commitDiffUrl(pid: number, sha: string, f: GitFile): string {
   const q = new URLSearchParams({ path: f.path });
   if (f.oldPath) q.set('old', f.oldPath);
   return `/api/projects/${pid}/git/commits/${sha}/diff?${q}`;
+}
+
+export function commitImageUrls(pid: number, sha: string, f: GitFile): GitImageUrls {
+  return gitImageUrls(
+    `/api/projects/${pid}/git/commits/${sha}/raw`,
+    f.path,
+    f.oldPath,
+    f.status,
+  );
 }
 
 // ---------- 提交详情共用块（抽屉 + 右栏） ----------
@@ -562,6 +599,15 @@ export function wtDiffUrl(pid: number, e: WtEntry): string {
   return `/api/projects/${pid}/git/worktree/diff?${q}`;
 }
 
+export function wtImageUrls(pid: number, e: WtEntry): GitImageUrls {
+  return gitImageUrls(
+    `/api/projects/${pid}/git/worktree/raw`,
+    e.change.path,
+    e.change.oldPath,
+    e.code,
+  );
+}
+
 export function WtGroups({
   changes, selKey, onOpen,
 }: {
@@ -643,7 +689,14 @@ function CommitSheet({
             <button class="gs-x" onClick={onClose}>✕</button>
           </div>
           {fileAi.run && <AiPanel run={fileAi.run} onClose={fileAi.clear} />}
-          <DiffBody d={fd.diff} error={fd.err} />
+          <DiffContent
+            code={fd.file.status}
+            path={fd.file.path}
+            oldPath={fd.file.oldPath}
+            imageUrls={commitImageUrls(pid, sha, fd.file)}
+            d={fd.diff}
+            error={fd.err}
+          />
         </>
       ) : (
         <>
@@ -716,7 +769,14 @@ function WorktreeSheet({
             <button class="gs-x" onClick={onClose}>✕</button>
           </div>
           {fileAi.run && <AiPanel run={fileAi.run} onClose={fileAi.clear} />}
-          <DiffBody d={fd.diff} error={fd.err} />
+          <DiffContent
+            code={fd.file.code}
+            path={fd.file.change.path}
+            oldPath={fd.file.change.oldPath}
+            imageUrls={wtImageUrls(pid, fd.file)}
+            d={fd.diff}
+            error={fd.err}
+          />
         </>
       ) : (
         <>
@@ -749,11 +809,12 @@ function WorktreeSheet({
 
 /** 右栏 diff 子列：文件头（状态/路径/AI 解释/收起）+ 内联 AI 面板 + 着色 diff */
 function DiffCol({
-  code, path, oldPath, diff, error, onClose, explain,
+  code, path, oldPath, imageUrls, diff, error, onClose, explain,
 }: {
   code: string;
   path: string;
   oldPath?: string;
+  imageUrls: GitImageUrls;
   diff: GitDiff | null;
   error?: string;
   onClose: () => void;
@@ -779,11 +840,14 @@ function DiffCol({
         <button class="gs-x" title={tr('git.collapseDiff')} onClick={onClose}>✕</button>
       </div>
       {ai.run && <AiPanel run={ai.run} onClose={ai.clear} />}
-      {error ? (
-        <div class="empty"><span class="err">{error}</span></div>
-      ) : (
-        <DiffBody d={diff} />
-      )}
+      <DiffContent
+        code={code}
+        path={path}
+        oldPath={oldPath}
+        imageUrls={imageUrls}
+        d={diff}
+        error={error}
+      />
     </div>
   );
 }
@@ -807,6 +871,7 @@ export function CommitPanel({
         code={fd.file.status}
         path={fd.file.path}
         oldPath={fd.file.oldPath}
+        imageUrls={commitImageUrls(pid, sha, fd.file)}
         diff={fd.diff}
         error={fd.err}
         onClose={fd.close}
@@ -834,6 +899,7 @@ export function CommitPanel({
               code={fd.file.status}
               path={fd.file.path}
               oldPath={fd.file.oldPath}
+              imageUrls={commitImageUrls(pid, sha, fd.file)}
               diff={fd.diff}
               error={fd.err}
               onClose={fd.close}
@@ -887,6 +953,7 @@ function CommitCols({
             code={fd.file.status}
             path={fd.file.path}
             oldPath={fd.file.oldPath}
+            imageUrls={commitImageUrls(pid, sha, fd.file)}
             diff={fd.diff}
             error={fd.err}
             onClose={fd.close}
@@ -946,6 +1013,7 @@ function WorktreeCols({
             code={fd.file.code}
             path={fd.file.change.path}
             oldPath={fd.file.change.oldPath}
+            imageUrls={wtImageUrls(pid, fd.file)}
             diff={fd.diff}
             error={fd.err}
             onClose={fd.close}
@@ -991,6 +1059,13 @@ function workspaceDiffUrl(pid: number, file: GitWorkspaceFile): string | null {
     return `/api/projects/${pid}/git/worktree/diff?${q}`;
   }
   return `/api/projects/${pid}/git/commits/${file.sha}/diff?${q}`;
+}
+
+function workspaceImageUrls(pid: number, file: Exclude<GitWorkspaceFile, { kind: 'all' }>): GitImageUrls {
+  const endpoint = file.kind === 'worktree'
+    ? `/api/projects/${pid}/git/worktree/raw`
+    : `/api/projects/${pid}/git/commits/${file.sha}/raw`;
+  return gitImageUrls(endpoint, file.leaf.path, file.leaf.oldPath, file.leaf.code);
 }
 
 /** 当前工作区文件 diff；内容切换/刷新时重拉，并丢弃迟到响应。 */
@@ -1554,6 +1629,7 @@ function WorkspaceContext({
       code={leaf.code}
       path={leaf.path}
       oldPath={leaf.oldPath}
+      imageUrls={workspaceImageUrls(pid, file)}
       diff={diff}
       error={err}
       onClose={() => dispatch({ type: 'close-content' })}

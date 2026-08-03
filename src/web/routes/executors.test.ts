@@ -1,8 +1,12 @@
 import { describe, expect, test } from 'bun:test';
+import { promises as fsp } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { openDb } from '../../core/db';
 import { migrate } from '../../core/migrate';
 import { UserStore } from '../../core/users';
 import type { DirEntry, PathStat, TmuxSession } from '../../executor/driver';
+import { LocalDriver } from '../../executor/local';
 import { authDepsFromDb, createDispatcher } from '../middleware';
 import {
   executorsRoutes,
@@ -24,7 +28,7 @@ const PASSWD = [
   'games:x:5:60:games:/usr/games:/usr/sbin/nologin',
   'svc:x:999:999::/var/svc:/bin/false',
   'developer:x:1002:1002::/home/developer:/bin/bash',
-  'runner:x:1000:1000::/home/runner:/bin/bash',
+  'lighthouse:x:1000:1000::/home/lighthouse:/bin/bash',
   '坏行',
 ].join('\n');
 
@@ -87,7 +91,7 @@ describe('parsePasswd', () => {
   test('排除 nologin/false/sync/halt/shutdown 与系统 uid；按 uid 升序', () => {
     expect(parsePasswd(PASSWD)).toEqual([
       { name: 'root', uid: 0, home: '/root' },
-      { name: 'runner', uid: 1000, home: '/home/runner' },
+      { name: 'lighthouse', uid: 1000, home: '/home/lighthouse' },
       { name: 'developer', uid: 1002, home: '/home/developer' },
     ]);
   });
@@ -98,7 +102,7 @@ describe('managedProjectIdOf', () => {
     expect(managedProjectIdOf('cc-3')).toBe(3);
     expect(managedProjectIdOf('cc-3-console')).toBe(3);
     expect(managedProjectIdOf('cc-abc')).toBeNull();
-    expect(managedProjectIdOf('sample-app')).toBeNull();
+    expect(managedProjectIdOf('ontology')).toBeNull();
   });
 });
 
@@ -128,7 +132,7 @@ describe('executors 路由', () => {
     expect((await j(s.dispatch(req('GET', '/api/executors/1/os-users', s.alice.token)))).status).toBe(403);
     const r = await j(s.dispatch(req('GET', '/api/executors/1/os-users', s.admin.token)));
     expect(r.status).toBe(200);
-    expect(r.body.users.map((u: any) => u.name)).toEqual(['root', 'runner', 'developer']);
+    expect(r.body.users.map((u: any) => u.name)).toEqual(['root', 'lighthouse', 'developer']);
 
     const s2 = setup([], { noDriver: true });
     expect((await j(s2.dispatch(req('GET', '/api/executors/1/os-users', s2.admin.token)))).status).toBe(503);
@@ -138,15 +142,15 @@ describe('executors 路由', () => {
   test('tmux-sessions：托管/已导入/同目录项目标注 + 普通用户 workspace 越权标 false', async () => {
     const s = setup([
       { name: 'cc-1', createdTs: 10, attached: false, command: 'claude', cwd: '/ws/u9/x' },
-      { name: 'sample-app', createdTs: 20, attached: true, command: 'claude', cwd: '/home/developer/sample-app' },
+      { name: 'ontology', createdTs: 20, attached: true, command: 'claude', cwd: '/home/developer/onto' },
       { name: 'mine', createdTs: 30, attached: false, command: 'bash', cwd: `/ws/u2/mine` },
       { name: 'imported-one', createdTs: 40, attached: false, cwd: '/opt/x' },
       { name: 'nocwd', createdTs: 50, attached: false },
     ]);
-    // 项目 1（cc-1 的托管项目）+ 项目 2（cwd=/home/developer/sample-app 同目录）+ 登记 imported-one → 项目 2
+    // 项目 1（cc-1 的托管项目）+ 项目 2（cwd=/home/developer/onto 同目录）+ 登记 imported-one → 项目 2
     s.db.run(
       `INSERT INTO projects (name, executor_id, cwd, owner_user_id, created_ts) VALUES
-       ('a', 1, '/ws/u9/x', 1, 0), ('b', 1, '/home/developer/sample-app', 1, 0)`,
+       ('a', 1, '/ws/u9/x', 1, 0), ('b', 1, '/home/developer/onto', 1, 0)`,
     );
     s.db.run(`INSERT INTO sessions (name, executor_id, project_id, owner_user_id) VALUES ('imported-one', 1, 2, 1)`);
 
@@ -154,7 +158,7 @@ describe('executors 路由', () => {
     expect(r.status).toBe(200);
     const by = new Map(r.body.sessions.map((x: any) => [x.name, x]));
     expect((by.get('cc-1') as any).managedProjectId).toBe(1);
-    expect((by.get('sample-app') as any).sameCwdProjectId).toBe(2);
+    expect((by.get('ontology') as any).sameCwdProjectId).toBe(2);
     expect((by.get('imported-one') as any).importedProjectId).toBe(2);
     expect((by.get('nocwd') as any).cwd).toBeNull();
     // admin 全 allowed
@@ -164,8 +168,66 @@ describe('executors 路由', () => {
     const ra = await j(s.dispatch(req('GET', '/api/executors/1/tmux-sessions', s.alice.token)));
     const bya = new Map(ra.body.sessions.map((x: any) => [x.name, x]));
     expect((bya.get('mine') as any).allowed).toBe(true);
-    expect((bya.get('sample-app') as any).allowed).toBe(false);
+    expect((bya.get('ontology') as any).allowed).toBe(false);
     expect((bya.get('nocwd') as any).allowed).toBe(false);
+  });
+
+  test('agent-projects：按 Agent 返回历史项目摘要，并对普通用户隐藏 workspace 外候选', async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-agent-projects-'));
+    try {
+      const claudeDir = path.join(root, '.claude', 'projects', '-history');
+      await fsp.mkdir(claudeDir, { recursive: true });
+      const write = async (sid: string, cwd: string, prompt: string) => {
+        await fsp.writeFile(
+          path.join(claudeDir, `${sid}.jsonl`),
+          JSON.stringify({
+            type: 'user', cwd, sessionId: sid, timestamp: '2026-08-02T00:00:00Z',
+            message: { role: 'user', content: prompt },
+          }) + '\n',
+        );
+      };
+      await write('mine', '/ws/u2/app', '我的历史');
+      await write('private', '/srv/private', '不可泄露的历史');
+
+      const db = openDb(':memory:');
+      migrate(db);
+      const users = new UserStore(db);
+      const admin = users.create('admin', 'admin');
+      const alice = users.create('alice');
+      db.query(
+        `INSERT INTO executors
+           (name, host, port, ssh_user, key_ref, workspace_root, claude_dir, codex_dir)
+         VALUES ('local', '127.0.0.1', 22, 'root', 'k', '/ws', ?, ?)`,
+      ).run(path.dirname(claudeDir), path.join(root, '.codex', 'sessions'));
+      db.run(
+        `INSERT INTO projects (name, executor_id, cwd, owner_user_id, created_ts)
+         VALUES ('existing', 1, '/ws/u2/app', 2, 0)`,
+      );
+      const dispatch = createDispatcher(
+        executorsRoutes({ db, driverFor: () => new LocalDriver() }),
+        authDepsFromDb(db, users),
+      );
+
+      const mine = await j(dispatch(req('GET', '/api/executors/1/agent-projects?agent=claude', alice.token)));
+      expect(mine.status).toBe(200);
+      expect(mine.body.projects).toEqual([
+        expect.objectContaining({
+          agent: 'claude', cwd: '/ws/u2/app', name: 'app', sessionCount: 1, sameCwdProjectId: 1,
+        }),
+      ]);
+      expect(JSON.stringify(mine.body)).not.toContain('不可泄露的历史');
+      expect(JSON.stringify(mine.body)).not.toContain('jsonlPath');
+
+      const all = await j(dispatch(req('GET', '/api/executors/1/agent-projects?agent=claude', admin.token)));
+      expect(all.body.projects).toHaveLength(2);
+      const invalidAgent = await j(
+        dispatch(req('GET', '/api/executors/1/agent-projects?agent=other', admin.token)),
+      );
+      expect(invalidAgent.status).toBe(400);
+      expect(invalidAgent.body.error.code).toBe('executor.agent_invalid');
+    } finally {
+      await fsp.rm(root, { recursive: true, force: true });
+    }
   });
 });
 

@@ -6,7 +6,7 @@
 import { createIdListStore } from './idlist';
 
 const CAP = 8;
-const store = createIdListStore('mando.recentProjects');
+const store = createIdListStore('panda.recentProjects');
 
 export function getRecent(): number[] {
   return store.read();

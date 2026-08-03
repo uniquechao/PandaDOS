@@ -5,6 +5,8 @@ import { commonUiMessages } from '../domains/common-ui';
 import { statusMessages } from '../domains/status';
 import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
+import { projectSettingsMessages } from '../domains/project-settings';
+import { externalImportMessages } from '../domains/external-import';
 
 export const deCatalog = {
   ...shellMessages.de,
@@ -13,6 +15,13 @@ export const deCatalog = {
   ...statusMessages.de,
   ...errorMessages.de,
   ...notifyMessages.de,
+  ...projectSettingsMessages.de,
+  ...externalImportMessages.de,
+  'issue.editSubtask': 'Teilaufgabe {number} bearbeiten', 'issue.subtaskText': 'Inhalt der Teilaufgabe',
+  'view.importLocalHistory':'Lokalen Verlauf importieren','view.localHistoryHelp':'Es werden nur Claude-/Codex-Sitzungen angezeigt, deren Arbeitsverzeichnis genau diesem Projekt entspricht.','view.localHistoryAgentFilter':'Verlauf nach Agent filtern','view.historySelected':'{count, plural, one {# Sitzung ausgewählt} other {# Sitzungen ausgewählt}}','view.selectAllHistory':'Alle auswählen','view.clearHistorySelection':'Leeren','view.readingLocalHistory':'Lokaler Verlauf wird gelesen…','view.noLocalHistory':'Für dieses Projekt wurde kein passender lokaler Verlauf gefunden.','view.noFilteredLocalHistory':'Für diesen Agent-Filter ist kein Verlauf vorhanden.','view.localHistoryCandidates':'Lokale Verlaufssitzungen','view.untitledHistory':'Unbenannte Verlaufssitzung','view.historyAlreadyImported':'Importiert','view.noImportedConversation':'Nach dem Import wurde keine verfügbare Unterhaltung zurückgegeben.','view.localHistoryImported':'{count, plural, one {# Verlaufssitzung importiert} other {# Verlaufssitzungen importiert}}','view.importSelectedHistory':'Auswahl importieren',
+  'project.importTitle':'Importieren','project.importShort':'Importieren','project.importSource':'Importquelle','project.importTmuxSource':'tmux-Sitzung','project.importClaudeSource':'Claude-Projekt','project.importCodexSource':'Codex-Projekt',
+  'project.importTmuxHelp':'Laufende tmux-Sitzung registrieren','project.importClaudeHelp':'Lokale Projekte und Verläufe importieren','project.importCodexHelp':'Lokale Projekte und Verläufe importieren','project.readingProjects':'Lokale Projekte werden gelesen…',
+  'project.noAgentProjects':'Keine importierbaren {agent}-Projekte auf diesem Executor','project.importCandidates':'Importierbare Elemente','project.historySessions':'{count, plural, one {# Verlaufssitzung} other {# Verlaufssitzungen}}','project.tmuxAttached':'Verbunden','project.linkedHistory':'{count, plural, one {# Verlaufssitzung verknüpft} other {# Verlaufssitzungen verknüpft}}','project.noProjectsImportHelp':'Erstellen Sie ein Projekt oder importieren Sie ein vorhandenes Projekt bzw. eine Sitzung von einem Executor.','project.importExisting':'Vorhandenes Claude-/Codex-/tmux-Projekt importieren',
   'common.cancel': 'Abbrechen',
   'common.close': 'Schließen',
   'common.loading': 'Wird geladen…',
@@ -20,7 +29,6 @@ export const deCatalog = {
   'common.issueCount': '{count, plural, one {# Issue} other {# Issues}}',
   'locale.loadFailed': 'Die gewählte Sprache konnte nicht geladen werden. Englisch wird verwendet.',
   'locale.languageAria': 'Sprache',
-  'login.tagline': 'Ihr Engineering-Assistent für unterwegs',
   'login.username': 'Benutzername',
   'login.token': 'Token',
   'login.signingIn': 'Anmeldung läuft…',
@@ -137,7 +145,7 @@ export const deCatalog = {
   'project.projectName': 'Projektname', 'project.repoNameDefault': ' (leer lassen, um den Repository-Namen zu verwenden)',
   'project.cloneTo': 'Klonen nach', 'project.selectedUserHome': 'Home-Verzeichnis des ausgewählten Benutzers',
   'project.yourWorkspace': 'Ihr Arbeitsbereich', 'project.pickDirectory': 'Verzeichnis auswählen',
-  'project.branchFallbackHelp': 'Die Arbeit erfolgt auf Ihrem aktuellen Branch. MandoAI erstellt, wechselt oder merged keine Branches; dies ist nur ein Fallback, falls der aktuelle Branch nicht gelesen werden kann.',
+  'project.branchFallbackHelp': 'Die Arbeit erfolgt auf Ihrem aktuellen Branch. PandaDOS erstellt, wechselt oder merged keine Branches; dies ist nur ein Fallback, falls der aktuelle Branch nicht gelesen werden kann.',
   'project.cloning': 'Wird geklont…', 'project.cloneCreate': 'Klonen und erstellen', 'project.managed': 'Verwaltet #{id}',
   'project.imported': 'Importiert #{id}', 'project.noPermission': 'Keine Berechtigung', 'project.mergeInto': 'In #{id} zusammenführen',
   'project.importedWarnings': 'Mit Warnungen importiert:\n{warnings}', 'project.importTmux': 'tmux-Sitzung importieren',
@@ -331,7 +339,7 @@ export const deCatalog = {
   'admin.agent': 'Agent', 'admin.systemLocal': 'Systemlokal', 'admin.noExecutors': 'Noch keine Executors',
   'admin.executorUpdated': 'Executor {name} aktualisiert', 'admin.executorRegistered': 'Executor {name} registriert', 'admin.name': 'Name',
   'admin.host': 'Host (leer bedeutet lokaler Executor)', 'admin.sshPort': 'SSH-Port', 'admin.sshUser': 'SSH-Benutzer (für lokalen Executor optional)',
-  'admin.keyRef': 'Pfad oder Referenz des privaten Schlüssels (Referenzen werden aus ~/.mando/keys/ geladen; für lokal leer lassen)',
+  'admin.keyRef': 'Pfad oder Referenz des privaten Schlüssels (Referenzen werden aus ~/.panda/keys/ geladen; für lokal leer lassen)',
   'admin.chooseDirectory': 'Verzeichnis auswählen',
   'admin.connectionFirst': 'Geben Sie einen Namen und gültige Verbindungsdaten ein, bevor Sie Remote-Verzeichnisse erkennen oder durchsuchen.',
   'admin.suggestion': 'Vorschlag:', 'admin.useSuggestion': 'Vorschlag verwenden', 'admin.editExecutor': 'Executor {name} bearbeiten',
@@ -359,4 +367,9 @@ export const deCatalog = {
   'notify.failed': 'Die Aktion konnte nicht abgeschlossen werden', 'notify.approved': '✅ Genehmigt',
   'notify.rejected': '❌ Abgelehnt; fügen Sie in der Web-App eine ausführliche Rückmeldung hinzu',
   'notify.invalidSelection': 'Ungültiger Auswahl-Callback', 'notify.selectedOption': 'Option {index} ausgewählt',
+  'ui.organizeKindCreate':'Erstellen','ui.organizeKindRename':'Umbenennen','ui.organizeKindMerge':'Zusammenführen','ui.organizeKindMove':'Issues verschieben',
+  'ui.organizeDescriptionCreate':'Modul „{name}“ erstellen ({slug} · {agent})','ui.organizeDescriptionRename':'„{name}“: {fromSlug} → {slug}','ui.organizeDescriptionRenameWithName':'„{name}“: {fromSlug} → {slug} (Anzeigename → „{displayName}“)','ui.organizeDescriptionMerge':'{sources} in „{target}“ zusammenführen','ui.organizeDescriptionMove':'{issues} nach „{target}“ verschieben',
+  'ui.moduleIssueCount':'{count, plural, one {# Issue} other {# Issues}}','ui.organizeResultCreate':'Modul „{name}“ erstellt ({slug} · {agent})','ui.organizeResultRename':'Modul in „{name}“ umbenannt ({slug})','ui.organizeResultMerge':'{count, plural, one {In „{target}“ zusammengeführt; # Issue verschoben} other {In „{target}“ zusammengeführt; # Issues verschoben}}','ui.organizeResultMove':'{count, plural, one {# Issue nach „{target}“ verschoben} other {# Issues nach „{target}“ verschoben}}',
+  'ui.organizeFailureTimeout':'Die letzte Analyse hat das Zeitlimit überschritten. Sie können sie erneut ausführen.','ui.organizeFailureNoOutput':'Die letzte Analyse hat keinen Organisationsplan geliefert. Sie können sie erneut ausführen.','ui.organizeFailureError':'Die letzte Analyse ist fehlgeschlagen. Sie können sie erneut ausführen.','ui.organizeFailureDetail':'Technische Details: {detail}',
+  'git.imageBefore':'Vorher','git.imageAfter':'Nachher','git.openImage':'{name} öffnen','git.viewImage':'Bild {name} anzeigen','git.downloadImage':'{name} herunterladen',
 } as const satisfies MessageCatalog;
