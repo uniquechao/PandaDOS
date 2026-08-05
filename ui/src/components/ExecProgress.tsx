@@ -49,7 +49,8 @@ export function canEditSubtask(
 ): boolean {
   if (subtask.done) return false;
   if (status === 'plan_review') return true;
-  return implMode === 'seq' && (status === 'implementing' || status === 'blocked') && index > subIndex;
+  if (status === 'blocked') return index >= subIndex;
+  return implMode === 'seq' && status === 'implementing' && index > subIndex;
 }
 
 /** 纯函数：把 subtasks + subIndex + status 折成进度链（组件只管画）。

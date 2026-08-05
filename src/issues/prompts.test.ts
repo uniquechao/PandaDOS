@@ -56,6 +56,20 @@ describe('prompt 模板与哨兵协议配套', () => {
     expect(p).toContain('第 2 步拆太粗');
   });
 
+  test('受阻恢复规划带解除方法和修订后的子任务', () => {
+    const p = buildPlanningPrompt({
+      issue: { ...issue, body: '改用离线缓存并保留失败记录' },
+      recovery: {
+        guidance: '先检查缓存目录权限，再从失败步骤继续',
+        subtasks: ['准备缓存目录', '恢复失败步骤'],
+      },
+    });
+    expect(p).toContain('改用离线缓存并保留失败记录');
+    expect(p).toContain('先检查缓存目录权限，再从失败步骤继续');
+    expect(p).toContain('1. 准备缓存目录');
+    expect(p).toContain('2. 恢复失败步骤');
+  });
+
   test('subtask：SUBTASK_DONE 带 id + 分支上下文 + NEED_CLARIFY + 越界防护措辞', () => {
     const p = buildSubtaskPrompt({ issue, subtasks: ['a', 'b'], idx: 0, branch: 'issue/42' });
     expect(p).toContain('【实施 子任务 1/2】');

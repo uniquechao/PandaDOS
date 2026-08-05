@@ -179,6 +179,19 @@ describe('Issue 工作台信息架构', () => {
     expect(source).toContain("tr('ui.cancel')");
   });
 
+  test('受阻恢复必须经弹窗提交解除方法，并提供编辑 issue 与受阻子任务入口', () => {
+    expect(source).toContain('function BlockedRecoveryModal');
+    expect(source).toContain('setRecoveryOpen(true)');
+    expect(source).toContain("{ guidance: recoveryGuidance.trim() }");
+    expect(source).toContain("tr('issue.recoveryGuidanceRequired')");
+    expect(source).toContain("tr('issue.editBlockedIssue')");
+    expect(source).toContain("tr('issue.editBlockedSubtask')");
+    expect(source).toContain("issue.status === 'pending' || issue.status === 'blocked'");
+    expect(source).not.toContain('onUnblock={() => void post(`/api/projects/${pid}/issues/${iid}/unblock`)}');
+    expect(styles).toContain('.blocked-recovery');
+    expect(styles).toContain('.recovery-tools');
+  });
+
   test('当前子任务旋转环使用带居中位移的旋转关键帧，不再依赖负 margin 猜测中心', () => {
     expect(styles).toContain('transform: translate(-50%, -50%) rotate(360deg)');
     expect(styles).toContain('.plan-i .ck.ep-n {');

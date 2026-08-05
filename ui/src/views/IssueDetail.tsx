@@ -102,6 +102,11 @@ export function IssueWorkbench({
   const [note, setNote] = useState('');
   const [tab, setTab] = useState<WbTab>('detail');
   const [editing, setEditing] = useState(false);
+  const [returnToRecovery, setReturnToRecovery] = useState(false);
+  const [recoveryOpen, setRecoveryOpen] = useState(false);
+  const [recoveryGuidance, setRecoveryGuidance] = useState('');
+  const [recoveryError, setRecoveryError] = useState('');
+  const [subtaskEditRequest, setSubtaskEditRequest] = useState<{ index: number; nonce: number } | null>(null);
   const [clarifyOpen, setClarifyOpen] = useState(false);
   // 当前在灯箱里查看的截图相对路径（null=未打开）；详情/编辑里的缩略图点击时设置。
   const [lightbox, setLightbox] = useState<string | null>(null);
@@ -143,6 +148,11 @@ export function IssueWorkbench({
     setActErr('');
     setNote('');
     setEditing(false);
+    setReturnToRecovery(false);
+    setRecoveryOpen(false);
+    setRecoveryGuidance('');
+    setRecoveryError('');
+    setSubtaskEditRequest(null);
     setLightbox(null); // 切换 issue 时收起灯箱
     load();
     pollRef.current = window.setInterval(load, POLL_MS);
@@ -240,6 +250,32 @@ export function IssueWorkbench({
     void post(`/api/projects/${pid}/issues/${iid}/retry-gate`);
   };
 
+  const openRecovery = (): void => {
+    if (issue?.status !== 'blocked') return;
+    setRecoveryError('');
+    setRecoveryOpen(true);
+  };
+
+  const submitRecovery = async (): Promise<void> => {
+    if (busy || !recoveryGuidance.trim()) {
+      if (!recoveryGuidance.trim()) setRecoveryError(tr('issue.recoveryGuidanceRequired'));
+      return;
+    }
+    setBusy(true);
+    setRecoveryError('');
+    setActErr('');
+    try {
+      await api(`/api/projects/${pid}/issues/${iid}/unblock`, 'POST', { guidance: recoveryGuidance.trim() });
+      setRecoveryOpen(false);
+      setRecoveryGuidance('');
+      load();
+    } catch (error) {
+      setRecoveryError(error instanceof ApiError ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const remove = (): void => {
     if (!confirm(tr('issue.deleteConfirm', { id: iid }))) return;
     void act(async () => {
@@ -268,6 +304,24 @@ export function IssueWorkbench({
 
   const subs = detail?.subtasks ?? [];
   const doneN = subs.filter((s) => s.done).length;
+  const blockedSubtaskIndex =
+    issue?.status === 'blocked'
+      ? subs.findIndex((subtask, index) =>
+          canEditSubtask(subtask, index, issue.subIndex, issue.status, issue.implMode),
+        )
+      : -1;
+
+  const openIssueEditor = (fromRecovery = false): void => {
+    setReturnToRecovery(fromRecovery);
+    setRecoveryOpen(false);
+    setEditing(true);
+  };
+
+  const closeIssueEditor = (): void => {
+    setEditing(false);
+    if (returnToRecovery && issue?.status === 'blocked') setRecoveryOpen(true);
+    setReturnToRecovery(false);
+  };
 
   const saveSubtask = async (index: number, text: string): Promise<void> => {
     try {
@@ -302,7 +356,7 @@ export function IssueWorkbench({
           🚫 {tr('issue.cancelledCanRerun')}
           <span class="mut small"> {tr('issue.queueImmediately')}</span>
         </span>
-        <button class="btn sm" disabled={busy} onClick={() => setEditing(true)}>
+        <button class="btn sm" disabled={busy} onClick={() => openIssueEditor()}>
           ✏️ {tr('issue.editAction')}
         </button>
         <button class="btn sm primary" disabled={busy} onClick={reopen}>
@@ -328,7 +382,7 @@ export function IssueWorkbench({
       onCancel={() => {
         if (confirm(tr('issue.cancelConfirm'))) void post(`/api/projects/${pid}/issues/${iid}/cancel`);
       }}
-      onUnblock={() => void post(`/api/projects/${pid}/issues/${iid}/unblock`)}
+      onUnblock={openRecovery}
     />
   ) : null;
 
@@ -417,8 +471,8 @@ export function IssueWorkbench({
                 {issue.pinnedTs != null ? `📌 ${tr('board.unpin')}` : `📌 ${tr('issue.pinned')}`}
               </button>
             )}
-            {issue && issue.status === 'pending' && (
-              <button class="btn sm" disabled={busy} onClick={() => setEditing(true)}>
+            {issue && (issue.status === 'pending' || issue.status === 'blocked') && (
+              <button class="btn sm" disabled={busy} onClick={() => openIssueEditor()}>
                 {tr('issue.edit')}
               </button>
             )}
@@ -463,6 +517,7 @@ export function IssueWorkbench({
             approvals={approvals}
             onOpenImage={setLightbox}
             onSaveSubtask={saveSubtask}
+            editRequest={subtaskEditRequest}
           />
         )}
         {issue && tab === 'exec' && (
@@ -478,7 +533,7 @@ export function IssueWorkbench({
             onTerminate={() => {
               if (confirm(tr('issue.terminateConfirm'))) void post(`/api/projects/${pid}/issues/${iid}/cancel`);
             }}
-            onUnblock={() => void post(`/api/projects/${pid}/issues/${iid}/unblock`)}
+            onUnblock={openRecovery}
           />
         )}
         {issue && tab === 'changes' && (
@@ -489,13 +544,38 @@ export function IssueWorkbench({
       {/* 执行 tab 的卡点条在 ChatPane 内；其余 tab 常驻底部，看着 diff/提交就地拍板 */}
       {tab !== 'exec' && gateBar}
 
+      {recoveryOpen && issue?.status === 'blocked' && (
+        <BlockedRecoveryModal
+          blockedReason={blockedReason}
+          guidance={recoveryGuidance}
+          error={recoveryError}
+          busy={busy}
+          canEditSubtask={blockedSubtaskIndex >= 0}
+          onGuidanceChange={(value) => {
+            setRecoveryGuidance(value);
+            if (value.trim()) setRecoveryError('');
+          }}
+          onClose={() => {
+            if (!busy) setRecoveryOpen(false);
+          }}
+          onEditIssue={() => openIssueEditor(true)}
+          onEditSubtask={() => {
+            if (blockedSubtaskIndex < 0) return;
+            setTab('detail');
+            setSubtaskEditRequest({ index: blockedSubtaskIndex, nonce: Date.now() });
+            setRecoveryOpen(false);
+          }}
+          onSubmit={() => void submitRecovery()}
+        />
+      )}
+
       {editing && issue && (
         <EditIssueModal
           pid={pid}
           issue={issue}
-          onClose={() => setEditing(false)}
+          onClose={closeIssueEditor}
           onSaved={() => {
-            setEditing(false);
+            closeIssueEditor();
             load();
           }}
           onOpenImage={setLightbox}
@@ -509,7 +589,87 @@ export function IssueWorkbench({
   );
 }
 
-// ---------- 编辑 issue（仅「提交后未运行」的 pending 可直接改内容） ----------
+// ---------- 编辑 issue（pending / blocked / cancelled；保存不改变状态） ----------
+
+function BlockedRecoveryModal(props: {
+  blockedReason: string;
+  guidance: string;
+  error: string;
+  busy: boolean;
+  canEditSubtask: boolean;
+  onGuidanceChange: (value: string) => void;
+  onClose: () => void;
+  onEditIssue: () => void;
+  onEditSubtask: () => void;
+  onSubmit: () => void;
+}) {
+  return (
+    <Modal title={tr('issue.recoveryTitle')} onClose={props.onClose}>
+      <form
+        class="blocked-recovery"
+        onSubmit={(event) => {
+          event.preventDefault();
+          props.onSubmit();
+        }}
+      >
+        <section class="recovery-reason" aria-label={tr('issue.recoveryReason')}>
+          <div class="recovery-label">{tr('issue.recoveryReason')}</div>
+          <div class="block-box">{props.blockedReason}</div>
+        </section>
+        <p class="recovery-help">{tr('issue.recoveryHelp')}</p>
+        <label class="field recovery-guidance">
+          {tr('issue.recoveryGuidance')}
+          <textarea
+            autoFocus
+            rows={5}
+            maxLength={4000}
+            value={props.guidance}
+            placeholder={tr('issue.recoveryGuidancePlaceholder')}
+            aria-invalid={props.error ? 'true' : undefined}
+            onInput={(event) => props.onGuidanceChange(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                event.preventDefault();
+                props.onSubmit();
+              }
+            }}
+          />
+          <span class="mut small recovery-count">
+            {tr('issue.recoveryLength', { current: props.guidance.length, max: 4000 })}
+          </span>
+        </label>
+        <div class="recovery-tools">
+          <button class="recovery-tool" type="button" disabled={props.busy} onClick={props.onEditIssue}>
+            <span aria-hidden="true">✏️</span>
+            <span><b>{tr('issue.editBlockedIssue')}</b><small>{tr('issue.editBlockedIssueHint')}</small></span>
+          </button>
+          <button
+            class="recovery-tool"
+            type="button"
+            disabled={props.busy || !props.canEditSubtask}
+            onClick={props.onEditSubtask}
+          >
+            <span aria-hidden="true">☑</span>
+            <span>
+              <b>{tr('issue.editBlockedSubtask')}</b>
+              <small>{props.canEditSubtask ? tr('issue.editBlockedSubtaskHint') : tr('issue.noEditableBlockedSubtask')}</small>
+            </span>
+          </button>
+        </div>
+        {props.error && <div class="err" role="alert">{props.error}</div>}
+        <div class="recovery-queue-hint">{tr('issue.recoveryQueueHint')}</div>
+        <div class="mbtns">
+          <button class="btn" type="button" disabled={props.busy} onClick={props.onClose}>
+            {tr('ui.cancel')}
+          </button>
+          <button class="btn primary" type="submit" disabled={props.busy || !props.guidance.trim()}>
+            {props.busy ? tr('ui.saving') : tr('issue.confirmRecovery')}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
 
 function EditIssueModal({
   pid,
@@ -804,6 +964,7 @@ function DetailTab({
   approvals,
   onOpenImage,
   onSaveSubtask,
+  editRequest,
 }: {
   issue: Issue;
   pid: number;
@@ -814,11 +975,21 @@ function DetailTab({
   approvals: ApprovalLogRow[];
   onOpenImage: (path: string) => void;
   onSaveSubtask: (index: number, text: string) => Promise<void>;
+  editRequest: { index: number; nonce: number } | null;
 }) {
   const [editIndex, setEditIndex] = useState<number | null>(null);
   const [draft, setDraft] = useState('');
   const [saving, setSaving] = useState(false);
   const [editError, setEditError] = useState('');
+
+  useEffect(() => {
+    if (!editRequest) return;
+    const subtask = subs[editRequest.index];
+    if (!subtask || !canEditSubtask(subtask, editRequest.index, issue.subIndex, issue.status, issue.implMode)) return;
+    setEditIndex(editRequest.index);
+    setDraft(subtask.text);
+    setEditError('');
+  }, [editRequest?.nonce]);
 
   const cancelSubtaskEdit = (): void => {
     if (saving) return;
@@ -1428,7 +1599,7 @@ function GateBar(props: {
             {tr('issue.cancelIssue')}
           </button>
           <button class="btn ok" disabled={busy} onClick={props.onUnblock}>
-            {tr('issue.unblockRerun')}
+            {tr('issue.openRecovery')}
           </button>
         </div>
       </div>

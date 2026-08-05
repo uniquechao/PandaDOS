@@ -3,6 +3,7 @@
  * 困住 fixed 遮罩、被 .bhead/.id-head（z-index:5）反压（同 ImageLightbox，issue #79）。 */
 import type { ComponentChildren } from 'preact';
 import { createPortal } from 'preact/compat';
+import { useEffect, useRef } from 'preact/hooks';
 
 export function Modal({
   title,
@@ -16,6 +17,47 @@ export function Modal({
   wide?: boolean;
   children: ComponentChildren;
 }) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (!panel) return;
+    const focusable = Array.from(
+      panel.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [href], [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((element) => !element.hasAttribute('hidden'));
+    focusable[0]?.focus();
+
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      if (focusable.length === 0) {
+        event.preventDefault();
+        panel.focus();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable[focusable.length - 1]!;
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || !panel.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, []);
+
   return createPortal(
     <div
       class="modal-bg"
@@ -23,7 +65,14 @@ export function Modal({
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div class={wide ? 'modal wide' : 'modal'}>
+      <div
+        ref={panelRef}
+        class={wide ? 'modal wide' : 'modal'}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        tabIndex={-1}
+      >
         <h3>{title}</h3>
         {children}
       </div>

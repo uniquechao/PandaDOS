@@ -12,6 +12,8 @@ export const zhHantCatalog = {
   ...shellMessages['zh-Hant'],
   ...actionMessages['zh-Hant'],
   ...commonUiMessages['zh-Hant'],
+  'issue.recoveryLength':'已輸入 {current} / {max} 字',
+  'issue.recoveryTitle':'解除阻擋','issue.recoveryReason':'執行受阻原因','issue.recoveryHelp':'請補充明確的處理意見，或先修改 issue 與受阻子工作。儲存編輯不會自動重新執行。','issue.recoveryGuidance':'補充意見或解除方法','issue.recoveryGuidancePlaceholder':'說明需要修改什麼、採用哪種方案，或如何解除目前阻擋…','issue.recoveryGuidanceRequired':'請先填寫補充意見或解除方法。','issue.editBlockedIssue':'編輯 issue 內容','issue.editBlockedIssueHint':'修改標題、詳細資料、設定或截圖','issue.editBlockedSubtask':'編輯受阻子工作','issue.editBlockedSubtaskHint':'重新執行前修正目前受阻步驟','issue.noEditableBlockedSubtask':'沒有可編輯的未完成子工作','issue.recoveryQueueHint':'確認後 issue 將返回規劃階段，並可能立即開始執行。','issue.confirmRecovery':'提交意見並重新執行','issue.openRecovery':'處理阻擋',
   ...statusMessages['zh-Hant'],
   ...errorMessages['zh-Hant'],
   ...notifyMessages['zh-Hant'],

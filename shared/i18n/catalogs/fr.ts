@@ -12,6 +12,8 @@ export const frCatalog = {
   ...shellMessages.fr,
   ...actionMessages.fr,
   ...commonUiMessages.fr,
+  'issue.recoveryLength':'{current} / {max} caractères',
+  'issue.recoveryTitle':'Résoudre le blocage','issue.recoveryReason':'Raison de l’arrêt de l’exécution','issue.recoveryHelp':'Ajoutez des consignes concrètes ou corrigez l’issue et la sous-tâche bloquée avant de relancer. Enregistrer les modifications ne relance pas l’issue.','issue.recoveryGuidance':'Consignes supplémentaires ou méthode de résolution','issue.recoveryGuidancePlaceholder':'Décrivez ce qui doit changer, l’approche à utiliser ou comment lever le blocage…','issue.recoveryGuidanceRequired':'Saisissez des consignes supplémentaires ou une méthode de résolution avant de continuer.','issue.editBlockedIssue':'Modifier l’issue','issue.editBlockedIssueHint':'Modifier le titre, les détails, les réglages ou les images','issue.editBlockedSubtask':'Modifier la sous-tâche bloquée','issue.editBlockedSubtaskHint':'Corriger l’étape bloquée avant de réessayer','issue.noEditableBlockedSubtask':'Aucune sous-tâche inachevée ne peut être modifiée','issue.recoveryQueueHint':'Après confirmation, l’issue revient à la planification et peut démarrer immédiatement.','issue.confirmRecovery':'Envoyer les consignes et relancer','issue.openRecovery':'Résoudre le blocage',
   ...statusMessages.fr,
   ...errorMessages.fr,
   ...notifyMessages.fr,

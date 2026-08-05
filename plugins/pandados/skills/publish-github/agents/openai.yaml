@@ -1,0 +1,4 @@
+interface:
+  display_name: "发布 GitHub"
+  short_description: "从私库最新版本 Tag 安全发布代码并生成 Release 说明"
+  default_prompt: "使用 $publish-github 从私库最新 Tag 发布 PandaDOS，并根据历史 Issue 生成版本 Release。"

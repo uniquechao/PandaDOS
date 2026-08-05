@@ -444,7 +444,8 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
       handler: async ({ req, params }) => {
         const issue = issueOf(engine, params);
         if (!issue) return json({ ok: false, error: '无此 issue' }, 404);
-        // 可改内容的状态见 EDITABLE_STATES（pending 提交后未运行 + cancelled 已停，#93「取消→改→重跑」）。
+        // 可改内容的状态见 EDITABLE_STATES（pending / blocked / cancelled）。blocked 保存后仍受阻，
+        // 必须再明确提交解除方法才会重新运行。
         // 已开跑的走澄清/打回把意见带回 CC，直接改 title/body 于事无补（CC 已读过原文）且会造成
         // 人机认知不一致；done 是真终态同样不给改。
         if (!isEditableStatus(issue.status)) {
@@ -454,7 +455,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
               error:
                 issue.status === 'done'
                   ? '已完成的 issue 不能改内容'
-                  : `已开跑（${issue.status}）的 issue 不能直接改内容，请用澄清/打回把修改意见带回`,
+                  : `执行中（${issue.status}）的 issue 不能直接改内容，请用澄清/打回把修改意见带回`,
             },
             400,
           );
@@ -595,10 +596,14 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
       method: 'POST',
       path: '/api/projects/:projectId/issues/:issueId/unblock',
       auth: 'project-access',
-      handler: async ({ params, user }) => {
+      handler: async ({ req, params, user }) => {
         const issue = issueOf(engine, params);
         if (!issue) return json({ ok: false, error: '无此 issue' }, 404);
-        const r = await engine.unblockIssue(issue.id, user!.id);
+        const b = await readBody(req);
+        const guidance = typeof b.guidance === 'string' ? b.guidance.trim() : '';
+        if (!guidance) return json({ ok: false, error: '解除阻塞前必须填写补充意见或解除方法' }, 400);
+        if (guidance.length > 4000) return json({ ok: false, error: '解除方法不能超过 4000 字' }, 400);
+        const r = await engine.unblockIssue(issue.id, guidance, user!.id);
         return r.ok ? json({ ok: true, issue: engine.store.get(issue.id) }) : json(r, 409);
       },
     },

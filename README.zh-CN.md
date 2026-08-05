@@ -1,7 +1,7 @@
 # PandaDOS — Claude Code 与 Codex 的长时间自动驾驶系统
 
 <p align="center">
-  <img src="ui/public/logo-mark.png" alt="PandaDOS Logo" width="156" />
+  <img src="docs/images/pandados-readme-header.png" alt="PandaDOS — Claude Code 与 Codex 的长时间自动驾驶系统" />
 </p>
 
 PandaDOS 是一个开源、自托管的 Agent 编排控制面，让 Claude Code 与 Codex 以 issue 为

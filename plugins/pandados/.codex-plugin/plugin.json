@@ -1,0 +1,36 @@
+{
+  "name": "pandados",
+  "version": "0.1.0",
+  "description": "PandaDOS development workflows for issue modules, frontend, internationalization, and safe GitHub publishing.",
+  "author": {
+    "name": "PandaDOS",
+    "url": "https://github.com/uniquechao/PandaDOS"
+  },
+  "homepage": "https://github.com/uniquechao/PandaDOS",
+  "repository": "https://github.com/uniquechao/PandaDOS",
+  "keywords": [
+    "pandados",
+    "coding-agents",
+    "issue-workflow",
+    "internationalization"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "PandaDOS",
+    "shortDescription": "Build and maintain PandaDOS with its project workflows.",
+    "longDescription": "Adds PandaDOS-specific issue memory, frontend design, ten-locale internationalization, and sanitized GitHub publishing workflows to Codex.",
+    "developerName": "PandaDOS",
+    "category": "Productivity",
+    "capabilities": [
+      "Issue workflows",
+      "Frontend guidance",
+      "Internationalization",
+      "Release publishing"
+    ],
+    "websiteURL": "https://github.com/uniquechao/PandaDOS",
+    "brandColor": "#F5B82E",
+    "composerIcon": "./assets/logo.png",
+    "logo": "./assets/logo.png",
+    "defaultPrompt": "Help me build and maintain PandaDOS using its project workflows."
+  }
+}

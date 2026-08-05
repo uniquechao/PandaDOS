@@ -1,0 +1,4 @@
+interface:
+  display_name: "PandaDOS 国际化"
+  short_description: "统一约束界面、错误、通知、AI 输出与格式化的十语言实现"
+  default_prompt: "使用 $pandados-i18n 检查并实现这项面向用户的国际化改动。"

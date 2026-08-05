@@ -493,9 +493,16 @@ describe('testing 失败回退计数（≤3 回 implementing，超限 blocked）
     }
     expect(engine.store.countEvents(issue.id, 'tests_failed')).toBe(4);
     expect(s.notifications.some((n) => n.kind === 'issue_blocked' && n.issueId === issue.id)).toBe(true);
-    // blocked 后 unblock 重新入队
-    const r = await engine.unblockIssue(issue.id, s.admin.id);
+    // blocked 后必须带解除方法；成功后下一轮真实规划 prompt 会收到该方法与子任务快照
+    const missing = await engine.unblockIssue(issue.id, '   ', s.admin.id);
+    expect(missing.ok).toBe(false);
+    expect(engine.store.get(issue.id)!.status).toBe('blocked');
+    const r = await engine.unblockIssue(issue.id, '修复失败测试后继续', s.admin.id);
     expect(r.ok).toBe(true);
+    await engine.tick();
+    const recovery = s.driver.prompts().find((prompt) => prompt.includes('【受阻恢复】'));
+    expect(recovery).toContain('修复失败测试后继续');
+    expect(recovery).toContain('1. a');
   });
 });
 
@@ -752,9 +759,9 @@ describe('正式模块绑定', () => {
       .get(12)!.conversation_id;
     expect(running.convId).toBe(moduleConv);
     expect(s.driver.tmuxSessions.has('cc-1-m-billing-core')).toBe(true);
-    // 已开跑的仍然不许换模块（#93 只放宽到 cancelled，驱动中一律拒）
+    // 已开跑的仍然不许换模块，驱动中一律拒
     await expect(s.engine.changePendingModule(issue.id, { moduleId: 11 })).rejects.toThrow(
-      /只有待办或已取消/,
+      /只有待办、受阻或已取消/,
     );
 
     const next = await s.engine.createIssue(s.projectId, { title: '同模块后续', moduleId: 12 }, false);
@@ -1422,7 +1429,7 @@ describe('ISSUE_BLOCKED 哨兵 / clarifying / 手动旁路封死', () => {
     expect(s.engine.store.get(b.id)!.convId).toBeNull();
     deferredIssueId = a.id;
 
-    const unblock = s.engine.unblockIssue(a.id, s.admin.id);
+    const unblock = s.engine.unblockIssue(a.id, '释放并发测试中的受阻任务', s.admin.id);
     await unblockNotifyEntered;
     expect(s.engine.store.get(a.id)!.status).toBe('pending'); // CAS 已落，A transition tail 仍被通知占用
 

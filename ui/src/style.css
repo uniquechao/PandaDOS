@@ -1461,11 +1461,39 @@ table.tbl { border-collapse: collapse; width: 100%; font-size: 13px; }
 /* 动作行（iOS 底部大按钮）：均分整宽、44px 触控高 */
 .modal .mbtns { display: flex; gap: 8px; }
 .modal .mbtns .btn { flex: 1; min-height: var(--ctl-h-lg); font-size: 15px; border-radius: var(--r-lg); }
+
+/* 受阻恢复：先理解原因、再给方法；编辑入口是辅助路径，主动作始终只保留一个。 */
+.blocked-recovery { display: flex; flex-direction: column; gap: 12px; }
+.recovery-reason { display: flex; flex-direction: column; gap: 6px; }
+.recovery-label { color: var(--mut); font-size: 12px; font-weight: 650; }
+.recovery-help { margin: 0; color: var(--mut); font-size: 13px; line-height: 1.55; }
+.recovery-guidance { position: relative; }
+.recovery-guidance textarea { min-height: 112px; resize: vertical; padding-bottom: 25px; }
+.recovery-count { position: absolute; right: 9px; bottom: 7px; padding: 1px 4px; border-radius: var(--r-sm); background: var(--card); }
+.recovery-tools { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.recovery-tool {
+  min-width: 0; min-height: 58px; padding: 9px 10px; display: flex; align-items: flex-start; gap: 8px;
+  border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--card); color: var(--fg);
+  font: inherit; text-align: left; cursor: pointer; box-shadow: var(--sh-1); touch-action: manipulation;
+  transition: transform var(--motion-instant) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard), background var(--motion-fast) var(--ease-standard), box-shadow var(--motion-fast) var(--ease-standard);
+}
+.recovery-tool > span:last-child { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.recovery-tool b { font-size: 13px; font-weight: 650; }
+.recovery-tool small { color: var(--mut); font-size: 11.5px; line-height: 1.35; }
+.recovery-tool:active:not(:disabled) { transform: scale(0.98); }
+.recovery-tool:disabled { opacity: 0.45; cursor: not-allowed; }
+.recovery-queue-hint { padding: 8px 10px; border-radius: var(--r-md); background: var(--accent-weak); color: var(--accent-2); font-size: 12px; line-height: 1.45; }
+@media (hover: hover) {
+  .recovery-tool:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-weak); box-shadow: var(--sh-2); }
+}
 @media (max-width: 719px) {
   .modal-bg { align-items: flex-end; padding: 0; }
   .modal { max-width: none; border-radius: var(--r-xl) var(--r-xl) 0 0; padding-bottom: calc(18px + env(safe-area-inset-bottom)); animation: sheet-rise var(--dur-3) var(--ease-out) both; }
   /* 抓手，暗示可从底部弹出 */
   .modal::before { content: ''; display: block; width: 38px; height: 5px; border-radius: 2.5px; background: rgba(193, 145, 47, 0.3); margin: -6px auto 4px; }
+}
+@media (max-width: 479px) {
+  .recovery-tools { grid-template-columns: 1fr; }
 }
 
 /* 项目统一导入：来源先选、候选后选；保持暖白卡片和单一黄色当前态。 */

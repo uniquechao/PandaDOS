@@ -12,6 +12,8 @@ export const ptBrCatalog = {
   ...shellMessages['pt-BR'],
   ...actionMessages['pt-BR'],
   ...commonUiMessages['pt-BR'],
+  'issue.recoveryLength':'{current} / {max} caracteres',
+  'issue.recoveryTitle':'Resolver bloqueio','issue.recoveryReason':'Motivo da interrupção da execução','issue.recoveryHelp':'Adicione orientações concretas ou corrija a issue e a subtarefa bloqueada antes de executar novamente. Salvar edições não reinicia a issue.','issue.recoveryGuidance':'Orientação adicional ou método de recuperação','issue.recoveryGuidancePlaceholder':'Descreva o que deve mudar, qual abordagem usar ou como remover o bloqueio…','issue.recoveryGuidanceRequired':'Informe uma orientação adicional ou método de recuperação antes de continuar.','issue.editBlockedIssue':'Editar issue','issue.editBlockedIssueHint':'Alterar título, detalhes, configurações ou imagens','issue.editBlockedSubtask':'Editar subtarefa bloqueada','issue.editBlockedSubtaskHint':'Corrigir a etapa bloqueada antes de tentar novamente','issue.noEditableBlockedSubtask':'Não há subtarefa incompleta que possa ser editada','issue.recoveryQueueHint':'Após confirmar, a issue volta ao planejamento e pode iniciar imediatamente.','issue.confirmRecovery':'Enviar orientação e executar novamente','issue.openRecovery':'Resolver bloqueio',
   ...statusMessages['pt-BR'],
   ...errorMessages['pt-BR'],
   ...notifyMessages['pt-BR'],

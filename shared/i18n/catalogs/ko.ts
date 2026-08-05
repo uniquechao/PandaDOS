@@ -12,6 +12,8 @@ export const koCatalog = {
   ...shellMessages.ko,
   ...actionMessages.ko,
   ...commonUiMessages.ko,
+  'issue.recoveryLength':'{current} / {max}자',
+  'issue.recoveryTitle':'차단 해결','issue.recoveryReason':'실행이 중단된 이유','issue.recoveryHelp':'구체적인 해결 지침을 추가하거나 issue와 차단된 하위 작업을 수정하세요. 편집 내용을 저장해도 자동으로 다시 실행되지 않습니다.','issue.recoveryGuidance':'추가 의견 또는 해결 방법','issue.recoveryGuidancePlaceholder':'변경할 내용, 사용할 방법 또는 차단 해결 방법을 입력하세요…','issue.recoveryGuidanceRequired':'계속하기 전에 추가 의견 또는 해결 방법을 입력하세요.','issue.editBlockedIssue':'issue 편집','issue.editBlockedIssueHint':'제목, 세부 정보, 설정 또는 이미지 수정','issue.editBlockedSubtask':'차단된 하위 작업 편집','issue.editBlockedSubtaskHint':'다시 시도하기 전에 현재 단계를 수정','issue.noEditableBlockedSubtask':'편집할 수 있는 미완료 하위 작업이 없습니다','issue.recoveryQueueHint':'확인하면 issue가 계획 단계로 돌아가 즉시 실행될 수 있습니다.','issue.confirmRecovery':'의견 제출 후 다시 실행','issue.openRecovery':'차단 해결',
   ...statusMessages.ko,
   ...errorMessages.ko,
   ...notifyMessages.ko,

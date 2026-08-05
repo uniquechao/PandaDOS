@@ -301,7 +301,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     expect((await j(s.dispatch(req('POST', path, s.alice.token)))).status).toBe(409);
   });
 
-  test('PATCH 元数据（仅 pending 可直接改内容）/ detail / unblock / 跨项目 issue 404', async () => {
+  test('PATCH 元数据 / detail / 带解除方法 unblock / 跨项目 issue 404', async () => {
     const s = await setup();
     s.pm.questions = null;
     const created = await j(
@@ -344,11 +344,22 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     expect(patched.body.issue.implMode).toBe('team');
     expect(patched.body.issue.agent).toBe('codex'); // pending 未绑对话，可换代理
 
-    // block → unblock 重新入队（unblock 后接力自动再开跑）
+    // block → 解除方法必填；提交后重新入队（unblock 后接力自动再开跑）
     expect((await s.engine.blockIssue(iid, '手动卡住')).ok).toBe(true);
-    const ub = await j(s.dispatch(req('POST', `/api/projects/1/issues/${iid}/unblock`, s.alice.token)));
+    expect(
+      (await j(s.dispatch(req('POST', `/api/projects/1/issues/${iid}/unblock`, s.alice.token, {})))).status,
+    ).toBe(400);
+    const ub = await j(
+      s.dispatch(
+        req('POST', `/api/projects/1/issues/${iid}/unblock`, s.alice.token, {
+          guidance: '先修正执行参数，再重新规划',
+        }),
+      ),
+    );
     expect(ub.status).toBe(200);
     expect(['pending', 'planning']).toContain(ub.body.issue.status);
+    const unblockEvent = s.engine.store.listEvents(iid).find((event) => event.kind === 'unblock_guidance');
+    expect(unblockEvent?.dataJson).toContain('先修正执行参数，再重新规划');
   });
 
   test('PATCH 子任务只修改未派发项，并返回稳定错误码', async () => {
@@ -367,6 +378,14 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     const current = await j(s.dispatch(req('PATCH', `${base}/0`, s.alice.token, { text: '偷改当前项' })));
     expect(current.status).toBe(409);
     expect(current.body.error.code).toBe('issue.subtask_already_dispatched');
+
+    expect((await s.engine.blockIssue(issue.id, '当前项缺少正确参数')).ok).toBe(true);
+    const blockedCurrent = await j(
+      s.dispatch(req('PATCH', `${base}/0`, s.alice.token, { text: '带正确参数重跑当前项' })),
+    );
+    expect(blockedCurrent.status).toBe(200);
+    expect(blockedCurrent.body.subtask.text).toBe('带正确参数重跑当前项');
+    expect(s.engine.store.get(issue.id)?.status).toBe('blocked');
 
     const empty = await j(s.dispatch(req('PATCH', `${base}/1`, s.alice.token, { text: '   ' })));
     expect(empty.status).toBe(400);
@@ -387,7 +406,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     ).toBe(404);
   });
 
-  test('#93 编辑守卫放宽到 cancelled：取消的可改内容，done/blocked/驱动中仍拒', async () => {
+  test('#93 编辑守卫允许 cancelled 和 blocked：保存不改变状态，done/驱动中仍拒', async () => {
     const s = await setup();
     // #1 建完即开跑（驱动态），#2 留在 pending
     const running = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: '占位' })));
@@ -399,7 +418,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
       s.dispatch(req('PATCH', `/api/projects/1/issues/${runId}`, s.alice.token, { title: '偷改' })),
     );
     expect(drivingRes.status).toBe(400);
-    expect(String(drivingRes.body.error.details)).toContain('已开跑');
+    expect(String(drivingRes.body.error.details)).toContain('执行中');
 
     // 取消后：可改内容（本 issue 的核心诉求——取消 → 改需求 → 重新运行）
     expect((await s.engine.cancelIssue(runId, s.alice.user.id)).ok).toBe(true);
@@ -420,13 +439,21 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     expect(edited.body.issue.targetBranch).toBe('feature/redo');
     expect(edited.body.issue.status).toBe('cancelled'); // 改内容不改状态
 
-    // blocked：仍拒（受阻要走 unblock 重跑，不是改需求）
+    // blocked：可先改需求，保存后仍保持受阻，等用户明确解除
     const blocked = await s.engine.createIssue(1, { title: '受阻的' }, false);
     expect((await s.engine.blockIssue(blocked.id, '卡住了')).ok).toBe(true);
     const blockedRes = await j(
-      s.dispatch(req('PATCH', `/api/projects/1/issues/${blocked.id}`, s.alice.token, { title: 'x' })),
+      s.dispatch(
+        req('PATCH', `/api/projects/1/issues/${blocked.id}`, s.alice.token, {
+          title: '修订后的受阻需求',
+          body: '补充正确运行方法',
+        }),
+      ),
     );
-    expect(blockedRes.status).toBe(400);
+    expect(blockedRes.status).toBe(200);
+    expect(blockedRes.body.issue.status).toBe('blocked');
+    expect(blockedRes.body.issue.title).toBe('修订后的受阻需求');
+    expect(blockedRes.body.issue.body).toBe('补充正确运行方法');
 
     // done：真终态，仍拒
     const finished = await s.engine.createIssue(1, { title: '完成的' }, false);

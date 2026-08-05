@@ -12,6 +12,8 @@ export const esCatalog = {
   ...shellMessages.es,
   ...actionMessages.es,
   ...commonUiMessages.es,
+  'issue.recoveryLength':'{current} / {max} caracteres',
+  'issue.recoveryTitle':'Resolver bloqueo','issue.recoveryReason':'Motivo por el que se detuvo la ejecución','issue.recoveryHelp':'Añade instrucciones concretas o corrige la issue y la subtarea bloqueada antes de volver a ejecutar. Guardar cambios no reinicia la issue.','issue.recoveryGuidance':'Indicaciones adicionales o método de recuperación','issue.recoveryGuidancePlaceholder':'Describe qué debe cambiar, qué enfoque usar o cómo eliminar el bloqueo…','issue.recoveryGuidanceRequired':'Introduce indicaciones adicionales o un método de recuperación antes de continuar.','issue.editBlockedIssue':'Editar issue','issue.editBlockedIssueHint':'Modificar título, detalles, ajustes o imágenes','issue.editBlockedSubtask':'Editar subtarea bloqueada','issue.editBlockedSubtaskHint':'Corregir el paso bloqueado antes de reintentar','issue.noEditableBlockedSubtask':'No hay subtareas pendientes que se puedan editar','issue.recoveryQueueHint':'Tras confirmar, la issue vuelve a planificación y puede iniciarse de inmediato.','issue.confirmRecovery':'Enviar indicaciones y ejecutar de nuevo','issue.openRecovery':'Resolver bloqueo',
   ...statusMessages.es,
   ...errorMessages.es,
   ...notifyMessages.es,

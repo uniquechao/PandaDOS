@@ -1,7 +1,7 @@
 # PandaDOS — Long-running autopilot for Claude Code and Codex
 
 <p align="center">
-  <img src="ui/public/logo-mark.png" alt="PandaDOS logo" width="156" />
+  <img src="docs/images/pandados-readme-header.png" alt="PandaDOS — Long-running autopilot for Claude Code and Codex" />
 </p>
 
 PandaDOS is an open-source, self-hosted control plane that turns Claude Code and Codex into

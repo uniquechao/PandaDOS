@@ -12,6 +12,8 @@ export const jaCatalog = {
   ...shellMessages.ja,
   ...actionMessages.ja,
   ...commonUiMessages.ja,
+  'issue.recoveryLength':'{current} / {max} 文字',
+  'issue.recoveryTitle':'ブロックを解消','issue.recoveryReason':'実行が停止した理由','issue.recoveryHelp':'具体的な対応方法を追加するか、issueとブロック中のサブタスクを修正してください。編集を保存しても自動再実行されません。','issue.recoveryGuidance':'追加の指示または解消方法','issue.recoveryGuidancePlaceholder':'変更点、採用する方法、またはブロックの解消方法を入力…','issue.recoveryGuidanceRequired':'続行する前に追加の指示または解消方法を入力してください。','issue.editBlockedIssue':'issueを編集','issue.editBlockedIssueHint':'タイトル、詳細、設定、画像を修正','issue.editBlockedSubtask':'ブロック中のサブタスクを編集','issue.editBlockedSubtaskHint':'再試行前に現在の手順を修正','issue.noEditableBlockedSubtask':'編集できる未完了サブタスクはありません','issue.recoveryQueueHint':'確認後、issueは計画段階に戻り、すぐに実行される場合があります。','issue.confirmRecovery':'指示を送信して再実行','issue.openRecovery':'ブロックを解消',
   ...statusMessages.ja,
   ...errorMessages.ja,
   ...notifyMessages.ja,

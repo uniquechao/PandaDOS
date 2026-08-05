@@ -196,6 +196,7 @@ export const DRIVING_STATES: readonly IssueState[] = ['planning', 'implementing'
  * 可以直接改内容（标题/正文/类别/模块/截图/分支意图）的状态——**唯一真相**（#93）。
  *
  * - `pending`：提交后还没开跑，改了不影响谁；
+ * - `blocked`：执行已停止，可修订需求或子任务；保存后仍保持受阻，等用户明确解除；
  * - `cancelled`：已经停了，没有 CC 在读它；「取消 → 改需求 → 重新运行」正是本 issue 的用途。
  *
  * 已开跑的一律不许直接改：CC 早读过原文，偷偷换掉只会造成人机认知不一致，得走澄清/打回把
@@ -204,7 +205,7 @@ export const DRIVING_STATES: readonly IssueState[] = ['planning', 'implementing'
  * 守卫落在四处（路由前置判断、updatePendingMeta 的两次检查、patchPendingGitMeta 的 SQL CAS），
  * 全部从这里派生，别再各写各的字符串。
  */
-export const EDITABLE_STATES: readonly IssueState[] = ['pending', 'cancelled'];
+export const EDITABLE_STATES: readonly IssueState[] = ['pending', 'blocked', 'cancelled'];
 
 export function isEditableStatus(status: IssueState): boolean {
   return EDITABLE_STATES.includes(status);
@@ -863,7 +864,7 @@ export class IssueStore {
   }
 
   /**
-   * target/source 必须同一条 SQL 落库，并以 pending 为 CAS 条件。
+   * target/source 必须同一条 SQL 落库，并以可编辑状态为 CAS 条件。
    * 这样状态迁移与 Git 意图编辑无论谁先写，另一个都能看到确定的先后顺序。
    */
   patchPendingGitMeta(
@@ -1709,7 +1710,7 @@ export class IssueEngine {
    * 内容元数据的最终写入口：在自动合并落地锁内重读状态；Git 意图再用 DB CAS 同条更新。
    * 路由在 readBody / 模块解析等 await 后必须走这里，不能拿旧 EngineIssue 直接 patchMeta。
    *
-   * 名字里的 Pending 是历史遗留——#93 起可编辑范围是 EDITABLE_STATES（pending + cancelled），
+   * 名字里的 Pending 是历史遗留——可编辑范围以 EDITABLE_STATES 为准，
    * 判据一律走 isEditableStatus，别照着方法名想当然。
    */
   async updatePendingMeta(
@@ -1720,7 +1721,7 @@ export class IssueEngine {
     const initial = this.store.get(issueId);
     if (!initial) throw new Error('issue 不存在');
     if (!isEditableStatus(initial.status)) {
-      throw new Error(`只有待办或已取消的 issue 可以修改（当前 ${initial.status}）`);
+      throw new Error(`只有待办、受阻或已取消的 issue 可以修改（当前 ${initial.status}）`);
     }
     const project = this.project(initial.projectId);
     if (!project) throw new Error('项目不存在');
@@ -1744,7 +1745,7 @@ export class IssueEngine {
     const updated = await this.deps.mutex.runExclusive(issueMetaLockKey(initial.projectId), () => {
       const fresh = this.store.get(issueId);
       if (!fresh || !isEditableStatus(fresh.status)) {
-        throw new Error(`只有待办或已取消的 issue 可以修改（当前 ${fresh?.status ?? 'missing'}）`);
+        throw new Error(`只有待办、受阻或已取消的 issue 可以修改（当前 ${fresh?.status ?? 'missing'}）`);
       }
       const requestedAgent = moduleSelection?.requestedAgent ?? meta.agent;
       if (requestedAgent && requestedAgent !== fresh.agent && fresh.convId) {
@@ -1782,7 +1783,7 @@ export class IssueEngine {
         })
       ) {
         const current = this.store.get(issueId);
-        throw new Error(`只有 pending issue 可以修改（当前 ${current?.status ?? 'missing'}）`);
+        throw new Error(`只有待办、受阻或已取消的 issue 可以修改（当前 ${current?.status ?? 'missing'}）`);
       }
       this.store.patchMeta(issueId, rest);
       return this.store.get(issueId)!;
@@ -1802,7 +1803,8 @@ export class IssueEngine {
   /**
    * 修改尚未派发的子任务文本。锁内重读执行游标，防止保存请求排队时任务已推进：
    * - plan_review 尚未派发，所有未完成项可改；
-   * - 顺序 implementing/blocked 只允许当前游标之后的项；
+   * - 顺序 implementing 只允许当前游标之后的项；
+   * - blocked 允许修订当前受阻项及其后的未完成项，保存不解除受阻；
    * - 并行模式开工即全量派发，其余阶段也不开放修改。
    */
   async updateUnstartedSubtask(
@@ -1827,8 +1829,9 @@ export class IssueEngine {
       const editableBeforeDispatch =
         !subtask.done &&
         (fresh.status === 'plan_review' ||
+          (fresh.status === 'blocked' && index >= fresh.subIndex) ||
           (fresh.implMode === 'seq' &&
-            (fresh.status === 'implementing' || fresh.status === 'blocked') &&
+            fresh.status === 'implementing' &&
             index > fresh.subIndex));
       if (!editableBeforeDispatch) return { ok: false, reason: 'already_dispatched' };
 
@@ -2959,9 +2962,17 @@ export class IssueEngine {
     return this.applyEvent(issueId, 'block', { note, actor });
   }
 
-  /** blocked → pending 重新入队（并尝试接力） */
-  async unblockIssue(issueId: number, actor?: number): Promise<ApplyResult> {
-    return this.applyEvent(issueId, 'unblock', { actor });
+  /** blocked → pending 重新入队；解除方法单独完整留痕，供下一轮规划可靠注入。 */
+  async unblockIssue(issueId: number, guidance: string, actor?: number): Promise<ApplyResult> {
+    const normalized = guidance.trim();
+    if (!normalized) return { ok: false, error: '解除阻塞前必须填写补充意见或解除方法' };
+    if (normalized.length > 4000) return { ok: false, error: '解除方法不能超过 4000 字' };
+    return this.applyEvent(issueId, 'unblock', { note: normalized, actor }, () => {
+      this.store.logEvent(issueId, 'unblock_guidance', {
+        guidance: normalized,
+        ...(actor !== undefined ? { actor } : {}),
+      });
+    });
   }
 
   /**
@@ -4526,6 +4537,27 @@ export class IssueEngine {
       case 'planning': {
         const entry = this.store.lastEnterInfo(issue.id, 'planning');
         const feedback = entry?.event === 'plan_rejected' ? (entry.note ?? '') : null;
+        const pendingEntry = this.store.lastEnterInfo(issue.id, 'pending');
+        const recoveryEvent = pendingEntry?.event === 'unblock'
+          ? [...this.store.listEvents(issue.id)].reverse().find((event) => event.kind === 'unblock_guidance')
+          : undefined;
+        let recoveryGuidance = '';
+        if (recoveryEvent?.dataJson) {
+          try {
+            const data = JSON.parse(recoveryEvent.dataJson) as { guidance?: unknown };
+            if (typeof data.guidance === 'string') recoveryGuidance = data.guidance;
+          } catch {
+            // 损坏的历史审计事件不应阻断规划；退化为普通 planning。
+          }
+        }
+        const recovery = recoveryGuidance
+          ? {
+              guidance: recoveryGuidance,
+              subtasks: this.store.subtasksOf(issue).map((subtask) =>
+                `${subtask.done ? '[已完成] ' : ''}${subtask.text}`,
+              ),
+            }
+          : null;
         const segmentPending =
           this.store.lastEventId(issue.id, 'conversation_segment_started') >
           this.store.lastEventId(issue.id, 'injected');
@@ -4538,8 +4570,8 @@ export class IssueEngine {
                 .get(issue.moduleId)?.display_name
             : null;
         return {
-          text: buildPlanningPrompt({ issue, goal: project.goal, feedback, imgHint, moduleName, locale }),
-          meta: { kind: 'planning', ...(feedback ? { rework: true } : {}) },
+          text: buildPlanningPrompt({ issue, goal: project.goal, feedback, recovery, imgHint, moduleName, locale }),
+          meta: { kind: 'planning', ...(feedback ? { rework: true } : {}), ...(recovery ? { recovery: true } : {}) },
         };
       }
       case 'implementing': {

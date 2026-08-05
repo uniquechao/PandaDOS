@@ -12,6 +12,8 @@ export const zhHansCatalog = {
   ...shellMessages['zh-Hans'],
   ...actionMessages['zh-Hans'],
   ...commonUiMessages['zh-Hans'],
+  'issue.recoveryLength':'已输入 {current} / {max} 字',
+  'issue.recoveryTitle':'解除阻塞','issue.recoveryReason':'执行受阻原因','issue.recoveryHelp':'请补充明确的处理意见，或先修改 issue 与受阻子任务。保存编辑不会自动重新运行。','issue.recoveryGuidance':'补充意见或解除方法','issue.recoveryGuidancePlaceholder':'说明需要改什么、采用哪种方案，或如何解除当前阻塞…','issue.recoveryGuidanceRequired':'请先填写补充意见或解除方法。','issue.editBlockedIssue':'编辑 issue 内容','issue.editBlockedIssueHint':'修改标题、详情、设置或截图','issue.editBlockedSubtask':'编辑受阻子任务','issue.editBlockedSubtaskHint':'重新运行前修正当前受阻步骤','issue.noEditableBlockedSubtask':'没有可编辑的未完成子任务','issue.recoveryQueueHint':'确认后 issue 将返回规划阶段，并可能立即开始运行。','issue.confirmRecovery':'提交意见并重新运行','issue.openRecovery':'处理阻塞',
   ...statusMessages['zh-Hans'],
   ...errorMessages['zh-Hans'],
   ...notifyMessages['zh-Hans'],

@@ -12,6 +12,8 @@ export const deCatalog = {
   ...shellMessages.de,
   ...actionMessages.de,
   ...commonUiMessages.de,
+  'issue.recoveryLength':'{current} / {max} Zeichen',
+  'issue.recoveryTitle':'Blockierung lösen','issue.recoveryReason':'Grund für den Ausführungsstopp','issue.recoveryHelp':'Fügen Sie konkrete Hinweise hinzu oder korrigieren Sie das Issue und die blockierte Teilaufgabe. Das Speichern startet das Issue nicht neu.','issue.recoveryGuidance':'Zusätzliche Hinweise oder Lösungsweg','issue.recoveryGuidancePlaceholder':'Beschreiben Sie die Änderung, den Ansatz oder wie die Blockierung gelöst wird…','issue.recoveryGuidanceRequired':'Geben Sie vor dem Fortfahren zusätzliche Hinweise oder einen Lösungsweg ein.','issue.editBlockedIssue':'Issue bearbeiten','issue.editBlockedIssueHint':'Titel, Details, Einstellungen oder Bilder ändern','issue.editBlockedSubtask':'Blockierte Teilaufgabe bearbeiten','issue.editBlockedSubtaskHint':'Den blockierten Schritt vor dem erneuten Versuch korrigieren','issue.noEditableBlockedSubtask':'Es gibt keine bearbeitbare unerledigte Teilaufgabe','issue.recoveryQueueHint':'Nach der Bestätigung kehrt das Issue zur Planung zurück und kann sofort starten.','issue.confirmRecovery':'Hinweise senden und erneut ausführen','issue.openRecovery':'Blockierung lösen',
   ...statusMessages.de,
   ...errorMessages.de,
   ...notifyMessages.de,

@@ -26,6 +26,8 @@ import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/lan
 export const BUDGET_ISSUE_TEXT = 600; // reserve space for the output-language contract
 export const BUDGET_GOAL = 250;
 export const BUDGET_FEEDBACK = 450; // 卡点 reject 意见 / 测试失败原因
+export const BUDGET_RECOVERY_GUIDANCE = 320;
+export const BUDGET_RECOVERY_SUBTASKS = 320;
 export const BUDGET_TEAM_LIST = 1120; // reserve language contract without risking sentinel truncation
 export const BUDGET_SUBTASK = 500; // 单条子任务（v1 平移）
 
@@ -96,13 +98,24 @@ export function buildPlanningPrompt(opts: {
   issue: PromptIssueLike;
   goal?: string | null;
   feedback?: string | null;
+  /** 受阻后由用户明确给出的恢复方法，以及保存后的子任务快照。 */
+  recovery?: { guidance: string; subtasks: string[] } | null;
   imgHint?: string;
   /** 模块永久共享会话的新 issue 切换提示；缺省表示独立会话，不额外占注入预算。 */
   moduleName?: string | null;
   locale?: SupportedLocale;
 }): string {
-  const goal = opts.goal ? midTruncate(opts.goal, BUDGET_GOAL) : '';
+  const goal = opts.goal ? midTruncate(opts.goal, opts.recovery ? 100 : BUDGET_GOAL) : '';
   const fb = opts.feedback ? midTruncate(opts.feedback, BUDGET_FEEDBACK) : '';
+  const recoveryGuidance = opts.recovery
+    ? midTruncate(opts.recovery.guidance, BUDGET_RECOVERY_GUIDANCE)
+    : '';
+  const recoverySubtasks = opts.recovery
+    ? midTruncate(
+        opts.recovery.subtasks.map((text, index) => `${index + 1}. ${text}`).join('\n'),
+        BUDGET_RECOVERY_SUBTASKS,
+      )
+    : '';
   const boundaryZh = opts.moduleName
     ? `【模块共享会话 · ${midTruncate(opts.moduleName, 60)}】当前切换到 Issue #${opts.issue.id}。` +
       `保留此前模块技术上下文，但前一个 Issue 已结束；当前目标和验收范围只以 Issue #${opts.issue.id} 为准。`
@@ -111,11 +124,20 @@ export function buildPlanningPrompt(opts: {
     ? `[Shared module conversation · ${midTruncate(opts.moduleName, 60)}] Now switching to Issue #${opts.issue.id}. ` +
       `Retain prior module technical context, but the previous issue is finished; use only Issue #${opts.issue.id} for the current goal and acceptance scope. `
     : '';
-  const issue = issueText(opts.issue, opts.moduleName ? 480 : BUDGET_ISSUE_TEXT);
+  const issue = issueText(opts.issue, opts.recovery ? 360 : opts.moduleName ? 480 : BUDGET_ISSUE_TEXT);
+  const recoveryZh = recoveryGuidance
+    ? `【受阻恢复】用户给出的解除方法：${recoveryGuidance}。` +
+      (recoverySubtasks ? `保存后的子任务如下：\n${recoverySubtasks}\n请以更新后的 issue 内容、解除方法和子任务为准重新规划。` : '')
+    : '';
+  const recoveryEn = recoveryGuidance
+    ? `[Blocked recovery] The user's recovery guidance is: ${recoveryGuidance}. ` +
+      (recoverySubtasks ? `The saved subtasks are:\n${recoverySubtasks}\nRe-plan using the updated issue, guidance, and subtasks. ` : '')
+    : '';
   const zh =
     boundaryZh +
       `【任务规划】我想做：${issue}${goal ? `（项目目标：${goal}）` : ''}。` +
       (fb ? `上一版计划被驳回，意见：${fb}。请针对意见重新规划。` : '') +
+      recoveryZh +
       `请先别写代码，通读相关代码理解现状；若有**不问清就会做错方向**的关键歧义、必须我拍板才能继续，` +
       `就把问题按编号列出、最后单独输出一行 NEED_CLARIFY:${opts.issue.id}` +
       `（**用纯文字提问，不要用交互式多选菜单/AskUserQuestion**，我在手机上打字回），我回答后你再继续；` +
@@ -129,6 +151,7 @@ export function buildPlanningPrompt(opts: {
     boundaryEn +
     `[Task planning] Requested work: ${issue}${goal ? ` (Project goal: ${goal})` : ''}. ` +
     (fb ? `The previous plan was rejected with this feedback: ${fb}. Re-plan around that feedback. ` : '') +
+    recoveryEn +
     `Do not write code yet. Read the relevant code first. Ask only about critical ambiguity that would otherwise send the work in the wrong direction; list numbered questions and then output NEED_CLARIFY:${opts.issue.id} on its own line. ` +
     `Use plain text, not an interactive AskUserQuestion menu. Decide implementation details yourself. Scale the process to the change; small changes do not need the full brainstorming, plan-document, and TDD workflow. ` +
     `When ready, split only the code changes into ordered, independently executable subtasks. Do not include tests, type checks, builds, browser checks, commits, or pushes because the system handles them. ` +

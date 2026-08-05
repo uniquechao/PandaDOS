@@ -88,12 +88,17 @@ describe('canEditSubtask', () => {
     expect(canEditSubtask({ text: '已完成', done: true }, 0, 0, 'plan_review', 'seq')).toBe(false);
   });
 
-  test('顺序执行只开放当前游标之后的项，blocked 保留同一边界', () => {
+  test('顺序执行只开放当前游标之后的项', () => {
     const future = { text: '后续项', done: false };
-    for (const status of ['implementing', 'blocked'] as const) {
-      expect(canEditSubtask(future, 0, 0, status, 'seq')).toBe(false);
-      expect(canEditSubtask(future, 1, 0, status, 'seq')).toBe(true);
-    }
+    expect(canEditSubtask(future, 0, 0, 'implementing', 'seq')).toBe(false);
+    expect(canEditSubtask(future, 1, 0, 'implementing', 'seq')).toBe(true);
+  });
+
+  test('blocked 可编辑当前受阻项及后续未完成项，且不受顺序/并行模式限制', () => {
+    const unfinished = { text: '受阻项', done: false };
+    expect(canEditSubtask(unfinished, 0, 0, 'blocked', 'seq')).toBe(true);
+    expect(canEditSubtask(unfinished, 1, 0, 'blocked', 'team')).toBe(true);
+    expect(canEditSubtask({ text: '已完成', done: true }, 0, 0, 'blocked', 'seq')).toBe(false);
   });
 
   test('并行执行开工后及其他阶段都不开放编辑', () => {

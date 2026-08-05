@@ -12,6 +12,8 @@ export const ruCatalog = {
   ...shellMessages.ru,
   ...actionMessages.ru,
   ...commonUiMessages.ru,
+  'issue.recoveryLength':'{current} / {max} символов',
+  'issue.recoveryTitle':'Устранить блокировку','issue.recoveryReason':'Причина остановки выполнения','issue.recoveryHelp':'Добавьте конкретные указания или исправьте issue и заблокированную подзадачу перед повторным запуском. Сохранение изменений не перезапускает issue.','issue.recoveryGuidance':'Дополнительные указания или способ устранения','issue.recoveryGuidancePlaceholder':'Опишите, что изменить, какой подход использовать или как снять блокировку…','issue.recoveryGuidanceRequired':'Перед продолжением введите дополнительные указания или способ устранения.','issue.editBlockedIssue':'Изменить issue','issue.editBlockedIssueHint':'Изменить заголовок, описание, настройки или изображения','issue.editBlockedSubtask':'Изменить заблокированную подзадачу','issue.editBlockedSubtaskHint':'Исправить текущий шаг перед повтором','issue.noEditableBlockedSubtask':'Нет незавершённых подзадач, доступных для изменения','issue.recoveryQueueHint':'После подтверждения issue вернётся к планированию и может запуститься сразу.','issue.confirmRecovery':'Отправить указания и запустить снова','issue.openRecovery':'Устранить блокировку',
   ...statusMessages.ru,
   ...errorMessages.ru,
   ...notifyMessages.ru,
