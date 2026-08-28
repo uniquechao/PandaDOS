@@ -4,9 +4,10 @@
  * 一切子进程走 node:child_process；文件走 node:fs/promises。
  */
 import { execFile, spawn } from 'node:child_process';
-import { promises as fsp } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { constants, promises as fsp } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { AgentKind } from '../core/types';
 import {
   type DirEntry,
@@ -16,6 +17,7 @@ import {
   type GitResult,
   type PathStat,
   type PtyChannel,
+  type TmuxScrollDirection,
   type TmuxSession,
   assertRemovablePath,
   DEFAULT_GIT_TIMEOUT_MS,
@@ -25,6 +27,7 @@ import {
   sanitizeInjectText,
   tmuxNewSessionArgs,
   tmuxResizeWindowArgs,
+  tmuxScrollPaneArgs,
 } from './driver';
 
 interface ExecResult {
@@ -234,6 +237,11 @@ export class LocalDriver implements ExecutorDriver {
     await this.tmux(tmuxResizeWindowArgs(session, size));
   }
 
+  async scrollPane(session: string, direction: TmuxScrollDirection, lines: number): Promise<void> {
+    const r = await this.tmux(tmuxScrollPaneArgs(session, direction, lines));
+    if (r.code !== 0) throw new Error(`tmux scroll-pane failed: ${r.err || r.out}`);
+  }
+
   // ---- 文件 ----
 
   async readFileRange(path: string, offset: number, limit: number): Promise<FileRange> {
@@ -248,6 +256,209 @@ export class LocalDriver implements ExecutorDriver {
     } finally {
       await fh.close();
     }
+  }
+
+  /**
+   * Symlink-resistant bounded read for governed project content.
+   * O_NOFOLLOW closes the final-component swap; lstat checks each component. A hostile process can
+   * still race replacement of an intermediate directory on platforms without openat2/openat walks.
+   */
+  async readFileNoFollowWithin(root: string, relativePath: string, limit: number): Promise<FileRange> {
+    if (!isAbsolute(root) || !Number.isSafeInteger(limit) || limit < 0) {
+      throw new Error('invalid secure read arguments');
+    }
+    const parts = relativePath.split(/[\\/]/);
+    if (parts.length === 0 || parts.some((part) => part.length === 0 || part === '.' || part === '..')) {
+      throw new Error('unsafe relative path');
+    }
+    const rootPath = resolve(root);
+    const rootStat = await fsp.lstat(rootPath);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error('secure read root is not a real directory');
+    const realRoot = await fsp.realpath(rootPath);
+    let current = rootPath;
+    for (let index = 0; index < parts.length; index++) {
+      current = join(current, parts[index]!);
+      const st = await fsp.lstat(current);
+      if (st.isSymbolicLink()) throw new Error('secure read rejects symlinks');
+      if (index < parts.length - 1 && !st.isDirectory()) throw new Error('secure read parent is not a directory');
+      if (index === parts.length - 1 && !st.isFile()) throw new Error('secure read target is not a regular file');
+    }
+    const realTarget = await fsp.realpath(current);
+    const fromRoot = relative(realRoot, realTarget);
+    if (fromRoot === '' || fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+      throw new Error('secure read escaped trusted root');
+    }
+    const fh = await fsp.open(current, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const st = await fh.stat();
+      if (!st.isFile()) throw new Error('secure read target is not a regular file');
+      const len = Math.min(limit, st.size);
+      const buf = Buffer.alloc(len);
+      let got = 0;
+      while (got < len) {
+        const result = await fh.read(buf, got, len - got, got);
+        if (result.bytesRead <= 0) break;
+        got += result.bytesRead;
+      }
+      return { data: new Uint8Array(buf.buffer, buf.byteOffset, got), size: st.size };
+    } finally {
+      await fh.close();
+    }
+  }
+
+  async writeFileNoFollowWithin(
+    root: string,
+    relativePath: string,
+    data: Uint8Array | string,
+    mode = 0o644,
+  ): Promise<'created' | 'unchanged' | 'conflict'> {
+    if (!isAbsolute(root)) throw new Error('invalid secure write root');
+    const parts = relativePath.split(/[\\/]/);
+    if (parts.length === 0 || parts.some((part) => !part || part === '.' || part === '..')) {
+      throw new Error('unsafe relative path');
+    }
+    const rootPath = resolve(root);
+    const rootStat = await fsp.lstat(rootPath);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error('secure write root is not a real directory');
+    let current = rootPath;
+    for (const part of parts.slice(0, -1)) {
+      current = join(current, part);
+      try {
+        await fsp.mkdir(current, { mode: 0o755 });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+      const st = await fsp.lstat(current);
+      if (st.isSymbolicLink() || !st.isDirectory()) throw new Error('secure write rejects links and non-directories');
+    }
+    const target = join(current, parts.at(-1)!);
+    const bytes = typeof data === 'string' ? Buffer.from(data) : Buffer.from(data);
+    let handle;
+    try {
+      handle = await fsp.open(
+        target,
+        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+        mode,
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const read = await fsp.open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const st = await read.stat();
+        if (!st.isFile() || st.size !== bytes.length) return 'conflict';
+        const existing = Buffer.alloc(st.size);
+        let got = 0;
+        while (got < existing.length) {
+          const result = await read.read(existing, got, existing.length - got, got);
+          if (result.bytesRead <= 0) break;
+          got += result.bytesRead;
+        }
+        return got === bytes.length && existing.equals(bytes) ? 'unchanged' : 'conflict';
+      } finally {
+        await read.close();
+      }
+    }
+    try {
+      await handle.write(bytes, 0, bytes.length, 0);
+      await handle.sync();
+      return 'created';
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async listDirectoryNoFollowWithin(root: string, relativePath: string): Promise<DirEntry[] | null> {
+    if (!isAbsolute(root)) throw new Error('invalid secure list root');
+    const parts = relativePath === '' ? [] : relativePath.split(/[\\/]/);
+    if (parts.some((part) => !part || part === '.' || part === '..')) throw new Error('unsafe relative path');
+    let current = resolve(root);
+    try {
+      const rootStat = await fsp.lstat(current);
+      if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error('secure list root is not a real directory');
+      for (const part of parts) {
+        current = join(current, part);
+        const st = await fsp.lstat(current);
+        if (st.isSymbolicLink() || !st.isDirectory()) throw new Error('secure list rejects links and non-directories');
+      }
+      const entries = await fsp.readdir(current, { withFileTypes: true });
+      return entries.map((entry) => ({
+        name: entry.name,
+        type: entry.isFile() ? 'file' : entry.isDirectory() ? 'dir' : entry.isSymbolicLink() ? 'symlink' : 'other',
+      }));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
+  async replaceFileNoFollowWithin(
+    root: string,
+    relativePath: string,
+    data: Uint8Array,
+    expectedSha256: string | null,
+  ): Promise<'written' | 'unchanged' | 'conflict'> {
+    if (expectedSha256 === null) {
+      const created = await this.writeFileNoFollowWithin(root, relativePath, data);
+      return created === 'created' ? 'written' : created;
+    }
+    if (!/^[a-f0-9]{64}$/.test(expectedSha256)) throw new Error('invalid expected digest');
+    const parts = relativePath.split(/[\\/]/);
+    if (!isAbsolute(root) || parts.some((part) => !part || part === '.' || part === '..')) throw new Error('unsafe relative path');
+    const parentParts = parts.slice(0, -1);
+    let parent = resolve(root);
+    const rootStat = await fsp.lstat(parent);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error('secure replace root is not a real directory');
+    for (const part of parentParts) {
+      parent = join(parent, part);
+      const st = await fsp.lstat(parent);
+      if (st.isSymbolicLink() || !st.isDirectory()) throw new Error('secure replace rejects links and non-directories');
+    }
+    const target = join(parent, parts.at(-1)!);
+    let handle;
+    try { handle = await fsp.open(target, constants.O_RDONLY | constants.O_NOFOLLOW); }
+    catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'conflict' : Promise.reject(error); }
+    let observed;
+    try {
+      observed = await handle.stat();
+      if (!observed.isFile()) return 'conflict';
+      const existing = await handle.readFile();
+      const actual = createHash('sha256').update(existing).digest('hex');
+      if (actual !== expectedSha256) return 'conflict';
+      if (Buffer.from(data).equals(existing)) return 'unchanged';
+    } finally { await handle.close(); }
+    const temp = join(parent, `.${parts.at(-1)!}.panda-${randomUUID()}.tmp`);
+    try {
+      const tempHandle = await fsp.open(temp, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o644);
+      try { await tempHandle.writeFile(data); await tempHandle.sync(); } finally { await tempHandle.close(); }
+      const latest = await fsp.lstat(target).catch(() => null);
+      if (!latest?.isFile() || latest.isSymbolicLink() || latest.dev !== observed.dev || latest.ino !== observed.ino) return 'conflict';
+      await fsp.rename(temp, target);
+      return 'written';
+    } finally { await fsp.unlink(temp).catch(() => {}); }
+  }
+
+  async removeFileNoFollowWithin(
+    root: string,
+    relativePath: string,
+    expectedSha256: string,
+  ): Promise<'removed' | 'missing' | 'conflict'> {
+    if (!/^[a-f0-9]{64}$/.test(expectedSha256)) throw new Error('invalid expected digest');
+    const read = await this.readFileNoFollowWithin(root, relativePath, 100 * 1024 * 1024).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    });
+    if (!read) return 'missing';
+    if (read.data.byteLength !== read.size || createHash('sha256').update(read.data).digest('hex') !== expectedSha256) return 'conflict';
+    const target = join(resolve(root), ...relativePath.split(/[\\/]/));
+    const handle = await fsp.open(target, constants.O_RDONLY | constants.O_NOFOLLOW).catch(() => null);
+    if (!handle) return 'missing';
+    try {
+      const before = await handle.stat();
+      const latest = await fsp.lstat(target).catch(() => null);
+      if (!latest?.isFile() || latest.isSymbolicLink() || latest.dev !== before.dev || latest.ino !== before.ino) return 'conflict';
+      await fsp.unlink(target);
+      return 'removed';
+    } finally { await handle.close(); }
   }
 
   async statPath(path: string): Promise<PathStat | null> {

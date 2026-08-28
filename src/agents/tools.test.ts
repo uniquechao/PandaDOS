@@ -48,6 +48,7 @@ function mockDriver(st: MockDriverState): ExecutorDriver {
     },
     async sendKey() {},
     async resizeWindow() {},
+    async scrollPane() {},
     async capturePane() {
       if (st.pane instanceof Error) throw st.pane;
       return st.pane;
@@ -86,7 +87,7 @@ function mockDriver(st: MockDriverState): ExecutorDriver {
 }
 
 function conv(id: string, label: string, archived = false): Conversation {
-  return { id, projectId: 7, label, createdTs: 1, archived, agent: 'claude', kind: 'issue', lastActiveTs: null, autoApprove: 'cautious' };
+  return { id, projectId: 7, label, createdTs: 1, archived, agent: 'claude', kind: 'issue', lastActiveTs: null, autoApprove: 'cautious', workspaceCwd: null };
 }
 
 function mockConvs(

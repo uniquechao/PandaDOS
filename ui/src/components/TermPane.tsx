@@ -1,14 +1,32 @@
 /**
  * components/TermPane —— 可嵌入的终端面板（原 views/Term 的 xterm 主体平移抽取）。
  * xterm.js 接 WS /ws/term/:projectId：binary=终端字节流双向；target 选择 shell、issue 或对话。
- * 客→服 {type:'resize',cols,rows}；服→客 {type:'exit'}。
+ * 客→服 {type:'resize',cols,rows} / {type:'scroll',direction,lines}；服→客 {type:'exit'}。
  * 断线不自动重连（overlay 手动）；onStatus 供宿主在自己的页头显示连接状态。
  * 渲染为 fragment（termbox + 按键条），宿主需是 flex column 容器。
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { connectWs, type WsHandle } from '../lib/ws';
 import { bindTermTouchScroll, createTermTouchScrollController } from './termTouchScroll';
+import { createTermWheelScrollController } from './termWheelScroll';
 import { tr } from '../i18n/runtime';
+
+const MAX_SCROLL_LINES_PER_FRAME = 100;
+
+export function buildTermScrollFrame(lines: number): {
+  type: 'scroll';
+  direction: 'up' | 'down';
+  lines: number;
+} | null {
+  if (!Number.isFinite(lines)) return null;
+  const wholeLines = Math.trunc(lines);
+  if (wholeLines === 0) return null;
+  return {
+    type: 'scroll',
+    direction: wholeLines < 0 ? 'up' : 'down',
+    lines: Math.min(MAX_SCROLL_LINES_PER_FRAME, Math.abs(wholeLines)),
+  };
+}
 
 /** 按键条 → 直接写入 pty 的字节 */
 const TERM_KEYS: Array<[string, string]> = [
@@ -46,6 +64,7 @@ interface TermPaneProps {
 export function TermPane({ pid, target, onStatus, closedMessage }: TermPaneProps) {
   const boxRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WsHandle | null>(null);
+  const pageScrollRef = useRef<(direction: -1 | 1) => void>(() => {});
   const [status, setStatus] = useState<TermStatus>('connecting');
   const [gen, setGen] = useState(0); // +1 = 手动重连（整套重建）
   const targetKey =
@@ -141,16 +160,40 @@ export function TermPane({ pid, target, onStatus, closedMessage }: TermPaneProps
         });
         wsRef.current = conn;
 
+        const sendTermScroll = (lines: number): void => {
+          const frame = buildTermScrollFrame(lines);
+          if (!disposed && frame) conn.send(JSON.stringify(frame));
+        };
+        const sendPageScroll = (direction: -1 | 1): void => {
+          sendTermScroll(direction * Math.max(1, term.rows - 1));
+        };
+        pageScrollRef.current = sendPageScroll;
+
         const dataSub = term.onData((d: string) => {
           if (!disposed) conn.send(enc.encode(d));
         });
+        const wheelController = createTermWheelScrollController({
+          getCellHeight: () => {
+            const screen = term.element?.querySelector<HTMLElement>('.xterm-screen');
+            const screenHeight = screen?.getBoundingClientRect().height ?? 0;
+            return term.rows > 0 ? screenHeight / term.rows : 0;
+          },
+          getPageRows: () => Math.max(1, term.rows - 1),
+          scrollLines: sendTermScroll,
+        });
+        term.attachCustomWheelEventHandler((event) =>
+          wheelController.onWheel(event, term.buffer.active.type),
+        );
         const touchController = createTermTouchScrollController({
           getCellHeight: () => {
             const screen = term.element?.querySelector<HTMLElement>('.xterm-screen');
             const screenHeight = screen?.getBoundingClientRect().height ?? 0;
             return term.rows > 0 ? screenHeight / term.rows : 0;
           },
-          scrollLines: (lines) => term.scrollLines(lines),
+          scrollLines: (lines) => {
+            if (term.buffer.active.type === 'alternate') sendTermScroll(lines);
+            else term.scrollLines(lines);
+          },
         });
         const unbindTouchScroll = term.element
           ? bindTermTouchScroll(term.element, touchController)
@@ -164,6 +207,7 @@ export function TermPane({ pid, target, onStatus, closedMessage }: TermPaneProps
           dataSub.dispose();
           conn.close();
           if (wsRef.current === conn) wsRef.current = null;
+          if (pageScrollRef.current === sendPageScroll) pageScrollRef.current = () => {};
           term.dispose();
         };
       })
@@ -181,9 +225,33 @@ export function TermPane({ pid, target, onStatus, closedMessage }: TermPaneProps
     wsRef.current?.send(new TextEncoder().encode(bytes));
   };
 
+  const sendPageScroll = (direction: -1 | 1): void => pageScrollRef.current(direction);
+
   return (
     <>
       <div class="termbox" ref={boxRef}>
+        <div class="term-scroll-controls">
+          <button
+            type="button"
+            class="term-scroll-btn"
+            aria-label={tr('ui.terminalPageUp')}
+            title={tr('ui.terminalPageUp')}
+            disabled={status !== 'open'}
+            onClick={() => sendPageScroll(-1)}
+          >
+            ↑
+          </button>
+          <button
+            type="button"
+            class="term-scroll-btn"
+            aria-label={tr('ui.terminalPageDown')}
+            title={tr('ui.terminalPageDown')}
+            disabled={status !== 'open'}
+            onClick={() => sendPageScroll(1)}
+          >
+            ↓
+          </button>
+        </div>
         {(status === 'closed' || status === 'exit') && (
           <div class="term-overlay">
             <div>{status === 'closed' ? (closedMessage ?? tr('ui.terminalDisconnected')) : tr('ui.terminalEnded')}</div>

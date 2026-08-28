@@ -7,6 +7,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { promises as fsp } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,6 +16,7 @@ import {
   DEFAULT_TMUX_TIMEOUT_MS,
   tmuxNewSessionArgs,
   tmuxResizeWindowArgs,
+  tmuxScrollPaneArgs,
   TMUX_WIN_COLS,
   TMUX_WIN_ROWS,
 } from './driver';
@@ -75,6 +77,79 @@ describe('I5 本地命令超时', () => {
       const r = await d.readGitBlob(dir, 'HEAD', 'x.png');
       expect(r.code).toBe(0);
       expect(Buffer.from(r.data)).toEqual(bytes);
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('readFileNoFollowWithin bounds reads and rejects root, bundle, and file symlinks', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-local-secure-read-'));
+    const outside = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-local-secure-outside-'));
+    try {
+      const root = path.join(dir, 'personas');
+      await fsp.mkdir(path.join(root, 'safe'), { recursive: true });
+      await fsp.writeFile(path.join(root, 'safe/PERSONA.md'), 'abcdef');
+      const driver = new LocalDriver();
+      const read = await driver.readFileNoFollowWithin(root, 'safe/PERSONA.md', 3);
+      expect(Buffer.from(read.data).toString()).toBe('abc');
+      expect(read.size).toBe(6);
+      await fsp.symlink(outside, path.join(root, 'linked-bundle'));
+      await expect(driver.readFileNoFollowWithin(root, 'linked-bundle/PERSONA.md', 10)).rejects.toThrow(/symlink/);
+      await fsp.writeFile(path.join(outside, 'PERSONA.md'), 'outside');
+      await fsp.symlink(path.join(outside, 'PERSONA.md'), path.join(root, 'safe/LINK.md'));
+      await expect(driver.readFileNoFollowWithin(root, 'safe/LINK.md', 10)).rejects.toThrow(/symlink/);
+      await fsp.symlink(root, path.join(dir, 'persona-root-link'));
+      await expect(driver.readFileNoFollowWithin(path.join(dir, 'persona-root-link'), 'safe/PERSONA.md', 10))
+        .rejects.toThrow(/root/);
+      await expect(driver.readFileNoFollowWithin(root, '../outside/PERSONA.md', 10)).rejects.toThrow(/unsafe/);
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true });
+      await fsp.rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  test('writeFileNoFollowWithin is exclusive, idempotent, conflict-safe, and rejects links', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-local-secure-write-'));
+    try {
+      const driver = new LocalDriver();
+      expect(await driver.writeFileNoFollowWithin(
+        dir, '.panda/personas/reviewer/PERSONA.md', 'canonical',
+      )).toBe('created');
+      expect(await driver.writeFileNoFollowWithin(
+        dir, '.panda/personas/reviewer/PERSONA.md', 'canonical',
+      )).toBe('unchanged');
+      expect(await driver.writeFileNoFollowWithin(
+        dir, '.panda/personas/reviewer/PERSONA.md', 'different',
+      )).toBe('conflict');
+      await fsp.symlink(path.join(dir, '.panda/personas/reviewer'), path.join(dir, '.panda/personas/link'));
+      await expect(driver.writeFileNoFollowWithin(dir, '.panda/personas/link/PERSONA.md', 'x'))
+        .rejects.toThrow(/rejects links/);
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('design projection primitives list, compare-and-swap, remove, and reject linked parents', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-local-design-files-'));
+    try {
+      const driver = new LocalDriver();
+      await fsp.mkdir(path.join(dir, '.panda/designs/design-1'), { recursive: true });
+      await fsp.writeFile(path.join(dir, '.panda/designs/design-1/DESIGN.md'), 'v1');
+      expect(await driver.listDirectoryNoFollowWithin(dir, '.panda/designs/design-1')).toEqual([
+        { name: 'DESIGN.md', type: 'file' },
+      ]);
+      const v1 = createHash('sha256').update('v1').digest('hex');
+      expect(await driver.replaceFileNoFollowWithin(
+        dir, '.panda/designs/design-1/DESIGN.md', new TextEncoder().encode('v2'), v1,
+      )).toBe('written');
+      expect(await driver.replaceFileNoFollowWithin(
+        dir, '.panda/designs/design-1/DESIGN.md', new TextEncoder().encode('v3'), v1,
+      )).toBe('conflict');
+      const v2 = createHash('sha256').update('v2').digest('hex');
+      expect(await driver.removeFileNoFollowWithin(dir, '.panda/designs/design-1/DESIGN.md', v2))
+        .toBe('removed');
+      await fsp.symlink(path.join(dir, '.panda/designs/design-1'), path.join(dir, '.panda/designs/link'));
+      await expect(driver.listDirectoryNoFollowWithin(dir, '.panda/designs/link')).rejects.toThrow(/links/);
     } finally {
       await fsp.rm(dir, { recursive: true, force: true });
     }
@@ -239,6 +314,27 @@ describe('I6 建会话尺寸单一来源', () => {
     expect(tmuxResizeWindowArgs('s1', null)).toEqual([
       'set-window-option', '-t', 's1', 'window-size', 'latest',
     ]);
+  });
+});
+
+describe('issue #37 tmux 历史滚动参数', () => {
+  test('上滚原子进入 copy-mode，下滚仅在 copy-mode 内执行并可在底部退出', () => {
+    expect(tmuxScrollPaneArgs('cc-1-console', 'up', 3)).toEqual([
+      'if-shell', '-t', 'cc-1-console', '-F', '#{pane_in_mode}',
+      'send-keys -X -N 3 scroll-up',
+      'copy-mode -e; send-keys -X -N 3 scroll-up',
+    ]);
+    expect(tmuxScrollPaneArgs('cc-1-console', 'down', 4)).toEqual([
+      'if-shell', '-t', 'cc-1-console', '-F', '#{pane_in_mode}',
+      'send-keys -X -N 4 scroll-down',
+      '',
+    ]);
+  });
+
+  test('拒绝无效滚动行数，避免绕过 WebSocket 边界直接放大 tmux 命令', () => {
+    for (const lines of [0, -1, 101, 1.5, Number.NaN]) {
+      expect(() => tmuxScrollPaneArgs('s1', 'up', lines)).toThrow(/scroll lines/);
+    }
   });
 });
 

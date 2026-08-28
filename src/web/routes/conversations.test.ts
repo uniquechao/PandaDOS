@@ -15,6 +15,7 @@ import type { HistoryArchiveFs } from '../../core/conversation-history';
 import { openDb } from '../../core/db';
 import { migrate } from '../../core/migrate';
 import { UserStore } from '../../core/users';
+import { DesignStore, migrateDesigns } from '../../designs/store';
 import { migrateIssueEngine } from '../../issues/engine';
 import { KeyedMutex } from '../../issues/mutex';
 import type { AgentHistoryReader } from '../../executor/agent-history';
@@ -60,6 +61,7 @@ function setup(models?: ConvModelPort, historyDriver?: AgentHistoryReader & Hist
   const db = openDb(':memory:');
   migrate(db);
   migrateIssueEngine(db);
+  migrateDesigns(db);
   const users = new UserStore(db);
   const { token: adminToken } = users.create('admin', 'admin');
   const { user: alice, token: aliceToken } = users.create('alice');
@@ -201,6 +203,44 @@ describe('conversations 路由：新建/列表', () => {
     const t = setup();
     const c = await t.call('POST', P, t.aliceToken, {});
     expect(c.body.conversation.label).toBe('新对话');
+  });
+
+  test('design-bound chat 不进入普通列表，也不能由普通 chat 路由操作', async () => {
+    const t = setup();
+    const conversation = t.convs.create(1, 'Design workspace', 'codex', 'chat');
+    new DesignStore(t.db).createTask({
+      projectId: 1,
+      title: 'Design workspace',
+      originalRequest: 'Keep this conversation private to the design routes.',
+      agent: 'codex',
+      conversationId: conversation.id,
+    });
+
+    const list = await t.call('GET', P, t.aliceToken);
+    expect(list.body.conversations).toEqual([]);
+    for (const action of ['activate', 'archive', 'rename']) {
+      const result = await t.call(
+        'POST',
+        `${P}/${conversation.id}/${action}`,
+        t.aliceToken,
+        action === 'rename' ? { label: 'forged rename' } : undefined,
+      );
+      expect(result.status).toBe(409);
+      expect(result.body.error).toEqual({
+        code: 'design.conversation_reserved',
+        params: { conversationId: conversation.id },
+        fallback: 'This conversation is managed by the design workspace.',
+      });
+    }
+    const autoApprove = await t.call(
+      'POST', `${P}/${conversation.id}/auto-approve`, t.aliceToken, { level: 'auto' },
+    );
+    expect(autoApprove.status).toBe(409);
+    expect(autoApprove.body.error.code).toBe('design.conversation_reserved');
+    const model = await t.call('GET', `${P}/${conversation.id}/model`, t.aliceToken);
+    expect(model.status).toBe(409);
+    expect(model.body.error.code).toBe('design.conversation_reserved');
+    expect(t.convs.get(conversation.id)).toMatchObject({ archived: false, label: 'Design workspace' });
   });
 });
 
@@ -357,6 +397,39 @@ describe('conversations 路由：导入当前项目本地历史', () => {
 
       const rejected = await t.call('POST', `${P}/local-history`, t.aliceToken, {
         sessions: [{ agent: 'codex', sessionId: fixture.codexSid }],
+      });
+      expect(rejected.status).toBe(404);
+      expect(rejected.body.error.code).toBe('history.not_found');
+    } finally {
+      await fsp.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test('候选查询和导入都排除 design-bound 原生会话', async () => {
+    const fixture = await historyFixture();
+    try {
+      const t = setup(undefined, fixture.driver);
+      t.db.query('UPDATE executors SET claude_dir = ?, codex_dir = ? WHERE id = 1')
+        .run(fixture.claudeRoot, fixture.codexRoot);
+      t.db.query(
+        `INSERT INTO conversations
+           (id, project_id, label, created_ts, agent, agent_session_id, agent_jsonl_path, kind)
+         VALUES ('claude-local', 1, 'design claude', 0, 'claude', 'claude-local', '/design.jsonl', 'chat')`,
+      ).run();
+      new DesignStore(t.db).createTask({
+        projectId: 1,
+        title: 'Private design',
+        originalRequest: 'Keep native history in the design workspace.',
+        agent: 'claude',
+        conversationId: 'claude-local',
+      });
+
+      const candidates = await t.call('GET', `${P}/local-history`, t.aliceToken);
+      expect(candidates.status).toBe(200);
+      expect(candidates.body.sessions.map((session: any) => session.sessionId)).toEqual([fixture.codexSid]);
+
+      const rejected = await t.call('POST', `${P}/local-history`, t.aliceToken, {
+        sessions: [{ agent: 'claude', sessionId: 'claude-local' }],
       });
       expect(rejected.status).toBe(404);
       expect(rejected.body.error.code).toBe('history.not_found');

@@ -37,6 +37,9 @@ function makeFake() {
     killSession: async (s: string) => {
       calls.push(`kill:${s}`);
     },
+    scrollPane: async (s: string, direction: string, lines: number) => {
+      calls.push(`scroll:${s}:${direction}:${lines}`);
+    },
   } as unknown as ExecutorDriver;
   return {
     inner,
@@ -145,5 +148,44 @@ describe('PaneCacheDriver（M6 capturePane TTL 合并缓存）', () => {
     await d.close();
     expect(f.isClosed()).toBe(true);
     expect(PANE_CACHE_TTL_MS).toBe(300);
+  });
+
+  test('tmux 历史滚动原样透传到底层 Driver', async () => {
+    const f = makeFake();
+    await withPaneCache(f.inner).scrollPane('s1', 'up', 6);
+    expect(f.calls).toContain('scroll:s1:up:6');
+  });
+
+  test('secure no-follow read forwards explicitly and rejects unsupported inner drivers', async () => {
+    const unsupported = withPaneCache(makeFake().inner);
+    await expect(unsupported.readFileNoFollowWithin('/root', 'bundle/PERSONA.md', 10))
+      .rejects.toThrow(/capability unavailable/);
+    const fake = makeFake();
+    (fake.inner as { readFileNoFollowWithin?: ExecutorDriver['readFileNoFollowWithin'] })
+      .readFileNoFollowWithin = async () => ({ data: new TextEncoder().encode('safe'), size: 4 });
+    const result = await withPaneCache(fake.inner).readFileNoFollowWithin('/root', 'bundle/PERSONA.md', 10);
+    expect(new TextDecoder().decode(result.data)).toBe('safe');
+    await expect(unsupported.writeFileNoFollowWithin('/root', 'bundle/PERSONA.md', 'x'))
+      .rejects.toThrow(/capability unavailable/);
+    (fake.inner as { writeFileNoFollowWithin?: ExecutorDriver['writeFileNoFollowWithin'] })
+      .writeFileNoFollowWithin = async () => 'created';
+    expect(await withPaneCache(fake.inner).writeFileNoFollowWithin('/root', 'bundle/PERSONA.md', 'x'))
+      .toBe('created');
+    await expect(unsupported.listDirectoryNoFollowWithin('/root', '.panda/designs'))
+      .rejects.toThrow(/capability unavailable/);
+    (fake.inner as { listDirectoryNoFollowWithin?: ExecutorDriver['listDirectoryNoFollowWithin'] })
+      .listDirectoryNoFollowWithin = async () => [{ name: 'design-1', type: 'dir' }];
+    expect(await withPaneCache(fake.inner).listDirectoryNoFollowWithin('/root', '.panda/designs'))
+      .toEqual([{ name: 'design-1', type: 'dir' }]);
+    (fake.inner as { replaceFileNoFollowWithin?: ExecutorDriver['replaceFileNoFollowWithin'] })
+      .replaceFileNoFollowWithin = async () => 'written';
+    expect(await withPaneCache(fake.inner).replaceFileNoFollowWithin(
+      '/root', '.panda/designs/design-1/DESIGN.md', new Uint8Array(), null,
+    )).toBe('written');
+    (fake.inner as { removeFileNoFollowWithin?: ExecutorDriver['removeFileNoFollowWithin'] })
+      .removeFileNoFollowWithin = async () => 'removed';
+    expect(await withPaneCache(fake.inner).removeFileNoFollowWithin(
+      '/root', '.panda/designs/design-1/DESIGN.md', 'a'.repeat(64),
+    )).toBe('removed');
   });
 });

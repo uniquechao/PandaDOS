@@ -14,8 +14,8 @@ describe('项目配置页外部 issue 来源请求', () => {
 
   test('GitLab 自建实例、token 与清除意图显式传递', () => {
     expect(externalIssueSourcePayload({
-      provider: 'gitlab', remoteName: 'upstream', instanceUrl: ' https://gitlab.example/team ', apiToken: ' secret ', clearApiToken: false,
-    })).toEqual({ provider: 'gitlab', remoteName: 'upstream', instanceUrl: 'https://gitlab.example/team', apiToken: 'secret' });
+      provider: 'gitlab', remoteName: 'upstream', instanceUrl: ' https://gitlab.example.com/team ', apiToken: ' secret ', clearApiToken: false,
+    })).toEqual({ provider: 'gitlab', remoteName: 'upstream', instanceUrl: 'https://gitlab.example.com/team', apiToken: 'secret' });
     expect(externalIssueSourcePayload({
       provider: 'gitlab', remoteName: 'origin', instanceUrl: '', apiToken: '', clearApiToken: true,
     })).toEqual({ provider: 'gitlab', remoteName: 'origin', clearApiToken: true });
@@ -51,6 +51,8 @@ describe('项目设置控制台', () => {
     expect(source).toContain('id="settings-issue-subscription"');
     expect(source).toContain('id="settings-members"');
     expect(source).toContain('id="settings-modules"');
+    expect(source).toContain('id="settings-workflows"');
+    expect(source).toContain('nav(`/p/${pid}/workflows`)');
     expect(source).not.toContain('id="settings-people"');
     expect(source).not.toContain('nav(`/p/${pid}/external-issues`)');
     expect(source).not.toContain("t('project.workBranch')");

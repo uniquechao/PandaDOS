@@ -178,12 +178,14 @@ describe('终端触摸事件绑定', () => {
 });
 
 describe('TermPane 触摸滚动接入', () => {
-  test('TermPane 建立从触摸事件到 xterm 历史滚动的通路', async () => {
+  test('TermPane 建立触摸事件到普通 xterm 或备用 tmux 历史的共享通路', async () => {
     const source = await Bun.file(new URL('./TermPane.tsx', import.meta.url)).text();
 
     expect(source).toContain('createTermTouchScrollController');
     expect(source).toContain('bindTermTouchScroll');
-    expect(source).toContain('term.scrollLines');
+    expect(source).toContain("term.buffer.active.type === 'alternate'");
+    expect(source).toContain('term.scrollLines(lines)');
+    expect(source).toContain('sendTermScroll(lines)');
     expect(source).toContain('.xterm-screen');
   });
 });

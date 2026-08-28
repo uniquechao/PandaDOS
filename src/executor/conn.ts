@@ -51,8 +51,19 @@ export interface SftpLike {
     position: number,
     cb: (err: Error | null | undefined, bytesRead: number) => void,
   ): void;
+  write?(
+    handle: unknown,
+    buffer: Buffer,
+    offset: number,
+    length: number,
+    position: number,
+    cb: (err: Error | null | undefined) => void,
+  ): void;
   close(handle: unknown, cb: (err: Error | null | undefined) => void): void;
   stat(path: string, cb: (err: Error | null | undefined, stats: SftpStatsLike) => void): void;
+  /** ssh2 exposes lstat; optional keeps legacy injected fakes source-compatible. */
+  lstat?(path: string, cb: (err: Error | null | undefined, stats: SftpStatsLike) => void): void;
+  mkdir?(path: string, attrs: { mode?: number }, cb: (err: Error | null | undefined) => void): void;
   readdir(path: string, cb: (err: Error | null | undefined, list: SftpDirEntryLike[]) => void): void;
   writeFile(
     path: string,
@@ -61,6 +72,8 @@ export interface SftpLike {
     cb: (err: Error | null | undefined) => void,
   ): void;
   chmod(path: string, mode: number, cb: (err: Error | null | undefined) => void): void;
+  rename?(oldPath: string, newPath: string, cb: (err: Error | null | undefined) => void): void;
+  unlink?(path: string, cb: (err: Error | null | undefined) => void): void;
 }
 
 export interface SshClientLike {

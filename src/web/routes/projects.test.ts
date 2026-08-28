@@ -32,6 +32,7 @@ function setup() {
       kind: 'issue' as const,
       lastActiveTs: null,
       autoApprove: 'cautious' as const,
+      workspaceCwd: null,
     }),
   };
   // waiting_input 数据源：测试用集合模拟（生产 = 审批管道登记 ∪ 菜单滞留）
@@ -391,6 +392,7 @@ describe('POST /api/projects/import', () => {
     expect(r.body.project.name).toBe('ontology');
     expect(r.body.project.cwd).toBe('/home/developer/onto');
     expect(r.body.project.runUser).toBe('developer');
+    expect(r.body.project.kind).toBe('issue');
     const reg = s.db
       .query<{ project_id: number; owner_user_id: number }, [string]>(
         'SELECT project_id, owner_user_id FROM sessions WHERE name = ?',
@@ -411,14 +413,18 @@ describe('POST /api/projects/import', () => {
     const s = setupImport(live);
     // 预置同 cwd 项目（alice 的）
     s.db.run(
-      `INSERT INTO projects (name, executor_id, cwd, owner_user_id, created_ts) VALUES ('已有', 1, '/ws/u2/mine', 2, 0)`,
+      `INSERT INTO projects (name, executor_id, cwd, owner_user_id, created_ts, kind)
+       VALUES ('已有', 1, '/ws/u2/mine', 2, 0, 'chat')`,
     );
     const merged = await j(
-      s.dispatch(req('POST', '/api/projects/import', s.alice.token, { executorId: 1, session: 'mine' })),
+      s.dispatch(req('POST', '/api/projects/import', s.alice.token, {
+        executorId: 1, session: 'mine', kind: 'issue',
+      })),
     );
     expect(merged.status).toBe(200);
     expect(merged.body.created).toBe(false);
     expect(merged.body.project.name).toBe('已有');
+    expect(merged.body.project.kind).toBe('chat');
 
     // 普通用户导 workspace 外 → 403
     const out = await j(
@@ -461,7 +467,7 @@ describe('POST /api/projects/import', () => {
       );
       expect(claude.status).toBe(200);
       expect(claude.body.created).toBe(true);
-      expect(claude.body.project).toMatchObject({ name: 'app', cwd: '/ws/u2/app', kind: 'chat' });
+      expect(claude.body.project).toMatchObject({ name: 'app', cwd: '/ws/u2/app', kind: 'issue' });
       expect(claude.body.importedConversations).toBe(2);
       expect(claude.body.existingConversations).toBe(0);
       const claudeRows = s.db
@@ -523,6 +529,27 @@ describe('POST /api/projects/import', () => {
       expect(conflict.status).toBe(409);
       expect(conflict.body.error.code).toBe('project.import_history_assigned');
       expect(s.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM projects').get()!.n).toBe(1);
+    } finally {
+      await fsp.rm(s.root, { recursive: true, force: true });
+    }
+  });
+
+  test('显式 chat 类型适用于 Agent 导入，历史仍登记为可恢复 chat 对话', async () => {
+    const s = await setupAgentImport();
+    try {
+      const imported = await j(
+        s.dispatch(req('POST', '/api/projects/import', s.alice.token, {
+          source: 'codex', executorId: 1, cwd: '/ws/u2/app', kind: 'chat',
+        })),
+      );
+      expect(imported.status).toBe(200);
+      expect(imported.body.project.kind).toBe('chat');
+      expect(imported.body.importedConversations).toBe(1);
+      expect(
+        s.db.query<{ kind: string }, [string]>(
+          'SELECT kind FROM conversations WHERE agent_session_id = ?',
+        ).get(s.codexSid)?.kind,
+      ).toBe('chat');
     } finally {
       await fsp.rm(s.root, { recursive: true, force: true });
     }
@@ -603,6 +630,13 @@ describe('POST /api/projects/import', () => {
       );
       expect(badSource.status).toBe(400);
       expect(badSource.body.error.code).toBe('project.import_source_invalid');
+      const badKind = await j(
+        s.dispatch(req('POST', '/api/projects/import', s.admin.token, {
+          source: 'claude', executorId: 1, cwd: '/ws/u2/app', kind: 'other',
+        })),
+      );
+      expect(badKind.status).toBe(400);
+      expect(badKind.body.error.details).toBe('kind 必须是 issue 或 chat');
     } finally {
       await fsp.rm(s.root, { recursive: true, force: true });
     }

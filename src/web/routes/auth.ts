@@ -6,7 +6,7 @@
  * 本模块只 export 路由定义，注册进 index.ts 由集成步骤统一做。
  */
 import { genToken, hashEq, hashToken, type UserStore } from '../../core/users';
-import { loginCookie, logoutCookie, requestIsSecure } from '../auth';
+import { loginCookie, logoutCookies, requestIsSecure } from '../auth';
 import { json, type RouteDef } from '../middleware';
 import { apiError } from '../errors';
 
@@ -55,14 +55,15 @@ export function authRoutes(deps: AuthRoutesDeps): RouteDef[] {
       method: 'POST',
       path: '/api/logout',
       auth: 'public', // 幂等清 cookie：token 已失效的会话也允许登出
-      handler: ({ req, url }) =>
-        new Response(JSON.stringify({ ok: true }), {
+      handler: ({ req, url }) => {
+        const headers = new Headers({ 'content-type': 'application/json; charset=utf-8' });
+        const secure = requestIsSecure(req, url);
+        for (const cookie of logoutCookies({ secure })) headers.append('set-cookie', cookie);
+        return new Response(JSON.stringify({ ok: true }), {
           status: 200,
-          headers: {
-            'content-type': 'application/json; charset=utf-8',
-            'set-cookie': logoutCookie({ secure: requestIsSecure(req, url) }),
-          },
-        }),
+          headers,
+        });
+      },
     },
     {
       method: 'GET',

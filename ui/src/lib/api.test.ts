@@ -7,6 +7,22 @@ const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
 
 describe('localized API errors', () => {
+  test('sends the caller-owned idempotency key on retried mutation requests', async () => {
+    let request: { input: RequestInfo | URL; init?: RequestInit } | undefined;
+    globalThis.fetch = (async (input, init) => {
+      request = { input, init };
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    await api('/api/projects/1/designs', 'POST', { title: 'Safe rollout' }, {
+      idempotencyKey: 'design-create-1',
+    });
+    expect(new Headers(request?.init?.headers).get('Idempotency-Key')).toBe('design-create-1');
+  });
+
   test('parses the structured wire contract and localizes known codes', async () => {
     globalThis.fetch = (async () => new Response(JSON.stringify({
       ok: false,
@@ -74,6 +90,28 @@ describe('localized API errors', () => {
     );
   });
 
+  test('localizes workflow validation errors while retaining structured issue details', () => {
+    const error = new ApiError({
+      code: 'workflow.graph_invalid',
+      params: { count: 1 },
+      fallback: 'The workflow graph is invalid.',
+      details: { issues: [{ code: 'workflow.node_unreachable', nodeKey: 'review' }] },
+    }, 400);
+    const fr = createI18n({ locale: 'fr', timeZone: 'UTC', catalog: frCatalog });
+    expect(localizeApiError(error, fr.t)).toBe('Corrigez les problèmes signalés dans la structure du workflow.');
+    expect(error.details).toEqual({ issues: [{ code: 'workflow.node_unreachable', nodeKey: 'review' }] });
+  });
+
+  test('localizes issue workflow selection and executor capability errors', () => {
+    const fr = createI18n({ locale: 'fr', timeZone: 'UTC', catalog: frCatalog });
+    expect(localizeApiError(new ApiError({
+      code: 'workflow.inactive', params: {}, fallback: 'Workflow inactive.',
+    }, 409), fr.t)).toBe('Le modèle sélectionné est archivé.');
+    expect(localizeApiError(new ApiError({
+      code: 'workflow.agent_unavailable', params: {}, fallback: 'Agent unavailable.',
+    }, 409), fr.t)).toBe('Le workflow nécessite un Agent indisponible sur cet exécuteur.');
+  });
+
   test('localizes subtask edit errors instead of falling back to a generic request failure', () => {
     const fr = createI18n({ locale: 'fr', timeZone: 'UTC', catalog: frCatalog });
     expect(localizeApiError(new ApiError({
@@ -86,6 +124,30 @@ describe('localized API errors', () => {
       params: { max: 500 },
       fallback: 'Subtask text must not exceed 500 characters.',
     }, 400), fr.t)).toBe('Le contenu de la sous-tâche ne doit pas dépasser 500 caractères.');
+  });
+
+  test('localizes design revision conflicts while preserving the current revision parameter', () => {
+    const fr = createI18n({ locale: 'fr', timeZone: 'UTC', catalog: frCatalog });
+    const error = new ApiError({
+      code: 'design.revision_conflict',
+      params: { currentRevision: 7 },
+      fallback: 'The design changed. Refresh it and try again.',
+    }, 409);
+    expect(localizeApiError(error, fr.t)).toBe(
+      'La conception a changé (révision actuelle : 7). Actualisez-la, puis réessayez.',
+    );
+  });
+
+  test('localizes reserved design conversations without exposing a fixed-language legacy detail', () => {
+    const fr = createI18n({ locale: 'fr', timeZone: 'UTC', catalog: frCatalog });
+    const error = new ApiError({
+      code: 'design.conversation_reserved',
+      params: { conversationId: 'design-1' },
+      fallback: 'This conversation is managed by the design workspace.',
+    }, 409);
+    expect(localizeApiError(error, fr.t)).toBe(
+      'Cette conversation est gérée par l’espace de conception.',
+    );
   });
 
   test('uses stable local codes for invalid responses and network failures', async () => {

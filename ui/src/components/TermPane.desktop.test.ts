@@ -43,15 +43,37 @@ describe('TermPane PC 端回归', () => {
     expect(source).toContain('conn.send(JSON.stringify({ type:');
   });
 
-  test('鼠标滚轮仍由 xterm 自身处理，触摸接入不注册 wheel 监听', async () => {
-    const [paneSource, xtermSource] = await Promise.all([
+  test('通过 xterm 自定义 wheel 钩子区分普通与备用缓冲区', async () => {
+    const source = await Bun.file(termPaneUrl).text();
+
+    expect(source).toContain('createTermWheelScrollController');
+    expect(source).toContain('term.attachCustomWheelEventHandler');
+    expect(source).toContain('term.buffer.active.type');
+    expect(source).not.toMatch(/addEventListener\(['"]wheel/);
+  });
+
+  test('滚动控制帧保留方向语义并限制单帧行数', async () => {
+    const { buildTermScrollFrame } = await import('./TermPane');
+
+    expect(buildTermScrollFrame(-12)).toEqual({ type: 'scroll', direction: 'up', lines: 12 });
+    expect(buildTermScrollFrame(8)).toEqual({ type: 'scroll', direction: 'down', lines: 8 });
+    expect(buildTermScrollFrame(999)).toEqual({ type: 'scroll', direction: 'down', lines: 100 });
+    expect(buildTermScrollFrame(0)).toBeNull();
+  });
+
+  test('终端右侧提供共用的上下翻页按钮', async () => {
+    const [source, css] = await Promise.all([
       Bun.file(termPaneUrl).text(),
-      Bun.file(new URL('../../../node_modules/@xterm/xterm/src/browser/CoreBrowserTerminal.ts', import.meta.url)).text(),
+      Bun.file(new URL('../style.css', import.meta.url)).text(),
     ]);
 
-    expect(paneSource).not.toMatch(/addEventListener\(['"]wheel/);
-    expect(xtermSource).toContain("addDisposableListener(el, 'wheel'");
-    expect(xtermSource).toContain("el.addEventListener('wheel', eventListeners.wheel, { passive: false })");
+    expect(source).toContain('class="term-scroll-controls"');
+    expect(source).toContain("aria-label={tr('ui.terminalPageUp')}");
+    expect(source).toContain("aria-label={tr('ui.terminalPageDown')}");
+    expect(source).toContain('sendPageScroll(-1)');
+    expect(source).toContain('sendPageScroll(1)');
+    expect(css).toContain('.term-scroll-controls');
+    expect(css).toContain('.term-scroll-btn:focus-visible');
   });
 
   test('终端键盘输入仍编码后写入当前 WebSocket', async () => {

@@ -35,6 +35,7 @@ import type {
   IssueDetail,
   IssueEvent,
   IssueGitInfo,
+  IssueWorkflowRuntime,
   IssuePushState,
   MergeGatePayload,
   PlanGatePayload,
@@ -76,10 +77,12 @@ import {
   type IssueGitBranchValue,
 } from '../lib/issuegitbranch';
 import { tr } from '../i18n/runtime';
+import { WorkflowGraph } from '../components/WorkflowGraph';
+import { issueWorkflowStatusKey, workflowNodeStatusKey, workflowWorktreeStatusKey } from '../lib/workflow';
 
 const POLL_MS = 5000;
 
-type WbTab = 'detail' | 'exec' | 'changes';
+type WbTab = 'detail' | 'workflow' | 'exec' | 'changes';
 
 /**
  * 一个 issue 的工作台。embedded=true 作看板右栏（无返回键）；
@@ -161,6 +164,10 @@ export function IssueWorkbench({
   }, [pid, iid]);
 
   const issue = detail?.issue ?? null;
+
+  useEffect(() => {
+    if (detail && tab === 'workflow' && !detail.workflowRuntime) setTab('detail');
+  }, [detail, tab]);
 
   // 执行会话正在用的模型（issue #109）：只读展示，没开跑（无 convId）或探不到就不显示
   const model = useConvModel(pid, issue?.convId ?? null);
@@ -495,6 +502,11 @@ export function IssueWorkbench({
           <button class={`seg-btn${tab === 'detail' ? ' on' : ''}`} onClick={() => setTab('detail')}>
             {tr('issue.detailsTab')}
           </button>
+          {detail?.workflowRuntime && (
+            <button class={`seg-btn${tab === 'workflow' ? ' on' : ''}`} onClick={() => setTab('workflow')}>
+              {tr('workflow.issueTab')}
+            </button>
+          )}
           <button class={`seg-btn${tab === 'exec' ? ' on' : ''}`} onClick={() => setTab('exec')}>
             {tr('issue.executionTab')}
           </button>
@@ -535,6 +547,9 @@ export function IssueWorkbench({
             }}
             onUnblock={openRecovery}
           />
+        )}
+        {issue && tab === 'workflow' && detail?.workflowRuntime && (
+          <WorkflowRuntimePanel runtime={detail.workflowRuntime} />
         )}
         {issue && tab === 'changes' && (
           <IssueChangesTab key={iid} pid={pid} iid={iid} info={git.info} err={git.err} onRefresh={git.refresh} />
@@ -954,6 +969,123 @@ function IssueGitHead({ info, onRefresh }: { info: IssueGitInfo; onRefresh: () =
 
 // ---------- 详情 tab ----------
 
+export function workflowParallelProgress(runtime: IssueWorkflowRuntime): { key: string; done: number; total: number }[] {
+  const groups = new Map<string, Map<string, boolean>>();
+  for (const run of runtime.runs) {
+    if (!run.parallelGroupKey) continue;
+    const nodes = groups.get(run.parallelGroupKey) ?? new Map<string, boolean>();
+    const done = run.status === 'succeeded' || run.status === 'skipped' || run.status === 'cancelled';
+    nodes.set(run.nodeKey, done || (nodes.get(run.nodeKey) ?? false));
+    groups.set(run.parallelGroupKey, nodes);
+  }
+  return [...groups].map(([key, nodes]) => ({
+    key,
+    done: [...nodes.values()].filter(Boolean).length,
+    total: nodes.size,
+  }));
+}
+
+export function workflowConflictFiles(details: string | null): string[] {
+  if (!details) return [];
+  try {
+    const parsed = JSON.parse(details) as { files?: unknown; conflictedFiles?: unknown };
+    const files = Array.isArray(parsed.files) ? parsed.files : parsed.conflictedFiles;
+    return Array.isArray(files) ? files.filter((file): file is string => typeof file === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function WorkflowRuntimePanel({ runtime }: { runtime: IssueWorkflowRuntime }) {
+  const nodeByKey = new Map(runtime.workflow.graph.nodes.map((node) => [node.key, node]));
+  const parallel = workflowParallelProgress(runtime);
+  const worktrees = runtime.worktrees.filter((item) => item.status !== 'cleaned');
+  const conflicts = runtime.worktrees.filter((item) => item.conflictDetails || item.status === 'resolving' || item.status === 'paused' || item.status === 'failed');
+  const orderedRuns = [...runtime.runs].sort((a, b) => b.id - a.id);
+
+  return (
+    <div class="wfr">
+      <header class="wfr-head">
+        <div>
+          <span class="eyebrow">{tr('workflow.runtimeTitle')}</span>
+          <h3>{runtime.workflow.templateName}</h3>
+          <p class="mut small">{tr('workflow.runtimeMeta', { version: runtime.workflow.templateVersion, loops: runtime.workflow.maxLoopIterations })}</p>
+        </div>
+        <span class={`wfr-status status-${runtime.workflow.status}`}>{tr(issueWorkflowStatusKey(runtime.workflow.status))}</span>
+      </header>
+
+      {runtime.workflow.status === 'paused' && (
+        <section class="wfr-alert" role="status">
+          <div><strong>{tr('workflow.pausedTitle')}</strong><p>{runtime.workflow.pauseReason || tr('workflow.pauseReasonUnknown')}</p></div>
+          <span>{tr('workflow.pausedHelp')}</span>
+        </section>
+      )}
+
+      <WorkflowGraph graph={runtime.workflow.graph} runs={runtime.runs} />
+
+      {(parallel.length > 0 || worktrees.length > 0) && (
+        <div class="wfr-progress-grid">
+          {parallel.map((group) => (
+            <section key={group.key} class="wfr-progress-card">
+              <span class="eyebrow">{tr('workflow.parallelProgress')}</span>
+              <strong>{tr('workflow.parallelGroupValue', { key: group.key })}</strong>
+              <progress
+                value={group.done}
+                max={Math.max(1, group.total)}
+                aria-label={tr('workflow.parallelProgressAria', { key: group.key, done: group.done, total: group.total })}
+              />
+              <small>{tr('workflow.progressValue', { done: group.done, total: group.total })}</small>
+            </section>
+          ))}
+          {worktrees.map((worktree) => (
+            <section key={worktree.id} class="wfr-progress-card" aria-label={tr('workflow.worktreeAria', { branch: worktree.branch, status: tr(workflowWorktreeStatusKey(worktree.status)) })}>
+              <span class="eyebrow">{tr('workflow.mergeProgress')}</span>
+              <strong class="mono">{worktree.branch}</strong>
+              <span class={`wfr-mini-status status-${worktree.status}`}>{tr(workflowWorktreeStatusKey(worktree.status))}</span>
+            </section>
+          ))}
+        </div>
+      )}
+
+      {conflicts.map((worktree) => {
+        const files = workflowConflictFiles(worktree.conflictDetails);
+        return (
+          <section key={`conflict-${worktree.id}`} class="wfr-conflict" aria-label={tr('workflow.conflictAria', { branch: worktree.branch })}>
+            <div class="wfr-conflict-title"><strong>{tr('workflow.conflictTitle')}</strong><span class="mono">{worktree.branch}</span></div>
+            {files.length > 0 && <div class="wfr-file-list">{files.map((file) => <code key={file}>{file}</code>)}</div>}
+            {worktree.conflictDetails && <details><summary>{tr('workflow.conflictDiagnostics')}</summary><pre>{worktree.conflictDetails}</pre></details>}
+            {worktree.resolutionConversationId && <small>{tr('workflow.autoResolving')}</small>}
+          </section>
+        );
+      })}
+
+      <section class="wfr-runs">
+        <div class="wfr-section-title"><h3>{tr('workflow.nodeRuns')}</h3><span>{tr('workflow.runCount', { value: runtime.runs.length })}</span></div>
+        {orderedRuns.length === 0 ? <div class="empty">{tr('workflow.noRuns')}</div> : orderedRuns.map((run) => {
+          const node = nodeByKey.get(run.nodeKey);
+          const routeReason = run.routeReason ?? runtime.transitions.find((transition) => transition.fromRunId === run.id)?.decisionText ?? null;
+          return (
+            <article key={run.id} class={`wfr-run status-${run.status}`} aria-label={tr('workflow.runAria', { title: node?.title ?? run.nodeKey, status: tr(workflowNodeStatusKey(run.status)), iteration: run.iteration, attempt: run.attempt })}>
+              <div class="wfr-run-main">
+                <span class="wfr-run-dot" aria-hidden="true" />
+                <div>
+                  <strong>{node?.title ?? run.nodeKey}</strong>
+                  <span>{run.agent ? (run.agent === 'claude' ? 'Claude Code' : 'Codex') : tr(`workflow.nodeKind.${node?.kind ?? 'issue'}`)} · {tr('workflow.iterationAttempt', { iteration: run.iteration, attempt: run.attempt })}</span>
+                </div>
+                <span class="wfr-mini-status">{tr(workflowNodeStatusKey(run.status))}</span>
+              </div>
+              {routeReason && <div class="wfr-run-detail" aria-label={tr('workflow.routeReasonAria', { title: node?.title ?? run.nodeKey })}><b>{tr('workflow.routeReason')}</b><p>{routeReason}</p></div>}
+              {run.outputText && <details><summary>{tr('workflow.nodeOutput')}</summary><pre>{run.outputText}</pre></details>}
+              {(run.errorDetails || run.errorCode) && <div class="err small">{run.errorDetails || run.errorCode}</div>}
+              <time>{timeAgo(run.updatedTs)}</time>
+            </article>
+          );
+        })}
+      </section>
+    </div>
+  );
+}
+
 function DetailTab({
   issue,
   pid,
@@ -1099,7 +1231,7 @@ function DetailTab({
                     <span class="tx">{step.text}</span>
                     {editable && (
                       <button
-                        class="btn sm ghost plan-edit"
+                        class="btn sm plan-edit"
                         type="button"
                         title={tr('issue.editSubtask', { number: step.n })}
                         aria-label={tr('issue.editSubtask', { number: step.n })}
@@ -1109,7 +1241,11 @@ function DetailTab({
                           setEditError('');
                         }}
                       >
-                        {tr('issue.edit')}
+                        <svg class="plan-edit-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+                          <path d="M4 13.8V16h2.2L15 7.2 12.8 5 4 13.8Z" />
+                          <path d="m11.7 6.1 2.2 2.2M10.5 16H16" />
+                        </svg>
+                        <span>{tr('issue.edit')}</span>
                       </button>
                     )}
                   </>

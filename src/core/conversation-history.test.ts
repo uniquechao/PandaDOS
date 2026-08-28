@@ -6,6 +6,7 @@ import { openDb } from './db';
 import { migrate } from './migrate';
 import { UserStore } from './users';
 import { migrateIssueEngine } from '../issues/engine';
+import { DesignStore, migrateDesigns } from '../designs/store';
 import {
   archiveHistoryConversations,
   findBoundHistoryConversation,
@@ -20,6 +21,7 @@ function setup() {
   const db = openDb(':memory:');
   migrate(db);
   migrateIssueEngine(db);
+  migrateDesigns(db);
   const users = new UserStore(db);
   const alice = users.create('alice').user;
   db.run(
@@ -132,6 +134,25 @@ describe('importHistoryConversations', () => {
       id: chat.importedIds[0],
       projectId: 1,
       kind: 'chat',
+    });
+  });
+
+  test('excludes design-bound native sessions from both candidate filtering and import', () => {
+    const { db } = setup();
+    const first = importHistoryConversations(db, 1, [claude]);
+    new DesignStore(db).createTask({
+      projectId: 1,
+      title: 'Private design',
+      originalRequest: 'Do not expose this in ordinary history.',
+      agent: 'claude',
+      conversationId: first.importedIds[0],
+    });
+
+    expect(importableHistorySessions(db, [claude])).toEqual([]);
+    expect(importHistoryConversations(db, 1, [claude])).toEqual({
+      importedIds: [],
+      existingIds: [],
+      conflicts: [],
     });
   });
 

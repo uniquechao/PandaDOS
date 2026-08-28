@@ -411,8 +411,8 @@ describe('执行机 CRUD', () => {
       authDepsFromDb(app.db, app.users),
     );
     const connection = {
-      name: 'jimi',
-      host: 'jimi.chaoa.xyz',
+      name: 'runner',
+      host: 'runner.example.com',
       port: 22,
       sshUser: 'developer',
       keyRef: '/Users/developer/.ssh/id_ed25519',

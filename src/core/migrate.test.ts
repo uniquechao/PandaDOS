@@ -29,7 +29,7 @@ const EXPECTED_TABLES = [
 ].sort();
 
 /** core/migrations 当前最新编号（新增迁移文件时同步 +1） */
-const LATEST_MIGRATION = 17;
+const LATEST_MIGRATION = 18;
 
 function tableNames(db: Database): string[] {
   return db
@@ -255,6 +255,36 @@ describe('migrate', () => {
     expect(
       db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM external_issue_records').get()?.n,
     ).toBe(1);
+    db.close();
+  });
+
+  test('018 迁移：技能市场人格源 epoch 默认从 0 开始', () => {
+    const db = openDb(':memory:');
+    migrate(db);
+    const column = db.query<{ name: string; dflt_value: string | null }, []>(
+      "PRAGMA table_info('skill_markets')",
+    ).all().find((candidate) => candidate.name === 'persona_source_epoch');
+    expect(column?.dflt_value).toBe('0');
+    expect(db.query<{ persona_source_epoch: number }, []>(
+      'SELECT persona_source_epoch FROM skill_markets ORDER BY id LIMIT 1',
+    ).get()?.persona_source_epoch).toBe(0);
+    db.close();
+  });
+
+  test('018 迁移：从 017 升级时保留已有技能市场源', () => {
+    const db = openDb(':memory:');
+    migrate(db);
+    db.run('ALTER TABLE skill_markets DROP COLUMN persona_source_epoch');
+    db.run('DELETE FROM schema_migrations WHERE id = 18');
+    const before = db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM skill_markets').get()!.n;
+
+    const status = migrate(db);
+
+    expect(status.latest).toBe(18);
+    expect(db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM skill_markets').get()!.n).toBe(before);
+    expect(db.query<{ persona_source_epoch: number }, []>(
+      'SELECT persona_source_epoch FROM skill_markets ORDER BY id LIMIT 1',
+    ).get()?.persona_source_epoch).toBe(0);
     db.close();
   });
 

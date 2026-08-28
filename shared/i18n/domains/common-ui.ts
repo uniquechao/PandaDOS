@@ -1,3 +1,5 @@
+import type { SupportedLocale } from '../locales';
+
 const en = {
   'issue.editSubtask': 'Edit subtask {number}', 'issue.subtaskText': 'Subtask text',
   'ui.loading': 'Loading…', 'ui.download': 'Download', 'ui.downloadOriginal': 'Download original',
@@ -33,7 +35,7 @@ const en = {
   'ui.sendPlaceholder':'Send a message or intervention…','ui.send':'Send','ui.imageUploading':'Uploading image…','ui.readOnlyChat':'Read-only history — this conversation is no longer driving the issue.',
   'ui.toolRunning':'Running · {tool}','ui.thinking':'Thinking…','ui.tool':'Tool','ui.dragColumns':'Drag to resize columns','ui.dragColumnsReset':'Drag to resize columns · double-click to reset',
   'ui.dragList':'Drag to resize the list','ui.dragListReset':'Drag to resize the list · double-click to reset','ui.terminalDisconnected':'Terminal disconnected','ui.terminalEnded':'Terminal session ended',
-  'ui.subtaskProgress':'Subtask progress','ui.completedProgress':'Completed {done}/{total}','ui.endpoint':'Endpoint','ui.collapse':'Collapse','ui.expandCount':'Expand · {count}',
+  'ui.subtaskProgress':'Subtask progress','ui.subtaskProgressStep':'Subtask {number}: {text}','ui.completedProgress':'Completed {done}/{total}','ui.endpoint':'Endpoint','ui.collapse':'Collapse','ui.expandCount':'Expand · {count}',
   'ui.issueNoMessages':'This issue has no chat messages yet','ui.directoryPicker':'Choose an executor directory','ui.parentDirectory':'Parent','ui.directoryMissing':'This directory does not exist yet. You can create it here.',
   'ui.reading':'Reading…','ui.noSubdirectories':'No subdirectories','ui.tooManyDirectories':'Too many directories; showing the first 1,000.','ui.newDirectoryName':'New directory name',
   'ui.useDirectory':'Use this directory','ui.loadFailed':'Could not load','ui.emptyDirectory':'Empty directory',
@@ -47,7 +49,7 @@ const en = {
   'ui.executed':'Executed','ui.executing':'Executing…','ui.execute':'Execute','ui.noModules':'No modules yet. They are created automatically when issues are classified.',
   'ui.renamed':'Renamed','ui.archived':'Archived','ui.archiveModuleConfirm':'Archive module “{name}”? It will be hidden from selectors and automatic classification; its records remain.',
   'ui.moduleAgentChanged':'Module now uses {agent}','ui.moduleSource':'Module source','ui.migrated':'Migrated','ui.manual':'Manual','ui.moduleAgent':'Module agent','ui.unavailable':'Unavailable','ui.relatedIssueCount':'Related issue count',
-  'ui.reconnect':'Reconnect','ui.expand':'Expand',
+  'ui.reconnect':'Reconnect','ui.expand':'Expand','ui.terminalPageUp':'Scroll terminal up one page','ui.terminalPageDown':'Scroll terminal down one page',
   'view.projectFallback':'Project #{id}','view.nativeBash':'Native Bash','view.ended':'Ended','view.files':'Files',
   'view.uploadFailed':'Upload failed (HTTP {status})','view.uploaded':'Uploaded {name}','view.fileTreeWidth':'File tree width','view.chooseFile':'Choose a file on the left to preview or edit it.',
   'view.directoryTooLarge':'Directory is too large; showing the first 1,000 items.','view.mySettings':'My settings','view.account':'Account','view.lastLogin':'Last login: {time}',
@@ -73,7 +75,7 @@ const en = {
   'project.migrateAdmin':'Move the complete project directory to a new location (administrator only)','project.welcomeBack':'Welcome back, {name}',
   'project.noMatches':'No projects match the current filters{query}','project.searchSuffix':' (search: “{query}”)','project.archivedCount':'Archived ({count})',
   'project.gitRequired':'Enter a Git repository URL','project.clonedCreated':'Repository cloned and project created','project.createdWarnings':'Created with warnings:\n{warnings}',
-  'project.newProject':'New project','project.chatModeHelp':'Chat mode: ask questions and create files in the project directory without issues; each project can have multiple conversations.',
+  'project.newProject':'New project','project.issueModeHelp':'Issue mode: organize work on the issue board and let agents run it through the project workflow.','project.chatModeHelp':'Chat mode: ask questions and create files in the project directory without issues; each project can have multiple conversations.',
   'project.projectName':'Project name','project.repoNameDefault':' (leave empty to use the repository name)','project.cloneTo':'Clone to','project.selectedUserHome':'selected user home','project.yourWorkspace':'your workspace',
   'project.pickDirectory':'Choose a directory','project.branchFallbackHelp':'Work happens on your current branch. PandaDOS does not create, switch, or merge branches; this is only a fallback if the current branch cannot be read.',
   'project.cloning':'Cloning…','project.cloneCreate':'Clone and create','project.managed':'Managed #{id}','project.imported':'Imported #{id}','project.noPermission':'No permission','project.mergeInto':'Merge into #{id}',
@@ -157,7 +159,7 @@ const en = {
 type Common = { [K in keyof typeof en]: string };
 const locale = (values: Partial<Record<keyof Common, string>>): Common => ({ ...en, ...values });
 
-export const commonUiMessages = {
+const baseCommonUiMessages = {
   en,
   'zh-Hans': locale({ 'ui.loading':'载入中…','ui.download':'下载','ui.downloadOriginal':'下载原图','ui.downloadPdf':'下载 PDF','ui.save':'保存','ui.saving':'保存中…','ui.saved':'已保存','ui.pdfDownload':'PDF 文件，请下载后查看。','ui.fileNotEditable':'该文件无法在线编辑（二进制或超过 1 MB）。','ui.runRunning':'运行中','ui.terminate':'终止','ui.terminateIssue':'取消整个 issue','ui.pickSummaryModel':'选择模型更新项目简介','ui.viewScreenshot':'查看截图 {name}','ui.imageLoadFailed':'图片加载失败。','ui.downloadToView':'下载查看','ui.attachScreenshot':'附截图','ui.attachHint':'拍照、选取图片或直接粘贴，最多 {max} 张，每张不超过 5 MB。','ui.someUploadsFailed':'部分图片上传失败：{error}','ui.removeScreenshot':'移除这张截图','ui.yes':'是','ui.no':'否','ui.cancel':'取消','ui.confirm':'确认','ui.delete':'删除','ui.edit':'编辑','ui.create':'创建','ui.creating':'创建中…','ui.refresh':'刷新','ui.search':'搜索','ui.copy':'复制','ui.copied':'已复制 ✓','ui.rename':'重命名','ui.archive':'归档','ui.enable':'启用','ui.details':'详情','ui.view':'查看','ui.back':'返回','ui.upload':'上传','ui.uploading':'上传中…','ui.none':'无','ui.unknown':'未知','ui.never':'从未','ui.notConfigured':'未配置','ui.connected':'已连接','ui.disconnected':'已断开','ui.reconnecting':'断开，重连中…','git.imageBefore':'修改前','git.imageAfter':'修改后','git.openImage':'打开图片 {name}','git.viewImage':'查看图片 {name}','git.downloadImage':'下载图片 {name}' }),
   'zh-Hant': locale({ 'ui.loading':'載入中…','ui.download':'下載','ui.downloadOriginal':'下載原圖','ui.downloadPdf':'下載 PDF','ui.save':'儲存','ui.saving':'儲存中…','ui.saved':'已儲存','ui.pdfDownload':'請下載此 PDF 後檢視。','ui.fileNotEditable':'此檔案為二進位檔或超過 1 MB，無法線上編輯。','ui.runRunning':'執行中','ui.terminate':'終止','ui.terminateIssue':'取消整個 issue','ui.pickSummaryModel':'選擇模型更新專案簡介','ui.viewScreenshot':'檢視截圖 {name}','ui.imageLoadFailed':'圖片載入失敗。','ui.downloadToView':'下載後檢視','ui.attachScreenshot':'附加圖片','ui.attachHint':'拍照、選取圖片或直接貼上，最多 {max} 張，每張不超過 5 MB。','ui.someUploadsFailed':'部分圖片上傳失敗：{error}','ui.removeScreenshot':'移除此圖片','ui.yes':'是','ui.no':'否','ui.cancel':'取消','ui.confirm':'確認','ui.delete':'刪除','ui.edit':'編輯','ui.create':'建立','ui.creating':'建立中…','ui.refresh':'重新整理','ui.search':'搜尋','ui.copy':'複製','ui.copied':'已複製 ✓','ui.rename':'重新命名','ui.archive':'封存','ui.enable':'啟用','ui.details':'詳細資料','ui.view':'檢視','ui.back':'返回','ui.upload':'上傳','ui.uploading':'上傳中…','ui.none':'無','ui.unknown':'未知','ui.never':'從未','ui.notConfigured':'未設定','ui.connected':'已連線','ui.disconnected':'已中斷','ui.reconnecting':'連線中斷，正在重新連線…','git.imageBefore':'修改前','git.imageAfter':'修改後','git.openImage':'開啟圖片 {name}','git.viewImage':'檢視圖片 {name}','git.downloadImage':'下載圖片 {name}' }),
@@ -169,3 +171,41 @@ export const commonUiMessages = {
   'pt-BR': locale({ 'ui.loading':'Carregando…','ui.download':'Baixar','ui.downloadOriginal':'Baixar original','ui.downloadPdf':'Baixar PDF','ui.save':'Salvar','ui.saving':'Salvando…','ui.saved':'Salvo','ui.pdfDownload':'Baixe este PDF para visualizá-lo.','ui.fileNotEditable':'Este arquivo não pode ser editado on-line porque é binário ou tem mais de 1 MB.','ui.runRunning':'Em execução','ui.terminate':'Encerrar','ui.terminateIssue':'Cancelar toda a issue','ui.pickSummaryModel':'Escolher um modelo para atualizar o resumo do projeto','ui.viewScreenshot':'Ver captura {name}','ui.imageLoadFailed':'Não foi possível carregar a imagem.','ui.downloadToView':'Baixar para ver','ui.attachScreenshot':'Anexar imagem','ui.attachHint':'Tire uma foto, escolha uma imagem ou cole. Até {max}, 5 MB cada.','ui.someUploadsFailed':'Falha ao enviar algumas imagens: {error}','ui.removeScreenshot':'Remover esta imagem','ui.yes':'Sim','ui.no':'Não','ui.cancel':'Cancelar','ui.confirm':'Confirmar','ui.delete':'Excluir','ui.edit':'Editar','ui.create':'Criar','ui.creating':'Criando…','ui.refresh':'Atualizar','ui.search':'Pesquisar','ui.copy':'Copiar','ui.copied':'Copiado ✓','ui.rename':'Renomear','ui.archive':'Arquivar','ui.enable':'Ativar','ui.details':'Detalhes','ui.view':'Ver','ui.back':'Voltar','ui.upload':'Enviar','ui.uploading':'Enviando…','ui.none':'Nenhum','ui.unknown':'Desconhecido','ui.never':'Nunca','ui.notConfigured':'Não configurado','ui.connected':'Conectado','ui.disconnected':'Desconectado','ui.reconnecting':'Desconectado. Reconectando…' }),
   ru: locale({ 'ui.loading':'Загрузка…','ui.download':'Скачать','ui.downloadOriginal':'Скачать оригинал','ui.downloadPdf':'Скачать PDF','ui.save':'Сохранить','ui.saving':'Сохранение…','ui.saved':'Сохранено','ui.pdfDownload':'Скачайте PDF, чтобы открыть его.','ui.fileNotEditable':'Этот файл нельзя редактировать онлайн: он двоичный или больше 1 МБ.','ui.runRunning':'Выполняется','ui.terminate':'Остановить','ui.terminateIssue':'Отменить всю issue','ui.pickSummaryModel':'Выбрать модель для обновления описания проекта','ui.viewScreenshot':'Открыть снимок {name}','ui.imageLoadFailed':'Не удалось загрузить изображение.','ui.downloadToView':'Скачать для просмотра','ui.attachScreenshot':'Прикрепить изображение','ui.attachHint':'Сделайте фото, выберите изображение или вставьте его. До {max}, каждое не более 5 МБ.','ui.someUploadsFailed':'Не удалось загрузить некоторые изображения: {error}','ui.removeScreenshot':'Удалить это изображение','ui.yes':'Да','ui.no':'Нет','ui.cancel':'Отмена','ui.confirm':'Подтвердить','ui.delete':'Удалить','ui.edit':'Изменить','ui.create':'Создать','ui.creating':'Создание…','ui.refresh':'Обновить','ui.search':'Поиск','ui.copy':'Копировать','ui.copied':'Скопировано ✓','ui.rename':'Переименовать','ui.archive':'Архивировать','ui.enable':'Включить','ui.details':'Подробнее','ui.view':'Открыть','ui.back':'Назад','ui.upload':'Загрузить','ui.uploading':'Загрузка…','ui.none':'Нет','ui.unknown':'Неизвестно','ui.never':'Никогда','ui.notConfigured':'Не настроено','ui.connected':'Подключено','ui.disconnected':'Отключено','ui.reconnecting':'Соединение разорвано. Переподключение…' }),
 } as const;
+
+const subtaskProgressStep: Record<SupportedLocale, string> = {
+  en: 'Subtask {number}: {text}',
+  'zh-Hans': '子任务 {number}：{text}',
+  'zh-Hant': '子工作 {number}：{text}',
+  ja: 'サブタスク {number}：{text}',
+  ko: '하위 작업 {number}: {text}',
+  es: 'Subtarea {number}: {text}',
+  fr: 'Sous-tâche {number} : {text}',
+  de: 'Teilaufgabe {number}: {text}',
+  'pt-BR': 'Subtarefa {number}: {text}',
+  ru: 'Подзадача {number}: {text}',
+};
+
+const terminalPageLabels: Record<SupportedLocale, { up: string; down: string }> = {
+  en: { up: 'Scroll terminal up one page', down: 'Scroll terminal down one page' },
+  'zh-Hans': { up: '终端向上翻一页', down: '终端向下翻一页' },
+  'zh-Hant': { up: '終端機向上翻一頁', down: '終端機向下翻一頁' },
+  ja: { up: 'ターミナルを1ページ上へ', down: 'ターミナルを1ページ下へ' },
+  ko: { up: '터미널 한 페이지 위로', down: '터미널 한 페이지 아래로' },
+  es: { up: 'Desplazar el terminal una página hacia arriba', down: 'Desplazar el terminal una página hacia abajo' },
+  fr: { up: 'Faire défiler le terminal d’une page vers le haut', down: 'Faire défiler le terminal d’une page vers le bas' },
+  de: { up: 'Terminal eine Seite nach oben scrollen', down: 'Terminal eine Seite nach unten scrollen' },
+  'pt-BR': { up: 'Rolar o terminal uma página para cima', down: 'Rolar o terminal uma página para baixo' },
+  ru: { up: 'Прокрутить терминал на страницу вверх', down: 'Прокрутить терминал на страницу вниз' },
+};
+
+export const commonUiMessages: Readonly<Record<SupportedLocale, Common>> = Object.fromEntries(
+  (Object.keys(baseCommonUiMessages) as SupportedLocale[]).map((localeKey) => [
+    localeKey,
+    {
+      ...baseCommonUiMessages[localeKey],
+      'ui.subtaskProgressStep': subtaskProgressStep[localeKey],
+      'ui.terminalPageUp': terminalPageLabels[localeKey].up,
+      'ui.terminalPageDown': terminalPageLabels[localeKey].down,
+    },
+  ]),
+) as Record<SupportedLocale, Common>;

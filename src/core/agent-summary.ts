@@ -17,31 +17,22 @@
  *
  * 依赖方向：core 最内层。Driver 用 ExecutorDriver 的结构化子集（Pick），SshDriver/LocalDriver 直接满足。
  */
-import { DEFAULT_CODEX_ARGS } from './conversations';
 import type { AgentKind } from './types';
-import type { ExecutorDriver } from '../executor/driver';
-import { detectSelection, isCodexUpdatePrompt } from './screen';
-import { readDriverText } from './skills';
+import { isCodexUpdatePrompt } from './screen';
+import {
+  pickAffirmative,
+  runAgentArtifacts,
+  type AgentArtifactDriver,
+} from './agent-artifact-runner';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
 import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/language';
 
 // isCodexUpdatePrompt 已迁至 core/screen（中立、无循环依赖），此处再导出保持既有引用（clarify-runner/测试）不变
 export { isCodexUpdatePrompt };
+export { pickAffirmative };
 
 /** runner 需要的 Driver 子集（tmux + 受限文件；结构兼容 ExecutorDriver） */
-export type SummaryDriver = Pick<
-  ExecutorDriver,
-  | 'listSessions'
-  | 'createSession'
-  | 'killSession'
-  | 'sendKeys'
-  | 'sendKey'
-  | 'capturePane'
-  | 'writeFile'
-  | 'statPath'
-  | 'readFileRange'
-  | 'removeTree'
->;
+export type SummaryDriver = AgentArtifactDriver;
 
 /** scratch 目录名（挂在项目 cwd 下；README.md 在仓库根，不在此，故清理不误伤） */
 export const SCRATCH_DIR = '.panda/tmp/summary';
@@ -71,13 +62,6 @@ export function summaryPaths(cwd: string): {
 /** 独立总结会话名（项目维度；与驱动 issue 的 cc-<id> 互不干扰） */
 export function summarySessionName(projectId: number): string {
   return `sum-${projectId}`;
-}
-
-/** 肯定项识别：信任/接受/继续/允许… 选它；都不匹配退化到第 0 项 */
-const AFFIRM_RE = /(yes|accept|proceed|trust|continue|allow|confirm|同意|信任|继续|确认|接受|允许)/i;
-export function pickAffirmative(options: string[]): number {
-  const i = options.findIndex((o) => AFFIRM_RE.test(o));
-  return i >= 0 ? i : 0;
 }
 
 /**
@@ -189,15 +173,6 @@ export type RunSummaryResult =
   | { ok: true; understanding: string }
   | { ok: false; reason: 'timeout' | 'no-output' | 'error'; error?: string };
 
-const DEFAULT_OPTIONS: Required<SummaryRunOptions> = {
-  pollIntervalMs: 4000,
-  timeoutMs: 8 * 60 * 1000,
-  readyDelayMs: 12000, // 给 claude/codex 足够启动（codex 还要过更新弹窗 + 重绘 TUI）再注入提示词
-  claudeArgs: '--permission-mode acceptEdits', // 自动放行写文件（root 可用，非 bypassPermissions）
-  codexArgs: DEFAULT_CODEX_ARGS,
-  maxUnderstandingBytes: MAX_UNDERSTANDING_BYTES,
-};
-
 export class AgentSummaryRunner {
   private readonly driver: SummaryDriver;
   private readonly now: () => number;
@@ -209,112 +184,37 @@ export class AgentSummaryRunner {
     this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   }
 
-  private startCommand(agent: AgentKind, o: Required<SummaryRunOptions>): string {
-    return agent === 'codex' ? `codex ${o.codexArgs}`.trim() : `claude ${o.claudeArgs}`.trim();
-  }
-
-  /**
-   * 抓屏，若有选择菜单则自动选肯定项（信任/接受/权限弹窗）。
-   * 每轮见到菜单就点——**不做签名去重**：连续两次同款权限弹窗（如先写 understanding、
-   * 再写 done，选项文字完全一样）签名相同，去重会漏掉后一个 → 卡死永不产出 done（实测坑）。
-   * 轮询间隔（默认 4s）远大于渲染时间，重复点也只是多一个空 Enter（无害）。
-   */
-  private async clearMenusOnce(session: string): Promise<void> {
-    const pane = await this.driver.capturePane(session).catch(() => '');
-    // codex 启动「有可用更新」弹窗（用 › 光标，detectSelection（认 ❯）抓不到；直接 Enter
-    // 会选中高亮的「1. Update now」跑安装脚本）——输入 2 选「Skip」跳过（sendKeys 自带回车确认）。
-    if (isCodexUpdatePrompt(pane)) {
-      await this.driver.sendKeys(session, '2').catch(() => {});
-      return;
-    }
-    const sel = detectSelection(pane);
-    if (!sel) return;
-    const target = pickAffirmative(sel.options);
-    const delta = target - sel.cursorIndex;
-    const key = delta < 0 ? 'Up' : 'Down';
-    for (let i = 0; i < Math.abs(delta); i++) {
-      await this.driver.sendKey(session, key).catch(() => {});
-    }
-    await this.driver.sendKey(session, 'Enter').catch(() => {});
-  }
-
-  private async killQuiet(session: string): Promise<void> {
-    await this.driver.killSession(session).catch(() => {});
-  }
-
-  private async removeQuiet(path: string): Promise<void> {
-    await this.driver.removeTree(path).catch(() => {});
-  }
-
-  /** 就绪等待：拉起代理后等 readyDelayMs，其间反复清菜单（过掉信任弹窗）后再注入提示词。 */
-  private async waitReady(session: string, readyDelayMs: number, pollMs: number): Promise<void> {
-    let waited = 0;
-    while (waited < readyDelayMs) {
-      await this.clearMenusOnce(session);
-      await this.sleep(pollMs);
-      waited += pollMs;
-    }
-    await this.clearMenusOnce(session);
-  }
-
-  /** 轮询 done 标记，其间持续清菜单；出现→true，超时→false。 */
-  private async pollUntilDone(
-    session: string,
-    donePath: string,
-    timeoutMs: number,
-    pollMs: number,
-  ): Promise<boolean> {
-    const deadline = this.now() + timeoutMs;
-    while (this.now() < deadline) {
-      await this.clearMenusOnce(session);
-      const st = await this.driver.statPath(donePath).catch(() => null);
-      if (st) return true;
-      await this.sleep(pollMs);
-    }
-    return false;
-  }
-
   async run(input: RunSummaryInput, options: SummaryRunOptions = {}): Promise<RunSummaryResult> {
-    const o: Required<SummaryRunOptions> = { ...DEFAULT_OPTIONS, ...options };
     const session = summarySessionName(input.projectId);
     const p = summaryPaths(input.cwd);
-
-    try {
-      // 0) 清残留会话与旧 scratch，保证干净起步
-      await this.killQuiet(session);
-      await this.removeQuiet(p.scratch);
-
-      // 1) 写历史摘要（writeFile 自动建父目录 = 重建 scratch）
-      await this.driver.writeFile(p.history, input.historyDigest);
-
-      // 2) 起代理
-      await this.driver.createSession(session, input.cwd);
-      await this.driver.sendKeys(session, this.startCommand(input.agent, o));
-
-      // 3) 等就绪 + 过信任弹窗
-      await this.waitReady(session, o.readyDelayMs, o.pollIntervalMs);
-
-      // 4) 注入任务提示词（按 target 选更新 README 还是项目记忆文件）
-      await this.driver.sendKeys(
+    const result = await runAgentArtifacts(
+      { driver: this.driver, now: this.now, sleep: this.sleep },
+      {
+        agent: input.agent,
+        cwd: input.cwd,
         session,
-        buildSummaryPrompt(input.agent, input.projectName, input.target ?? 'readme', input.locale),
-      );
-
-      // 5) 轮询 done 标记
-      const done = await this.pollUntilDone(session, p.done, o.timeoutMs, o.pollIntervalMs);
-      if (!done) return { ok: false, reason: 'timeout' };
-
-      // 6) 读回认知总结（scratch 清理前）
-      const text = await readDriverText(this.driver, p.understanding, o.maxUnderstandingBytes);
-      const trimmed = (text ?? '').trim();
-      if (!trimmed) return { ok: false, reason: 'no-output' };
-      return { ok: true, understanding: trimmed };
-    } catch (e) {
-      return { ok: false, reason: 'error', error: String(e).slice(0, 300) };
-    } finally {
-      await this.killQuiet(session);
-      await this.removeQuiet(p.scratch);
+        scratch: p.scratch,
+        prompt: buildSummaryPrompt(input.agent, input.projectName, input.target ?? 'readme', input.locale),
+        inputFiles: [{ path: p.history, data: input.historyDigest }],
+        donePath: p.done,
+        artifacts: [{
+          key: 'understanding',
+          path: p.understanding,
+          maxBytes: options.maxUnderstandingBytes ?? MAX_UNDERSTANDING_BYTES,
+          required: false,
+        }],
+      },
+      options,
+    );
+    if (!result.ok) {
+      return result.reason === 'timeout'
+        ? { ok: false, reason: 'timeout' }
+        : { ok: false, reason: 'error', ...(result.error ? { error: result.error } : {}) };
     }
+    const understanding = typeof result.artifacts.understanding === 'string'
+      ? result.artifacts.understanding.trim()
+      : '';
+    return understanding ? { ok: true, understanding } : { ok: false, reason: 'no-output' };
   }
 }
 

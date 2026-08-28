@@ -3,6 +3,7 @@ import { openDb } from '../../core/db';
 import { migrate } from '../../core/migrate';
 import { UserStore } from '../../core/users';
 import { COOKIE } from '../auth';
+import { UPGRADE_COOKIE_NAME } from '../auth-upgrade-compat';
 import { authDepsFromDb, createDispatcher } from '../middleware';
 import { authRoutes } from './auth';
 
@@ -80,13 +81,15 @@ describe('POST /api/login', () => {
 });
 
 describe('POST /api/logout', () => {
-  test('清 cookie（Max-Age=0），无 token 也放行（幂等）', async () => {
+  test('清理新旧 cookie（Max-Age=0），无 token 也放行（幂等）', async () => {
     const { dispatch } = makeApp();
     const r = await dispatch(new Request('http://x/api/logout', { method: 'POST' }));
     expect(r!.status).toBe(200);
-    const cookie = r!.headers.get('set-cookie')!;
-    expect(cookie).toContain(`${COOKIE}=;`);
-    expect(cookie).toContain('Max-Age=0');
+    const cookies = r!.headers.getSetCookie();
+    expect(cookies).toHaveLength(2);
+    expect(cookies[0]).toContain(`${COOKIE}=;`);
+    expect(cookies[1]).toContain(`${UPGRADE_COOKIE_NAME}=;`);
+    expect(cookies.every((cookie) => cookie.includes('Max-Age=0'))).toBe(true);
   });
 });
 

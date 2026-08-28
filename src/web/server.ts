@@ -2,7 +2,7 @@
  * web/server —— V2 控制面完整装配。
  *
  * 装配顺序：
- *   1. DB 打开 + 迁移链 migrate → migrateIssueEngine → migrateNotify → migratePmAgent
+ *   1. DB 打开 + 迁移链 migrate → migrateIssueEngine → migratePmAgent → migrateDesigns → migrateNotify
  *   2. UserStore + ensureAdminUser（明文 token 一次性 stdout + 0600 文件，严禁进日志）
  *   3. executors 表 → Driver 池（127.0.0.1/localhost 且无 keyRef = LocalDriver，否则 SshDriver 懒连接）
  *   4. 单例 KeyedMutex / JsonlLocator / ConversationManager（PM 与引擎共用，锁才有互斥意义）
@@ -17,9 +17,10 @@
  * FEISHU_APP_ID+FEISHU_APP_SECRET / LLM_*（agents/llm.ts）/ PERSONA_FILE（agents/pm.ts）。
  */
 import type { Database } from 'bun:sqlite';
+import { randomBytes } from 'node:crypto';
 import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { explainMenuForHuman } from '../agents/approval';
 import { createLlmClient } from '../agents/llm';
 import { createPmPool, migratePmAgent } from '../agents/pm';
@@ -33,6 +34,7 @@ import {
   discoverLocalExecutorDefaults,
   ensureSystemLocalExecutor,
   listExecutors,
+  projectAgentSupport,
   type LocalExecutorDefaults,
 } from '../core/executors';
 import { JsonlLocator } from '../core/jsonl';
@@ -45,6 +47,20 @@ import { migrate, type MigrationStatus } from '../core/migrate';
 import { SessionStore } from '../core/sessions';
 import type { Executor, ExecutorStatus } from '../core/types';
 import { ensureAdminUser, UserStore } from '../core/users';
+import { DesignEngine } from '../designs/engine';
+import { createDesignAssetRuntime } from '../designs/assets-adapter';
+import { designGraphDigest } from '../designs/graph';
+import { createDesignExecutionWorkspaceAdapter } from '../designs/execution-workspace';
+import { createDesignFilesService, createDesignFilesTargetResolver } from '../designs/files-adapter';
+import type { DesignFilesDriver, DesignProjectionPersona } from '../designs/files';
+import { OpenAIImageProvider, type DesignImageGenerator } from '../designs/image-provider';
+import { DesignPersonaRegistry } from '../designs/personas';
+import { DesignPublisher } from '../designs/publisher';
+import { DesignRunCoordinator } from '../designs/run-coordinator';
+import { DesignRunner } from '../designs/runner';
+import { DesignSyncCoordinator } from '../designs/sync';
+import { DesignStore, migrateDesigns } from '../designs/store';
+import { DesignWorktreeService, DesignWorktreeStore } from '../designs/worktree';
 import type { ExecutorDriver } from '../executor/driver';
 import { LocalDriver } from '../executor/local';
 import { withPaneCache } from '../executor/pane-cache';
@@ -54,7 +70,7 @@ import { runOrganize } from '../issues/organize-runner';
 import { DRIVING_STATES, getProject, IssueEngine, migrateIssueEngine, type EngineConfig } from '../issues/engine';
 import { ModuleDocs } from '../issues/module-docs';
 import { ModuleManager, ModuleStore } from '../issues/modules';
-import { KeyedMutex } from '../issues/mutex';
+import { KeyedMutex, tmuxLockKey } from '../issues/mutex';
 import { FeishuChannel, type FeishuConfig } from '../notify/feishu';
 import { migrateNotify, NotifyRouter, userByFeishuOpenid } from '../notify/router';
 import type { Project } from '../core/types';
@@ -106,6 +122,41 @@ export interface ServerOptions {
   chatApprovalTickMs?: number;
   /** 进度管道批处理窗口秒数（透传 ProgressReporter；缺省 30s） */
   progressThrottleSeconds?: number;
+  /** 单条 publication post-commit recovery 的 deadline；缺省 5s。 */
+  publicationRecoveryTimeoutMs?: number;
+  /** Tests/embedders may replace the real artifact runner while retaining durable orchestration. */
+  designRunnerForProject?: (
+    project: Project,
+    deps: { engine: DesignEngine; store: DesignStore },
+  ) => DesignRunner;
+  /** HMAC key for short-lived design-file overwrite tokens. Random per process by default. */
+  designFilesConflictSecret?: string | Uint8Array;
+  /** Bounded stop wait for active design agent runs. */
+  designRunStopTimeoutMs?: number;
+  /** Tests/embedders may inject a provider while retaining the production durable asset service. */
+  designImageRuntime?: DesignImageRuntime | null;
+  /** Absolute controlled storage root; defaults beside the SQLite database. */
+  designAssetStorageRoot?: string;
+  /** Bounded wait while aborting active provider calls during shutdown. */
+  designAssetShutdownTimeoutMs?: number;
+  /** Retry interval for pending execution-sync external effects. */
+  executionSyncEffectIntervalMs?: number;
+  /** Per-drain deadline and shutdown join budget for execution-sync external effects. */
+  executionSyncEffectDrainTimeoutMs?: number;
+  /** Maximum worktree recovery rows inspected before the server starts accepting work. */
+  designWorktreeRecoveryLimit?: number;
+  /** Overall startup deadline for authoritative worktree recovery. */
+  designWorktreeRecoveryTimeoutMs?: number;
+}
+
+export interface DesignImageRuntime {
+  generator: DesignImageGenerator;
+  provider: {
+    name: 'openai';
+    model: string;
+    outputFormat: 'png' | 'webp';
+    quality: 'low' | 'medium' | 'high' | 'auto';
+  };
 }
 
 export interface PandaServer {
@@ -164,15 +215,67 @@ export function feishuConfigFromEnv(): FeishuConfig | null {
   return appId && appSecret ? { appId, appSecret } : null;
 }
 
+/** No key means an explicitly disabled, side-effect-free capability; malformed keyed config fails startup. */
+export function designImageRuntimeFromEnv(
+  env: Partial<Record<
+    | 'OPENAI_API_KEY'
+    | 'OPENAI_IMAGE_MODEL'
+    | 'OPENAI_IMAGE_OUTPUT_FORMAT'
+    | 'OPENAI_IMAGE_QUALITY'
+    | 'OPENAI_IMAGE_TIMEOUT_MS'
+    | 'OPENAI_IMAGE_RESPONSE_URL_HOSTS',
+    string
+  >> = process.env as Partial<Record<
+    | 'OPENAI_API_KEY'
+    | 'OPENAI_IMAGE_MODEL'
+    | 'OPENAI_IMAGE_OUTPUT_FORMAT'
+    | 'OPENAI_IMAGE_QUALITY'
+    | 'OPENAI_IMAGE_TIMEOUT_MS'
+    | 'OPENAI_IMAGE_RESPONSE_URL_HOSTS',
+    string
+  >>,
+  fetchPort: (input: string | URL | Request, init?: RequestInit) => Promise<Response> = fetch,
+): DesignImageRuntime | null {
+  if (!env.OPENAI_API_KEY?.trim()) return null;
+  const model = env.OPENAI_IMAGE_MODEL ?? 'gpt-image-2';
+  const outputFormat = env.OPENAI_IMAGE_OUTPUT_FORMAT ?? 'png';
+  const quality = env.OPENAI_IMAGE_QUALITY ?? 'medium';
+  const generator = new OpenAIImageProvider({ fetch: fetchPort, env });
+  return {
+    generator,
+    provider: {
+      name: 'openai',
+      model,
+      outputFormat: outputFormat as 'png' | 'webp',
+      quality: quality as 'low' | 'medium' | 'high' | 'auto',
+    },
+  };
+}
+
+export function resolveDesignAssetStorageRoot(dbPath: string, configured?: string): string {
+  if (dbPath === ':memory:' && configured === undefined) {
+    throw new Error('an in-memory database requires an explicit isolated design asset root');
+  }
+  const root = configured ?? join(dirname(resolve(dbPath)), 'design-assets');
+  if (!isAbsolute(root) || resolve(root) === '/') {
+    throw new Error('design asset storage root must be an absolute non-root path');
+  }
+  return root;
+}
+
 // ---------- 装配 ----------
 
 export async function startServer(opts: ServerOptions = {}): Promise<PandaServer> {
   // ---- 1. DB + 迁移链（顺序固定；各自幂等，记入同一 schema_migrations） ----
-  const db = openDb(opts.dbPath ?? defaultDbPath());
+  const dbPath = opts.dbPath ?? defaultDbPath();
+  // Validate controlled storage before opening SQLite or creating bootstrap credentials.
+  const assetStorageRoot = resolveDesignAssetStorageRoot(dbPath, opts.designAssetStorageRoot);
+  const db = openDb(dbPath);
   migrate(db);
   migrateIssueEngine(db);
-  migrateNotify(db);
-  const migrations = migratePmAgent(db); // 链尾返回全量迁移状态
+  migratePmAgent(db);
+  migrateDesigns(db);
+  const migrations = migrateNotify(db); // 链尾返回全量迁移状态
   ensureSystemLocalExecutor(
     db,
     opts.localExecutorDefaults ?? discoverLocalExecutorDefaults(),
@@ -262,7 +365,38 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     sendKey: (session, key) => resolvePrimary().sendKey(session, key),
     capturePane: (session) => resolvePrimary().capturePane(session),
     resizeWindow: (session, size) => resolvePrimary().resizeWindow(session, size),
+    scrollPane: (session, direction, lines) => resolvePrimary().scrollPane(session, direction, lines),
     readFileRange: (path, offset, limit) => resolvePrimary().readFileRange(path, offset, limit),
+    readFileNoFollowWithin: (root, relativePath, limit) => {
+      const driver = resolvePrimary();
+      const read = driver.readFileNoFollowWithin;
+      if (typeof read !== 'function') return Promise.reject(new Error('executor secure read capability unavailable'));
+      return read.call(driver, root, relativePath, limit);
+    },
+    writeFileNoFollowWithin: (root, relativePath, data, mode) => {
+      const driver = resolvePrimary();
+      const write = driver.writeFileNoFollowWithin;
+      if (typeof write !== 'function') return Promise.reject(new Error('executor secure write capability unavailable'));
+      return write.call(driver, root, relativePath, data, mode);
+    },
+    listDirectoryNoFollowWithin: (root, relativePath) => {
+      const driver = resolvePrimary();
+      const list = driver.listDirectoryNoFollowWithin;
+      if (typeof list !== 'function') return Promise.reject(new Error('executor secure list capability unavailable'));
+      return list.call(driver, root, relativePath);
+    },
+    replaceFileNoFollowWithin: (root, relativePath, data, expectedSha256) => {
+      const driver = resolvePrimary();
+      const replace = driver.replaceFileNoFollowWithin;
+      if (typeof replace !== 'function') return Promise.reject(new Error('executor secure replace capability unavailable'));
+      return replace.call(driver, root, relativePath, data, expectedSha256);
+    },
+    removeFileNoFollowWithin: (root, relativePath, expectedSha256) => {
+      const driver = resolvePrimary();
+      const remove = driver.removeFileNoFollowWithin;
+      if (typeof remove !== 'function') return Promise.reject(new Error('executor secure remove capability unavailable'));
+      return remove.call(driver, root, relativePath, expectedSha256);
+    },
     statPath: (path) => resolvePrimary().statPath(path),
     listDir: (path) => resolvePrimary().listDir(path),
     writeFile: (path, data, mode) =>
@@ -321,11 +455,95 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   const llm = createLlmClient(db);
   const pmFor = createPmPool({ driver: primaryDriver, llm, users, convs, locator, mutex, db });
   const moduleStore = new ModuleStore(db);
+  const designStore = new DesignStore(db);
+  const designScope = {
+      projectExists: (projectId) => db.query<{ found: number }, [number]>(
+        'SELECT 1 AS found FROM projects WHERE id = ?',
+      ).get(projectId)?.found === 1,
+      getModule: (moduleId) => {
+        const module = moduleStore.get(moduleId);
+        return module ? { projectId: module.projectId, agent: module.agent } : null;
+      },
+      supportsAgent: (projectId, agent) => projectAgentSupport(db, projectId, agent).ok,
+    } satisfies ConstructorParameters<typeof DesignEngine>[0]['scope'];
+  const designConversations = {
+      createDesignConversation: async ({ conversationId, sagaToken, projectId, designId, agent }) =>
+        convs.createOwnedWithId(
+          conversationId,
+          projectId,
+          `design:${designId}`,
+          agent,
+          'chat',
+          sagaToken,
+        ),
+      activateDesignConversation: async (conversationId) => {
+        const conversation = convs.get(conversationId);
+        if (!conversation) throw new Error(`design conversation not found: ${conversationId}`);
+        await mutex.runExclusive(tmuxLockKey(convs.sessionName(conversation)), async () => {
+          await convs.activate(conversationId);
+        });
+      },
+      archiveDesignConversation: async (conversationId) => {
+        const conversation = convs.get(conversationId);
+        if (!conversation) return;
+        await mutex.runExclusive(tmuxLockKey(convs.sessionName(conversation)), async () => {
+          await convs.archiveStrict(conversationId);
+        });
+      },
+      deleteDesignConversation: async ({ conversationId, ownershipProof }) => {
+        const conversation = convs.get(conversationId);
+        if (!conversation) return true;
+        return mutex.runExclusive(tmuxLockKey(convs.sessionName(conversation)), () =>
+          convs.deleteStrictOwned(conversationId, ownershipProof));
+      },
+    } satisfies ConstructorParameters<typeof DesignEngine>[0]['conversations'];
   const modulesFor = (project: Project) =>
     new ModuleManager(moduleStore, {
       suggest: (input) => pmFor(project).suggestModule(input),
       docs: new ModuleDocs(driverForProject(project), project.cwd),
     });
+
+  const designWorktreeStore = new DesignWorktreeStore(db);
+  const designWorktrees = new DesignWorktreeService({
+    store: designWorktreeStore,
+    mutex,
+    projectLookup: (projectId) => getProject(db, projectId) ?? null,
+    approvedDesignLookup: (projectId, designId, revision, graphDigest) => {
+      const task = designStore.getTask(designId);
+      const immutable = designStore.getRevision(designId, revision);
+      if (!task || !immutable || task.projectId !== projectId || task.status !== 'active'
+        || task.stage !== 'approved' || task.currentRevision !== revision
+        || designGraphDigest(designId, revision, immutable.graph) !== graphDigest) return null;
+      return { projectId, designId, revision, graphDigest };
+    },
+    publicationLookup: (publicationId) => {
+      const publication = designStore.getPublication(publicationId);
+      return publication ? {
+        id: publication.id,
+        projectId: publication.projectId,
+        designId: publication.designTaskId,
+        revision: publication.revision,
+        graphDigest: publication.graphDigest,
+        status: publication.status,
+      } : null;
+    },
+    authorizeOwner: (actor, project) => {
+      const user = users.byId(actor.userId);
+      const persisted = getProject(db, project.id);
+      return Boolean(user && persisted && (user.role === 'admin' || persisted.ownerUserId === actor.userId));
+    },
+    driverForProject: (scope) => {
+      const project = getProject(db, scope.id);
+      if (!project) throw new Error('design worktree project disappeared');
+      return driverForProject(project);
+    },
+    publicationHasBusyIssues: (publicationId) => Boolean(db.query<{ busy: number }, [number]>(`
+      SELECT 1 AS busy FROM design_issue_links link
+      JOIN issues issue ON issue.id = link.issue_id AND issue.project_id = link.project_id
+      WHERE link.publication_id = ? AND issue.status NOT IN ('done', 'cancelled') LIMIT 1
+    `).get(publicationId)),
+  });
+  const executionWorkspaces = createDesignExecutionWorkspaceAdapter({ db, conversations: convs });
 
   // 「Agent 认知总结」后台编排：digest 走共享 locator + 主 Driver 读 jsonl（与引擎/WS 同源）；
   // runner 在项目所在执行机的 sum-<id> 会话里跑（driverForProject）。启动即清「卡在 running」的僵尸态。
@@ -409,6 +627,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     pmFor,
     notify,
     mutex,
+    executionWorkspaces,
     modulesFor,
     // 创建时澄清：clr-<issueId> 一次性独立会话（按项目所在执行机取 Driver）
     clarify: (project, input) => runClarify({ driver: driverForProject(project) }, input),
@@ -418,6 +637,149 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     onMenuGone: (session) => approvals.menuGone(session),
     onConvMessages: (issue, project, msgs) => progress.onConvMessages(issue, project, msgs),
     ...(opts.engineConfig ? { config: opts.engineConfig } : {}),
+  });
+  // Publication is a cross-domain application service: it receives only IssueEngine's narrow
+  // batch port, then is installed into DesignEngine before either engine starts serving work.
+  const designPublisher = new DesignPublisher({
+    store: designStore,
+    issues: engine,
+    executionRuns: designWorktreeStore,
+    ...(opts.publicationRecoveryTimeoutMs === undefined
+      ? {}
+      : { postCommitTimeoutMs: opts.publicationRecoveryTimeoutMs }),
+  });
+  const designSync = new DesignSyncCoordinator({ store: designStore, issues: engine });
+  const designEngine = new DesignEngine({
+    store: designStore,
+    scope: designScope,
+    conversations: designConversations,
+    publisher: designPublisher,
+    revisionSync: designSync,
+  });
+  const designPersonas = new DesignPersonaRegistry(db);
+  const designRunners = new Map<number, DesignRunner>();
+  const runnerForProject = (projectId: number): DesignRunner => {
+    const project = getProject(db, projectId);
+    if (!project) throw new Error('design runner project not found');
+    if (opts.designRunnerForProject) return opts.designRunnerForProject(project, {
+      engine: designEngine, store: designStore,
+    });
+    let runner = designRunners.get(projectId);
+    if (!runner) {
+      runner = new DesignRunner({
+        driver: driverForProject(project),
+        engine: designEngine,
+        intents: designStore,
+      });
+      designRunners.set(projectId, runner);
+    }
+    return runner;
+  };
+  const designRuns = new DesignRunCoordinator({
+    store: designStore,
+    personas: designPersonas,
+    project: (projectId) => {
+      const project = getProject(db, projectId);
+      return project ? { id: project.id, cwd: project.cwd } : null;
+    },
+    runnerForProject,
+  });
+  const projectionPersonas = {
+    listForRevision(_projectId: number, designId: number, revision: number): DesignProjectionPersona[] {
+      const output = new Map<string, DesignProjectionPersona>();
+      const rows = db.query<{ request_json: string }, [number]>(
+        'SELECT request_json FROM design_agent_operations WHERE design_task_id = ? ORDER BY created_ts',
+      ).all(designId);
+      for (const row of rows) {
+        try {
+          const request = JSON.parse(row.request_json) as Record<string, unknown>;
+          const sourceRevision = request.sourceRevision ?? request.expectedRevision;
+          const provenance = request.personaProvenance as Record<string, unknown> | undefined;
+          if (typeof sourceRevision !== 'number' || sourceRevision > revision || !provenance
+            || typeof provenance.key !== 'string' || typeof provenance.origin !== 'string'
+            || typeof provenance.contentHash !== 'string') continue;
+          output.set(provenance.key, {
+            key: provenance.key,
+            source: provenance.origin,
+            contentHash: provenance.contentHash,
+            ...(typeof provenance.gitCommit === 'string' ? { gitCommit: provenance.gitCommit } : {}),
+          });
+        } catch { /* Corrupt provenance is excluded from the projection. */ }
+      }
+      return [...output.values()].sort((a, b) => a.key.localeCompare(b.key));
+    },
+  };
+  const designFilesDriverForProject = (project: Project): DesignFilesDriver => {
+    const driver = driverForProject(project);
+    if (!driver.listDirectoryNoFollowWithin || !driver.readFileNoFollowWithin
+      || !driver.replaceFileNoFollowWithin || !driver.removeFileNoFollowWithin) {
+      throw new Error('executor design files capability unavailable');
+    }
+    // ExecutorDriver's older secure-read contract throws ENOENT while DesignFiles treats a
+    // missing owned projection as the normal empty base. Normalize only that exact condition;
+    // links, permissions, and malformed paths must remain fail-closed.
+    return {
+      git: (cwd, args) => driver.git(cwd, args),
+      listDirectoryNoFollowWithin: (root, relativePath) =>
+        driver.listDirectoryNoFollowWithin!(root, relativePath),
+      readFileNoFollowWithin: async (root, relativePath, limit) => {
+        try { return await driver.readFileNoFollowWithin!(root, relativePath, limit); }
+        catch (error) {
+          const code = (error as { code?: unknown }).code;
+          if (code === 'ENOENT' || code === 2 || code === '2') return null;
+          throw error;
+        }
+      },
+      replaceFileNoFollowWithin: (root, relativePath, data, expectedSha256) =>
+        driver.replaceFileNoFollowWithin!(root, relativePath, data, expectedSha256),
+      removeFileNoFollowWithin: (root, relativePath, expectedSha256) =>
+        driver.removeFileNoFollowWithin!(root, relativePath, expectedSha256),
+    } satisfies DesignFilesDriver;
+  };
+  const designFilesTarget = createDesignFilesTargetResolver({
+    projectLookup: (projectId) => getProject(db, projectId),
+    worktreeLookup: designWorktreeStore,
+    driverForProject: designFilesDriverForProject,
+  });
+  const imageRuntime = opts.designImageRuntime === undefined
+    ? designImageRuntimeFromEnv()
+    : opts.designImageRuntime;
+  const designAssetsRuntime = createDesignAssetRuntime({
+    db,
+    designStore,
+    storageRoot: assetStorageRoot,
+    generator: imageRuntime?.generator ?? null,
+    ...(imageRuntime ? { provider: imageRuntime.provider } : {}),
+    authorizeOwner: (projectId, userId) => {
+      const project = getProject(db, projectId);
+      const user = users.byId(userId);
+      return Boolean(project && user && (user.role === 'admin' || project.ownerUserId === userId));
+    },
+    projectFiles: {
+      async read(scope, relativePath, maxBytes, signal) {
+        if (signal?.aborted) throw new Error('project reference read cancelled');
+        const target = await designFilesTarget(scope.projectId, scope.designId);
+        if (signal?.aborted) throw new Error('project reference read cancelled');
+        const file = await target.driver.readFileNoFollowWithin(
+          target.cwd, relativePath, maxBytes + 1,
+        );
+        if (!file || file.size <= 0 || file.size > maxBytes || file.data.length !== file.size) {
+          throw new Error('project reference is unavailable');
+        }
+        if (signal?.aborted) throw new Error('project reference read cancelled');
+        return file.data.slice();
+      },
+    },
+  });
+  const designFiles = createDesignFilesService({
+    store: designStore,
+    assets: designAssetsRuntime.service,
+    personas: projectionPersonas,
+    mutex,
+    conflictSecret: opts.designFilesConflictSecret ?? randomBytes(32),
+    projectLookup: (projectId) => getProject(db, projectId),
+    worktreeLookup: designWorktreeStore,
+    driverForProject: designFilesDriverForProject,
   });
 
   // ---- 7b. 菜单审批管道 + 进度管道 ----
@@ -449,9 +811,74 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
       : {}),
   });
 
+  // Worktree health is authoritative for linked Issue scheduling, so reconcile every durable
+  // assignment before IssueEngine is allowed to claim pending work.
+  await designWorktrees.recoverAll({
+    limit: opts.designWorktreeRecoveryLimit ?? 25,
+    overallTimeoutMs: opts.designWorktreeRecoveryTimeoutMs ?? 5_000,
+  });
+  await designRuns.recoverStartup(25);
   engine.start(); // reporter 挂引擎生命周期：引擎起 tick 才产事件，停机时 progress.stopAll()
   chatApprovals.start();
   let engineRunning = true;
+  let stopped = false;
+  const executionEffectControllers = new Set<AbortController>();
+  const executionEffectDrains = new Set<Promise<void>>();
+  const executionEffectTimeoutMs = Math.max(
+    1,
+    Math.min(60_000, Math.trunc(opts.executionSyncEffectDrainTimeoutMs ?? 5_000)),
+  );
+  const startExecutionEffectDrain = (): void => {
+    if (stopped || executionEffectDrains.size > 0) return;
+    const controller = new AbortController();
+    executionEffectControllers.add(controller);
+    let deadlineTimer!: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<void>((resolve) => {
+      deadlineTimer = setTimeout(() => {
+        controller.abort(new DOMException('drain deadline', 'TimeoutError'));
+        resolve();
+      }, executionEffectTimeoutMs);
+    });
+    let drain!: Promise<void>;
+    const work = engine.drainExecutionSyncEffectOutbox(100, { signal: controller.signal })
+      .then(() => {})
+      .catch((error) => {
+        if (!stopped && !controller.signal.aborted) {
+          console.error(`[${PRODUCT_NAME}] execution sync effect drain failed:`, error);
+        }
+      });
+    drain = Promise.race([work, deadline])
+      .finally(() => {
+        clearTimeout(deadlineTimer);
+        executionEffectControllers.delete(controller);
+        executionEffectDrains.delete(drain);
+      });
+    executionEffectDrains.add(drain);
+  };
+  const publicationRecovery = designPublisher.recoverPostCommit(25).catch((error) => {
+    if (!stopped) console.error(`[${PRODUCT_NAME}] design publication recovery failed:`, error);
+  });
+  const revisionSyncRecovery = Promise.resolve()
+    .then(() => designSync.drainRevisionSyncJobs({ limit: 25 }))
+    .catch((error) => {
+      if (!stopped) console.error(`[${PRODUCT_NAME}] design Issue sync recovery failed:`, error);
+    });
+  const designAssetRecovery = designAssetsRuntime.service.recover().catch((error) => {
+    if (!stopped) console.error(`[${PRODUCT_NAME}] design visual asset recovery failed:`, error);
+  });
+  const revisionSyncTimer = setInterval(() => {
+    if (stopped) return;
+    try {
+      designSync.drainRevisionSyncJobs({ limit: 25 });
+    } catch (error) {
+      console.error(`[${PRODUCT_NAME}] design Issue sync retry failed:`, error);
+    }
+  }, 5_000);
+  startExecutionEffectDrain();
+  const executionEffectTimer = setInterval(
+    startExecutionEffectDrain,
+    Math.max(5, Math.min(60_000, Math.trunc(opts.executionSyncEffectIntervalMs ?? 5_000))),
+  );
 
   // ---- 8. 路由聚合 + 静态 + healthz ----
   const publicUrl = opts.publicUrl ?? process.env.PANDA_PUBLIC_URL;
@@ -459,6 +886,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     db,
     users,
     engine,
+    designs: {
+      engine: designEngine,
+      store: designStore,
+      sync: designSync,
+      personas: designPersonas,
+      runs: designRuns,
+      worktrees: designWorktrees,
+      files: designFiles,
+      assets: designAssetsRuntime.service,
+    },
     modules: moduleStore,
     driver: primaryDriver,
     driverFor: (ex) => driverForExecutor(ex),
@@ -618,12 +1055,44 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     websocket: createWsHandlers(wsDeps),
   });
 
+  const designCreationRecoveryAbort = new AbortController();
+  const designCreationRecovery = designEngine.recoverIncompleteCreations({
+    maxSagas: 25,
+    attemptBudget: 25,
+    perSagaTimeoutMs: 5_000,
+    signal: designCreationRecoveryAbort.signal,
+  }).catch((error) => {
+    if (!stopped) console.error(`[${PRODUCT_NAME}] design creation recovery failed:`, error);
+  });
+
   // ---- 9. 优雅停机（M1：先停引擎并等在途 tick 归还，driver/db 最后关）----
-  let stopped = false;
   const stop = async (): Promise<void> => {
     if (stopped) return;
     stopped = true;
     clearInterval(statusTimer);
+    clearInterval(revisionSyncTimer);
+    clearInterval(executionEffectTimer);
+    designCreationRecoveryAbort.abort('shutdown');
+    for (const controller of executionEffectControllers) {
+      controller.abort(new DOMException('shutdown', 'AbortError'));
+    }
+    await Promise.all([
+      designRuns.stop(opts.designRunStopTimeoutMs),
+      designAssetsRuntime.service.shutdown(opts.designAssetShutdownTimeoutMs),
+    ]);
+    // shutdown() boundedly joins the asset drain. A provider that ignores AbortSignal may settle
+    // later, but DesignAssetService checks stopped before every post-provider durable write.
+    void designAssetRecovery;
+    await Promise.all([publicationRecovery, revisionSyncRecovery, designCreationRecovery]);
+    if (executionEffectDrains.size > 0) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.all([...executionEffectDrains].map((drain) => drain.catch(() => {}))).then(() => {}),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, executionEffectTimeoutMs); }),
+      ]);
+      if (timer) clearTimeout(timer);
+    }
+    // Recovery owns Issue/Design DB work; never close the DB underneath it.
     await engine.stop(); // M1：await 在途 tick 归还——之后不再有引擎侧执行机/db 调用
     await chatApprovals.stop(); // 同理：等在途巡检归还，之后不再有它侧的执行机/db 调用
     engineRunning = false;

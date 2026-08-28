@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import type { IssueEvent } from '../lib/types';
+import type { IssueEvent, IssueWorkflowRuntime } from '../lib/types';
 import { CLARIFY_ANALYZING_MAX_AGE_MS, clarifyPanelState } from '../lib/issueStatus';
+import { workflowConflictFiles, workflowParallelProgress } from './IssueDetail';
 
 const source = readFileSync(new URL('./IssueDetail.tsx', import.meta.url), 'utf8');
 const styles = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
@@ -71,7 +72,7 @@ describe('Issue 工作台信息架构', () => {
 
   test('提交併入改动（#80）：四 tab→三 tab，改动 tab = 未提交树 + 已提交树 + 提交记录区', () => {
     // tab 收敛：不再有独立提交 tab / IssueCommitsTab
-    expect(source).toContain("type WbTab = 'detail' | 'exec' | 'changes'");
+    expect(source).toContain("type WbTab = 'detail' | 'workflow' | 'exec' | 'changes'");
     expect(source).not.toContain('IssueCommitsTab');
     // 双树都走 ChangeTree（构树/折叠在组件与 lib/changetree），worktree 两列码先归一
     expect(source).toContain('<ChangeTree leaves={wtLeaves}');
@@ -177,6 +178,14 @@ describe('Issue 工作台信息架构', () => {
     expect(source).toContain("tr('issue.subtaskText')");
     expect(source).toContain("tr('ui.saving')");
     expect(source).toContain("tr('ui.cancel')");
+    expect(source).toContain('class="btn sm plan-edit"');
+    expect(source).toContain('class="plan-edit-icon"');
+    expect(source).not.toContain('class="btn sm ghost plan-edit"');
+    expect(styles).toMatch(/\.plan-edit\s*\{[^}]*border-color:\s*var\(--line-2\)[^}]*background:\s*var\(--card\)[^}]*box-shadow:\s*var\(--sh-1\)/s);
+    expect(styles).toContain('.plan-edit:hover:not(:disabled)');
+    expect(styles).toContain('.plan-edit:active:not(:disabled)');
+    expect(styles).toContain('.plan-edit:focus-visible');
+    expect(styles).toMatch(/@media \(max-width: 719px\)\s*\{[^}]*\.plan-edit\s*\{[^}]*min-height:\s*44px/s);
   });
 
   test('受阻恢复必须经弹窗提交解除方法，并提供编辑 issue 与受阻子任务入口', () => {
@@ -207,6 +216,47 @@ describe('Issue 工作台信息架构', () => {
     expect(source).toContain("tr('issue.agentFeedback')");
     // 分析中也展示反馈区块（无旧反馈时只有占位）
     expect(source).toContain('(issue.clarifyFeedback || analyzing)');
+  });
+});
+
+describe('Issue 工作流实时视图（Issue #33）', () => {
+  test('工作流 tab 展示轮询运行态、节点图、路由原因、冲突和恢复提示', () => {
+    expect(source).toContain("tab === 'workflow' && detail?.workflowRuntime");
+    expect(source).toContain('<WorkflowGraph graph={runtime.workflow.graph} runs={runtime.runs} />');
+    expect(source).toContain('runtime.transitions.find((transition) => transition.fromRunId === run.id)?.decisionText');
+    expect(source).toContain("runtime.workflow.status === 'paused'");
+    expect(source).toContain('workflowConflictFiles(worktree.conflictDetails)');
+    expect(source).toContain("tab !== 'exec' && gateBar");
+    expect(styles).toContain('.wfr-progress-grid {');
+    expect(styles).toContain('.wfr-conflict {');
+  });
+
+  test('运行状态、分支原因和 worktree 合并诊断使用类型映射及无障碍名称', () => {
+    expect(source).toContain('issueWorkflowStatusKey(runtime.workflow.status)');
+    expect(source).toContain('workflowNodeStatusKey(run.status)');
+    expect(source).toContain('workflowWorktreeStatusKey(worktree.status)');
+    expect(source).toContain("tr('workflow.parallelProgressAria'");
+    expect(source).toContain("tr('workflow.worktreeAria'");
+    expect(source).toContain("tr('workflow.conflictAria'");
+    expect(source).toContain("tr('workflow.runAria'");
+    expect(source).toContain("tr('workflow.routeReasonAria'");
+  });
+
+  test('并行进度按组和节点去重，重试成功会覆盖失败态', () => {
+    const runtime = {
+      runs: [
+        { id: 1, nodeKey: 'a', parallelGroupKey: 'g', status: 'failed' },
+        { id: 2, nodeKey: 'a', parallelGroupKey: 'g', status: 'succeeded' },
+        { id: 3, nodeKey: 'b', parallelGroupKey: 'g', status: 'running' },
+      ],
+    } as IssueWorkflowRuntime;
+    expect(workflowParallelProgress(runtime)).toEqual([{ key: 'g', done: 1, total: 2 }]);
+  });
+
+  test('冲突诊断兼容 files 和 conflictedFiles 契约及非 JSON 文本', () => {
+    expect(workflowConflictFiles('{"files":["a.ts","b.ts"]}')).toEqual(['a.ts', 'b.ts']);
+    expect(workflowConflictFiles('{"conflictedFiles":["c.ts"]}')).toEqual(['c.ts']);
+    expect(workflowConflictFiles('git conflict')).toEqual([]);
   });
 });
 

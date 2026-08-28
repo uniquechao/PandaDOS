@@ -46,9 +46,9 @@ export interface ProjectSettingsFields {
   goal: string;
 }
 
-type SettingsSection = 'general' | 'repository' | 'issueSubscription' | 'members' | 'modules';
+type SettingsSection = 'general' | 'repository' | 'issueSubscription' | 'members' | 'modules' | 'workflows';
 const SETTINGS_SECTION_INDEX: Record<SettingsSection, string> = {
-  general: '01', repository: '02', issueSubscription: '03', members: '04', modules: '05',
+  general: '01', repository: '02', issueSubscription: '03', members: '04', modules: '05', workflows: '06',
 };
 
 function normalizedProjectSettings(fields: ProjectSettingsFields): ProjectSettingsFields {
@@ -467,6 +467,14 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
                 ))}
               </div>
             )}
+          </section>
+
+          <section id="settings-workflows" class="ps-section">
+            <div class="ps-section-head">
+              <div><span>{SETTINGS_SECTION_INDEX.workflows}</span><h2>{t('projectSettings.workflows')}</h2></div>
+              <button class="btn sm" onClick={() => nav(`/p/${pid}/workflows`)}>{t('projectSettings.manageWorkflows')}</button>
+            </div>
+            <p class="mut small ps-section-copy">{t('projectSettings.workflowsHelp')}</p>
           </section>
         </div>
       </div>

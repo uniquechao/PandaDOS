@@ -4,6 +4,7 @@
  * 帧协议（与 UI 工程师的共同契约）：
  * - binary = 终端字节流双向透传（PTY ↔ xterm.js）；
  * - text JSON 客→服 {type:'resize',cols,rows} → PtyChannel.resize（Ssh 走 channel setWindow）；
+ * - text JSON 客→服 {type:'scroll',direction,lines} → 对应会话的 tmux copy-mode 历史滚动；
  * - text JSON 服→客 {type:'exit'}（PTY 退出，随后关连接）。
  *
  * 生命周期：upgrade 后 open 里 Driver.openPty(`tmux attach -t <session>`)；
@@ -11,7 +12,7 @@
  */
 import type { ServerWebSocket } from 'bun';
 import type { ExecutorDriver, PtyChannel } from '../../executor/driver';
-import { TMUX_WIN_COLS, TMUX_WIN_ROWS } from '../../executor/driver';
+import { MAX_TMUX_SCROLL_LINES, TMUX_WIN_COLS, TMUX_WIN_ROWS } from '../../executor/driver';
 
 export interface TermWsData {
   kind: 'term';
@@ -22,6 +23,8 @@ export interface TermWsData {
   pty: PtyChannel | null;
   /** openPty 在途时到达的输入（就绪后按序回放） */
   pending: (string | Uint8Array)[];
+  /** 串行执行高频滚动帧，避免 Local/SSH 的 tmux 命令乱序。 */
+  scrollQueue: Promise<void>;
   closed: boolean;
 }
 
@@ -78,20 +81,38 @@ export async function termOpen(ws: ServerWebSocket<TermWsData>): Promise<void> {
 export function termMessage(ws: ServerWebSocket<TermWsData>, msg: string | Uint8Array): void {
   const d = ws.data;
   if (typeof msg === 'string') {
-    // 控制帧：{type:'resize',cols,rows}
+    // 控制帧：{type:'resize',cols,rows} | {type:'scroll',direction,lines}
     let j: unknown;
     try {
       j = JSON.parse(msg);
     } catch {
       return; // 文本帧只认 JSON 控制帧，其余丢弃（键盘输入走 binary）
     }
-    const f = j as { type?: unknown; cols?: unknown; rows?: unknown };
+    const f = j as {
+      type?: unknown;
+      cols?: unknown;
+      rows?: unknown;
+      direction?: unknown;
+      lines?: unknown;
+    };
     if (f.type === 'resize') {
       const cols = clampInt(String(f.cols), d.cols, 20, 400);
       const rows = clampInt(String(f.rows), d.rows, 5, 200);
       d.cols = cols;
       d.rows = rows;
       d.pty?.resize(cols, rows);
+    } else if (
+      f.type === 'scroll' &&
+      (f.direction === 'up' || f.direction === 'down') &&
+      typeof f.lines === 'number' &&
+      Number.isSafeInteger(f.lines) &&
+      f.lines > 0
+    ) {
+      const direction = f.direction;
+      const lines = Math.min(MAX_TMUX_SCROLL_LINES, f.lines);
+      d.scrollQueue = d.scrollQueue
+        .then(() => (d.closed ? undefined : d.driver.scrollPane(d.session, direction, lines)))
+        .catch(() => {});
     }
     return;
   }

@@ -352,9 +352,12 @@ export class ModuleManager {
     module: ProjectModule,
     issue: { id: number; title: string; body: string | null; status: string; agent: AgentKind; createdTs: number },
     projectIssues: Array<{ id: number; title: string; status: string; moduleId: number | null }>,
+    signal?: AbortSignal,
   ): Promise<void> {
     if (!this.deps.docs.createIssuePage || !this.deps.docs.refreshIssueIndex) return;
+    if (signal?.aborted) throw new Error('publication post-commit drain aborted');
     await this.deps.docs.createIssuePage(module, issue);
+    if (signal?.aborted) throw new Error('publication post-commit drain aborted');
     const items = projectIssues
       .filter((i) => i.moduleId === module.id)
       .map((i) => ({
@@ -364,6 +367,7 @@ export class ModuleManager {
         docPath: moduleIssueRelPath(module.slug, i.id, i.title),
       }));
     await this.deps.docs.refreshIssueIndex(module, items);
+    if (signal?.aborted) throw new Error('publication post-commit drain aborted');
     this.store.touch(module.id);
   }
 

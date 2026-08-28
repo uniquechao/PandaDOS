@@ -28,7 +28,7 @@ import { AgentPicker } from '../components/AgentPicker';
 import { DirPicker } from '../components/DirPicker';
 import { tr } from '../i18n/runtime';
 
-export type AdminTab = 'users' | 'execs' | 'llm' | 'owner' | 'overview';
+export type AdminTab = 'users' | 'execs' | 'llm' | 'owner' | 'overview' | 'personaMarkets';
 
 export function AdminView({ initialTab = 'users' }: { initialTab?: AdminTab }) {
   const [tab, setTab] = useState<AdminTab>(initialTab);
@@ -39,6 +39,7 @@ export function AdminView({ initialTab = 'users' }: { initialTab?: AdminTab }) {
     ['llm', tr('admin.llm')],
     ['owner', tr('admin.ownership')],
     ['overview', tr('admin.overview')],
+    ['personaMarkets', tr('admin.personaMarkets')],
   ];
   return (
     <div class="page">
@@ -55,8 +56,58 @@ export function AdminView({ initialTab = 'users' }: { initialTab?: AdminTab }) {
       {tab === 'llm' && <LlmConfigTab />}
       {tab === 'owner' && <OwnerTab />}
       {tab === 'overview' && <OverviewTab />}
+      {tab === 'personaMarkets' && <PersonaMarketsTab />}
     </div>
   );
+}
+
+interface PersonaMarketSource {
+  id: number; name: string; repo: string; subdir: string; note: string; enabled: boolean;
+  lastSyncTs: number | null; lastError: string | null; personaSourceEpoch: number;
+}
+
+function PersonaMarketsTab() {
+  const [markets, setMarkets] = useState<PersonaMarketSource[] | null>(null);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [name, setName] = useState(''); const [repo, setRepo] = useState('');
+  const [subdir, setSubdir] = useState(''); const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(''); const [error, setError] = useState('');
+  const load = (): void => { void api<{ markets: PersonaMarketSource[] }>('/api/admin/design-persona-markets').then((result) => { setMarkets(result.markets); setError(''); }).catch((cause: Error) => setError(cause.message)); };
+  useEffect(load, []);
+  const reset = () => { setEditing(null); setName(''); setRepo(''); setSubdir(''); setNote(''); };
+  const save = async () => {
+    if (busy || !name.trim() || !repo.trim()) return; setBusy('save');
+    try {
+      if (editing) await api(`/api/admin/design-persona-markets/${encodeURIComponent(editing)}`, 'PATCH', { repo: repo.trim(), subdir: subdir.trim(), note: note.trim() });
+      else await api('/api/admin/design-persona-markets', 'POST', { name: name.trim(), repo: repo.trim(), subdir: subdir.trim(), note: note.trim() });
+      reset(); load(); toast.success(tr('admin.personaMarketSaved'));
+    } catch (cause) { toast.error(cause instanceof ApiError ? cause.message : String(cause)); }
+    finally { setBusy(''); }
+  };
+  const sync = async (market: PersonaMarketSource) => {
+    if (busy) return; setBusy(`sync-${market.name}`);
+    try { await api(`/api/admin/design-persona-markets/${encodeURIComponent(market.name)}/sync`, 'POST'); load(); toast.success(tr('admin.personaMarketSynced')); }
+    catch (cause) { toast.error(cause instanceof ApiError ? cause.message : String(cause)); }
+    finally { setBusy(''); }
+  };
+  const toggle = async (market: PersonaMarketSource) => {
+    if (busy) return; setBusy(`toggle-${market.name}`);
+    try { await api(`/api/admin/design-persona-markets/${encodeURIComponent(market.name)}`, 'PATCH', { enabled: !market.enabled }); load(); }
+    catch (cause) { toast.error(cause instanceof ApiError ? cause.message : String(cause)); }
+    finally { setBusy(''); }
+  };
+  const remove = async (market: PersonaMarketSource) => {
+    if (busy || !confirm(tr('admin.personaMarketDeleteConfirm', { name: market.name }))) return; setBusy(`delete-${market.name}`);
+    try { await api(`/api/admin/design-persona-markets/${encodeURIComponent(market.name)}`, 'DELETE'); load(); toast.info(tr('admin.personaMarketDeleted')); }
+    catch (cause) { toast.error(cause instanceof ApiError ? cause.message : String(cause)); }
+    finally { setBusy(''); }
+  };
+  if (!markets && !error) return <Loading/>;
+  return <div class="sect persona-market-admin"><div class="h2">{tr('admin.personaMarkets')}</div><p class="mut">{tr('admin.personaMarketsHelp')}</p>
+    {error && <div class="err">{error}</div>}
+    <div class="persona-market-form"><label>{tr('admin.personaMarketName')}<input value={name} disabled={editing !== null} onInput={(event) => setName(event.currentTarget.value)}/></label><label>{tr('admin.personaMarketRepo')}<input value={repo} onInput={(event) => setRepo(event.currentTarget.value)}/></label><label>{tr('admin.personaMarketSubdir')}<input value={subdir} onInput={(event) => setSubdir(event.currentTarget.value)}/></label><label>{tr('admin.personaMarketNote')}<input value={note} onInput={(event) => setNote(event.currentTarget.value)}/></label><div class="row"><button class="btn primary" disabled={!!busy || !name.trim() || !repo.trim()} onClick={() => void save()}>{editing ? tr('ui.save') : tr('admin.personaMarketCreate')}</button>{editing && <button class="btn" onClick={reset}>{tr('common.cancel')}</button>}</div></div>
+    <div class="persona-market-list">{markets?.map((market) => <article><div class="row"><div class="grow"><strong>{market.name}</strong><code>{market.repo}</code><small>{market.subdir || tr('admin.personaMarketRoot')}</small></div><span class={`badge ${market.enabled ? 'b-green' : 'b-gray'}`}>{market.enabled ? tr('admin.personaMarketEnabled') : tr('admin.personaMarketDisabled')}</span></div>{market.note && <p>{market.note}</p>}{market.lastError && <div class="err">{market.lastError}</div>}<div class="row"><button class="btn" disabled={!!busy} onClick={() => { setEditing(market.name); setName(market.name); setRepo(market.repo); setSubdir(market.subdir); setNote(market.note); }}>{tr('ui.edit')}</button><button class="btn" disabled={!!busy} onClick={() => void toggle(market)}>{market.enabled ? tr('admin.personaMarketDisable') : tr('admin.personaMarketEnable')}</button><button class="btn" disabled={!!busy} onClick={() => void sync(market)}>{tr('admin.personaMarketSync')}</button><button class="btn danger" disabled={!!busy} onClick={() => void remove(market)}>{tr('ui.delete')}</button></div></article>)}</div>
+  </div>;
 }
 
 // ---------- 驱动大模型 ----------

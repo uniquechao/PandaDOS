@@ -525,7 +525,7 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
        * 统一项目导入：
        * - tmux：执行机现查 session/cwd 后登记终端 attach 权限；
        * - claude/codex：执行机现扫 Agent 历史，以服务端候选核对 cwd，登记项目并批量绑定
-       *   kind=chat 的可恢复 conversations。
+       *   kind=chat 的可恢复 conversations；项目类型由 kind 指定，默认 issue。
        * 同执行机同 cwd 的活跃项目一律合并；会话标识重复时幂等，不复制历史或覆盖归属。
        */
       method: 'POST',
@@ -541,6 +541,9 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
           ), 503);
         }
         const b = await readBody(req);
+        const pk = parseProjectKind(b);
+        if (pk.error) return pk.error;
+        const importKind: ProjectKind = pk.value ?? 'issue';
         const source = parseImportSource(b.source);
         if (!source) {
           return json(apiError(
@@ -766,7 +769,7 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
               str(b, 'goal')?.slice(0, 2000) ?? null,
               Date.now(),
               ru.value ?? '',
-              source === 'tmux' ? 'issue' : 'chat',
+              importKind,
             );
           if (!row) {
             return json(apiError(

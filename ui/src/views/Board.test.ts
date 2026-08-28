@@ -58,10 +58,10 @@ describe('项目配置入口（Issue #10）', () => {
     const start = source.indexOf('<div class="bacts">');
     const end = source.indexOf('{project?.goal', start);
     const headerActions = source.slice(start, end);
-    const routes = ['/chat', '/files', '/skills', '/term', '/git', '/settings'];
+    const routes = ['/designs', '/chat', '/files', '/skills', '/term', '/git', '/settings'];
     expect(start).toBeGreaterThan(0);
     expect(end).toBeGreaterThan(start);
-    expect(headerActions.match(/<button class="btn sm"/g)).toHaveLength(7);
+    expect(headerActions.match(/<button class="btn sm"/g)).toHaveLength(8);
     expect(headerActions).toContain("subscribed ? tr('board.subscribedLabel') : tr('board.subscribe')");
     for (const route of routes) expect(headerActions).toContain(`nav(\`/p/\${pid}${route}\`)`);
     for (let index = 1; index < routes.length; index += 1) {
@@ -81,5 +81,24 @@ describe('项目配置入口（Issue #10）', () => {
     expect(listHeader).toContain("tr('externalImport.title')");
     expect(listHeader).toContain('nav(`/p/${pid}/external-issues`)');
     expect(listHeader).toContain('setCreating(true)');
+  });
+});
+
+describe('新建 issue：高级工作流（Issue #33）', () => {
+  test('按需加载启用模板，预览节点图并提交不可变模板选择', () => {
+    expect(source).toContain('if (!advancedOpen || workflowLoaded || workflowLoading) return;');
+    expect(source).toContain('`/api/projects/${pid}/workflows`');
+    expect(source).toContain("item.template.status === 'active'");
+    expect(source).toContain('<WorkflowGraph graph={selectedWorkflow.version.graph} compact />');
+    expect(source).toContain('...(workflowTemplateId !== null ? { workflowTemplateId } : {})');
+  });
+
+  test('模板选择页与窄屏样式使用 PandaDOS 视觉令牌', () => {
+    expect(source).toContain("tr('workflow.advanced')");
+    expect(source).toContain('role="listbox"');
+    expect(source).toContain('aria-selected={workflowTemplateId === item.template.id}');
+    expect(css).toContain('.wf-pick-layout {');
+    expect(css).toContain('background: var(--accent-weak)');
+    expect(css).toContain('@media (max-width: 720px)');
   });
 });

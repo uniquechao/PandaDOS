@@ -41,6 +41,7 @@ export interface SkillMarket {
   enabled: boolean;
   lastSyncTs: number | null;
   lastError: string | null;
+  personaSourceEpoch: number;
 }
 
 /** 市场里的一条技能（rel = 相对市场根的目录路径，安装/读取的键） */
@@ -71,6 +72,7 @@ export interface MarketRow {
   enabled: number;
   last_sync_ts: number | null;
   last_error: string | null;
+  persona_source_epoch: number;
 }
 
 // ---------- 基础 ----------
@@ -105,6 +107,7 @@ function rowToMarket(r: MarketRow): SkillMarket {
     enabled: r.enabled !== 0,
     lastSyncTs: r.last_sync_ts,
     lastError: r.last_error,
+    personaSourceEpoch: r.persona_source_epoch ?? 0,
   };
 }
 
@@ -137,6 +140,40 @@ export function addMarket(
   }
 }
 
+function normalizeSubdir(value: string): string | null {
+  const subdir = value.trim().replace(/^\/+|\/+$/g, '');
+  if (subdir && (subdir.includes('..') || !/^[\w./-]+$/.test(subdir))) return null;
+  return subdir;
+}
+
+/** Atomic source update; unlike delete+add it preserves cache, identity, and sync history. */
+export function updateMarket(
+  db: Database,
+  name: string,
+  patch: { repo?: string; subdir?: string; note?: string; enabled?: boolean },
+): { ok: boolean; error?: string } {
+  if (!MARKET_NAME_RE.test(name)) return { ok: false, error: '非法市场名' };
+  const current = listMarkets(db).find((market) => market.name === name);
+  if (!current) return { ok: false, error: '市场不存在' };
+  const repo = patch.repo === undefined ? current.repo : normalizeRepo(patch.repo);
+  if (!repo) return { ok: false, error: '仓库地址无效（支持 owner/repo、https、git@）' };
+  const subdir = patch.subdir === undefined ? current.subdir : normalizeSubdir(patch.subdir);
+  if (subdir === null) return { ok: false, error: '子目录无效' };
+  const note = patch.note === undefined ? current.note : patch.note.trim().slice(0, 200);
+  const enabled = patch.enabled === undefined ? current.enabled : patch.enabled;
+  const locationChanged = repo !== current.repo || subdir !== current.subdir;
+  const sourceChanged = locationChanged || enabled !== current.enabled;
+  db.query(`
+    UPDATE skill_markets
+       SET repo = ?, subdir = ?, note = ?, enabled = ?,
+           last_sync_ts = CASE WHEN ? THEN NULL ELSE last_sync_ts END,
+           last_error = NULL,
+           persona_source_epoch = persona_source_epoch + ?
+     WHERE name = ?
+  `).run(repo, subdir, note, enabled ? 1 : 0, locationChanged ? 1 : 0, sourceChanged ? 1 : 0, name);
+  return { ok: true };
+}
+
 /** 删市场源：DB 行 + 本地缓存目录 + 该市场的富化缓存一并清。 */
 export function removeMarket(db: Database, name: string, baseDir = marketsBaseDir()): { ok: boolean; error?: string } {
   if (!MARKET_NAME_RE.test(name)) return { ok: false, error: '非法市场名' };
@@ -159,8 +196,11 @@ async function gitSyncOne(m: SkillMarket, baseDir: string): Promise<void> {
   const cloned = fs.existsSync(path.join(dir, '.git'));
   if (cloned) {
     try {
-      await pExecFile('git', ['-C', dir, 'pull', '--ff-only', '-q'], opts);
-      return;
+      const origin = await pExecFile('git', ['-C', dir, 'remote', 'get-url', 'origin'], opts);
+      if (origin.stdout.trim() === m.repo) {
+        await pExecFile('git', ['-C', dir, 'pull', '--ff-only', '-q'], opts);
+        return;
+      }
     } catch {
       /* 浅仓库 force-push/历史改写 → 抹掉重克隆 */
     }
@@ -205,6 +245,99 @@ export async function syncMarkets(
     }
   }
   return { ok: results.some((r) => r.ok) || results.length === 0, results };
+}
+
+/** Validated cache snapshot used to pin governed persona provenance. */
+export async function marketSnapshot(
+  db: Database,
+  name: string,
+  baseDir = marketsBaseDir(),
+): Promise<{ root: string; commit: string } | null> {
+  const market = MARKET_NAME_RE.test(name)
+    ? listMarkets(db).find((candidate) => candidate.name === name)
+    : undefined;
+  if (!market) return null;
+  const root = path.join(baseDir, name);
+  if (!fs.existsSync(path.join(root, '.git'))) return null;
+  try {
+    const origin = await pExecFile('git', ['-C', root, 'remote', 'get-url', 'origin'], {
+      timeout: GIT_SYNC_TIMEOUT_MS,
+      maxBuffer: 64 * 1024,
+    });
+    if (origin.stdout.trim() !== market.repo) return null;
+    const result = await pExecFile('git', ['-C', root, 'rev-parse', 'HEAD'], {
+      timeout: GIT_SYNC_TIMEOUT_MS,
+      maxBuffer: 64 * 1024,
+    });
+    const commit = result.stdout.trim();
+    return /^[a-f0-9]{40}$/i.test(commit) ? { root, commit: commit.toLowerCase() } : null;
+  } catch {
+    return null;
+  }
+}
+
+interface PersonaMarketSnapshotRow {
+  market_name: string;
+  repo: string;
+  subdir: string;
+  git_commit: string;
+  synced_ts: number;
+  source_epoch: number;
+}
+
+/** Admin-controlled provenance pin. Generic market sync may move HEAD but never advances this row. */
+export async function approvePersonaMarketSnapshot(
+  db: Database,
+  name: string,
+  baseDir = marketsBaseDir(),
+): Promise<{ root: string; commit: string } | null> {
+  const market = listMarkets(db).find((candidate) => candidate.name === name && candidate.enabled);
+  if (!market) return null;
+  const snapshot = await marketSnapshot(db, name, baseDir);
+  if (!snapshot) return null;
+  db.query(`INSERT INTO design_persona_market_snapshots
+    (market_name, repo, subdir, git_commit, source_epoch, synced_ts)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(market_name) DO UPDATE SET
+      repo = excluded.repo,
+      subdir = excluded.subdir,
+      git_commit = excluded.git_commit,
+      source_epoch = excluded.source_epoch,
+      synced_ts = excluded.synced_ts`
+  ).run(name, market.repo, market.subdir, snapshot.commit, market.personaSourceEpoch, Date.now());
+  return snapshot;
+}
+
+/** Read the last admin-approved commit only when it still matches the active source identity. */
+export async function approvedPersonaMarketSnapshot(
+  db: Database,
+  name: string,
+  baseDir = marketsBaseDir(),
+): Promise<{ root: string; commit: string } | null> {
+  const market = listMarkets(db).find((candidate) => candidate.name === name && candidate.enabled);
+  if (!market) return null;
+  const row = db.query<PersonaMarketSnapshotRow, [string]>(
+    'SELECT * FROM design_persona_market_snapshots WHERE market_name = ?',
+  ).get(name);
+  if (!row || row.repo !== market.repo || row.subdir !== market.subdir
+    || row.source_epoch !== market.personaSourceEpoch
+    || !/^[a-f0-9]{40}$/i.test(row.git_commit)) return null;
+  const root = path.join(baseDir, name);
+  if (!fs.existsSync(path.join(root, '.git'))) return null;
+  try {
+    const origin = await pExecFile('git', ['-C', root, 'remote', 'get-url', 'origin'], {
+      timeout: GIT_SYNC_TIMEOUT_MS,
+      maxBuffer: 64 * 1024,
+    });
+    if (origin.stdout.trim() !== market.repo) return null;
+    await pExecFile('git', ['-C', root, 'cat-file', '-e', `${row.git_commit}^{commit}`], {
+      timeout: GIT_SYNC_TIMEOUT_MS,
+      maxBuffer: 64 * 1024,
+    });
+    return { root, commit: row.git_commit.toLowerCase() };
+  } catch {
+    return null;
+  }
 }
 
 // ---------- 扫描 ----------

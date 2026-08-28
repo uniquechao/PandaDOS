@@ -9,6 +9,7 @@
  * #/p/:pid/git         git 提交图
  * #/p/:pid/skills      技能（全局/项目 + 市场）
  * #/p/:pid/settings    项目配置
+ * #/p/:pid/workflows   工作流模板维护
  * #/p/:pid/external-issues 外部 issue 导入
  * #/settings          我的设定
  * #/admin            admin 后台
@@ -22,12 +23,15 @@ export type Route =
   | { name: 'admin'; section?: 'llm' }
   | { name: 'board'; pid: number }
   | { name: 'issue'; pid: number; iid: number }
+  | { name: 'designs'; pid: number }
+  | { name: 'design'; pid: number; did: number }
   | { name: 'chat'; pid: number }
   | { name: 'term'; pid: number }
   | { name: 'files'; pid: number }
   | { name: 'git'; pid: number }
   | { name: 'skills'; pid: number }
   | { name: 'external-issues'; pid: number }
+  | { name: 'workflows'; pid: number }
   | { name: 'project-settings'; pid: number };
 
 export function parseHash(hash: string): Route {
@@ -43,11 +47,19 @@ export function parseHash(hash: string): Route {
         const iid = Number(parts[3]);
         if (Number.isInteger(iid) && iid > 0) return { name: 'issue', pid, iid };
       }
+      if (parts[2] === 'designs') {
+        if (parts[3]) {
+          const did = Number(parts[3]);
+          if (Number.isInteger(did) && did > 0) return { name: 'design', pid, did };
+        }
+        return { name: 'designs', pid };
+      }
       if (parts[2] === 'chat') return { name: 'chat', pid };
       if (parts[2] === 'term') return { name: 'term', pid };
       if (parts[2] === 'files') return { name: 'files', pid };
       if (parts[2] === 'git') return { name: 'git', pid };
       if (parts[2] === 'external-issues') return { name: 'external-issues', pid };
+      if (parts[2] === 'workflows') return { name: 'workflows', pid };
       if (parts[2] === 'settings') return { name: 'project-settings', pid };
       if (parts[2] === 'skills') return { name: 'skills', pid };
       return { name: 'board', pid };

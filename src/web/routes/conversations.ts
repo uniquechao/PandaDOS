@@ -80,6 +80,29 @@ async function readBody(req: Request): Promise<Record<string, unknown>> {
 export function conversationsRoutes(deps: ConversationsRoutesDeps): RouteDef[] {
   const { db, convs, mutex, models } = deps;
 
+  const designBound = (conversationId: string): boolean => {
+    const exists = db.query<{ n: number }, []>(
+      `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'design_tasks'`,
+    ).get()!.n > 0;
+    if (exists && db.query<{ n: number }, [string]>(
+      'SELECT COUNT(*) AS n FROM design_tasks WHERE conversation_id = ?',
+    ).get(conversationId)!.n > 0) return true;
+    const hasOwners = db.query<{ n: number }, []>(
+      `SELECT COUNT(*) AS n FROM sqlite_master
+       WHERE type = 'table' AND name = 'design_saga_conversation_owners'`,
+    ).get()!.n > 0;
+    return hasOwners && db.query<{ found: number }, [string]>(
+      `SELECT 1 AS found FROM design_saga_conversation_owners
+       WHERE conversation_id = ?`,
+    ).get(conversationId)?.found === 1;
+  };
+  const designReserved = (conversationId: string): Response => json(apiError(
+    'design.conversation_reserved',
+    'This conversation is managed by the design workspace.',
+    409,
+    { conversationId },
+  ), 409);
+
   const discoverProjectHistory = async (
     project: Project,
   ): Promise<{ sessions: AgentHistorySession[] } | { error: Response }> => {
@@ -124,7 +147,10 @@ export function conversationsRoutes(deps: ConversationsRoutesDeps): RouteDef[] {
   ): { conv: Conversation } | { error: Response } => {
     const pid = Number(params.projectId);
     const c = convs.get(params.convId ?? '');
-    if (!c || c.projectId !== pid) return { error: json({ ok: false, error: '无此对话' }, 404) };
+    if (!c || c.projectId !== pid) {
+      return { error: json({ ok: false, error: '无此对话' }, 404) };
+    }
+    if (designBound(c.id)) return { error: designReserved(c.id) };
     if (c.kind !== 'chat') {
       return { error: json({ ok: false, error: 'issue 对话由引擎管理，不能在此操作' }, 400) };
     }
@@ -361,7 +387,10 @@ export function conversationsRoutes(deps: ConversationsRoutesDeps): RouteDef[] {
       handler: async ({ params }) => {
         const pid = Number(params.projectId);
         const c = convs.get(params.convId ?? '');
-        if (!c || c.projectId !== pid) return json({ ok: false, error: '无此对话' }, 404);
+        if (!c || c.projectId !== pid) {
+          return json({ ok: false, error: '无此对话' }, 404);
+        }
+        if (designBound(c.id)) return designReserved(c.id);
         const model = models ? await models.modelOf(c.id).catch(() => null) : null;
         return json({ ok: true, agent: c.agent, model });
       },

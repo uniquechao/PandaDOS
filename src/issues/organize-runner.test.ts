@@ -27,6 +27,10 @@ class FakeDriver implements OrganizeDriver {
   failCreate = false;
   onCapture?: (n: number, files: Map<string, string>) => void;
 
+  async findExecutable(agent: 'claude' | 'codex') {
+    return agent;
+  }
+
   async listSessions() {
     return [...this.sessions].map((name) => ({ name, createdTs: 0, attached: false }));
   }

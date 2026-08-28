@@ -231,6 +231,12 @@ class MockSftp implements SftpLike {
   readCalls = 0;
 
   open(path: string, _flags: string, cb: (err: Error | null | undefined, handle: unknown) => void): void {
+    if (_flags === 'wx' && !this.files.has(path) && !this.modes.has(path)) {
+      this.files.set(path, Buffer.alloc(0));
+      this.modes.set(path, 0o100644);
+      cb(null, { path });
+      return;
+    }
     if (!this.files.has(path)) {
       cb(Object.assign(new Error(`No such file ${path}`), { code: 2 }), null);
       return;
@@ -261,15 +267,42 @@ class MockSftp implements SftpLike {
     data.copy(buffer, offset, position, position + n);
     cb(null, n);
   }
+  write(
+    handle: unknown,
+    buffer: Buffer,
+    offset: number,
+    length: number,
+    position: number,
+    cb: (err: Error | null | undefined) => void,
+  ): void {
+    const { path } = handle as { path: string };
+    const prior = this.files.get(path) ?? Buffer.alloc(0);
+    const next = Buffer.alloc(Math.max(prior.length, position + length));
+    prior.copy(next);
+    buffer.copy(next, position, offset, offset + length);
+    this.files.set(path, next);
+    cb(null);
+  }
   close(_handle: unknown, cb: (err: Error | null | undefined) => void): void {
     cb(null);
   }
   stat(path: string, cb: (err: Error | null | undefined, stats: SftpStatsLike) => void): void {
-    if (!this.files.has(path)) {
+    if (!this.files.has(path) && !this.modes.has(path)) {
       cb(Object.assign(new Error(`No such file ${path}`), { code: 2 }), mkStats(0));
       return;
     }
-    cb(null, mkStats(this.files.get(path)!.length, this.modes.get(path) ?? 0o100644));
+    cb(null, mkStats(this.files.get(path)?.length ?? 0, this.modes.get(path) ?? 0o100644));
+  }
+  lstat(path: string, cb: (err: Error | null | undefined, stats: SftpStatsLike) => void): void {
+    this.stat(path, cb);
+  }
+  mkdir(path: string, attrs: { mode?: number }, cb: (err: Error | null | undefined) => void): void {
+    if (this.files.has(path) || this.modes.has(path)) {
+      cb(new Error('exists'));
+      return;
+    }
+    this.modes.set(path, 0o040000 | (attrs.mode ?? 0o755));
+    cb(null);
   }
   readdir(_path: string, cb: (err: Error | null | undefined, list: SftpDirEntryLike[]) => void): void {
     cb(null, [
@@ -385,6 +418,19 @@ describe('SshDriver（mock ssh2）', () => {
     await driver.close();
   });
 
+  it('scrollPane：Local/SSH 共用原子 copy-mode 命令，连续上下滚动各只占一次 exec', async () => {
+    const { driver, clients } = mkDriver({ onExec: (_c, _o, s) => respond(s, { code: 0 }) });
+    await driver.scrollPane('cc-main', 'up', 3);
+    await driver.scrollPane('cc-main', 'down', 4);
+    expect(clients[0]!.execCalls.map((call) => call.cmd)).toEqual([
+      `tmux 'if-shell' '-t' 'cc-main' '-F' '#{pane_in_mode}'` +
+        ` 'send-keys -X -N 3 scroll-up' 'copy-mode -e; send-keys -X -N 3 scroll-up'`,
+      `tmux 'if-shell' '-t' 'cc-main' '-F' '#{pane_in_mode}'` +
+        ` 'send-keys -X -N 4 scroll-down' ''`,
+    ]);
+    await driver.close();
+  });
+
   it('createSession 带显式尺寸 -x 220 -y 50；失败抛错；capturePane 回原文', async () => {
     const { driver, clients } = mkDriver({
       onExec: tmuxStub([
@@ -448,6 +494,41 @@ describe('SshDriver（mock ssh2）', () => {
     const r2 = await driver.readFileRange('/log/x.jsonl', content.length + 10, 8);
     expect(r2.data.length).toBe(0);
     expect(r2.size).toBe(content.length);
+    await driver.close();
+  });
+
+  it('readFileNoFollowWithin checks each SFTP component and rejects symlinks', async () => {
+    const sftp = new MockSftp();
+    sftp.modes.set('/project/personas', 0o040755);
+    sftp.modes.set('/project/personas/reviewer', 0o040755);
+    sftp.files.set('/project/personas/reviewer/PERSONA.md', Buffer.from('persona'));
+    const { driver } = mkDriver({ sftp });
+    const read = await driver.readFileNoFollowWithin('/project/personas', 'reviewer/PERSONA.md', 4);
+    expect(Buffer.from(read.data).toString()).toBe('pers');
+    expect(read.size).toBe(7);
+    sftp.modes.set('/project/personas/reviewer', 0o120777);
+    await expect(driver.readFileNoFollowWithin('/project/personas', 'reviewer/PERSONA.md', 20))
+      .rejects.toThrow(/rejects links/);
+    await driver.close();
+  });
+
+  it('writeFileNoFollowWithin creates safely, is idempotent, conflicts, and rejects remote links', async () => {
+    const sftp = new MockSftp();
+    sftp.modes.set('/project', 0o040755);
+    const { driver } = mkDriver({ sftp });
+    expect(await driver.writeFileNoFollowWithin(
+      '/project', '.panda/personas/reviewer/PERSONA.md', 'canonical',
+    )).toBe('created');
+    expect(await driver.writeFileNoFollowWithin(
+      '/project', '.panda/personas/reviewer/PERSONA.md', 'canonical',
+    )).toBe('unchanged');
+    expect(await driver.writeFileNoFollowWithin(
+      '/project', '.panda/personas/reviewer/PERSONA.md', 'different',
+    )).toBe('conflict');
+    sftp.modes.set('/project/.panda/personas/link', 0o120777);
+    await expect(driver.writeFileNoFollowWithin(
+      '/project', '.panda/personas/link/PERSONA.md', 'x',
+    )).rejects.toThrow(/rejects links/);
     await driver.close();
   });
 

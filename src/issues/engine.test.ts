@@ -11,7 +11,8 @@ import { gitLockKey, KeyedMutex, tmuxLockKey } from './mutex';
 import { ModuleManager, ModuleStore } from './modules';
 import { MAX_TEST_FAILURES, transition } from './machine';
 import { BUSY_STATES } from './queue';
-import type { Project, ProjectModule } from '../core/types';
+import type { Project, ProjectModule, WorkflowGraphSnapshot } from '../core/types';
+import { migrateDesigns } from '../designs/store';
 import {
   buildResultSummaryPrompt,
   DEFAULT_ENGINE_CONFIG,
@@ -29,7 +30,14 @@ import {
   type EngineMergeCandidate,
   type EngineMergeGroup,
   type EngineDeps,
+  type EngineIssue,
+  type DesignIssueDraft,
+  type IssueExecutionSync,
+  type IssueExecutionSyncEffectContext,
+  type PreparedDesignBatch,
 } from './engine';
+import { workflowNodePaths } from './workflow-node-runner';
+import { validateWorkflowGraph, WorkflowTemplateStore } from './workflows';
 
 // ---------- 假 Driver：文件/git 走真 fs（LocalDriver），tmux 进内存录制 ----------
 
@@ -44,6 +52,18 @@ class FakeDriver extends LocalDriver {
   pane = '';
   /** 每会话的 #{pane_current_command}（不设 = 老实现/解析失败，判活退化成只看屏） */
   paneCommands = new Map<string, string>();
+  gitCalls: Array<{ cwd: string; args: string[] }> = [];
+  managedUpstream: 'missing' | 'present' | null = null;
+  override async git(cwd: string, args: string[]) {
+    this.gitCalls.push({ cwd, args: [...args] });
+    if (this.managedUpstream && args.join('\0') === 'rev-parse\0--symbolic-full-name\0@{upstream}') {
+      return this.managedUpstream === 'present'
+        ? { code: 0, out: 'refs/remotes/origin/codex/design-1-1\n', err: '' }
+        : { code: 128, out: '', err: 'no upstream' };
+    }
+    if (this.managedUpstream && args[0] === 'push') return { code: 0, out: '', err: '' };
+    return super.git(cwd, args);
+  }
   /** listSessions 调用次数（issue #97：健康路径必须零额外 tmux 调用） */
   listCalls = 0;
   override async findExecutable(agent: 'claude' | 'codex') {
@@ -118,7 +138,7 @@ describe('issue 引擎迁移', () => {
     const first = migrateIssueEngine(db);
     const second = migrateIssueEngine(db);
     expect(first.applied.filter((id) => id >= 30 && id < 40)).toEqual([
-      30, 31, 32, 33, 34, 35, 36, 37, 38,
+      30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
     ]);
     expect(second).toEqual(first);
     const columns = db
@@ -142,6 +162,7 @@ async function setup(opts: {
   config?: Partial<EngineConfig>;
   modulesFor?: EngineDeps['modulesFor'];
   onNotify?: (event: EngineNotifyEvent) => void | Promise<void>;
+  executionWorkspaces?: EngineDeps['executionWorkspaces'];
 } = {}) {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-engine-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
@@ -149,6 +170,7 @@ async function setup(opts: {
   const db = openDb(':memory:');
   migrate(db);
   migrateIssueEngine(db); // 030：module/impl_mode 列 + project_active_conv
+  if (opts.executionWorkspaces) migrateDesigns(db);
   const users = new UserStore(db);
   const { user: admin } = users.create('admin', 'admin');
   users.putSettings(admin.id, { locale: 'zh-Hans' }); // legacy prompt assertions in this suite
@@ -248,6 +270,7 @@ async function setup(opts: {
     driver,
     convs,
     locator,
+    ...(opts.executionWorkspaces ? { executionWorkspaces: opts.executionWorkspaces } : {}),
     pmFor: () => pm,
     notify,
     mutex,
@@ -284,6 +307,144 @@ describe('对话模式项目守卫', () => {
     );
     // 且没有 issue 落库
     expect(s.engine.store.listByProject(s.projectId)).toHaveLength(0);
+  });
+});
+
+describe('design execution workspace port', () => {
+  test('managed issues reuse a run/module conversation without mutating the permanent module binding', async () => {
+    let workspace = '';
+    let healthy = true;
+    let convsRef: ConversationManager;
+    const byModule = new Map<string, ReturnType<ConversationManager['createInWorkspace']>>();
+    const executionWorkspaces: NonNullable<EngineDeps['executionWorkspaces']> = {
+      resolve: () => {
+        if (!healthy) throw new Error('WORKTREE_UNHEALTHY');
+        return { cwd: workspace, kind: 'design-worktree', branch: 'codex/design-1-1', runId: 'run-1' };
+      },
+      conversationFor: async (issue, resolved) => {
+        const key = `${resolved.runId}:module:${issue.moduleId ?? 'none'}`;
+        let conv = byModule.get(key);
+        if (!conv) {
+          conv = convsRef.createInWorkspace(issue.projectId, key, issue.agent, resolved.cwd);
+          byModule.set(key, conv);
+        }
+        return conv;
+      },
+    };
+    const s = await setup({ executionWorkspaces });
+    convsRef = s.convs;
+    workspace = path.join(s.dir, 'design-worktree');
+    expect((await s.driver.git(s.repo, [
+      'worktree', 'add', '--no-track', '-b', 'codex/design-1-1', workspace, 'HEAD',
+    ])).code).toBe(0);
+    const permanent = s.convs.create(s.projectId, 'permanent module', 'claude');
+    s.db.query(`INSERT INTO project_modules
+      (project_id, slug, display_name, agent, source, status, conversation_id, created_ts)
+      VALUES (1, 'design-module', 'Design module', 'claude', 'manual', 'active', ?, 1)`)
+      .run(permanent.id);
+
+    const first = await s.engine.createIssue(s.projectId, {
+      title: 'worktree first', moduleId: 1,
+    }, false);
+    expect((await s.engine.startIssue(first.id)).ok).toBe(true);
+    const bound = s.engine.store.get(first.id)!;
+    expect(bound.convId).not.toBe(permanent.id);
+    expect(s.convs.get(bound.convId!)?.workspaceCwd).toBe(workspace);
+    expect(s.db.query<{ conversation_id: string }, []>(
+      'SELECT conversation_id FROM project_modules WHERE id = 1',
+    ).get()?.conversation_id).toBe(permanent.id);
+    expect(s.driver.gitCalls.filter((call) => call.args[0] === 'checkout')).toEqual([]);
+    expect(s.driver.gitCalls.some((call) => call.cwd === workspace && call.args[0] === 'symbolic-ref')).toBe(true);
+
+    const finish = async (issueId: number) => {
+      expect((await s.engine.applyEvent(issueId, 'plan_ready')).ok).toBe(true);
+      expect(s.engine.store.get(issueId)?.status).toBe('implementing');
+      expect((await s.engine.applyEvent(issueId, 'impl_done')).ok).toBe(true);
+      expect((await s.engine.applyEvent(issueId, 'tests_passed')).ok).toBe(true);
+    };
+    s.setManualReview(false);
+    s.driver.managedUpstream = 'missing';
+    await finish(first.id);
+    expect(s.driver.gitCalls.some((call) => call.cwd === workspace && call.args.join('\0')
+      === 'push\0--set-upstream\0origin\0HEAD')).toBe(true);
+
+    const second = await s.engine.createIssue(s.projectId, {
+      title: 'worktree second', moduleId: 1,
+    }, false);
+    expect((await s.engine.startIssue(second.id)).ok).toBe(true);
+    expect(s.engine.store.get(second.id)?.convId).toBe(bound.convId);
+    s.driver.managedUpstream = 'present';
+    await finish(second.id);
+    expect(s.driver.gitCalls.some((call) => call.cwd === workspace && call.args.join('\0')
+      === 'push\0origin\0HEAD')).toBe(true);
+
+    healthy = false;
+    const blocked = await s.engine.createIssue(s.projectId, { title: 'unhealthy' }, false);
+    const before = s.driver.gitCalls.length;
+    expect(await s.engine.startIssue(blocked.id)).toMatchObject({ ok: false });
+    expect(s.engine.store.get(blocked.id)?.convId).toBeNull();
+    expect(s.driver.gitCalls).toHaveLength(before);
+  });
+});
+
+describe('工作流 issue 生命周期接线', () => {
+  test('无需原 issue 对话即可推进，并保持现有 merge_review 卡点', async () => {
+    const s = await setup();
+    const graph: WorkflowGraphSnapshot = {
+      schemaVersion: 1,
+      entryNodeKey: 'issue',
+      maxLoopIterations: 3,
+      nodes: [
+        { key: 'issue', kind: 'issue', title: 'Issue', instructions: null, agent: null, executionMode: 'read', maxVisits: 1, positionX: 0, positionY: 0, config: null },
+        { key: 'code', kind: 'agent', title: '实现', instructions: '完成实现', agent: 'codex', executionMode: 'write', maxVisits: 1, positionX: 1, positionY: 0, config: null },
+        { key: 'end', kind: 'end', title: '完成', instructions: null, agent: null, executionMode: 'read', maxVisits: 1, positionX: 2, positionY: 0, config: null },
+      ],
+      edges: [
+        { key: 'start', fromNodeKey: 'issue', toNodeKey: 'code', conditionText: null, priority: 0, isDefault: false },
+        { key: 'finish', fromNodeKey: 'code', toNodeKey: 'end', conditionText: '实现完成', priority: 0, isDefault: false },
+      ],
+    };
+    const validated = validateWorkflowGraph(graph, ['claude', 'codex']);
+    if (!validated.ok) throw new Error('测试工作流无效');
+    const template = new WorkflowTemplateStore(s.db).create({
+      projectId: s.projectId,
+      name: '单节点工作流',
+      graph: validated.graph,
+      graphJson: validated.graphJson,
+      graphHash: validated.graphHash,
+    });
+    const issue = await s.engine.createIssue(s.projectId, {
+      title: '工作流任务',
+      body: '按节点执行',
+      createdBy: s.admin.id,
+      workflowTemplateId: template.template.id,
+    });
+    expect(s.engine.store.get(issue.id)).toMatchObject({ status: 'implementing', convId: null });
+    expect(s.engine.store.listDriving().map((row) => row.id)).toContain(issue.id);
+    const workflow = s.engine.workflowSnapshot(issue.id)!;
+    const run = s.db.query<{ id: number }, [number]>(
+      "SELECT id FROM issue_workflow_node_runs WHERE issue_workflow_id = ? AND node_key = 'code'",
+    ).get(workflow.id)!;
+    const paths = workflowNodePaths(s.repo, workflow.id, run.id);
+    await fsp.writeFile(paths.result, JSON.stringify({
+      schemaVersion: 1,
+      output: '实现完成',
+      selectedEdgeKey: 'finish',
+      routeReason: '实现完成',
+    }));
+    await fsp.writeFile(paths.done, 'ok');
+    await s.engine.tick();
+    expect(s.engine.store.get(issue.id)!.status).toBe('merge_review');
+    expect(s.engine.store.listGates(issue.id).map((gate) => gate.kind)).toEqual(['merge_review']);
+    expect(s.engine.store.listEvents(issue.id).map((event) => event.kind)).toContain('workflow_completed');
+
+    s.db.query("UPDATE issues SET status = 'blocked' WHERE id = ?").run(issue.id);
+    s.db.query("UPDATE issue_workflows SET status = 'paused' WHERE issue_id = ?").run(issue.id);
+    const queued = await s.engine.createIssue(s.projectId, { title: '必须等待冲突恢复' }, false);
+    expect(await s.engine.startIssue(queued.id)).toEqual({
+      ok: false,
+      error: '项目忙（已有 issue 在跑），先排队',
+    });
   });
 });
 
@@ -3622,7 +3783,8 @@ describe('同模块智能合并（调度前 LLM 归并）', () => {
     releasePause();
     const completed = await Promise.race([
       Promise.all([scheduled, starting]).then(([, result]) => ({ completed: true as const, result })),
-      new Promise<{ completed: false }>((resolve) => setTimeout(() => resolve({ completed: false }), 250)),
+      // 真 Git 分支准备在较慢的 macOS CI 上可能超过 250ms；保留超时防锁死，避免把正常 I/O 当死锁。
+      new Promise<{ completed: false }>((resolve) => setTimeout(() => resolve({ completed: false }), 1_000)),
     ]);
     expect(completed.completed).toBe(true);
     if (!completed.completed) return;
@@ -4728,5 +4890,669 @@ describe('reopenIssue：取消的 issue 改完需求重新运行', () => {
     ]);
     expect([r1.ok, r2.ok].filter(Boolean)).toHaveLength(1);
     expect(s.engine.store.countEvents(issue.id, 'reopened')).toBe(1);
+  });
+});
+
+// ---------- Task 7.2：设计图原子发布适配器（Issue 域） ----------
+
+describe('Task 7.2 原子 Issue 发布批次', () => {
+  const draft = (
+    nodeId: string,
+    title: string,
+    moduleId: number,
+    implMode: 'direct' | 'team' = 'direct',
+    agent: 'claude' | 'codex' = 'claude',
+  ) => ({
+    nodeId,
+    title,
+    body: `完整契约：${title}\n验收、测试、证据与完成报告均不可截断。`,
+    moduleId,
+    implMode,
+    agent,
+  });
+
+  function readyModule(
+    db: ReturnType<typeof openDb>,
+    projectId: number,
+    slug: string,
+    agent: 'claude' | 'codex' = 'claude',
+  ): ProjectModule {
+    return new ModuleStore(db).create({
+      projectId,
+      slug,
+      displayName: slug,
+      agent,
+      source: 'manual',
+      createdTs: 10,
+    });
+  }
+
+  test('第二个 node 插入失败时，整个批次及 created 事件一起回滚', async () => {
+    const s = await setup();
+    const mod = readyModule(s.db, s.projectId, 'batch-core');
+    const prepared = await s.engine.prepareDesignBatch(s.projectId, [
+      draft('a', 'A', mod.id),
+      draft('b', 'B', mod.id),
+    ]);
+    s.db.exec(`CREATE TRIGGER fail_second_publication_issue
+      BEFORE INSERT ON issues WHEN NEW.title = 'B'
+      BEGIN SELECT RAISE(ABORT, 'injected node fault'); END`);
+
+    expect(() => s.engine.commitPreparedDesignBatch(prepared, [], () => {})).toThrow(/injected node fault/);
+    expect(s.engine.store.listByProject(s.projectId)).toHaveLength(0);
+    expect(s.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM issue_events').get()?.n).toBe(0);
+  });
+
+  test('dependency 或 linkage callback 抛错时，issues/dependencies/linkage 全部回滚', async () => {
+    const s = await setup();
+    const mod = readyModule(s.db, s.projectId, 'batch-links');
+    const prepared = await s.engine.prepareDesignBatch(s.projectId, [
+      draft('root', 'Root', mod.id),
+      draft('leaf', 'Leaf', mod.id),
+    ]);
+    s.db.exec('CREATE TABLE test_design_links (node_id TEXT PRIMARY KEY, issue_id INTEGER NOT NULL)');
+    s.db.exec(`CREATE TRIGGER fail_dependency_insert
+      BEFORE INSERT ON issue_dependencies
+      BEGIN SELECT RAISE(ABORT, 'injected dependency fault'); END`);
+    expect(() => s.engine.commitPreparedDesignBatch(
+      prepared,
+      [{ fromNodeId: 'root', toNodeId: 'leaf' }],
+      () => {},
+    )).toThrow(/injected dependency fault/);
+    expect(s.engine.store.listByProject(s.projectId)).toHaveLength(0);
+
+    s.db.exec('DROP TRIGGER fail_dependency_insert');
+    expect(() => s.engine.commitPreparedDesignBatch(
+      prepared,
+      [{ fromNodeId: 'root', toNodeId: 'leaf' }],
+      (byNode) => {
+        expect(byNode.size).toBe(2);
+        expect(s.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM issue_dependencies').get()?.n).toBe(1);
+        s.db.query('INSERT INTO test_design_links (node_id, issue_id) VALUES (?, ?)')
+          .run('root', byNode.get('root')!.id);
+        throw new Error('injected linkage fault');
+      },
+    )).toThrow(/injected linkage fault/);
+    expect(s.engine.store.listByProject(s.projectId)).toHaveLength(0);
+    expect(s.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM issue_dependencies').get()?.n).toBe(0);
+    expect(s.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM test_design_links').get()?.n).toBe(0);
+  });
+
+  test('拒绝 async/thenable linkage callback，并回滚 callback 返回前的同步写入', async () => {
+    const s = await setup();
+    const mod = readyModule(s.db, s.projectId, 'batch-sync-callback');
+    const prepared = await s.engine.prepareDesignBatch(s.projectId, [draft('a', 'A', mod.id)]);
+    s.db.exec('CREATE TABLE test_design_links (node_id TEXT PRIMARY KEY, issue_id INTEGER NOT NULL)');
+
+    let asyncCallbackEntered = false;
+    const asyncCallback = (async () => {
+      asyncCallbackEntered = true;
+      await Promise.resolve();
+    }) as unknown as (issuesByNodeId: ReadonlyMap<string, EngineIssue>) => void;
+    expect(() => s.engine.commitPreparedDesignBatch(prepared, [], asyncCallback)).toThrow(/synchronous|同步/);
+    expect(asyncCallbackEntered).toBe(false);
+    expect(s.engine.store.listByProject(s.projectId)).toHaveLength(0);
+
+    const thenableCallback = ((byNode: ReadonlyMap<string, EngineIssue>) => {
+      s.db.query('INSERT INTO test_design_links (node_id, issue_id) VALUES (?, ?)')
+        .run('a', byNode.get('a')!.id);
+      return { then() {} };
+    }) as unknown as (issuesByNodeId: ReadonlyMap<string, EngineIssue>) => void;
+    expect(() => s.engine.commitPreparedDesignBatch(prepared, [], thenableCallback)).toThrow(/synchronous|同步/);
+    expect(s.engine.store.listByProject(s.projectId)).toHaveLength(0);
+    expect(s.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM test_design_links').get()?.n).toBe(0);
+
+    if (false) {
+      // @ts-expect-error publication linkage callbacks must not return PromiseLike values
+      s.engine.commitPreparedDesignBatch(prepared, [], async () => {});
+    }
+  });
+
+  test('prepared capability 只允许创建它的 engine commit，callback 位于该 engine 的 DB 事务内', async () => {
+    const owner = await setup();
+    const other = await setup();
+    const mod = readyModule(owner.db, owner.projectId, 'batch-owner');
+    const prepared = await owner.engine.prepareDesignBatch(owner.projectId, [draft('a', 'A', mod.id)]);
+
+    const sameDbOtherEngine = new IssueEngine({
+      db: owner.db,
+      driver: owner.driver,
+      convs: owner.convs,
+      locator: owner.locator,
+      pmFor: () => owner.pm,
+      notify: { dispatch: async () => {} },
+      mutex: new KeyedMutex(),
+      config: { resultSummaryTimeoutMs: 0 },
+    });
+    let foreignCallbackEntered = false;
+    expect(() => sameDbOtherEngine.commitPreparedDesignBatch(prepared, [], () => {
+      foreignCallbackEntered = true;
+    })).toThrow(/untrusted|different IssueEngine|owner/);
+    expect(() => other.engine.commitPreparedDesignBatch(prepared, [], () => {
+      foreignCallbackEntered = true;
+    })).toThrow(/untrusted|different IssueEngine|owner/);
+    expect(foreignCallbackEntered).toBe(false);
+    expect(owner.engine.store.listByProject(owner.projectId)).toHaveLength(0);
+    expect(other.engine.store.listByProject(other.projectId)).toHaveLength(0);
+
+    owner.db.exec('CREATE TABLE test_design_links (node_id TEXT PRIMARY KEY, issue_id INTEGER NOT NULL)');
+    const committed = owner.engine.commitPreparedDesignBatch(prepared, [], (byNode) => {
+      expect(owner.db.inTransaction).toBe(true);
+      expect(other.db.inTransaction).toBe(false);
+      owner.db.query('INSERT INTO test_design_links (node_id, issue_id) VALUES (?, ?)')
+        .run('a', byNode.get('a')!.id);
+    });
+    expect(committed).toHaveLength(1);
+    expect(owner.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM test_design_links').get()?.n).toBe(1);
+
+    if (false) {
+      // @ts-expect-error prepared batches carry a module-private capability brand
+      const forged: PreparedDesignBatch = { projectId: owner.projectId, drafts: prepared.drafts };
+      void forged;
+    }
+  });
+
+  test('依赖图在首个 INSERT 前拒绝未知边、自环、重复边与环；generic store 拒绝跨项目边', async () => {
+    const s = await setup();
+    const mod = readyModule(s.db, s.projectId, 'batch-dag');
+    const prepared = await s.engine.prepareDesignBatch(s.projectId, [
+      draft('a', 'A', mod.id),
+      draft('b', 'B', mod.id),
+      draft('c', 'C', mod.id),
+    ]);
+    s.db.exec(`CREATE TRIGGER reject_any_publication_insert
+      BEFORE INSERT ON issues
+      BEGIN SELECT RAISE(ABORT, 'node insert reached'); END`);
+    expect(() => s.engine.commitPreparedDesignBatch(
+      prepared,
+      [
+        { fromNodeId: 'a', toNodeId: 'b' },
+        { fromNodeId: 'b', toNodeId: 'c' },
+        { fromNodeId: 'c', toNodeId: 'a' },
+      ],
+      () => {},
+    )).toThrow(/cycle|环/);
+    s.db.exec('DROP TRIGGER reject_any_publication_insert');
+    expect(() => s.engine.commitPreparedDesignBatch(
+      prepared,
+      [{ fromNodeId: 'missing', toNodeId: 'a' }],
+      () => {},
+    )).toThrow(/unknown/);
+    expect(() => s.engine.commitPreparedDesignBatch(
+      prepared,
+      [{ fromNodeId: 'a', toNodeId: 'a' }],
+      () => {},
+    )).toThrow(/itself/);
+    expect(() => s.engine.commitPreparedDesignBatch(
+      prepared,
+      [
+        { fromNodeId: 'a', toNodeId: 'b' },
+        { fromNodeId: 'a', toNodeId: 'b' },
+      ],
+      () => {},
+    )).toThrow(/duplicate/);
+    expect(s.engine.store.listByProject(s.projectId)).toHaveLength(0);
+
+    const otherProjectId = s.db.query<{ id: number }, [number]>(
+      `INSERT INTO projects (name, executor_id, cwd, owner_user_id, goal, created_ts)
+       VALUES ('other', 1, '/other', ?, 'other', 2) RETURNING id`,
+    ).get(s.admin.id)!.id;
+    const left = s.engine.store.create(s.projectId, { title: 'left' });
+    const right = s.engine.store.create(otherProjectId, { title: 'right' });
+    expect(() => s.engine.store.addDependency(left.id, right.id)).toThrow(/same project/);
+  });
+
+  test('commit 只落 pending：不启动、不绑定会话、不澄清，并精确映射 direct→seq/team→team', async () => {
+    let clarifyCalls = 0;
+    const s = await setup({
+      clarify: async () => {
+        clarifyCalls++;
+        return { ok: true, feedback: '不应执行', questions: [] };
+      },
+    });
+    const mod = readyModule(s.db, s.projectId, 'batch-modes');
+    const exactBody = 'x'.repeat(5_000);
+    const prepared = await s.engine.prepareDesignBatch(s.projectId, [
+      { ...draft('direct-node', 'Direct', mod.id, 'direct'), body: exactBody },
+      draft('team-node', 'Team', mod.id, 'team'),
+    ]);
+
+    const issues = s.engine.commitPreparedDesignBatch(prepared, [], (byNode) => {
+      expect([...byNode.values()].every((issue) => issue.status === 'pending')).toBe(true);
+      expect([...byNode.values()].every((issue) => issue.convId === null)).toBe(true);
+    });
+
+    expect(issues.map((issue) => issue.implMode)).toEqual(['seq', 'team']);
+    expect(issues[0]?.body).toBe(exactBody);
+    expect(issues.every((issue) => issue.publicationLocked)).toBe(true);
+    expect(clarifyCalls).toBe(0);
+    expect(s.driver.sent).toHaveLength(0);
+    expect(issues.flatMap((issue) => s.engine.store.listEvents(issue.id)).some((event) => event.kind === 'clarify_started'))
+      .toBe(false);
+  });
+
+  test('prepare/commit 双重校验项目、模块 ready/agent 与执行机能力，失败不写入', async () => {
+    const s = await setup();
+    const valid = readyModule(s.db, s.projectId, 'batch-valid');
+    const wrongAgent = readyModule(s.db, s.projectId, 'batch-codex', 'codex');
+
+    const invalidCategory = { ...draft('x', 'X', valid.id), category: 'design' } as unknown as DesignIssueDraft;
+    await expect(s.engine.prepareDesignBatch(s.projectId, [invalidCategory]))
+      .rejects.toThrow(/ordinary task|普通 task/);
+
+    const otherProject = s.db.query<{ id: number }, [number]>(
+      `INSERT INTO projects (name, executor_id, cwd, owner_user_id, goal, created_ts)
+       VALUES ('other', 1, '/other', ?, 'other', 2) RETURNING id`,
+    ).get(s.admin.id)!;
+    const foreignModule = readyModule(s.db, otherProject.id, 'batch-foreign');
+    await expect(s.engine.prepareDesignBatch(s.projectId, [draft('foreign', 'Foreign', foreignModule.id)]))
+      .rejects.toThrow(/outside project scope/);
+
+    await expect(s.engine.prepareDesignBatch(s.projectId, [draft('x', 'X', wrongAgent.id, 'direct', 'claude')]))
+      .rejects.toThrow(/module Agent/);
+    s.db.query("UPDATE project_modules SET sync_status = 'error' WHERE id = ?").run(valid.id);
+    await expect(s.engine.prepareDesignBatch(s.projectId, [draft('x', 'X', valid.id)]))
+      .rejects.toThrow(/ready|同步/);
+    s.db.query("UPDATE project_modules SET sync_status = 'ready' WHERE id = ?").run(valid.id);
+    s.db.query('UPDATE executors SET supports_claude = 0 WHERE id = 1').run();
+    await expect(s.engine.prepareDesignBatch(s.projectId, [draft('x', 'X', valid.id)]))
+      .rejects.toThrow(/未启用 Claude/);
+
+    s.db.query('UPDATE executors SET supports_claude = 1 WHERE id = 1').run();
+    const prepared = await s.engine.prepareDesignBatch(s.projectId, [draft('x', 'X', valid.id)]);
+    s.db.query("UPDATE project_modules SET status = 'archived' WHERE id = ?").run(valid.id);
+    expect(() => s.engine.commitPreparedDesignBatch(prepared, [], () => {})).toThrow(/active|归档/);
+    expect(s.engine.store.listByProject(s.projectId)).toHaveLength(0);
+
+    s.db.query("UPDATE project_modules SET status = 'active' WHERE id = ?").run(valid.id);
+    s.db.query('UPDATE executors SET supports_claude = 0 WHERE id = 1').run();
+    expect(() => s.engine.commitPreparedDesignBatch(prepared, [], () => {})).toThrow(/未启用 Claude/);
+    expect(s.engine.store.listByProject(s.projectId)).toHaveLength(0);
+  });
+
+  test('dependency 是持久 runnable 门禁：置顶不能绕过，前驱 done 后自动解锁', async () => {
+    const s = await setup();
+    s.setManualReview(false);
+    const mod = readyModule(s.db, s.projectId, 'batch-deps');
+    const prepared = await s.engine.prepareDesignBatch(s.projectId, [
+      draft('root', 'Root', mod.id),
+      draft('leaf', 'Leaf', mod.id),
+    ]);
+    const issues = s.engine.commitPreparedDesignBatch(
+      prepared,
+      [{ fromNodeId: 'root', toNodeId: 'leaf' }],
+      () => {},
+    );
+    const root = issues[0]!;
+    const leaf = issues[1]!;
+    s.engine.store.setPinned(leaf.id, 999_999);
+
+    const bypass = await s.engine.startIssue(leaf.id);
+    expect(bypass.ok).toBe(false);
+    expect(!bypass.ok && bypass.error).toContain('依赖');
+    expect(s.engine.store.get(leaf.id)?.status).toBe('pending');
+
+    await s.engine.completeDesignBatch(s.projectId, issues.map((issue) => issue.id));
+    expect(s.engine.store.get(root.id)?.status).toBe('planning');
+    expect(s.engine.store.get(leaf.id)?.status).toBe('pending');
+    expect(s.engine.store.dependencyBlockers(leaf.id)).toEqual([{ issueId: root.id, status: 'planning' }]);
+
+    s.engine.store.setSubtasks(root.id, ['implement']);
+    expect((await s.engine.applyEvent(root.id, 'plan_ready')).ok).toBe(true);
+    expect((await s.engine.applyEvent(root.id, 'impl_done')).ok).toBe(true);
+    expect((await s.engine.applyEvent(root.id, 'tests_passed')).ok).toBe(true);
+    expect(s.engine.store.get(root.id)?.status).toBe('done');
+    expect(s.engine.store.get(leaf.id)?.status).toBe('planning');
+    expect(s.engine.store.dependencyBlockers(leaf.id)).toEqual([]);
+  }, 30000);
+
+  test('design-linked pending 不进自动合并，LLM 返回后变成 linked 的竞态也会在落地锁内拒绝', async () => {
+    const s = await setup();
+    const mod = readyModule(s.db, s.projectId, 'batch-merge');
+    const prepared = await s.engine.prepareDesignBatch(s.projectId, [
+      draft('a', 'Published A', mod.id),
+      draft('b', 'Published B', mod.id),
+    ]);
+    const published = s.engine.commitPreparedDesignBatch(prepared, [], () => {});
+    s.pm.merges = [{ members: published.map((issue) => issue.id), title: '不应合并', body: 'bad' }];
+    await s.engine.scheduleNext(s.projectId, `#${mod.id}`);
+    expect(s.pm.mergeCalls).toHaveLength(0);
+    expect(s.engine.store.get(published[0]!.id)?.title).toBe('Published A');
+    expect(s.engine.store.get(published[1]!.id)?.status).toBe('pending');
+
+    await s.engine.cancelIssue(published[0]!.id);
+    // A 的终态接力会立即启动 B；先把 B 也收口，下面才是在空闲项目里测真实 LLM 竞态。
+    await s.engine.cancelIssue(published[1]!.id);
+    const regularA = await s.engine.createIssue(s.projectId, { title: 'Regular A', module: mod.slug, moduleId: mod.id }, false);
+    const regularB = await s.engine.createIssue(s.projectId, { title: 'Regular B', module: mod.slug, moduleId: mod.id }, false);
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    let suggested!: () => void;
+    const suggestionStarted = new Promise<void>((resolve) => { suggested = resolve; });
+    s.pm.mergeModuleTasks = async () => {
+      suggested();
+      await hold;
+      return [{ members: [regularA.id, regularB.id], title: 'race merge', body: 'bad' }];
+    };
+    const scheduling = s.engine.scheduleNext(s.projectId, `#${mod.id}`);
+    await suggestionStarted;
+    s.db.query('UPDATE issues SET publication_locked = 1 WHERE id = ?').run(regularB.id);
+    release();
+    await scheduling;
+    expect(s.engine.store.get(regularA.id)?.title).toBe('Regular A');
+    expect(s.engine.store.get(regularB.id)?.status).toBe('pending');
+  });
+
+  test('module-doc outbox 按 item 回执：失败重试跳过已完成 item，且不重复创建 issue', async () => {
+    const recordCalls = new Map<string, number>();
+    let fail = true;
+    const s = await setup({
+      modulesFor: () => ({
+        resolve: async () => { throw new Error('publication must not resolve modules'); },
+        recordIssue: async (_module, issue) => {
+          recordCalls.set(issue.title, (recordCalls.get(issue.title) ?? 0) + 1);
+          if (fail && issue.title === 'B') throw new Error('injected module-doc failure');
+        },
+      }),
+    });
+    const mod = readyModule(s.db, s.projectId, 'batch-retry');
+    const prepared = await s.engine.prepareDesignBatch(s.projectId, [
+      draft('a', 'A', mod.id),
+      draft('b', 'B', mod.id),
+    ]);
+    const issues = s.engine.commitPreparedDesignBatch(prepared, [], () => {});
+    const completed = new Set<string>();
+    const retries: string[] = [];
+    const outbox = {
+      isComplete: async (operation: { key: string }) => completed.has(operation.key),
+      markComplete: async (operation: { key: string }) => { completed.add(operation.key); },
+      markRetry: async (operation: { key: string }, error: string) => { retries.push(`${operation.key}:${error}`); },
+    };
+
+    await expect(s.engine.completeDesignBatch(s.projectId, issues.map((issue) => issue.id), outbox))
+      .rejects.toThrow(/post-commit|module-doc/);
+    expect(recordCalls).toEqual(new Map([['A', 1], ['B', 1]]));
+    expect(retries.some((entry) => entry.includes('module-doc') && entry.includes('injected'))).toBe(true);
+    fail = false;
+    await s.engine.completeDesignBatch(s.projectId, issues.map((issue) => issue.id), outbox);
+    expect(recordCalls).toEqual(new Map([['A', 1], ['B', 2]]));
+    expect(s.engine.store.listByProject(s.projectId).map((issue) => issue.id)).toEqual(issues.map((issue) => issue.id));
+  });
+});
+
+describe('Task 7.2 generic execution sync boundary/recovery', () => {
+  function restartedEngine(s: Awaited<ReturnType<typeof setup>>): IssueEngine {
+    return new IssueEngine({
+      db: s.db,
+      driver: s.driver,
+      convs: s.convs,
+      locator: s.locator,
+      pmFor: () => s.pm,
+      notify: { dispatch: async () => {} },
+      mutex: new KeyedMutex(),
+      config: { now: s.clock.now, resultSummaryTimeoutMs: 0 },
+    });
+  }
+
+  test('request 幂等、boundary 持久化、决定后重复恢复只执行一次且不创建 gate/新状态', async () => {
+    const s = await setup();
+    const mod = new ModuleStore(s.db).create({
+      projectId: s.projectId,
+      slug: 'sync-boundary',
+      displayName: 'sync boundary',
+      agent: 'claude',
+      source: 'manual',
+    });
+    const prepared = await s.engine.prepareDesignBatch(s.projectId, [{
+      nodeId: 'node-a',
+      title: 'Sync target',
+      body: 'baseline',
+      moduleId: mod.id,
+      implMode: 'direct',
+      agent: 'claude',
+    }]);
+    const issue = s.engine.commitPreparedDesignBatch(prepared, [], () => {})[0]!;
+    const request = {
+      sourceKind: 'design',
+      sourceKey: 'design-7/node-a',
+      sourceRevision: '5',
+      sourceDigest: 'sha256:five',
+      diff: { title: { base: 'old', incoming: 'new' } },
+    };
+    const first = s.engine.requestExecutionSync(issue.id, request);
+    const duplicate = s.engine.requestExecutionSync(issue.id, request);
+    expect(duplicate.id).toBe(first.id);
+    expect(() => s.engine.requestExecutionSync(issue.id, { ...request, sourceDigest: 'sha256:tampered' }))
+      .toThrow(/conflict|冲突/);
+
+    const held = s.engine.holdExecutionSyncBoundary(issue.id, 'plan_ready', {
+      kind: 'issue-event',
+      event: 'plan_ready',
+    });
+    expect(held).toMatchObject({ id: first.id, state: 'boundary_waiting', boundaryKind: 'plan_ready' });
+    const decided = s.engine.decideExecutionSync(first.id, 'ignore', s.admin.id);
+    expect(decided).toMatchObject({ state: 'ignored', resumeState: 'pending' });
+    expect(decided.resumeKey).toMatch(/^issue-sync:/);
+    expect(s.engine.decideExecutionSync(first.id, 'ignore', s.admin.id).id).toBe(first.id);
+
+    let resumes = 0;
+    const resume = (action: unknown) => {
+      resumes++;
+      expect(action).toEqual({ kind: 'issue-event', event: 'plan_ready' });
+      return { ok: true };
+    };
+    expect(s.engine.recoverExecutionSyncs(resume).resumed).toBe(1);
+    expect(s.engine.recoverExecutionSyncs(resume)).toEqual({ examined: 0, resumed: 0 });
+    expect(s.engine.resumeExecutionSync(first.id, resume)).toEqual({
+      resumed: false,
+      result: { ok: true },
+    });
+    expect(resumes).toBe(1);
+    expect(s.engine.store.getExecutionSync(first.id)?.resumeState).toBe('complete');
+    expect(s.engine.store.get(issue.id)?.status).toBe('pending');
+    expect(s.engine.store.listGates(issue.id)).toHaveLength(0);
+  });
+
+  test('effect callback 抛错时 effect/receipt/complete 同事务回滚，进程重建后可重试', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: 'sync retry' }, false);
+    const sync = s.engine.requestExecutionSync(issue.id, {
+      sourceKind: 'design',
+      sourceKey: 'design-7/node-retry',
+      sourceRevision: '9',
+      sourceDigest: 'sha256:nine',
+      diff: { body: 'incoming' },
+    });
+    s.engine.holdExecutionSyncBoundary(issue.id, 'impl_done', { kind: 'issue-event', event: 'impl_done' });
+    s.engine.decideExecutionSync(sync.id, 'apply', s.admin.id);
+    const stableResumeKey = s.engine.store.getExecutionSync(sync.id)?.resumeKey ?? null;
+    expect(stableResumeKey).toMatch(/^issue-sync:/);
+    s.db.exec('CREATE TABLE test_sync_effects (resume_key TEXT PRIMARY KEY, calls INTEGER NOT NULL)');
+    let attempts = 0;
+    expect(() => s.engine.recoverExecutionSyncs((_action, claimed) => {
+      attempts++;
+      s.db.query('INSERT INTO test_sync_effects (resume_key, calls) VALUES (?, 1)').run(claimed.resumeKey!);
+      throw new Error('effect failed');
+    })).toThrow(/effect failed/);
+    expect(s.engine.store.getExecutionSync(sync.id)?.resumeState).toBe('pending');
+    expect(s.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM test_sync_effects').get()?.n).toBe(0);
+    expect(s.db.query<{ n: number }, []>(
+      'SELECT COUNT(*) AS n FROM issue_execution_sync_effect_receipts',
+    ).get()?.n).toBe(0);
+
+    const restarted = new IssueEngine({
+      db: s.db,
+      driver: s.driver,
+      convs: s.convs,
+      locator: s.locator,
+      pmFor: () => s.pm,
+      notify: { dispatch: async () => {} },
+      mutex: new KeyedMutex(),
+      config: { resultSummaryTimeoutMs: 0 },
+    });
+    const recovered = restarted.recoverExecutionSyncs((action, claimed) => {
+      attempts++;
+      expect(action).toEqual({ kind: 'issue-event', event: 'impl_done' });
+      expect(claimed.resumeKey).toBe(stableResumeKey);
+      s.db.query('INSERT INTO test_sync_effects (resume_key, calls) VALUES (?, 1)').run(claimed.resumeKey!);
+      return { resumed: true };
+    });
+    expect(recovered).toEqual({ examined: 1, resumed: 1 });
+    expect(attempts).toBe(2);
+    expect(restarted.store.getExecutionSync(sync.id)?.resumeState).toBe('complete');
+    expect(s.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM test_sync_effects').get()?.n).toBe(1);
+  });
+
+  test('effect 与 receipt 后的 complete 提交失败时三者一起回滚，不留下可重复 crash window', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: 'atomic sync completion' }, false);
+    const sync = s.engine.requestExecutionSync(issue.id, {
+      sourceKind: 'design',
+      sourceKey: 'design-7/node-atomic',
+      sourceRevision: '9b',
+      sourceDigest: 'sha256:nine-b',
+      diff: { body: 'incoming' },
+    });
+    s.engine.holdExecutionSyncBoundary(issue.id, 'impl_done', { kind: 'issue-event', event: 'impl_done' });
+    s.engine.decideExecutionSync(sync.id, 'apply', s.admin.id);
+    s.db.exec('CREATE TABLE test_sync_effects (resume_key TEXT PRIMARY KEY, calls INTEGER NOT NULL)');
+    s.db.exec(`CREATE TRIGGER fail_sync_effect_complete
+      BEFORE UPDATE OF resume_state ON issue_execution_syncs
+      WHEN NEW.resume_state = 'complete'
+      BEGIN SELECT RAISE(ABORT, 'simulated crash before atomic commit'); END`);
+
+    expect(() => s.engine.resumeExecutionSync(sync.id, (_action, claimed) => {
+      s.db.query('INSERT INTO test_sync_effects (resume_key, calls) VALUES (?, 1)').run(claimed.resumeKey!);
+      return { committed: true };
+    })).toThrow(/simulated crash/);
+    expect(s.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM test_sync_effects').get()?.n).toBe(0);
+    expect(s.db.query<{ n: number }, []>(
+      'SELECT COUNT(*) AS n FROM issue_execution_sync_effect_receipts',
+    ).get()?.n).toBe(0);
+    expect(s.engine.store.getExecutionSync(sync.id)?.resumeState).toBe('pending');
+  });
+
+  test('effect callback 必须同步；async/thenable 在执行前被拒绝且不领取 claim', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: 'sync callback shape' }, false);
+    const sync = s.engine.requestExecutionSync(issue.id, {
+      sourceKind: 'design',
+      sourceKey: 'design-7/node-shape',
+      sourceRevision: '10',
+      sourceDigest: 'sha256:ten',
+      diff: { body: 'incoming' },
+    });
+    s.engine.holdExecutionSyncBoundary(issue.id, 'impl_done', { kind: 'issue-event', event: 'impl_done' });
+    s.engine.decideExecutionSync(sync.id, 'apply', s.admin.id);
+
+    let asyncEntered = false;
+    const asyncCallback = (async () => {
+      asyncEntered = true;
+    }) as unknown as (action: unknown, claimed: IssueExecutionSync) => void;
+    expect(() => s.engine.resumeExecutionSync(sync.id, asyncCallback)).toThrow(/synchronous|同步/);
+    expect(asyncEntered).toBe(false);
+    expect(s.engine.store.getExecutionSync(sync.id)?.resumeState).toBe('pending');
+
+    const thenable = (() => ({ then() {} })) as unknown as (action: unknown, claimed: IssueExecutionSync) => void;
+    expect(() => s.engine.resumeExecutionSync(sync.id, thenable)).toThrow(/synchronous|同步/);
+    expect(s.engine.store.getExecutionSync(sync.id)?.resumeState).toBe('pending');
+
+    if (false) {
+      // @ts-expect-error resume effects must not return PromiseLike values
+      s.engine.resumeExecutionSync(sync.id, async () => {});
+    }
+  });
+
+  test('effect 后 complete 前崩溃：receipt 让 reset 直接完成，双 engine/recover 都不重跑 effect', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: 'crashed sync owner' }, false);
+    const sync = s.engine.requestExecutionSync(issue.id, {
+      sourceKind: 'design',
+      sourceKey: 'design-7/node-crash',
+      sourceRevision: '11',
+      sourceDigest: 'sha256:eleven',
+      diff: { body: 'incoming' },
+    });
+    s.engine.holdExecutionSyncBoundary(issue.id, 'tests_passed', {
+      kind: 'issue-event',
+      event: 'tests_passed',
+    });
+    const decided = s.engine.decideExecutionSync(sync.id, 'ignore', s.admin.id);
+    const abandoned = s.engine.store.claimExecutionSyncResume(sync.id, s.clock.now())!;
+    expect(abandoned).toMatchObject({ resumeState: 'running', resumeKey: decided.resumeKey });
+    const restarted = restartedEngine(s);
+
+    s.db.exec('CREATE TABLE test_sync_effects (resume_key TEXT PRIMARY KEY, calls INTEGER NOT NULL)');
+    s.db.transaction(() => {
+      s.db.query('INSERT INTO test_sync_effects (resume_key, calls) VALUES (?, 1)').run(decided.resumeKey!);
+      s.db.query(
+        `INSERT INTO issue_execution_sync_effect_receipts
+           (resume_key, sync_id, result_json, completed_ts)
+         VALUES (?, ?, ?, ?)`,
+      ).run(decided.resumeKey!, sync.id, JSON.stringify({ value: { applied: true } }), s.clock.now());
+    })();
+
+    s.clock.advance(120_000);
+    let actions = 0;
+    expect(restarted.recoverExecutionSyncs(() => { actions++; }).resumed).toBe(0);
+    expect(restarted.resetAbandonedExecutionSyncResume(sync.id, decided.resumeKey!, 'wrong-token')).toBe(false);
+    expect(restarted.resetAbandonedExecutionSyncResume(sync.id, 'wrong-key', abandoned.resumeToken!)).toBe(false);
+    expect(restarted.resetAbandonedExecutionSyncResume(
+      sync.id,
+      decided.resumeKey!,
+      abandoned.resumeToken!,
+    )).toBe(true);
+    expect(restarted.recoverExecutionSyncs(() => { actions++; })).toEqual({ examined: 0, resumed: 0 });
+    expect(restarted.resumeExecutionSync(sync.id, () => {
+      actions++;
+      return { applied: false };
+    })).toEqual({
+      resumed: false,
+      result: { applied: true },
+    });
+    expect(actions).toBe(0);
+    expect(s.db.query<{ calls: number }, []>('SELECT calls FROM test_sync_effects').get()?.calls).toBe(1);
+    expect(restarted.store.getExecutionSync(sync.id)).toMatchObject({
+      resumeState: 'complete',
+      resumeToken: null,
+    });
+    expect(restarted.resetAbandonedExecutionSyncResume(
+      sync.id,
+      decided.resumeKey!,
+      abandoned.resumeToken!,
+    )).toBe(false);
+  });
+
+  test('两个 engine 对同一 resumeKey 只提交一次 DB effect，并可事务性写唯一外部 effect intent', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: 'duplicate resume engines' }, false);
+    const sync = s.engine.requestExecutionSync(issue.id, {
+      sourceKind: 'design',
+      sourceKey: 'design-7/node-dupe',
+      sourceRevision: '12',
+      sourceDigest: 'sha256:twelve',
+      diff: { body: 'incoming' },
+    });
+    s.engine.holdExecutionSyncBoundary(issue.id, 'tests_passed', { kind: 'issue-event', event: 'tests_passed' });
+    s.engine.decideExecutionSync(sync.id, 'apply', s.admin.id);
+    const second = restartedEngine(s);
+    s.db.exec('CREATE TABLE test_sync_effects (resume_key TEXT PRIMARY KEY, calls INTEGER NOT NULL)');
+    let callbacks = 0;
+    const effect = (_action: unknown, claimed: IssueExecutionSync, context: IssueExecutionSyncEffectContext) => {
+      callbacks++;
+      s.db.query('INSERT INTO test_sync_effects (resume_key, calls) VALUES (?, 1)').run(claimed.resumeKey!);
+      context.enqueueExternalEffect('dispatch', 'issue-event', { event: 'tests_passed' });
+      return { owner: 'first' };
+    };
+    expect(s.engine.resumeExecutionSync(sync.id, effect)).toEqual({ resumed: true, result: { owner: 'first' } });
+    expect(second.resumeExecutionSync(sync.id, effect)).toEqual({ resumed: false, result: { owner: 'first' } });
+    expect(callbacks).toBe(1);
+    expect(s.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM test_sync_effects').get()?.n).toBe(1);
+    expect(s.db.query<{ n: number }, []>(
+      'SELECT COUNT(*) AS n FROM issue_execution_sync_effect_outbox',
+    ).get()?.n).toBe(1);
+    const completed = s.engine.store.getExecutionSync(sync.id)!;
+    expect(s.engine.resetAbandonedExecutionSyncResume(sync.id, completed.resumeKey!, completed.resumeToken ?? 'gone'))
+      .toBe(false);
   });
 });

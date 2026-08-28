@@ -167,17 +167,24 @@ export function buildSubtaskPrompt(opts: {
   idx: number;
   branch: string;
   locale?: SupportedLocale;
+  resumeKey?: string;
 }): string {
   const { issue, subtasks, idx, branch } = opts;
   const sub = midTruncate(subtasks[idx] ?? '', BUDGET_SUBTASK);
-  const zh = `【实施 子任务 ${idx + 1}/${subtasks.length}】${sub}。` +
+  const resumeZh = opts.resumeKey
+    ? `SYNC_RESUME_KEY:${opts.resumeKey}。若已处理过完全相同的 key，不得重复执行该子任务。`
+    : '';
+  const resumeEn = opts.resumeKey
+    ? `SYNC_RESUME_KEY:${opts.resumeKey}. If this exact key was already processed, do not execute the subtask again. `
+    : '';
+  const zh = resumeZh + `【实施 子任务 ${idx + 1}/${subtasks.length}】${sub}。` +
       `当前工作分支 ${branch}，不要自行切换分支或合并。` +
       `流程按改动规模裁剪：小改动直接改，别为这一条走「头脑风暴→写计划文档→TDD」全套。` +
       `完成并跑相关测试通过后，单独输出一行：SUBTASK_DONE:${issue.id}。` +
       `若必须我先拍板/补充信息才能继续，按编号列出问题并单独输出一行：NEED_CLARIFY:${issue.id}，我回答后再继续；` +
       `若卡住无法完成，单独输出一行：ISSUE_BLOCKED:${issue.id} 简短原因。` +
       `完成本子任务前别做清单外的事。`;
-  const en = `[Implementation subtask ${idx + 1}/${subtasks.length}] ${sub}. ` +
+  const en = resumeEn + `[Implementation subtask ${idx + 1}/${subtasks.length}] ${sub}. ` +
     `The current working branch is ${branch}; do not switch or merge branches. Scale the process to the change. ` +
     `After completing it and passing relevant tests, output SUBTASK_DONE:${issue.id} on its own line. ` +
     `If a user decision or missing information is essential, list numbered questions and output NEED_CLARIFY:${issue.id} on its own line. ` +

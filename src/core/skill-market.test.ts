@@ -25,6 +25,8 @@ import {
   removeMarket,
   scanMarketSkills,
   syncMarkets,
+  updateMarket,
+  marketSnapshot,
 } from './skill-market';
 
 function makeDb(): Database {
@@ -90,6 +92,24 @@ describe('seed 迁移与源管理', () => {
     expect(existsSync(join(baseDir, 'm1'))).toBe(false);
     expect(db.query('SELECT COUNT(*) c FROM skill_i18n').get()).toEqual({ c: 0 });
     expect(removeMarket(db, 'm1', baseDir).ok).toBe(false);
+  });
+
+  test('updateMarket validates and atomically preserves source identity', () => {
+    const db = makeDb();
+    const before = listMarkets(db).find((market) => market.name === 'superpowers')!;
+    expect(updateMarket(db, 'superpowers', {
+      repo: 'openai/superpowers', subdir: 'skills', note: 'personas', enabled: false,
+    })).toEqual({ ok: true });
+    const after = listMarkets(db).find((market) => market.name === 'superpowers')!;
+    expect(after).toMatchObject({
+      id: before.id,
+      repo: 'https://github.com/openai/superpowers.git',
+      subdir: 'skills',
+      note: 'personas',
+      enabled: false,
+    });
+    expect(updateMarket(db, 'superpowers', { subdir: '../escape' }).ok).toBe(false);
+    expect(updateMarket(db, 'missing', { enabled: true }).ok).toBe(false);
   });
 });
 
@@ -172,6 +192,10 @@ describe('git 同步（本地 file:// 仓库）', () => {
     expect(good.count).toBe(1);
     expect(bad.ok).toBe(false);
     expect(listMarkets(db).find((m) => m.name === 'bad-m')!.lastError).toBeTruthy();
+    expect((await marketSnapshot(db, 'local-m', baseDir))?.commit).toMatch(/^[a-f0-9]{40}$/);
+    db.query("UPDATE skill_markets SET repo = 'https://example.com/other.git' WHERE name = 'local-m'").run();
+    expect(await marketSnapshot(db, 'local-m', baseDir)).toBeNull();
+    db.query('UPDATE skill_markets SET repo = ? WHERE name = ?').run(remote, 'local-m');
     // 远端加技能 → pull 增量可见
     mkdirSync(join(remote, 'second'));
     writeFileSync(join(remote, 'second', 'SKILL.md'), '# 2');

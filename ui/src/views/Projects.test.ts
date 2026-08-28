@@ -110,7 +110,7 @@ describe('迁移工程目录（admin）', () => {
   });
 });
 
-describe('统一项目导入界面（issue #7）', () => {
+describe('统一项目导入界面（issue #7/#28）', () => {
   const modal = source.match(/function ImportProjectModal[\s\S]*?\n}\s*$/)?.[0] ?? '';
 
   test('入口与弹窗不再限定 tmux，并提供三类执行机来源', () => {
@@ -126,6 +126,9 @@ describe('统一项目导入界面（issue #7）', () => {
     expect(source).toContain('ProjectImportResponse');
     expect(modal).toContain("? { session: (picked as TmuxSessionInfo).name }");
     expect(modal).toContain(": { cwd: (picked as AgentProjectImportCandidate).cwd }");
+    expect(modal).toContain("const [kind, setKind] = useState<ProjectKind>('issue')");
+    expect(modal).toContain('<ProjectKindField kind={kind} onChange={setKind} helpId="import-project-kind-help" />');
+    expect(modal).toContain('executorId: eid,\n          kind,');
     expect(source).toContain("nav(p.kind === 'chat' ? `/p/${p.id}/chat` : `/p/${p.id}`)");
     expect(modal).toContain("tr('project.linkedHistory'");
   });
@@ -138,6 +141,9 @@ describe('统一项目导入界面（issue #7）', () => {
     expect(modal).toContain('role="alert"');
     expect(modal).toContain('disabled={!sourceEnabled(value)}');
     expect(modal).not.toContain('style={{');
+    expect(source).toContain('aria-pressed={kind === \'issue\'}');
+    expect(source).toContain('aria-describedby={helpId}');
+    expect(source).toContain('role="status" aria-live="polite"');
   });
 
   test('PandaDOS 样式覆盖焦点、桌面/窄屏、触屏、Hover 与禁用态', () => {
@@ -145,7 +151,10 @@ describe('统一项目导入界面（issue #7）', () => {
     expect(css).toContain('.import-source-option:focus-visible, .import-candidate:focus-visible');
     expect(css).toContain('@media (hover: hover) {\n  .import-source-option:hover:not(:disabled)');
     expect(css).toContain('.import-candidate:disabled { opacity: 0.45; cursor: not-allowed; transition: none; }');
-    expect(css).toContain('@media (max-width: 559px) {\n  .import-source-options { grid-template-columns: 1fr;');
-    expect(css).toContain('@media (pointer: coarse) {\n  .import-source-option, .import-candidate { min-height: 64px; }');
+    expect(css).toContain('.import-source-options { grid-template-columns: 1fr; gap: 6px; }');
+    expect(css).toContain('.import-source-option, .import-candidate { min-height: 64px; }');
+    expect(css).toContain('.project-kind-options .seg-btn:focus-visible');
+    expect(css).toContain('@media (max-width: 559px) {\n  .project-kind-options { flex-direction: column;');
+    expect(css).toContain('@media (pointer: coarse) {\n  .project-kind-options .seg-btn { min-height: 44px; }');
   });
 });

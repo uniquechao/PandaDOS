@@ -6,6 +6,14 @@ import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
 import { projectSettingsMessages } from '../domains/project-settings';
 import { externalImportMessages } from '../domains/external-import';
+import { designWorkbenchMessages } from '../domains/design-workbench';
+import { designWorkbenchAdvancedMessages } from '../domains/design-workbench-advanced';
+import { designAssetsUiMessages } from '../domains/design-assets-ui';
+import { designFinalUiMessages } from '../domains/design-final-ui';
+import { designReviewFixMessages } from '../domains/design-review-fixes';
+import { designSnapshotUiMessages } from '../domains/design-snapshot-ui';
+import { designConfirmationUiMessages } from '../domains/design-confirmation-ui';
+import { workflowMessages } from '../domains/workflows';
 
 export const enCatalog = {
   ...shellMessages.en,
@@ -16,6 +24,14 @@ export const enCatalog = {
   ...notifyMessages.en,
   ...projectSettingsMessages.en,
   ...externalImportMessages.en,
+  ...designWorkbenchMessages.en,
+  ...designWorkbenchAdvancedMessages.en,
+  ...designAssetsUiMessages.en,
+  ...designFinalUiMessages.en,
+  ...designReviewFixMessages.en,
+  ...designSnapshotUiMessages.en,
+  ...designConfirmationUiMessages.en,
+  ...workflowMessages.en,
   'common.cancel': 'Cancel',
   'common.close': 'Close',
   'common.loading': 'Loading…',

@@ -77,11 +77,62 @@ const ERROR_MESSAGE_KEYS: Readonly<Record<string, MessageKey>> = {
   'external_issue.agent_unavailable': 'errors.external_issue.agent_unavailable',
   'external_issue.git_invalid': 'errors.external_issue.git_invalid',
   'external_issue.import_failed': 'errors.external_issue.import_failed',
+  'workflow.graph_invalid': 'errors.workflow.graph_invalid',
+  'workflow.save_failed': 'errors.workflow.save_failed',
+  'workflow.name_invalid': 'errors.workflow.name_invalid',
+  'workflow.description_invalid': 'errors.workflow.description_invalid',
+  'workflow.name_conflict': 'errors.workflow.name_conflict',
+  'workflow.not_found': 'errors.workflow.not_found',
+  'workflow.selection_invalid': 'errors.workflow.selection_invalid',
+  'workflow.inactive': 'errors.workflow.inactive',
+  'workflow.agent_unavailable': 'errors.workflow.agent_unavailable',
+  'workflow.status_invalid': 'errors.workflow.status_invalid',
+  'workflow.patch_required': 'errors.workflow.patch_required',
   'issue.not_found': 'errors.issue.not_found',
   'issue.subtask_text_required': 'errors.issue.subtask_text_required',
   'issue.subtask_text_too_long': 'errors.issue.subtask_text_too_long',
   'issue.subtask_not_found': 'errors.issue.subtask_not_found',
   'issue.subtask_already_dispatched': 'errors.issue.subtask_already_dispatched',
+  'design.invalid_request': 'errors.design.invalid_request',
+  'design.not_found': 'errors.design.not_found',
+  'design.agent_invalid': 'errors.design.agent_invalid',
+  'design.agent_unavailable': 'errors.design.agent_unavailable',
+  'design.module_invalid': 'errors.design.module_invalid',
+  'design.module_agent_mismatch': 'errors.design.module_agent_mismatch',
+  'design.revision_conflict': 'errors.design.revision_conflict',
+  'design.archived': 'errors.design.archived',
+  'design.forbidden': 'errors.design.forbidden',
+  'design.stage_conflict': 'errors.design.stage_conflict',
+  'design.graph_invalid': 'errors.design.graph_invalid',
+  'design.not_ready': 'errors.design.not_ready',
+  'design.operation_failed': 'errors.design.operation_failed',
+  'design.conversation_reserved': 'errors.design.conversation_reserved',
+  'design.conversation_failed': 'errors.design.conversation_failed',
+  'design.conversation_cleanup_failed': 'errors.design.conversation_cleanup_failed',
+  'design.idempotency_conflict': 'errors.design.idempotency_conflict',
+  'design.not_approved': 'errors.design.not_approved',
+  'design.confirmation_invalid': 'errors.design.confirmation_invalid',
+  'design.confirmation_expired': 'errors.design.confirmation_expired',
+  'design.confirmation_consumed': 'errors.design.confirmation_consumed',
+  'design.confirmation_mismatch': 'errors.design.confirmation_mismatch',
+  'design.already_published': 'errors.design.already_published',
+  'design.sync_not_found': 'errors.design.sync_not_found',
+  'design.sync_stale': 'errors.design.sync_stale',
+  'design.sync_conflict': 'errors.design.sync_conflict',
+  'design.sync_not_actionable': 'errors.design.sync_not_actionable',
+  'design.sync_invalid': 'errors.design.sync_invalid',
+  'design.persona_invalid': 'errors.design.persona_invalid',
+  'design.persona_not_found': 'errors.design.persona_not_found',
+  'design.persona_incompatible': 'errors.design.persona_incompatible',
+  'design.persona_approval_required': 'errors.design.persona_approval_required',
+  'design.persona_hash_stale': 'errors.design.persona_hash_stale',
+  'design.persona_source_invalid': 'errors.design.persona_source_invalid',
+  'design.persona_source_not_found': 'errors.design.persona_source_not_found',
+  'design.persona_discovery_failed': 'errors.design.persona_discovery_failed',
+  'design.persona_market_sync_failed': 'errors.design.persona_market_sync_failed',
+  'design.persona_operation_failed': 'errors.design.persona_operation_failed',
+  'design.persona_collision': 'errors.design.persona_collision',
+  'design.persona_publish_conflict': 'errors.design.persona_publish_conflict',
   'legacy.error': 'errors.legacy.error',
   'network.unreachable': 'errors.network.unreachable',
   'http.unexpected_response': 'errors.http.unexpected_response',
@@ -153,6 +204,10 @@ export function setOnUnauthorized(fn: () => void): void {
 export interface ApiOpts {
   /** true = 401 不触发全局登出回调（登录页自己展示错误） */
   silent401?: boolean;
+  /** Stable caller-owned key reused when retrying an idempotent mutation. */
+  idempotencyKey?: string;
+  /** Cancels requests superseded by a newer route, poll, or mutation refresh. */
+  signal?: AbortSignal;
 }
 
 export async function api<T>(
@@ -162,10 +217,14 @@ export async function api<T>(
   opts: ApiOpts = {},
 ): Promise<T> {
   const init: RequestInit = { method };
+  if (opts.signal !== undefined) init.signal = opts.signal;
+  const headers = new Headers();
   if (body !== undefined) {
-    init.headers = { 'content-type': 'application/json' };
+    headers.set('content-type', 'application/json');
     init.body = JSON.stringify(body);
   }
+  if (opts.idempotencyKey !== undefined) headers.set('Idempotency-Key', opts.idempotencyKey);
+  if ([...headers].length > 0) init.headers = headers;
   let r: Response;
   try {
     r = await fetch(path, init);
@@ -184,10 +243,10 @@ export async function api<T>(
 }
 
 /** 只用公开项目与执行机视图解析项目可用 Agent，不接触 SSH/目录等 admin 字段。 */
-export async function getProjectExecutorAgents(projectId: number): Promise<AgentKind[]> {
+export async function getProjectExecutorAgents(projectId: number, signal?: AbortSignal): Promise<AgentKind[]> {
   const [project, executors] = await Promise.all([
-    api<Project>(`/api/projects/${projectId}`),
-    api<ExecutorLite[]>('/api/executors'),
+    api<Project>(`/api/projects/${projectId}`, 'GET', undefined, { signal }),
+    api<ExecutorLite[]>('/api/executors', 'GET', undefined, { signal }),
   ]);
   return executors.find((x) => x.id === project.executorId)?.supportedAgents ?? [];
 }

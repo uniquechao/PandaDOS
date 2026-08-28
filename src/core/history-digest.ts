@@ -137,12 +137,28 @@ export async function buildHistoryDigest(
 ): Promise<string> {
   const opts: Required<HistoryDigestOptions> = { ...DEFAULTS, ...options };
   const { db, reader, locator } = deps;
+  const hasDesignTasks = db.query<{ n: number }, []>(
+    `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'design_tasks'`,
+  ).get()!.n > 0;
+  const designFilter = hasDesignTasks
+    ? ' AND NOT EXISTS (SELECT 1 FROM design_tasks d WHERE d.conversation_id = conversations.id)'
+    : '';
+  const hasOwners = db.query<{ n: number }, []>(
+    `SELECT COUNT(*) AS n FROM sqlite_master
+     WHERE type = 'table' AND name = 'design_saga_conversation_owners'`,
+  ).get()!.n > 0;
+  const creationFilter = hasOwners
+    ? ` AND NOT EXISTS (
+        SELECT 1 FROM design_saga_conversation_owners owner
+        WHERE owner.conversation_id = conversations.id
+      )`
+    : '';
 
   const rows = db
     .query<DigestConvRow, [number]>(
       `SELECT id, label, created_ts, archived, agent
          FROM conversations
-        WHERE project_id = ?
+        WHERE project_id = ?${designFilter}${creationFilter}
         ORDER BY created_ts DESC`,
     )
     .all(projectId)

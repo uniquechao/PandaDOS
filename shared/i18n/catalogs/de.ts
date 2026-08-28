@@ -7,6 +7,14 @@ import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
 import { projectSettingsMessages } from '../domains/project-settings';
 import { externalImportMessages } from '../domains/external-import';
+import { designWorkbenchMessages } from '../domains/design-workbench';
+import { designWorkbenchAdvancedMessages } from '../domains/design-workbench-advanced';
+import { designAssetsUiMessages } from '../domains/design-assets-ui';
+import { designFinalUiMessages } from '../domains/design-final-ui';
+import { designReviewFixMessages } from '../domains/design-review-fixes';
+import { designSnapshotUiMessages } from '../domains/design-snapshot-ui';
+import { designConfirmationUiMessages } from '../domains/design-confirmation-ui';
+import { workflowMessages } from '../domains/workflows';
 
 export const deCatalog = {
   ...shellMessages.de,
@@ -19,6 +27,14 @@ export const deCatalog = {
   ...notifyMessages.de,
   ...projectSettingsMessages.de,
   ...externalImportMessages.de,
+  ...designWorkbenchMessages.de,
+  ...designWorkbenchAdvancedMessages.de,
+  ...designAssetsUiMessages.de,
+  ...designFinalUiMessages.de,
+  ...designReviewFixMessages.de,
+  ...designSnapshotUiMessages.de,
+  ...designConfirmationUiMessages.de,
+  ...workflowMessages.de,
   'issue.editSubtask': 'Teilaufgabe {number} bearbeiten', 'issue.subtaskText': 'Inhalt der Teilaufgabe',
   'view.importLocalHistory':'Lokalen Verlauf importieren','view.localHistoryHelp':'Es werden nur Claude-/Codex-Sitzungen angezeigt, deren Arbeitsverzeichnis genau diesem Projekt entspricht.','view.localHistoryAgentFilter':'Verlauf nach Agent filtern','view.historySelected':'{count, plural, one {# Sitzung ausgewählt} other {# Sitzungen ausgewählt}}','view.selectAllHistory':'Alle auswählen','view.clearHistorySelection':'Leeren','view.readingLocalHistory':'Lokaler Verlauf wird gelesen…','view.noLocalHistory':'Für dieses Projekt wurde kein passender lokaler Verlauf gefunden.','view.noFilteredLocalHistory':'Für diesen Agent-Filter ist kein Verlauf vorhanden.','view.localHistoryCandidates':'Lokale Verlaufssitzungen','view.untitledHistory':'Unbenannte Verlaufssitzung','view.historyAlreadyImported':'Importiert','view.noImportedConversation':'Nach dem Import wurde keine verfügbare Unterhaltung zurückgegeben.','view.localHistoryImported':'{count, plural, one {# Verlaufssitzung importiert} other {# Verlaufssitzungen importiert}}','view.importSelectedHistory':'Auswahl importieren',
   'project.importTitle':'Importieren','project.importShort':'Importieren','project.importSource':'Importquelle','project.importTmuxSource':'tmux-Sitzung','project.importClaudeSource':'Claude-Projekt','project.importCodexSource':'Codex-Projekt',
@@ -143,7 +159,7 @@ export const deCatalog = {
   'project.searchSuffix': ' (Suche: „{query}“)', 'project.archivedCount': 'Archiviert ({count})',
   'project.gitRequired': 'URL eines Git-Repositorys eingeben', 'project.clonedCreated': 'Repository geklont und Projekt erstellt',
   'project.createdWarnings': 'Mit Warnungen erstellt:\n{warnings}', 'project.newProject': 'Neues Projekt',
-  'project.chatModeHelp': 'Chatmodus: Fragen stellen und Dateien im Projektverzeichnis ohne Issues erstellen; jedes Projekt kann mehrere Unterhaltungen haben.',
+  'project.issueModeHelp':'Issue-Modus: Organisieren Sie die Arbeit im Issue-Board und lassen Sie Agents sie im Projektablauf ausführen.','project.chatModeHelp': 'Chatmodus: Fragen stellen und Dateien im Projektverzeichnis ohne Issues erstellen; jedes Projekt kann mehrere Unterhaltungen haben.',
   'project.projectName': 'Projektname', 'project.repoNameDefault': ' (leer lassen, um den Repository-Namen zu verwenden)',
   'project.cloneTo': 'Klonen nach', 'project.selectedUserHome': 'Home-Verzeichnis des ausgewählten Benutzers',
   'project.yourWorkspace': 'Ihr Arbeitsbereich', 'project.pickDirectory': 'Verzeichnis auswählen',

@@ -14,20 +14,16 @@
  * scratch 按 issue 隔离（.panda/tmp/clarify/<issueId>/）：同项目多条 issue 并发分析互不踩；
  * 清理只删本 issue 子目录，不动兄弟。
  */
-import { DEFAULT_CODEX_ARGS } from '../core/conversations';
 import {
-  isCodexUpdatePrompt,
-  pickAffirmative,
-  type SummaryDriver,
-} from '../core/agent-summary';
-import { detectSelection } from '../core/screen';
-import { readDriverText } from '../core/skills';
+  runAgentArtifacts,
+  type AgentArtifactDriver,
+} from '../core/agent-artifact-runner';
 import type { AgentKind, IssueCategory } from '../core/types';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
 import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/language';
 
 /** runner 需要的 Driver 子集 = agent-summary 同款（tmux + 受限文件） */
-export type ClarifyDriver = SummaryDriver;
+export type ClarifyDriver = AgentArtifactDriver;
 
 /** scratch 根目录名（挂在项目 cwd 下；子目录按 issueId 隔离） */
 export const CLARIFY_SCRATCH_BASE = '.panda/tmp/clarify';
@@ -218,15 +214,6 @@ export type RunClarifyResult =
     }
   | { ok: false; reason: 'timeout' | 'no-output' | 'error'; error?: string };
 
-const DEFAULT_OPTIONS: Required<ClarifyRunOptions> = {
-  pollIntervalMs: 4000,
-  timeoutMs: 8 * 60 * 1000,
-  readyDelayMs: 12000, // 给 claude/codex 足够启动（codex 还要过更新弹窗 + 重绘 TUI）再注入提示词
-  claudeArgs: '--permission-mode acceptEdits',
-  codexArgs: DEFAULT_CODEX_ARGS,
-  maxFeedbackBytes: MAX_FEEDBACK_BYTES,
-};
-
 export class ClarifyRunner {
   private readonly driver: ClarifyDriver;
   private readonly now: () => number;
@@ -238,106 +225,46 @@ export class ClarifyRunner {
     this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   }
 
-  private startCommand(agent: AgentKind, o: Required<ClarifyRunOptions>): string {
-    return agent === 'codex' ? `codex ${o.codexArgs}`.trim() : `claude ${o.claudeArgs}`.trim();
-  }
-
-  /** 抓屏清菜单一轮（agent-summary 同款：不做签名去重，重复点只是多个空 Enter，无害） */
-  private async clearMenusOnce(session: string): Promise<void> {
-    const pane = await this.driver.capturePane(session).catch(() => '');
-    if (isCodexUpdatePrompt(pane)) {
-      await this.driver.sendKeys(session, '2').catch(() => {});
-      return;
-    }
-    const sel = detectSelection(pane);
-    if (!sel) return;
-    const target = pickAffirmative(sel.options);
-    const delta = target - sel.cursorIndex;
-    const key = delta < 0 ? 'Up' : 'Down';
-    for (let i = 0; i < Math.abs(delta); i++) {
-      await this.driver.sendKey(session, key).catch(() => {});
-    }
-    await this.driver.sendKey(session, 'Enter').catch(() => {});
-  }
-
-  private async killQuiet(session: string): Promise<void> {
-    await this.driver.killSession(session).catch(() => {});
-  }
-
-  private async removeQuiet(path: string): Promise<void> {
-    await this.driver.removeTree(path).catch(() => {});
-  }
-
-  /** 就绪等待：拉起代理后等 readyDelayMs，其间反复清菜单（过掉信任弹窗）后再注入提示词。 */
-  private async waitReady(session: string, readyDelayMs: number, pollMs: number): Promise<void> {
-    let waited = 0;
-    while (waited < readyDelayMs) {
-      await this.clearMenusOnce(session);
-      await this.sleep(pollMs);
-      waited += pollMs;
-    }
-    await this.clearMenusOnce(session);
-  }
-
-  /** 轮询 done 标记，其间持续清菜单；出现→true，超时→false。 */
-  private async pollUntilDone(
-    session: string,
-    donePath: string,
-    timeoutMs: number,
-    pollMs: number,
-  ): Promise<boolean> {
-    const deadline = this.now() + timeoutMs;
-    while (this.now() < deadline) {
-      await this.clearMenusOnce(session);
-      const st = await this.driver.statPath(donePath).catch(() => null);
-      if (st) return true;
-      await this.sleep(pollMs);
-    }
-    return false;
-  }
-
   async run(input: RunClarifyInput, options: ClarifyRunOptions = {}): Promise<RunClarifyResult> {
-    const o: Required<ClarifyRunOptions> = { ...DEFAULT_OPTIONS, ...options };
     const session = clarifySessionName(input.issueId);
     const p = clarifyPaths(input.cwd, input.issueId);
-
-    try {
-      // 0) 清残留会话与旧 scratch（只清本 issue 子目录，不动同项目兄弟）
-      await this.killQuiet(session);
-      await this.removeQuiet(p.scratch);
-
-      // 1) 写任务文件（writeFile 自动建父目录 = 重建 scratch）
-      await this.driver.writeFile(p.task, buildClarifyTaskMd(input));
-
-      // 2) 起代理
-      await this.driver.createSession(session, input.cwd);
-      await this.driver.sendKeys(session, this.startCommand(input.agent, o));
-
-      // 3) 等就绪 + 过信任弹窗
-      await this.waitReady(session, o.readyDelayMs, o.pollIntervalMs);
-
-      // 4) 注入任务提示词
-      await this.driver.sendKeys(
+    const maxBytes = options.maxFeedbackBytes ?? MAX_FEEDBACK_BYTES;
+    const result = await runAgentArtifacts(
+      { driver: this.driver, now: this.now, sleep: this.sleep },
+      {
+        agent: input.agent,
+        cwd: input.cwd,
         session,
-        buildClarifyPrompt(input.agent, input.issueId, { allowQuestions: input.allowQuestions !== false }, input.locale),
-      );
-
-      // 5) 轮询 done 标记
-      const done = await this.pollUntilDone(session, p.done, o.timeoutMs, o.pollIntervalMs);
-      if (!done) return { ok: false, reason: 'timeout' };
-
-      // 6) 读回产物（scratch 清理前）；questions.md 可以不存在（= 需求清晰）
-      const feedback = ((await readDriverText(this.driver, p.feedback, o.maxFeedbackBytes)) ?? '').trim();
-      const questionsRaw = await readDriverText(this.driver, p.questions, o.maxFeedbackBytes);
-      const questions = parseQuestions(questionsRaw);
-      if (!feedback && questions.length === 0) return { ok: false, reason: 'no-output' };
-      return { ok: true, feedback, questions, questionsText: (questionsRaw ?? '').trim() };
-    } catch (e) {
-      return { ok: false, reason: 'error', error: String(e).slice(0, 300) };
-    } finally {
-      await this.killQuiet(session);
-      await this.removeQuiet(p.scratch);
+        scratch: p.scratch,
+        prompt: buildClarifyPrompt(
+          input.agent,
+          input.issueId,
+          { allowQuestions: input.allowQuestions !== false },
+          input.locale,
+        ),
+        inputFiles: [{ path: p.task, data: buildClarifyTaskMd(input) }],
+        donePath: p.done,
+        artifacts: [
+          { key: 'feedback', path: p.feedback, maxBytes, required: false },
+          { key: 'questions', path: p.questions, maxBytes, required: false },
+        ],
+      },
+      options,
+    );
+    if (!result.ok) {
+      return result.reason === 'timeout'
+        ? { ok: false, reason: 'timeout' }
+        : { ok: false, reason: 'error', ...(result.error ? { error: result.error } : {}) };
     }
+    const feedback = typeof result.artifacts.feedback === 'string'
+      ? result.artifacts.feedback.trim()
+      : '';
+    const questionsRaw = typeof result.artifacts.questions === 'string'
+      ? result.artifacts.questions
+      : '';
+    const questions = parseQuestions(questionsRaw);
+    if (!feedback && questions.length === 0) return { ok: false, reason: 'no-output' };
+    return { ok: true, feedback, questions, questionsText: questionsRaw.trim() };
   }
 }
 

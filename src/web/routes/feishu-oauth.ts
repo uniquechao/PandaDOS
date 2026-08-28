@@ -28,7 +28,7 @@ export interface FeishuOauthRoutesDeps {
   sessions: SessionStore;
   /** 未配置飞书 app 凭据时传 null：status={enabled:false}，其余接口 503 */
   oauth: FeishuOauthPort | null;
-  /** 对外基址（如 https://stack.jimi.chaoa.xyz）；缺省按请求 Host/x-forwarded-proto 推导 */
+  /** 对外基址（如 https://stack.example.com）；缺省按请求 Host/x-forwarded-proto 推导 */
   publicUrl?: string | undefined;
   /** state 存储（测试注入短 TTL/假时钟；缺省进程级默认参数） */
   states?: OauthStateStore;

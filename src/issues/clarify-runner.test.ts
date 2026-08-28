@@ -30,6 +30,10 @@ class FakeDriver implements ClarifyDriver {
   /** 每次 capturePane 前的副作用钩子（模拟代理产出文件） */
   onCapture?: (n: number, files: Map<string, string>) => void;
 
+  async findExecutable(agent: 'claude' | 'codex') {
+    return agent;
+  }
+
   async listSessions() {
     return [...this.sessions].map((name) => ({ name, createdTs: 0, attached: false }));
   }

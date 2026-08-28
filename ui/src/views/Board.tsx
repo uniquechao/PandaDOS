@@ -31,6 +31,7 @@ import type {
   ProjectModule,
   ProjectMember,
   Subscription,
+  WorkflowTemplateDetail,
 } from '../lib/types';
 import { pollProjectSummary } from '../lib/pollSummary';
 import { resolveSelIid } from '../lib/seliid';
@@ -54,6 +55,7 @@ import {
 import { ChatView } from './Chat';
 import { IssueWorkbench } from './IssueDetail';
 import { reconcileAgent } from '../components/AgentPicker';
+import { WorkflowGraph } from '../components/WorkflowGraph';
 import { tr } from '../i18n/runtime';
 
 const POLL_MS = 5000;
@@ -318,6 +320,9 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
           </button>
           <span class="btitle">{project?.name ?? tr('view.projectFallback', { id: pid })}</span>
           <div class="bacts">
+            <button class="btn sm" onClick={() => nav(`/p/${pid}/designs`)}>
+              {tr('design.title')}
+            </button>
             {/* 项目对话模式入口：切到 chat 视图（chat 类型项目已在上方整页渲染，不会走到这里） */}
             <button class="btn sm" onClick={() => nav(`/p/${pid}/chat`)}>
               {tr('view.conversation')}
@@ -638,6 +643,12 @@ function NewIssueModal({
   const [gitBranchLoading, setGitBranchLoading] = useState(true);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [workflowPickerOpen, setWorkflowPickerOpen] = useState(false);
+  const [workflowTemplates, setWorkflowTemplates] = useState<WorkflowTemplateDetail[]>([]);
+  const [workflowTemplateId, setWorkflowTemplateId] = useState<number | null>(null);
+  const [workflowLoading, setWorkflowLoading] = useState(false);
+  const [workflowLoaded, setWorkflowLoaded] = useState(false);
 
   const uploading = images.some((im) => im.rel === null && !im.error);
   const selectedModule = modules.find((m) => m.slug === module.trim() || m.displayName === module.trim());
@@ -654,6 +665,18 @@ function NewIssueModal({
       .then((r) => setModules(r.modules))
       .catch(() => setModules([]));
   }, [pid]);
+
+  useEffect(() => {
+    if (!advancedOpen || workflowLoaded || workflowLoading) return;
+    setWorkflowLoading(true);
+    setWorkflowLoaded(true);
+    void api<{ workflows: WorkflowTemplateDetail[] }>(`/api/projects/${pid}/workflows`)
+      .then((result) => setWorkflowTemplates(result.workflows.filter((item) => item.template.status === 'active')))
+      .catch((error: Error) => setErr(error.message))
+      .finally(() => setWorkflowLoading(false));
+  }, [advancedOpen, pid, workflowLoaded, workflowLoading]);
+
+  const selectedWorkflow = workflowTemplates.find((item) => item.template.id === workflowTemplateId) ?? null;
 
   const submit = async (): Promise<void> => {
     if (!title.trim() || busy || gitBranchLoading || uploading || agentUnavailable) return;
@@ -672,6 +695,7 @@ function NewIssueModal({
         implMode: team ? 'team' : 'seq',
         agent,
         autoApprove,
+        ...(workflowTemplateId !== null ? { workflowTemplateId } : {}),
         ...issueGitBranchPayload(gitBranch),
         images: images.map((im) => im.rel).filter((r): r is string => r !== null),
       });
@@ -682,6 +706,61 @@ function NewIssueModal({
       setBusy(false);
     }
   };
+
+  if (workflowPickerOpen) {
+    return (
+      <Modal title={tr('workflow.selectForIssue')} wide onClose={() => setWorkflowPickerOpen(false)}>
+        <div class="wf-pick-page">
+          <div class="wf-pick-head">
+            <button class="btn sm" onClick={() => setWorkflowPickerOpen(false)}>‹ {tr('workflow.backToIssue')}</button>
+            <p class="mut">{tr('workflow.selectForIssueHelp')}</p>
+          </div>
+          {workflowLoading ? <Loading /> : workflowTemplates.length === 0 ? (
+            <div class="empty wf-pick-empty">
+              <strong>{tr('workflow.noActiveTemplates')}</strong>
+              <span class="mut small">{tr('workflow.noActiveTemplatesHelp')}</span>
+            </div>
+          ) : (
+            <div class="wf-pick-layout">
+              <div class="wf-pick-list" role="listbox" aria-label={tr('workflow.templateList')}>
+                {workflowTemplates.map((item) => (
+                  <button
+                    key={item.template.id}
+                    type="button"
+                    role="option"
+                    aria-selected={workflowTemplateId === item.template.id}
+                    aria-label={tr('workflow.templateAria', { name: item.template.name, version: item.template.currentVersion, status: tr('workflow.active') })}
+                    class={`wf-pick-card${workflowTemplateId === item.template.id ? ' on' : ''}`}
+                    onClick={() => setWorkflowTemplateId(item.template.id)}
+                  >
+                    <strong>{item.template.name}</strong>
+                    <span>{tr('workflow.templateMeta', { version: item.template.currentVersion, nodes: item.nodeCount })}</span>
+                    {item.template.description && <small>{item.template.description}</small>}
+                  </button>
+                ))}
+              </div>
+              <section class="wf-pick-preview" aria-label={tr('workflow.preview')}>
+                {selectedWorkflow ? (
+                  <>
+                    <div class="wf-pick-preview-title">
+                      <div><span class="eyebrow">{tr('workflow.preview')}</span><strong>{selectedWorkflow.template.name}</strong></div>
+                      <span class="badge b-gray">{tr('workflow.templateMeta', { version: selectedWorkflow.template.currentVersion, nodes: selectedWorkflow.nodeCount })}</span>
+                    </div>
+                    <WorkflowGraph graph={selectedWorkflow.version.graph} compact />
+                  </>
+                ) : <div class="empty">{tr('workflow.chooseToPreview')}</div>}
+              </section>
+            </div>
+          )}
+          {err && <div class="err">{err}</div>}
+        </div>
+        <div class="mbtns">
+          <button class="btn" onClick={() => { setWorkflowTemplateId(null); setWorkflowPickerOpen(false); }}>{tr('workflow.noWorkflow')}</button>
+          <button class="btn primary" disabled={workflowTemplateId === null} onClick={() => setWorkflowPickerOpen(false)}>{tr('workflow.useTemplate')}</button>
+        </div>
+      </Modal>
+    );
+  }
 
   return (
     <Modal title={tr('board.newIssue')} onClose={onClose}>
@@ -747,6 +826,28 @@ function NewIssueModal({
           {tr('board.teamMode')}
         </label>
         <ImageAttach projectId={pid} images={images} onChange={setImages} />
+        <section class={`nia-advanced${advancedOpen ? ' open' : ''}`}>
+          <button
+            type="button"
+            class="nia-advanced-toggle"
+            aria-expanded={advancedOpen}
+            aria-label={tr('workflow.advancedAria', { state: advancedOpen ? tr('workflow.expanded') : tr('workflow.collapsed') })}
+            onClick={() => setAdvancedOpen((value) => !value)}
+          >
+            <span><strong>{tr('workflow.advanced')}</strong><small>{tr('workflow.advancedHelp')}</small></span>
+            <span aria-hidden="true">{advancedOpen ? '−' : '+'}</span>
+          </button>
+          {advancedOpen && (
+            <div class="nia-workflow-choice">
+              <div>
+                <span class="eyebrow">{tr('workflow.issueWorkflow')}</span>
+                <strong>{selectedWorkflow?.template.name ?? tr('workflow.noWorkflow')}</strong>
+                <small class="mut">{selectedWorkflow ? tr('workflow.templateMeta', { version: selectedWorkflow.template.currentVersion, nodes: selectedWorkflow.nodeCount }) : tr('workflow.noWorkflowHelp')}</small>
+              </div>
+              <button type="button" class="btn sm" onClick={() => setWorkflowPickerOpen(true)}>{selectedWorkflow ? tr('workflow.changeTemplate') : tr('workflow.chooseTemplate')}</button>
+            </div>
+          )}
+        </section>
         {err && <div class="err">{err}</div>}
       </div>
       <div class="mbtns">

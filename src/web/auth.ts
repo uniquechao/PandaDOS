@@ -8,6 +8,7 @@
 import { hashToken, type UserStore } from '../core/users';
 import type { User } from '../core/types';
 import { AUTH_COOKIE_NAME } from '../core/branding';
+import { tokenFromUpgradeCookie, upgradeLogoutCookie } from './auth-upgrade-compat';
 
 export const COOKIE = AUTH_COOKIE_NAME;
 /** 30 天（v1 web.ts:106 平移） */
@@ -26,6 +27,8 @@ export function tokenFromReq(req: Request): string | null {
       return null;
     }
   }
+  const upgradeToken = tokenFromUpgradeCookie(cookie);
+  if (upgradeToken) return upgradeToken;
   const auth = req.headers.get('authorization') ?? '';
   if (auth.startsWith('Bearer ')) return auth.slice(7).trim() || null;
   return null;
@@ -48,6 +51,11 @@ export function loginCookie(token: string, opts: { secure?: boolean } = {}): str
 export function logoutCookie(opts: { secure?: boolean } = {}): string {
   const secure = opts.secure ? '; Secure' : '';
   return `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`;
+}
+
+/** 滚动升级期登出必须同时清理新旧 Cookie。 */
+export function logoutCookies(opts: { secure?: boolean } = {}): string[] {
+  return [logoutCookie(opts), upgradeLogoutCookie(opts)];
 }
 
 /** 会话查找的最小面（core/sessions.SessionStore 结构兼容；飞书扫码登录签发的会话） */

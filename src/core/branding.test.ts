@@ -31,12 +31,21 @@ describe('PandaDOS 品牌命名契约', () => {
       // 升级边界只识别并清除旧自动生成区块，不会继续生成或维护旧协议。
       'src/core/agent-compat.ts',
       'src/core/agent-compat.test.ts',
+      // 生产滚动升级的 30 天登录兼容层；到期后整文件删除。
+      'src/web/auth-upgrade-compat.ts',
       'src/core/branding.test.ts',
       'ui/src/lib/projcolor.test.ts',
       'ui/src/pandados.style.test.ts',
     ]);
     // 模块过程页属于必须原样保留的用户 Issue 历史；运行时、源码、配置和其他文档仍受旧品牌扫描约束。
-    const allowedPrefixes = ['.panda/modules/', 'docs/releases/', 'docs/superpowers/'];
+    const allowedPrefixes = [
+      // 运维迁移/回滚资产需要引用旧域名、旧服务名和兼容路径，不参与产品运行时命名。
+      '.deploy/',
+      '.panda/modules/',
+      // 公开版发布说明是不可改写的版本历史，允许记录旧版品牌名。
+      'docs/releases/',
+      'docs/superpowers/',
+    ];
     const legacy = /butler2|tmux[-_]butler|butler|\.butler|\bmando\b|mandoai|mando_token|mando\.db|\.mando|MANDO_/i;
     const violations: string[] = [];
     const tracked = Bun.spawnSync(['git', 'ls-files', '-z'], { cwd: root });

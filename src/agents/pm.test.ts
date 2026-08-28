@@ -63,6 +63,7 @@ const noopDriver = {
   sendKey: async () => {},
   capturePane: async () => '',
   resizeWindow: async () => {},
+  scrollPane: async () => {},
   readFileRange: async () => ({ data: new Uint8Array(), size: 0 }),
   statPath: async () => null,
   listDir: async () => [],
@@ -161,7 +162,7 @@ function makeDeps(
     },
     convs: {
       listByProject: () => [
-        { id: 'conv-a', projectId: 7, label: '导出功能', createdTs: 1, archived: false, agent: 'claude' as const, kind: 'issue' as const, lastActiveTs: null, autoApprove: 'cautious' as const },
+        { id: 'conv-a', projectId: 7, label: '导出功能', createdTs: 1, archived: false, agent: 'claude' as const, kind: 'issue' as const, lastActiveTs: null, autoApprove: 'cautious' as const, workspaceCwd: null },
       ],
       currentConv: () => 'conv-a',
       tmuxName: (pid) => `cc-${pid}`,

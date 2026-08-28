@@ -98,12 +98,32 @@ export function findBoundHistoryConversation(
   return row ? { id: row.id, projectId: row.project_id, kind: row.kind === 'chat' ? 'chat' : 'issue' } : null;
 }
 
+function isDesignBoundConversation(db: Database, conversationId: string): boolean {
+  const exists = db.query<{ n: number }, []>(
+    `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'design_tasks'`,
+  ).get()!.n > 0;
+  if (exists && db.query<{ found: number }, [string]>(
+    'SELECT 1 AS found FROM design_tasks WHERE conversation_id = ?',
+  ).get(conversationId)?.found === 1) return true;
+  const hasOwners = db.query<{ found: number }, []>(
+    `SELECT COUNT(*) AS found FROM sqlite_master
+     WHERE type = 'table' AND name = 'design_saga_conversation_owners'`,
+  ).get()!.found > 0;
+  return hasOwners && db.query<{ found: number }, [string]>(
+    `SELECT 1 AS found FROM design_saga_conversation_owners
+     WHERE conversation_id = ?`,
+  ).get(conversationId)?.found === 1;
+}
+
 /** PandaDOS issue 引擎发起的原生会话不应再被当作用户本地历史导入。 */
 export function importableHistorySessions<T extends Pick<HistoryConversationInput, 'agent' | 'sessionId'>>(
   db: Database,
   sessions: T[],
 ): T[] {
-  return sessions.filter((session) => findBoundHistoryConversation(db, session)?.kind !== 'issue');
+  return sessions.filter((session) => {
+    const bound = findBoundHistoryConversation(db, session);
+    return bound?.kind !== 'issue' && (!bound || !isDesignBoundConversation(db, bound.id));
+  });
 }
 
 function insertHistoryConversation(db: Database, projectId: number, session: HistoryConversationInput): string {
@@ -144,7 +164,7 @@ export function importHistoryConversations(
     conflicts: [],
   };
   db.transaction(() => {
-    for (const session of sessions) {
+    for (const session of importableHistorySessions(db, sessions)) {
       const bound = findBoundHistoryConversation(db, session);
       if (bound?.projectId === projectId) {
         result.existingIds.push(bound.id);

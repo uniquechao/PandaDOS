@@ -27,6 +27,8 @@ import { SkillsView } from './views/Skills';
 import { SettingsView } from './views/Settings';
 import { ProjectSettingsView } from './views/ProjectSettings';
 import { ExternalIssuesView } from './views/ExternalIssues';
+import { DesignsView } from './views/Designs';
+import { WorkflowTemplatesView } from './views/WorkflowTemplates';
 import { AdminView } from './views/Admin';
 import { I18nProvider, useI18n } from './i18n/provider';
 import packageInfo from '../../package.json';
@@ -451,6 +453,12 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
       // issue 详情并入工作台：宽屏在看板右栏展开，窄屏整页（BoardView 按屏宽定夺）
       view = <BoardView key={route.pid} pid={route.pid} selIid={route.iid} />;
       break;
+    case 'designs':
+      view = <DesignsView key={route.pid} pid={route.pid} me={me} />;
+      break;
+    case 'design':
+      view = <DesignsView key={route.pid} pid={route.pid} selDid={route.did} me={me} />;
+      break;
     case 'chat':
       // 对话模式视图（chat 项目的落地页 / issue 项目的项目级自由对话入口）
       view = <ChatView key={route.pid} pid={route.pid} />;
@@ -472,6 +480,9 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
       break;
     case 'external-issues':
       view = <ExternalIssuesView key={route.pid} pid={route.pid} />;
+      break;
+    case 'workflows':
+      view = <WorkflowTemplatesView key={route.pid} pid={route.pid} />;
       break;
     case 'settings':
       view = <SettingsView me={me} onLogout={onLogout} />;

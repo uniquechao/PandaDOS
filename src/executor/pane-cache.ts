@@ -23,6 +23,7 @@ import type {
   GitResult,
   PathStat,
   PtyChannel,
+  TmuxScrollDirection,
   TmuxSession,
 } from './driver';
 import type { AgentKind } from '../core/types';
@@ -115,6 +116,10 @@ export class PaneCacheDriver implements ExecutorDriver {
     }
   }
 
+  scrollPane(session: string, direction: TmuxScrollDirection, lines: number): Promise<void> {
+    return this.inner.scrollPane(session, direction, lines);
+  }
+
   // ---- 其余纯透传 ----
 
   findExecutable(agent: AgentKind): Promise<string | null> {
@@ -127,6 +132,50 @@ export class PaneCacheDriver implements ExecutorDriver {
 
   readFileRange(path: string, offset: number, limit: number): Promise<FileRange> {
     return this.inner.readFileRange(path, offset, limit);
+  }
+
+  readFileNoFollowWithin(root: string, relativePath: string, limit: number): Promise<FileRange> {
+    const read = this.inner.readFileNoFollowWithin;
+    if (typeof read !== 'function') return Promise.reject(new Error('executor secure read capability unavailable'));
+    return read.call(this.inner, root, relativePath, limit);
+  }
+
+  writeFileNoFollowWithin(
+    root: string,
+    relativePath: string,
+    data: Uint8Array | string,
+    mode?: number,
+  ): Promise<'created' | 'unchanged' | 'conflict'> {
+    const write = this.inner.writeFileNoFollowWithin;
+    if (typeof write !== 'function') return Promise.reject(new Error('executor secure write capability unavailable'));
+    return write.call(this.inner, root, relativePath, data, mode);
+  }
+
+  listDirectoryNoFollowWithin(root: string, relativePath: string): Promise<DirEntry[] | null> {
+    const list = this.inner.listDirectoryNoFollowWithin;
+    if (typeof list !== 'function') return Promise.reject(new Error('executor secure list capability unavailable'));
+    return list.call(this.inner, root, relativePath);
+  }
+
+  replaceFileNoFollowWithin(
+    root: string,
+    relativePath: string,
+    data: Uint8Array,
+    expectedSha256: string | null,
+  ): Promise<'written' | 'unchanged' | 'conflict'> {
+    const replace = this.inner.replaceFileNoFollowWithin;
+    if (typeof replace !== 'function') return Promise.reject(new Error('executor secure replace capability unavailable'));
+    return replace.call(this.inner, root, relativePath, data, expectedSha256);
+  }
+
+  removeFileNoFollowWithin(
+    root: string,
+    relativePath: string,
+    expectedSha256: string,
+  ): Promise<'removed' | 'missing' | 'conflict'> {
+    const remove = this.inner.removeFileNoFollowWithin;
+    if (typeof remove !== 'function') return Promise.reject(new Error('executor secure remove capability unavailable'));
+    return remove.call(this.inner, root, relativePath, expectedSha256);
   }
 
   statPath(path: string): Promise<PathStat | null> {

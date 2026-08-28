@@ -7,6 +7,14 @@ import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
 import { projectSettingsMessages } from '../domains/project-settings';
 import { externalImportMessages } from '../domains/external-import';
+import { designWorkbenchMessages } from '../domains/design-workbench';
+import { designWorkbenchAdvancedMessages } from '../domains/design-workbench-advanced';
+import { designAssetsUiMessages } from '../domains/design-assets-ui';
+import { designFinalUiMessages } from '../domains/design-final-ui';
+import { designReviewFixMessages } from '../domains/design-review-fixes';
+import { designSnapshotUiMessages } from '../domains/design-snapshot-ui';
+import { designConfirmationUiMessages } from '../domains/design-confirmation-ui';
+import { workflowMessages } from '../domains/workflows';
 
 export const frCatalog = {
   ...shellMessages.fr,
@@ -19,6 +27,14 @@ export const frCatalog = {
   ...notifyMessages.fr,
   ...projectSettingsMessages.fr,
   ...externalImportMessages.fr,
+  ...designWorkbenchMessages.fr,
+  ...designWorkbenchAdvancedMessages.fr,
+  ...designAssetsUiMessages.fr,
+  ...designFinalUiMessages.fr,
+  ...designReviewFixMessages.fr,
+  ...designSnapshotUiMessages.fr,
+  ...designConfirmationUiMessages.fr,
+  ...workflowMessages.fr,
   'issue.editSubtask': 'Modifier la sous-tâche {number}', 'issue.subtaskText': 'Contenu de la sous-tâche',
   'view.importLocalHistory':'Importer l’historique local','view.localHistoryHelp':'Seules les sessions Claude/Codex dont le répertoire de travail correspond exactement à ce projet sont affichées.','view.localHistoryAgentFilter':'Filtrer l’historique par agent','view.historySelected':'{count, plural, one {# session sélectionnée} other {# sessions sélectionnées}}','view.selectAllHistory':'Tout sélectionner','view.clearHistorySelection':'Effacer','view.readingLocalHistory':'Lecture de l’historique local…','view.noLocalHistory':'Aucun historique local ne correspond à ce projet.','view.noFilteredLocalHistory':'Aucun historique ne correspond à ce filtre d’agent.','view.localHistoryCandidates':'Sessions de l’historique local','view.untitledHistory':'Session historique sans titre','view.historyAlreadyImported':'Importée','view.noImportedConversation':'Aucune conversation disponible n’a été renvoyée après l’importation.','view.localHistoryImported':'{count, plural, one {# session historique importée} other {# sessions historiques importées}}','view.importSelectedHistory':'Importer la sélection',
   'project.importTitle':'Importer','project.importShort':'Importer','project.importSource':'Source à importer','project.importTmuxSource':'Session tmux','project.importClaudeSource':'Projet Claude','project.importCodexSource':'Projet Codex',
@@ -89,7 +105,7 @@ export const frCatalog = {
   'project.targetDirectoryName':'Nom du répertoire cible (ne doit pas encore exister)','project.migrating':'Déplacement…','project.startMigration':'Démarrer le déplacement','project.greeting':'Passez une journée productive ✨','project.summaryUpdated':'Résumé du projet mis à jour','project.knowledgeUpdated':'Connaissances du projet mises à jour',
   'project.generationFailed':'Échec de la génération','project.archiveVerb':'Archiver','project.enableVerb':'Activer','project.archiveHint':'Les projets archivés quittent la liste active et peuvent être réactivés à tout moment.','project.archived':'Archivé','project.statusReview':'En attente de confirmation','project.statusDoing':'En cours','project.statusTodo':'À faire','project.statusBlocked':'Bloqué',
   'project.migrateAdmin':'Déplacer tout le répertoire du projet vers un nouvel emplacement (administrateurs uniquement)','project.welcomeBack':'Bon retour, {name}','project.noMatches':'Aucun projet ne correspond aux filtres actuels{query}','project.searchSuffix':' (recherche : « {query} »)','project.archivedCount':'Archivés ({count})',
-  'project.gitRequired':'Saisissez l’URL d’un dépôt Git','project.clonedCreated':'Dépôt cloné et projet créé','project.createdWarnings':'Créé avec des avertissements :\n{warnings}','project.newProject':'Nouveau projet','project.chatModeHelp':'Mode discussion : posez des questions et créez des fichiers dans le répertoire du projet sans issue ; chaque projet peut contenir plusieurs conversations.',
+  'project.gitRequired':'Saisissez l’URL d’un dépôt Git','project.clonedCreated':'Dépôt cloné et projet créé','project.createdWarnings':'Créé avec des avertissements :\n{warnings}','project.newProject':'Nouveau projet','project.issueModeHelp':'Mode issue : organisez le travail dans le tableau d’issues et laissez les agents l’exécuter selon le flux du projet.','project.chatModeHelp':'Mode discussion : posez des questions et créez des fichiers dans le répertoire du projet sans issue ; chaque projet peut contenir plusieurs conversations.',
   'project.projectName':'Nom du projet','project.repoNameDefault':' (laissez vide pour utiliser le nom du dépôt)','project.cloneTo':'Cloner vers','project.selectedUserHome':'dossier personnel de l’utilisateur sélectionné','project.yourWorkspace':'votre espace de travail','project.pickDirectory':'Choisir un répertoire',
   'project.branchFallbackHelp':'Le travail s’effectue sur votre branche actuelle. PandaDOS ne crée, ne change et ne fusionne aucune branche ; cette valeur sert uniquement de repli si la branche actuelle ne peut pas être lue.','project.cloning':'Clonage…','project.cloneCreate':'Cloner et créer','project.managed':'Géré n° {id}','project.imported':'Importé n° {id}',
   'project.noPermission':'Autorisation refusée','project.mergeInto':'Fusionner dans le n° {id}','project.importedWarnings':'Importé avec des avertissements :\n{warnings}','project.importTmux':'Importer une session tmux','project.readingSessions':'Lecture des sessions…','project.noTmuxSessions':'Aucune session tmux sur cet exécuteur','project.cwdUnavailable':'Répertoire de travail indisponible',

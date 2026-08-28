@@ -58,6 +58,10 @@ class FakeDriver extends LocalDriver {
   pane = '';
   ptys: Array<{ cmd: string; cols: number; rows: number; pty: FakePty }> = [];
   resizes: Array<{ session: string; size: { cols: number; rows: number } | null }> = [];
+  scrolls: Array<{ session: string; direction: 'up' | 'down'; lines: number }> = [];
+  scrollDelayMs = 0;
+  scrollInFlight = 0;
+  maxScrollInFlight = 0;
   override async findExecutable(agent: 'claude' | 'codex') {
     return `/test/bin/${agent}`;
   }
@@ -87,6 +91,16 @@ class FakeDriver extends LocalDriver {
   }
   override async resizeWindow(session: string, size: { cols: number; rows: number } | null) {
     this.resizes.push({ session, size });
+  }
+  override async scrollPane(session: string, direction: 'up' | 'down', lines: number) {
+    this.scrollInFlight += 1;
+    this.maxScrollInFlight = Math.max(this.maxScrollInFlight, this.scrollInFlight);
+    try {
+      if (this.scrollDelayMs > 0) await Bun.sleep(this.scrollDelayMs);
+      this.scrolls.push({ session, direction, lines });
+    } finally {
+      this.scrollInFlight -= 1;
+    }
   }
 }
 
@@ -434,6 +448,26 @@ describe('WS term：强类型目标解析', () => {
     c.close();
     await c.closed;
 
+    const designConv = crypto.randomUUID();
+    ins.run(designConv, t.pid, '设计工作台对话', Date.now(), 'chat');
+    t.server.db.query(
+      `INSERT INTO design_tasks
+         (project_id, title, original_request, agent, conversation_id, created_ts, updated_ts)
+       VALUES (?, 'Design', 'Reserved conversation', 'claude', ?, ?, ?)`,
+    ).run(t.pid, designConv, Date.now(), Date.now());
+    const reservedTerm = await fetch(`${t.base}/ws/term/${t.pid}?conv=${designConv}`, {
+      headers: { authorization: `Bearer ${t.aliceToken}` },
+    });
+    expect(reservedTerm.status).toBe(409);
+    expect(await reservedTerm.json()).toEqual({
+      ok: false,
+      error: {
+        code: 'design.conversation_reserved',
+        params: { conversationId: designConv },
+        fallback: 'This conversation is managed by the design workspace.',
+      },
+    });
+
     expect(await status(t.base, `/ws/term/${t.pid}?conv=${issueConv}`, t.aliceToken)).toBe(409);
     expect(await status(t.base, `/ws/term/${t.pid}?conv=${crypto.randomUUID()}`, t.aliceToken)).toBe(404);
     t.driver.sessions.delete(`chat-${chatConv}`);
@@ -729,7 +763,7 @@ describe('WS chat：baseline → msg 增量 → selection → stale → 注入',
 // ---------- term（假 PTY 桥） ----------
 
 describe('WS term：PTY 桥', () => {
-  test('openPty(tmux attach) → 输出透传 / resize 控制帧 / binary 输入 / exit 帧 / 关连接回收', async () => {
+  test('openPty(tmux attach) → 输出透传 / resize与滚动控制帧 / binary 输入 / exit 帧 / 关连接回收', async () => {
     const t = await boot();
     const c = await connect(`${t.wsBase}/ws/term/${t.pid}?cols=100&rows=40`, t.aliceToken);
 
@@ -750,6 +784,24 @@ describe('WS term：PTY 桥', () => {
     c.send({ type: 'resize', cols: 133, rows: 44 });
     await waitFor(() => opened.pty.resizes.length === 1);
     expect(opened.pty.resizes[0]).toEqual([133, 44]);
+
+    t.driver.scrollDelayMs = 10;
+    c.send({ type: 'scroll', direction: 'up', lines: 3 });
+    c.send({ type: 'scroll', direction: 'down', lines: 999 });
+    await waitFor(() => t.driver.scrolls.length === 2);
+    expect(t.driver.scrolls).toEqual([
+      { session: `cc-${t.pid}-console`, direction: 'up', lines: 3 },
+      { session: `cc-${t.pid}-console`, direction: 'down', lines: 100 },
+    ]);
+    expect(t.driver.maxScrollInFlight).toBe(1);
+
+    for (const invalid of [
+      { type: 'scroll', direction: 'left', lines: 3 },
+      { type: 'scroll', direction: 'up', lines: 0 },
+      { type: 'scroll', direction: 'up', lines: '3' },
+    ]) c.send(invalid);
+    await Bun.sleep(20);
+    expect(t.driver.scrolls).toHaveLength(2);
 
     // PTY 退出 → {type:'exit'} + 连接关闭
     opened.pty.exit(0);
@@ -835,6 +887,21 @@ describe('WS chat ?conv=：钉住对话 live/只读 + mode 帧', () => {
     expect(await get(`/ws/chat/${t.pid}?conv=${crypto.randomUUID()}`)).toBe(403);
     // 合法 conv：鉴权全过，非 upgrade 请求到 upgrade 点 → 400
     expect(await get(`/ws/chat/${t.pid}?conv=${t.convA}`)).toBe(400);
+    t.server.db.query(
+      `INSERT INTO design_tasks
+         (project_id, title, original_request, agent, conversation_id, created_ts, updated_ts)
+       VALUES (?, 'Design', 'Reserved conversation', 'claude', ?, ?, ?)`,
+    ).run(t.pid, t.convB, Date.now(), Date.now());
+    const reservedChat = await fetch(`${t.base}/ws/chat/${t.pid}?conv=${t.convB}`, {
+      headers: { authorization: `Bearer ${t.aliceToken}` },
+    });
+    expect(reservedChat.status).toBe(409);
+    expect(await reservedChat.json()).toMatchObject({
+      error: {
+        code: 'design.conversation_reserved',
+        params: { conversationId: t.convB },
+      },
+    });
   });
 
   test('钉住激活对话 → mode live:true + baseline；菜单/注入全通', async () => {

@@ -206,6 +206,8 @@ export interface Conversation {
   lastActiveTs: number | null;
   /** 本对话的弹窗自动批准档位（014 迁移；默认 'cautious' = 现状全部等人点） */
   autoApprove: AutoApproveLevel;
+  /** Server-owned execution workspace; null keeps the project's canonical cwd. */
+  workspaceCwd: string | null;
 }
 
 // ---------- Project Module ----------
@@ -268,6 +270,232 @@ export interface Issue {
   createdBy: number | null;
   createdTs: number;
   doneTs: number | null;
+}
+
+// ---------- Project Workflow / Issue Workflow ----------
+
+/** 项目级工作流模板只修改身份与当前版本指针；已发布版本保持不可变。 */
+export type ProjectWorkflowTemplateStatus = 'active' | 'archived';
+
+export interface ProjectWorkflowTemplate {
+  id: number;
+  projectId: number;
+  name: string;
+  description: string | null;
+  status: ProjectWorkflowTemplateStatus;
+  currentVersion: number;
+  createdBy: number | null;
+  createdTs: number;
+  updatedTs: number;
+}
+
+/** 图节点：issue 是固定任务起点；agent 执行工作；fork/join/end 负责控制流。 */
+export type WorkflowNodeKind = 'issue' | 'agent' | 'fork' | 'join' | 'end';
+export type WorkflowNodeExecutionMode = 'read' | 'write';
+
+export interface WorkflowNodeDefinition {
+  key: string;
+  kind: WorkflowNodeKind;
+  title: string;
+  instructions: string | null;
+  agent: AgentKind | null;
+  executionMode: WorkflowNodeExecutionMode;
+  /** 节点经循环最多可进入的次数；图级上限仍会再次兜底。 */
+  maxVisits: number;
+  positionX: number;
+  positionY: number;
+  config: Record<string, unknown> | null;
+}
+
+export interface WorkflowEdgeDefinition {
+  key: string;
+  fromNodeKey: string;
+  toNodeKey: string;
+  /** Agent 根据自然语言输出直接判断是否命中；null 表示无条件边。 */
+  conditionText: string | null;
+  priority: number;
+  isDefault: boolean;
+}
+
+/** 模板版本和 issue 快照共同使用的规范化 JSON 契约。 */
+export interface WorkflowGraphSnapshot {
+  schemaVersion: 1;
+  entryNodeKey: string;
+  maxLoopIterations: number;
+  nodes: WorkflowNodeDefinition[];
+  edges: WorkflowEdgeDefinition[];
+}
+
+/** 所有节点共享读取的 issue、文档路径与创建时项目知识。用户原文保持不变。 */
+export interface IssueWorkflowSharedContext {
+  schemaVersion: 1;
+  issue: {
+    id: number;
+    title: string;
+    body: string | null;
+    category: IssueCategory;
+    createdTs: number;
+  };
+  project: {
+    id: number;
+    name: string;
+    goal: string | null;
+    readmeSummary: string | null;
+    understanding: string | null;
+    understandingAgent: AgentKind | null;
+    understandingTs: number | null;
+  };
+  module: {
+    id: number;
+    slug: string;
+    displayName: string;
+    agent: AgentKind;
+  } | null;
+  documents: {
+    /** 相对项目 cwd；null 表示旧装配没有正式模块。 */
+    module: string | null;
+    /** 相对项目 cwd；由 ModuleDocs 在正式创建提交后生成。 */
+    issueProcess: string | null;
+  };
+}
+
+export interface ProjectWorkflowVersion {
+  id: number;
+  templateId: number;
+  version: number;
+  graph: WorkflowGraphSnapshot;
+  graphHash: string;
+  createdBy: number | null;
+  createdTs: number;
+}
+
+/** 模板版本的关系型节点镜像，供后续查询和结构校验使用。 */
+export interface ProjectWorkflowNode extends WorkflowNodeDefinition {
+  id: number;
+  versionId: number;
+  createdTs: number;
+}
+
+/** 模板版本的关系型连线镜像。 */
+export interface ProjectWorkflowEdge extends WorkflowEdgeDefinition {
+  id: number;
+  versionId: number;
+  createdTs: number;
+}
+
+export type IssueWorkflowStatus =
+  | 'pending'
+  | 'running'
+  | 'paused'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+/** issue 创建时复制 graph；template 引用仅用于溯源，不参与后续执行。 */
+export interface IssueWorkflowSnapshot {
+  id: number;
+  issueId: number;
+  templateId: number | null;
+  templateVersionId: number | null;
+  templateName: string;
+  templateVersion: number;
+  graph: WorkflowGraphSnapshot;
+  graphHash: string;
+  context: IssueWorkflowSharedContext;
+  status: IssueWorkflowStatus;
+  pauseReason: string | null;
+  maxLoopIterations: number;
+  createdTs: number;
+  updatedTs: number;
+  startedTs: number | null;
+  completedTs: number | null;
+}
+
+export type WorkflowNodeRunStatus =
+  | 'queued'
+  | 'running'
+  | 'routing'
+  | 'waiting_join'
+  | 'succeeded'
+  | 'failed'
+  | 'blocked'
+  | 'cancelled'
+  | 'skipped';
+
+/** 每次进入节点都产生新 attempt；token/parallelGroup 记录并行分支的血缘。 */
+export interface IssueWorkflowNodeRun {
+  id: number;
+  issueWorkflowId: number;
+  nodeKey: string;
+  attempt: number;
+  iteration: number;
+  tokenKey: string;
+  parentRunId: number | null;
+  predecessorRunIds: number[];
+  parallelGroupKey: string | null;
+  agent: AgentKind | null;
+  conversationId: string | null;
+  status: WorkflowNodeRunStatus;
+  selectedEdgeKeys: string[];
+  outputText: string | null;
+  routeReason: string | null;
+  errorCode: string | null;
+  errorDetails: string | null;
+  createdTs: number;
+  updatedTs: number;
+  startedTs: number | null;
+  finishedTs: number | null;
+}
+
+/** Agent 自然语言路由决定的耐久审计记录；fork 可由一个 run 产生多条。 */
+export interface IssueWorkflowTransition {
+  id: number;
+  issueWorkflowId: number;
+  fromRunId: number;
+  edgeKey: string;
+  toNodeKey: string;
+  decisionText: string | null;
+  iteration: number;
+  parallelGroupKey: string | null;
+  createdTs: number;
+}
+
+export type WorkflowWorktreeStatus =
+  | 'preparing'
+  | 'active'
+  | 'merging'
+  | 'resolving'
+  | 'merged'
+  | 'paused'
+  | 'cleanup_pending'
+  | 'cleaned'
+  | 'failed';
+
+/** 并行写节点的隔离 worktree；自动解冲突会绑定独立 resolutionConversationId。 */
+export interface IssueWorkflowWorktree {
+  id: number;
+  issueWorkflowId: number;
+  nodeRunId: number;
+  path: string;
+  branch: string;
+  baseRef: string;
+  baseSha: string | null;
+  headSha: string | null;
+  status: WorkflowWorktreeStatus;
+  conflictDetails: string | null;
+  resolutionConversationId: string | null;
+  createdTs: number;
+  updatedTs: number;
+  mergedTs: number | null;
+  cleanedTs: number | null;
+}
+
+/** issue 工作台使用的完整只读运行态；所有字段都可由持久化事实源重建。 */
+export interface IssueWorkflowRuntime {
+  workflow: IssueWorkflowSnapshot;
+  runs: IssueWorkflowNodeRun[];
+  transitions: IssueWorkflowTransition[];
+  worktrees: IssueWorkflowWorktree[];
 }
 
 export interface IssueEvent {

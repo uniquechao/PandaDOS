@@ -9,6 +9,7 @@ import { UserStore } from './users';
 import { LocalDriver } from '../executor/local';
 import { JsonlLocator } from './jsonl';
 import { AgentJsonlLocator, rolloutSessionId } from './agent-locator';
+import { migrateDesigns } from '../designs/store';
 
 let dir: string;
 const driver = new LocalDriver();
@@ -124,6 +125,74 @@ describe('AgentJsonlLocator', () => {
       .get('conv-cx');
     expect(row!.agent_session_id).toBe('real-sid');
     expect(row!.agent_jsonl_path).toBe(f);
+  });
+
+  test('managed conversation discovers only its persisted workspace cwd', async () => {
+    const projectCwd = path.join(dir, 'locator-main');
+    const worktreeCwd = path.join(dir, 'locator-worktree');
+    const db = setup(projectCwd);
+    migrateDesigns(db);
+    const root = path.join(dir, 'codex-managed-workspace');
+    const t0 = Date.now();
+    insConv(db, 'conv-managed', 'codex', t0);
+    db.query('UPDATE conversations SET workspace_cwd = ? WHERE id = ?')
+      .run(worktreeCwd, 'conv-managed');
+    await writeRollout(root, t0 + 1000, 'main-session', projectCwd);
+    const managed = await writeRollout(root, t0 + 2000, 'managed-session', worktreeCwd);
+    const loc = new AgentJsonlLocator(
+      db, driver, new JsonlLocator(driver, path.join(dir, 'nope')), root,
+    );
+    expect(await loc.locate('conv-managed')).toBe(managed);
+    expect(db.query<{ sid: string }, []>(
+      "SELECT agent_session_id AS sid FROM conversations WHERE id = 'conv-managed'",
+    ).get()?.sid).toBe('managed-session');
+
+    await writeRollout(root, t0 + 3000, 'main-reclaim', projectCwd);
+    const managedReclaim = await writeRollout(root, t0 + 4000, 'managed-reclaim', worktreeCwd);
+    await appendTsLine(managedReclaim, Date.now());
+    expect(await loc.reclaim('conv-managed')).toBe(managedReclaim);
+  });
+
+  test('codex fresh 发现：容差窗内旧 rollout 不得抢占启动后创建的当前会话', async () => {
+    const cwd = path.join(dir, 'p2-collision');
+    const db = setup(cwd);
+    const root = path.join(dir, 'codex-sessions-collision');
+    const launchTs = Date.now();
+    insConv(db, 'conv-collision', 'codex', launchTs);
+    const stale = await writeRollout(root, launchTs - 111_000, 'stale-nearby', cwd);
+    const current = await writeRollout(root, launchTs + 5_000, 'current-sid', cwd);
+
+    const loc = new AgentJsonlLocator(
+      db,
+      driver,
+      new JsonlLocator(driver, path.join(dir, 'nope')),
+      root,
+      () => launchTs + 6_000,
+    );
+    expect(await loc.locate('conv-collision')).toBe(current);
+    expect(await loc.locate('conv-collision')).not.toBe(stale);
+  });
+
+  test('codex fresh 发现：确认期内不提前绑定仅有的锚点前候选，超时后仍兼容时钟偏差', async () => {
+    const cwd = path.join(dir, 'p2-clock-skew');
+    const db = setup(cwd);
+    const root = path.join(dir, 'codex-sessions-clock-skew');
+    const launchTs = Date.now();
+    let now = launchTs + 1_000;
+    insConv(db, 'conv-clock-skew', 'codex', launchTs);
+    const skewed = await writeRollout(root, launchTs - 15_000, 'skewed-sid', cwd);
+
+    const loc = new AgentJsonlLocator(
+      db,
+      driver,
+      new JsonlLocator(driver, path.join(dir, 'nope')),
+      root,
+      () => now,
+    );
+    expect(await loc.locate('conv-clock-skew')).toBeNull();
+
+    now = launchTs + 11_000;
+    expect(await loc.locate('conv-clock-skew')).toBe(skewed);
   });
 
   test('已绑他人 session id 排除；无锚点不猜', async () => {

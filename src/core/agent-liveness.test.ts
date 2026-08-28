@@ -48,7 +48,7 @@ const BASH_IDLE = `[root@VM-0-6-opencloudos livetest]#
 
 /** macOS zsh + Starship：`❯` 前面有 cwd/git 状态；不能和 Claude 的独立 composer 光标混为一谈。 */
 const MAC_STARSHIP_IDLE =
-  '~/Documents/codes/PandaDOS on codex/v2-root-cleanup ⇡3 ✗5 ?4 ❯';
+  '~/Documents/codes/tmux_kits on codex/v2-root-cleanup ⇡3 ✗5 ?4 ❯';
 
 describe('shellPromptTail', () => {
   test('末条非空行以 # / $ / % 收尾 → true（尾随空白/空行要回溯）', () => {

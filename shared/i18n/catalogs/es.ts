@@ -7,6 +7,14 @@ import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
 import { projectSettingsMessages } from '../domains/project-settings';
 import { externalImportMessages } from '../domains/external-import';
+import { designWorkbenchMessages } from '../domains/design-workbench';
+import { designWorkbenchAdvancedMessages } from '../domains/design-workbench-advanced';
+import { designAssetsUiMessages } from '../domains/design-assets-ui';
+import { designFinalUiMessages } from '../domains/design-final-ui';
+import { designReviewFixMessages } from '../domains/design-review-fixes';
+import { designSnapshotUiMessages } from '../domains/design-snapshot-ui';
+import { designConfirmationUiMessages } from '../domains/design-confirmation-ui';
+import { workflowMessages } from '../domains/workflows';
 
 export const esCatalog = {
   ...shellMessages.es,
@@ -19,6 +27,14 @@ export const esCatalog = {
   ...notifyMessages.es,
   ...projectSettingsMessages.es,
   ...externalImportMessages.es,
+  ...designWorkbenchMessages.es,
+  ...designWorkbenchAdvancedMessages.es,
+  ...designAssetsUiMessages.es,
+  ...designFinalUiMessages.es,
+  ...designReviewFixMessages.es,
+  ...designSnapshotUiMessages.es,
+  ...designConfirmationUiMessages.es,
+  ...workflowMessages.es,
   'issue.editSubtask': 'Editar subtarea {number}', 'issue.subtaskText': 'Contenido de la subtarea',
   'view.importLocalHistory':'Importar historial local','view.localHistoryHelp':'Solo se muestran sesiones de Claude/Codex cuyo directorio de trabajo coincide exactamente con este proyecto.','view.localHistoryAgentFilter':'Filtrar historial por agente','view.historySelected':'{count, plural, one {# sesión seleccionada} other {# sesiones seleccionadas}}','view.selectAllHistory':'Seleccionar todo','view.clearHistorySelection':'Limpiar','view.readingLocalHistory':'Leyendo historial local…','view.noLocalHistory':'No se encontró historial local para este proyecto.','view.noFilteredLocalHistory':'No hay historial para este filtro de agente.','view.localHistoryCandidates':'Sesiones del historial local','view.untitledHistory':'Sesión del historial sin título','view.historyAlreadyImported':'Importada','view.noImportedConversation':'La importación no devolvió una conversación disponible.','view.localHistoryImported':'{count, plural, one {Se importó # sesión del historial} other {Se importaron # sesiones del historial}}','view.importSelectedHistory':'Importar selección',
   'project.importTitle':'Importar','project.importShort':'Importar','project.importSource':'Origen de importación','project.importTmuxSource':'Sesión de tmux','project.importClaudeSource':'Proyecto de Claude','project.importCodexSource':'Proyecto de Codex',
@@ -105,7 +121,7 @@ export const esCatalog = {
   'project.statusReview':'Pendiente de confirmación','project.statusDoing':'En curso','project.statusTodo':'Pendiente','project.statusBlocked':'Bloqueado','project.migrateAdmin':'Mover el directorio completo del proyecto a otra ubicación (solo administradores)',
   'project.welcomeBack':'Te damos la bienvenida de nuevo, {name}','project.noMatches':'Ningún proyecto coincide con los filtros actuales{query}','project.searchSuffix':' (búsqueda: “{query}”)','project.archivedCount':'Archivados ({count})',
   'project.gitRequired':'Introduce una URL de repositorio Git','project.clonedCreated':'Repositorio clonado y proyecto creado','project.createdWarnings':'Creado con advertencias:\n{warnings}','project.newProject':'Nuevo proyecto',
-  'project.chatModeHelp':'Modo chat: haz preguntas y crea archivos en el directorio del proyecto sin issues; cada proyecto puede tener varias conversaciones.','project.projectName':'Nombre del proyecto',
+  'project.issueModeHelp':'Modo issue: organiza el trabajo en el tablero de issues y permite que los agentes lo ejecuten según el flujo del proyecto.','project.chatModeHelp':'Modo chat: haz preguntas y crea archivos en el directorio del proyecto sin issues; cada proyecto puede tener varias conversaciones.','project.projectName':'Nombre del proyecto',
   'project.repoNameDefault':' (déjalo vacío para usar el nombre del repositorio)','project.cloneTo':'Clonar en','project.selectedUserHome':'carpeta personal del usuario seleccionado','project.yourWorkspace':'tu espacio de trabajo',
   'project.pickDirectory':'Elegir un directorio','project.branchFallbackHelp':'El trabajo se realiza en la rama actual. PandaDOS no crea, cambia ni fusiona ramas; este valor solo se usa si no se puede leer la rama actual.',
   'project.cloning':'Clonando…','project.cloneCreate':'Clonar y crear','project.managed':'Gestionado n.º {id}','project.imported':'Importado n.º {id}','project.noPermission':'Sin permiso',

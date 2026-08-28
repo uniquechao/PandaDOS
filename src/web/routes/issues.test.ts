@@ -5,6 +5,7 @@ import path from 'node:path';
 import { MessageCounter } from '../../core/activity';
 import { openDb } from '../../core/db';
 import { migrate } from '../../core/migrate';
+import type { WorkflowGraphSnapshot } from '../../core/types';
 import { UserStore } from '../../core/users';
 import { ConversationManager } from '../../core/conversations';
 import { LocalDriver } from '../../executor/local';
@@ -17,6 +18,7 @@ import {
 } from '../../issues/engine';
 import { KeyedMutex } from '../../issues/mutex';
 import { ModuleManager, ModuleStore } from '../../issues/modules';
+import { validateWorkflowGraph, WorkflowTemplateStore } from '../../issues/workflows';
 import { authDepsFromDb, createDispatcher } from '../middleware';
 import { issuesRoutes } from './issues';
 
@@ -151,7 +153,138 @@ async function j(r: Response | Promise<Response> | null): Promise<{ status: numb
   return { status: resp.status, body: await resp.json() };
 }
 
+function workflowGraph(agent: 'claude' | 'codex' = 'codex'): WorkflowGraphSnapshot {
+  return {
+    schemaVersion: 1,
+    entryNodeKey: 'issue',
+    maxLoopIterations: 5,
+    nodes: [
+      { key: 'issue', kind: 'issue', title: 'Issue', instructions: null, agent: null, executionMode: 'read', maxVisits: 1, positionX: 0, positionY: 0, config: null },
+      { key: 'work', kind: 'agent', title: '实现', instructions: '完成任务', agent, executionMode: 'write', maxVisits: 1, positionX: 100, positionY: 0, config: null },
+      { key: 'end', kind: 'end', title: '完成', instructions: null, agent: null, executionMode: 'read', maxVisits: 1, positionX: 200, positionY: 0, config: null },
+    ],
+    edges: [
+      { key: 'issue-work', fromNodeKey: 'issue', toNodeKey: 'work', conditionText: null, priority: 0, isDefault: false },
+      { key: 'work-end', fromNodeKey: 'work', toNodeKey: 'end', conditionText: null, priority: 0, isDefault: false },
+    ],
+  };
+}
+
+function createWorkflow(db: ReturnType<typeof openDb>, projectId: number, name: string) {
+  const validated = validateWorkflowGraph(workflowGraph(), ['claude', 'codex']);
+  if (!validated.ok) throw new Error('测试工作流无效');
+  return new WorkflowTemplateStore(db, () => 1_000).create({
+    projectId,
+    name,
+    graph: validated.graph,
+    graphJson: validated.graphJson,
+    graphHash: validated.graphHash,
+  });
+}
+
 describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
+  test('高级工作流选择保存不可变快照和节点共享上下文', async () => {
+    const s = await setup({ modules: true });
+    s.db.run(
+      `UPDATE projects
+       SET goal = '交付目标', readme_summary = '项目简介', understanding = '项目知识',
+           understanding_agent = 'claude', understanding_ts = 1234
+       WHERE id = 1`,
+    );
+    const module = s.moduleStore.create({
+      projectId: 1,
+      slug: 'workflow-module',
+      displayName: '工作流模块',
+      agent: 'claude',
+      source: 'manual',
+      createdBy: s.alice.user.id,
+    });
+    const template = createWorkflow(s.db, 1, '标准交付');
+    const created = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, {
+      title: '共享上下文任务',
+      body: '保持用户正文',
+      category: 'design',
+      moduleId: module.id,
+      workflowTemplateId: template.template.id,
+    })));
+    expect(created.status).toBe(200);
+    expect(created.body.workflow).toMatchObject({
+      issueId: created.body.issue.id,
+      templateId: template.template.id,
+      templateVersionId: template.version.id,
+      templateName: '标准交付',
+      templateVersion: 1,
+      context: {
+        schemaVersion: 1,
+        issue: { title: '共享上下文任务', body: '保持用户正文', category: 'design' },
+        project: {
+          id: 1,
+          name: 'p1',
+          goal: '交付目标',
+          readmeSummary: '项目简介',
+          understanding: '项目知识',
+          understandingAgent: 'claude',
+          understandingTs: 1234,
+        },
+        module: { id: module.id, slug: 'workflow-module', displayName: '工作流模块', agent: 'claude' },
+        documents: {
+          module: '.panda/modules/workflow-module/MODULE.md',
+          issueProcess: `.panda/modules/workflow-module/issues/${created.body.issue.id}-issue.md`,
+        },
+      },
+    });
+
+    const originalGraph = created.body.workflow.graph;
+    const next = workflowGraph();
+    next.nodes.find((node) => node.key === 'work')!.title = '新版本实现';
+    const validated = validateWorkflowGraph(next, ['claude', 'codex']);
+    if (!validated.ok) throw new Error('测试工作流无效');
+    new WorkflowTemplateStore(s.db, () => 2_000).publish(
+      1,
+      template.template.id,
+      validated.graph,
+      validated.graphJson,
+      validated.graphHash,
+    );
+    const detail = await j(s.dispatch(req(
+      'GET',
+      `/api/projects/1/issues/${created.body.issue.id}`,
+      s.alice.token,
+    )));
+    expect(detail.body.workflow.graph).toEqual(originalGraph);
+    expect(detail.body.workflow.templateVersion).toBe(1);
+    expect(detail.body.workflowRuntime).toMatchObject({
+      workflow: { graph: originalGraph, templateVersion: 1 },
+      worktrees: [],
+    });
+    expect(detail.body.workflowRuntime.runs.map((run: { nodeKey: string }) => run.nodeKey)).toEqual(['issue', 'work']);
+    expect(detail.body.workflowRuntime.transitions).toMatchObject([{ edgeKey: 'issue-work', toNodeKey: 'work' }]);
+  });
+
+  test('拒绝无效或跨项目工作流选择且不留下 issue', async () => {
+    const s = await setup();
+    const other = createWorkflow(s.db, 2, '其他项目流程');
+    const local = createWorkflow(s.db, 1, '当前项目流程');
+    const before = s.db.query<{ count: number }, []>('SELECT COUNT(*) AS count FROM issues').get()!.count;
+    const invalid = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, {
+      title: '非法编号', workflowTemplateId: 'bad',
+    })));
+    expect(invalid.status).toBe(400);
+    expect(invalid.body.error.code).toBe('workflow.selection_invalid');
+    const foreign = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, {
+      title: '跨项目模板', workflowTemplateId: other.template.id,
+    })));
+    expect(foreign.status).toBe(404);
+    expect(foreign.body.error.code).toBe('workflow.not_found');
+    s.db.run('UPDATE executors SET supports_codex = 0 WHERE id = 1');
+    const unavailable = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, {
+      title: '不可用 Agent', workflowTemplateId: local.template.id,
+    })));
+    expect(unavailable.status).toBe(409);
+    expect(unavailable.body.error.code).toBe('workflow.agent_unavailable');
+    expect(s.db.query<{ count: number }, []>('SELECT COUNT(*) AS count FROM issues').get()!.count).toBe(before);
+  });
+
   test('执行机未启用 Codex 时创建/修改 issue 返回 409，Claude 可用', async () => {
     const s = await setup();
     s.db.run('UPDATE executors SET supports_codex = 0 WHERE id = 1');

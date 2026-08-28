@@ -59,6 +59,13 @@ export function moduleTmux(projectId: number, slug: string): string {
   return `cc-${projectId}-m-${slug}`;
 }
 
+/** Managed design-run conversations never share the project/module tmux namespace. */
+export function worktreeTmux(projectId: number, convId: string): string {
+  const stable = convId.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64);
+  if (!stable) throw new Error('managed conversation id is invalid');
+  return `cc-${projectId}-w-${stable}`;
+}
+
 /**
  * chat（对话模式）每对话独立 tmux 会话名（009）：以 convId（UUID）为键，与 issue 的
  * `cc-<pid>` 隔离——故同项目多条 chat 对话可各自常驻、来回切换互不 kill。
@@ -83,6 +90,7 @@ interface ConvRow {
   last_active_ts?: number | null;
   /** 014 迁移；旧库兜底 'cautious' */
   auto_approve?: string | null;
+  workspace_cwd?: string | null;
 }
 
 function mapConv(r: ConvRow): Conversation {
@@ -97,6 +105,7 @@ function mapConv(r: ConvRow): Conversation {
     lastActiveTs: r.last_active_ts ?? null,
     // 认不出的值（旧库无此列/脏数据）一律落到最保守档，宁可多问人也不误批
     autoApprove: r.auto_approve === 'medium' || r.auto_approve === 'auto' ? r.auto_approve : 'cautious',
+    workspaceCwd: typeof r.workspace_cwd === 'string' && r.workspace_cwd.trim() ? r.workspace_cwd : null,
   };
 }
 
@@ -167,9 +176,10 @@ export class ConversationManager {
   }
 
   listByProject(projectId: number): Conversation[] {
+    const designFilter = this.designConversationFilter();
     return this.db
       .query<ConvRow, [number]>(
-        'SELECT * FROM conversations WHERE project_id = ? ORDER BY created_ts DESC',
+        `SELECT * FROM conversations WHERE project_id = ?${designFilter} ORDER BY created_ts DESC`,
       )
       .all(projectId)
       .map(mapConv);
@@ -180,12 +190,46 @@ export class ConversationManager {
    * 默认排除已归档；includeArchived=true 时全列。
    */
   listChats(projectId: number, includeArchived = false): Conversation[] {
+    const designFilter = this.designConversationFilter();
     const sql = includeArchived
-      ? `SELECT * FROM conversations WHERE project_id = ? AND kind = 'chat'
+      ? `SELECT * FROM conversations WHERE project_id = ? AND kind = 'chat'${designFilter}
          ORDER BY COALESCE(last_active_ts, created_ts) DESC`
-      : `SELECT * FROM conversations WHERE project_id = ? AND kind = 'chat' AND archived = 0
+      : `SELECT * FROM conversations WHERE project_id = ? AND kind = 'chat' AND archived = 0${designFilter}
          ORDER BY COALESCE(last_active_ts, created_ts) DESC`;
     return this.db.query<ConvRow, [number]>(sql).all(projectId).map(mapConv);
+  }
+
+  private hasDesignTasks(): boolean {
+    return this.db
+      .query<{ n: number }, []>(
+        `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'design_tasks'`,
+      )
+      .get()!.n > 0;
+  }
+
+  private hasDesignSagaConversationOwners(): boolean {
+    return this.db
+      .query<{ n: number }, []>(
+        `SELECT COUNT(*) AS n FROM sqlite_master
+         WHERE type = 'table' AND name = 'design_saga_conversation_owners'`,
+      )
+      .get()!.n > 0;
+  }
+
+  private designConversationFilter(): string {
+    const taskFilter = this.hasDesignTasks()
+      ? ' AND NOT EXISTS (SELECT 1 FROM design_tasks d WHERE d.conversation_id = conversations.id)'
+      : '';
+    const ownerFilter = this.hasDesignSagaConversationOwners()
+      ? ` AND NOT EXISTS (
+          SELECT 1 FROM design_saga_conversation_owners owner
+          WHERE owner.conversation_id = conversations.id
+        )`
+      : '';
+    const workspaceFilter = this.hasWorkspaceCwd()
+      ? " AND NULLIF(TRIM(conversations.workspace_cwd), '') IS NULL"
+      : '';
+    return `${taskFilter}${ownerFilter}${workspaceFilter}`;
   }
 
   /** 项目当前激活的对话 id（入库，重启不丢） */
@@ -201,6 +245,12 @@ export class ConversationManager {
   /** issue 模式项目级会话名（cc-<pid>）；chat 对话请用 sessionName(conv) 取每对话独立会话 */
   tmuxName(projectId: number, convId?: string | null): string {
     if (convId) {
+      if (this.hasWorkspaceCwd()) {
+        const managed = this.db.query<{ workspace_cwd: string | null }, [number, string]>(
+          'SELECT workspace_cwd FROM conversations WHERE project_id = ? AND id = ?',
+        ).get(projectId, convId);
+        if (managed?.workspace_cwd?.trim()) return worktreeTmux(projectId, convId);
+      }
       const row = this.db
         .query<{ slug: string }, [number, string]>(
           'SELECT slug FROM project_modules WHERE project_id = ? AND conversation_id = ?',
@@ -228,7 +278,57 @@ export class ConversationManager {
     agent: AgentKind = 'claude',
     kind: ProjectKind = 'issue',
   ): Conversation {
-    const id = crypto.randomUUID();
+    return this.createWithId(crypto.randomUUID(), projectId, label, agent, kind);
+  }
+
+  /** Trusted design-execution adapter only; HTTP callers never control this path. */
+  createInWorkspace(
+    projectId: number,
+    label: string,
+    agent: AgentKind,
+    workspaceCwd: string,
+  ): Conversation {
+    return this.createInWorkspaceWithId(crypto.randomUUID(), projectId, label, agent, workspaceCwd);
+  }
+
+  /** Trusted atomic adapters may allocate the ID before binding another domain row. */
+  createInWorkspaceWithId(
+    id: string,
+    projectId: number,
+    label: string,
+    agent: AgentKind,
+    workspaceCwd: string,
+  ): Conversation {
+    if (!this.hasWorkspaceCwd()) throw new Error('managed workspace schema is unavailable');
+    if (!workspaceCwd.startsWith('/') || workspaceCwd.trim() !== workspaceCwd || workspaceCwd.includes('\0')) {
+      throw new Error('managed workspace cwd is invalid');
+    }
+    const row = this.db.query<ConvRow, [string, number, string, number, string, string]>(
+      `INSERT INTO conversations
+         (id, project_id, label, created_ts, agent, kind, workspace_cwd)
+       VALUES (?, ?, ?, ?, ?, 'issue', ?)
+       ON CONFLICT(id) DO NOTHING RETURNING *`,
+    ).get(
+      id, projectId, (label || '会话').slice(0, 80), Date.now(),
+      agent === 'codex' ? 'codex' : 'claude', workspaceCwd,
+    );
+    if (row) return mapConv(row);
+    const replay = this.get(id);
+    if (!replay || replay.projectId !== projectId || replay.agent !== agent
+      || replay.kind !== 'issue' || replay.workspaceCwd !== workspaceCwd) {
+      throw new Error('managed conversation id collision');
+    }
+    return replay;
+  }
+
+  /** Saga adapter: register a caller-allocated ID so cleanup remains deterministic after a partial failure. */
+  createWithId(
+    id: string,
+    projectId: number,
+    label: string,
+    agent: AgentKind = 'claude',
+    kind: ProjectKind = 'issue',
+  ): Conversation {
     const row = this.db
       .query<ConvRow, [string, number, string, number, string, string]>(
         `INSERT INTO conversations (id, project_id, label, created_ts, agent, kind)
@@ -244,6 +344,47 @@ export class ConversationManager {
       );
     if (!row) throw new Error('insert conversation failed');
     return mapConv(row);
+  }
+
+  /** Design creation saga registration with durable ownership proof and collision-safe replay. */
+  createOwnedWithId(
+    id: string,
+    projectId: number,
+    label: string,
+    agent: AgentKind,
+    kind: ProjectKind,
+    sagaToken: string,
+  ): { conversationId: string; created: boolean; ownershipProof: string | null } {
+    return this.db.transaction(() => {
+      const inserted = this.db.query<{ id: string }, [string, number, string, number, string, string]>(
+        `INSERT INTO conversations (id, project_id, label, created_ts, agent, kind)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT DO NOTHING RETURNING id`,
+      ).get(
+        id,
+        projectId,
+        (label || '会话').slice(0, 80),
+        Date.now(),
+        agent === 'codex' ? 'codex' : 'claude',
+        kind === 'chat' ? 'chat' : 'issue',
+      );
+      if (inserted) {
+        this.db.query(
+          `INSERT INTO design_saga_conversation_owners (conversation_id, saga_token, created_ts)
+           VALUES (?, ?, ?)`,
+        ).run(id, sagaToken, Date.now());
+        return { conversationId: id, created: true, ownershipProof: sagaToken };
+      }
+      const existing = this.db.query<{ sagaToken: string }, [string]>(
+        `SELECT saga_token AS sagaToken FROM design_saga_conversation_owners
+         WHERE conversation_id = ?`,
+      ).get(id);
+      return {
+        conversationId: id,
+        created: false,
+        ownershipProof: existing?.sagaToken === sagaToken ? sagaToken : null,
+      };
+    })();
   }
 
   /** 改对话标题（chat 对话重命名用；≤80 字符） */
@@ -264,6 +405,49 @@ export class ConversationManager {
     const c = this.get(id);
     this.db.query('UPDATE conversations SET archived = 1 WHERE id = ?').run(id);
     if (c?.kind === 'chat') await this.killChatSession(c);
+  }
+
+  /** Design saga cleanup: kill must succeed (or already be absent) before the archived bit is committed. */
+  async archiveStrict(id: string): Promise<void> {
+    const c = this.get(id);
+    if (!c) return;
+    if (c.kind === 'chat') await this.killChatSessionStrict(c);
+    this.db.query('UPDATE conversations SET archived = 1 WHERE id = ?').run(id);
+  }
+
+  /** Design-create compensation: strictly remove runtime state, then delete the registered conversation row. */
+  async deleteStrict(id: string): Promise<void> {
+    const c = this.get(id);
+    if (!c) return;
+    if (c.kind === 'chat') await this.killChatSessionStrict(c);
+    this.db.query('DELETE FROM conversations WHERE id = ?').run(id);
+  }
+
+  /** Strict cleanup that cannot touch a row/runtime unless its persisted saga token matches. */
+  async deleteStrictOwned(id: string, sagaToken: string): Promise<boolean> {
+    const ownership = this.db.query<{ sagaToken: string | null }, [string]>(
+      `SELECT owner.saga_token AS sagaToken
+       FROM conversations conversation
+       LEFT JOIN design_saga_conversation_owners owner
+         ON owner.conversation_id = conversation.id
+       WHERE conversation.id = ?`,
+    ).get(id);
+    if (!ownership) return true;
+    if (ownership.sagaToken !== sagaToken) return false;
+    const c = this.get(id);
+    if (!c) return false;
+    if (c.kind === 'chat') await this.killChatSessionStrict(c);
+    return this.db.transaction(() => {
+      const result = this.db.query(
+        `DELETE FROM conversations
+         WHERE id = ? AND EXISTS (
+           SELECT 1 FROM design_saga_conversation_owners owner
+           WHERE owner.conversation_id = conversations.id AND owner.saga_token = ?
+         )`,
+      ).run(id, sagaToken);
+      // The ownership row is removed by its ON DELETE CASCADE in this same transaction.
+      return result.changes > 0;
+    })();
   }
 
   /**
@@ -293,6 +477,14 @@ export class ConversationManager {
     } catch {
       /* 会话不存在或已关，正常 */
     }
+  }
+
+  private async killChatSessionStrict(c: Conversation): Promise<void> {
+    if (c.kind !== 'chat') return;
+    const session = chatTmux(c.id);
+    const sessions = await this.driver.listSessions();
+    if (!sessions.some((candidate) => candidate.name === session)) return;
+    await this.driver.killSession(session);
   }
 
   /** 记一条对话最近活跃时刻（009 last_active_ts；chat 列表按它排序） */
@@ -488,10 +680,10 @@ export class ConversationManager {
    * claude：首次（jsonl 未落地）`claude --session-id <id>`，之后 `claude --resume <id>`；
    * codex：已发现 session id 则 `codex resume <sid>`，否则 fresh 启动。
    */
-  async activate(id: string): Promise<Conversation | null> {
+  async activate(id: string, cwdOverride?: string): Promise<Conversation | null> {
     const c = this.get(id);
     if (!c) return null;
-    const cwd = this.projectCwd(c);
+    const cwd = cwdOverride ?? await this.conversationCwd(c);
 
     if (c.kind === 'chat') {
       // 独立聊天会话：代理真在跑即幂等短路（不打断在跑的对话），否则启动/重启
@@ -531,19 +723,30 @@ export class ConversationManager {
   async relaunch(id: string): Promise<Conversation | null> {
     const c = this.get(id);
     if (!c) return null;
-    await this.launchInto(this.sessionName(c), c, this.projectCwd(c));
+    await this.launchInto(this.sessionName(c), c, await this.conversationCwd(c));
     if (c.kind === 'chat') this.touch(id);
     else this.setActiveConv(c.projectId, id); // 重启后这条就是项目的当前对话（幂等）
     return c;
   }
 
   /** 项目 cwd（对话必须挂在存在的项目上，取不到是数据不一致，直接上抛） */
-  private projectCwd(c: Conversation): string {
+  private async conversationCwd(c: Conversation): Promise<string> {
+    if (c.workspaceCwd) {
+      const stat = await this.driver.statPath(c.workspaceCwd);
+      if (!stat?.isDirectory) throw new Error('managed conversation workspace is unavailable');
+      return c.workspaceCwd;
+    }
     const proj = this.db
       .query<{ cwd: string }, [number]>('SELECT cwd FROM projects WHERE id = ?')
       .get(c.projectId);
     if (!proj) throw new Error(`conversation ${c.id} 的项目 ${c.projectId} 不存在`);
     return proj.cwd;
+  }
+
+  private hasWorkspaceCwd(): boolean {
+    return this.db.query<{ n: number }, []>(
+      `SELECT COUNT(*) AS n FROM pragma_table_info('conversations') WHERE name = 'workspace_cwd'`,
+    ).get()!.n === 1;
   }
 
   private setActiveConv(projectId: number, convId: string): void {

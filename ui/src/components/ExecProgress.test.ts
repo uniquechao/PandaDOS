@@ -3,7 +3,7 @@
  * 只测纯函数 execProgressState——渲染部分 bun test 无 DOM，按仓库惯例不测。
  */
 import { describe, expect, test } from 'bun:test';
-import { canEditSubtask, execProgressState, stepGlyph, type ProgStep } from './ExecProgress';
+import { canEditSubtask, execProgressState, placeProgressTip, stepGlyph, type ProgStep } from './ExecProgress';
 import type { Subtask } from '../lib/types';
 
 const subs = (...done: boolean[]): Subtask[] => done.map((d, i) => ({ text: `子任务 ${i + 1} 正文`, done: d }));
@@ -107,5 +107,52 @@ describe('canEditSubtask', () => {
     for (const status of ['planning', 'testing', 'merging', 'done', 'cancelled'] as const) {
       expect(canEditSubtask(subtask, 1, 0, status, 'seq')).toBe(false);
     }
+  });
+});
+
+describe('placeProgressTip', () => {
+  test('按实测宽度将左右边缘夹在可见视口内', () => {
+    const left = placeProgressTip(
+      { left: 2, top: 40, width: 10, bottom: 50 },
+      { width: 320, height: 80 },
+      { left: 0, top: 0, width: 1024, height: 768 },
+    );
+    const right = placeProgressTip(
+      { left: 1008, top: 40, width: 10, bottom: 50 },
+      { width: 320, height: 80 },
+      { left: 0, top: 0, width: 1024, height: 768 },
+    );
+    expect(left.left).toBe(8);
+    expect(right.left).toBe(696);
+  });
+
+  test('下方空间不足时翻到锚点上方，并尊重 visualViewport 偏移', () => {
+    expect(placeProgressTip(
+      { left: 180, top: 690, width: 10, bottom: 700 },
+      { width: 240, height: 180 },
+      { left: 10, top: 100, width: 390, height: 640 },
+    )).toEqual({ left: 65, top: 504, side: 'above' });
+  });
+
+  test('两侧空间都不足时仍把完整浮层夹在视口内', () => {
+    expect(placeProgressTip(
+      { left: 180, top: 160, width: 10, bottom: 170 },
+      { width: 360, height: 584 },
+      { left: 0, top: 0, width: 375, height: 600 },
+    )).toEqual({ left: 8, top: 8, side: 'below' });
+  });
+});
+
+describe('ExecProgress 浮层交互契约', () => {
+  test('浮层 portal 到 body，支持焦点、Escape 和语义关联', async () => {
+    const source = await Bun.file(new URL('./ExecProgress.tsx', import.meta.url)).text();
+    expect(source).toContain("createPortal(");
+    expect(source).toContain('document.body');
+    expect(source).toContain("event.key === 'Escape'");
+    expect(source).toContain('onFocus=');
+    expect(source).toContain("matches(':focus-visible')");
+    expect(source).toContain('aria-describedby=');
+    expect(source).toContain('role="tooltip"');
+    expect(source).toContain("tr('ui.subtaskProgressStep'");
   });
 });

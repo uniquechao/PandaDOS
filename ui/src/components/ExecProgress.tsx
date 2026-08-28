@@ -5,7 +5,8 @@
  * 不用切回详情 tab 翻计划。编号后内联当前子任务标题（截断），悬停/点按编号弹出该子任务全文。
  * 纯展示：数据来自详情接口的 subtasks + issue.subIndex/status，自己不发请求。
  */
-import { useEffect, useState } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { ImplMode, IssueStatus, Subtask } from '../lib/types';
 import { tr } from '../i18n/runtime';
 
@@ -91,10 +92,57 @@ export function stepGlyph(s: ProgStep): string {
   return s.state === 'done' ? '✓' : s.state === 'blocked' ? '⚠' : s.state === 'cancelled' ? '✕' : String(s.n);
 }
 
-/** 浮层横向位置夹在视口内（编号在最左/最右时不被切掉） */
-function clampX(x: number): number {
-  const w = typeof window === 'undefined' ? 360 : window.innerWidth;
-  return Math.min(Math.max(x, 90), Math.max(90, w - 90));
+interface TipAnchor {
+  left: number;
+  top: number;
+  width: number;
+  bottom: number;
+}
+
+interface TipViewport {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+export interface ProgressTipPlacement {
+  left: number;
+  top: number;
+  side: 'above' | 'below';
+}
+
+const TIP_MARGIN = 8;
+const TIP_GAP = 6;
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), Math.max(min, max));
+}
+
+/**
+ * 以实测浮层尺寸定位：优先放在锚点下方；空间不足时翻到上方；两轴最终都夹在可见视口内。
+ * visualViewport 的 offset 也纳入计算，软键盘或缩放后仍不会掉出当前可见区域。
+ */
+export function placeProgressTip(
+  anchor: TipAnchor,
+  tip: { width: number; height: number },
+  viewport: TipViewport,
+): ProgressTipPlacement {
+  const viewLeft = viewport.left + TIP_MARGIN;
+  const viewTop = viewport.top + TIP_MARGIN;
+  const viewRight = viewport.left + viewport.width - TIP_MARGIN;
+  const viewBottom = viewport.top + viewport.height - TIP_MARGIN;
+  const belowTop = anchor.bottom + TIP_GAP;
+  const aboveTop = anchor.top - TIP_GAP - tip.height;
+  const belowSpace = viewBottom - belowTop;
+  const aboveSpace = anchor.top - TIP_GAP - viewTop;
+  const side = belowSpace >= tip.height || belowSpace >= aboveSpace ? 'below' : 'above';
+
+  return {
+    left: clamp(anchor.left + anchor.width / 2 - tip.width / 2, viewLeft, viewRight - tip.width),
+    top: clamp(side === 'below' ? belowTop : aboveTop, viewTop, viewBottom - tip.height),
+    side,
+  };
 }
 
 export function ExecProgress({
@@ -107,29 +155,61 @@ export function ExecProgress({
   status: IssueStatus;
 }) {
   // 详情浮层：编号 + 全文 + 视口坐标（null = 未弹）
-  const [tip, setTip] = useState<{ n: number; text: string; x: number; y: number } | null>(null);
+  const [tip, setTip] = useState<{ n: number; text: string; anchor: TipAnchor } | null>(null);
+  const [placement, setPlacement] = useState<ProgressTipPlacement | null>(null);
+  const tipRef = useRef<HTMLDivElement>(null);
   const tipOpen = tip !== null;
 
   // 点别处/滚动/改窗口大小都收起：手机上是点按弹出的，没有 mouseleave 可依赖。
   useEffect(() => {
     if (!tipOpen) return;
     const close = (): void => setTip(null);
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') close();
+    };
+    const viewport = window.visualViewport;
     document.addEventListener('click', close);
+    document.addEventListener('keydown', onKey);
     window.addEventListener('resize', close);
     window.addEventListener('scroll', close, true);
+    viewport?.addEventListener('resize', close);
+    viewport?.addEventListener('scroll', close);
     return () => {
       document.removeEventListener('click', close);
+      document.removeEventListener('keydown', onKey);
       window.removeEventListener('resize', close);
       window.removeEventListener('scroll', close, true);
+      viewport?.removeEventListener('resize', close);
+      viewport?.removeEventListener('scroll', close);
     };
   }, [tipOpen]);
+
+  useLayoutEffect(() => {
+    if (!tip || !tipRef.current) {
+      setPlacement(null);
+      return;
+    }
+    const visual = window.visualViewport;
+    const viewport: TipViewport = {
+      left: visual?.offsetLeft ?? 0,
+      top: visual?.offsetTop ?? 0,
+      width: visual?.width ?? window.innerWidth,
+      height: visual?.height ?? window.innerHeight,
+    };
+    setPlacement(placeProgressTip(
+      tip.anchor,
+      { width: tipRef.current.offsetWidth, height: tipRef.current.offsetHeight },
+      viewport,
+    ));
+  }, [tip]);
 
   const { steps, endDone, cur, doneN, total } = execProgressState(subs, subIndex, status);
   if (steps.length === 0) return null; // 没拆子任务的小改动：整块不渲染，顶栏保持原样
 
   const show = (el: HTMLElement, s: ProgStep): void => {
     const r = el.getBoundingClientRect();
-    setTip({ n: s.n, text: s.text, x: r.left + r.width / 2, y: r.bottom + 6 });
+    setPlacement(null);
+    setTip({ n: s.n, text: s.text, anchor: { left: r.left, top: r.top, width: r.width, bottom: r.bottom } });
   };
 
   return (
@@ -143,8 +223,9 @@ export function ExecProgress({
           <button
             key={s.n}
             class={`ep-dot ${s.state}`}
-            title={`${s.n}. ${s.text}`}
-            aria-label={`子任务 ${s.n}：${s.text}`}
+            aria-label={tr('ui.subtaskProgressStep', { number: s.n, text: s.text })}
+            aria-describedby={tip?.n === s.n ? `exec-progress-tip-${s.n}` : undefined}
+            aria-current={s.state === 'cur' ? 'step' : undefined}
             // 只对鼠标做悬停弹出：触摸设备上 pointerenter 也会来一发，会和下面的点按互相抵消
             onPointerEnter={(e) => {
               if (e.pointerType === 'mouse') show(e.currentTarget, s);
@@ -152,6 +233,11 @@ export function ExecProgress({
             onPointerLeave={(e) => {
               if (e.pointerType === 'mouse') setTip(null);
             }}
+            onFocus={(e) => {
+              // 鼠标/触屏随后还会触发 click；只让键盘焦点在 focus 阶段打开，避免首次点击开后即关。
+              if (e.currentTarget.matches(':focus-visible')) show(e.currentTarget, s);
+            }}
+            onBlur={() => setTip(null)}
             onClick={(e) => {
               e.stopPropagation(); // 否则冒到 document 上被上面的 close 立刻关掉
               if (tip && tip.n === s.n) setTip(null);
@@ -167,13 +253,24 @@ export function ExecProgress({
         </span>
       )}
       {tip && (
-        <div
-          class="ep-tip"
-          style={{ left: `${clampX(tip.x)}px`, top: `${tip.y}px` }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <b>{tip.n}.</b> {tip.text}
-        </div>
+        createPortal(
+          <div
+            ref={tipRef}
+            id={`exec-progress-tip-${tip.n}`}
+            class="ep-tip"
+            role="tooltip"
+            data-side={placement?.side}
+            style={{
+              left: `${placement?.left ?? 0}px`,
+              top: `${placement?.top ?? 0}px`,
+              visibility: placement ? 'visible' : 'hidden',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <b>{tip.n}.</b> {tip.text}
+          </div>,
+          document.body,
+        )
       )}
     </div>
   );

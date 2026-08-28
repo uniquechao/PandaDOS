@@ -20,8 +20,10 @@
  * 不 import 它们的实现；对执行机只走 ExecutorDriver。
  */
 import type { Database } from 'bun:sqlite';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { AgentExecutableNotFoundError } from '../core/conversations';
+import { projectAgentSupport } from '../core/executors';
 import { migrate, type MigrationStatus } from '../core/migrate';
 import { parseAutoApproveLevel } from '../core/types';
 import type {
@@ -35,6 +37,9 @@ import type {
   IssueCategory,
   IssueEvent,
   IssueState,
+  IssueWorkflowSharedContext,
+  IssueWorkflowRuntime,
+  IssueWorkflowSnapshot,
   Project,
   ProjectModule,
   ProjectStatus,
@@ -88,6 +93,16 @@ import { parseOrganizePlan, type OrganizeAction } from './organize-runner';
 import { BUSY_STATES, isBusy, moduleKeyOf, pickNext } from './queue';
 import { gitLockKey, KeyedMutex, projectLockKey, tmuxLockKey } from './mutex';
 import { outputLanguageInstruction, promptLanguage, userPromptLocale } from '../agents/prompts/language';
+import { moduleIssueRelPath } from './module-docs';
+import {
+  validateWorkflowGraph,
+  WorkflowTemplateStore,
+  type WorkflowTemplateDetail,
+  type WorkflowValidationIssue,
+} from './workflows';
+import { WorkflowNodeRunner } from './workflow-node-runner';
+import { WorkflowScheduler } from './workflow-scheduler';
+import { WorkflowWorktreeManager } from './workflow-worktrees';
 import type { SupportedLocale } from '../../shared/i18n/locales';
 
 /** pending 元数据编辑与自动合并落地共用的项目锁，避免 LLM 返回后的 Git 意图被并发改写。 */
@@ -162,6 +177,263 @@ export interface EngineIssue extends Issue {
   sourceRef: string | null;
   /** 本 issue 执行时的弹窗自动批准档位（038 迁移；默认 'medium' = 既有审批管道行为） */
   autoApprove: AutoApproveLevel;
+  /** 039：由原子发布批次创建的稳定节点；自动模块合并不得折叠。 */
+  publicationLocked?: boolean;
+}
+
+/** 设计域在边界上使用的产品实施模式；Issue 内部继续保持 seq/team。 */
+export type DesignPublicationMode = 'direct' | 'team';
+
+/** Issue 域可验证、但不依赖 designs 模块的发布草稿。 */
+export interface DesignIssueDraft {
+  nodeId: string;
+  title: string;
+  body: string;
+  moduleId: number | null;
+  implMode: DesignPublicationMode;
+  agent: AgentKind;
+  createdBy?: number | null;
+  targetBranch?: string | null;
+  sourceRef?: string | null;
+}
+
+export interface PreparedIssueDependency {
+  /** prerequisite node */
+  fromNodeId: string;
+  /** dependent node */
+  toNodeId: string;
+  kind?: 'blocks';
+}
+
+export interface PreparedDesignIssue extends DesignIssueDraft {
+  moduleSlug: string;
+}
+
+const PREPARED_DESIGN_BATCH_BRAND: unique symbol = Symbol('PreparedDesignBatch');
+
+export interface PreparedDesignBatch {
+  readonly [PREPARED_DESIGN_BATCH_BRAND]: true;
+  readonly projectId: number;
+  readonly drafts: readonly PreparedDesignIssue[];
+}
+
+export type SynchronousCallbackResult<Result> = Result extends PromiseLike<unknown> ? never : Result;
+
+/** Narrow port consumed by a later cross-domain publisher; commit is intentionally synchronous. */
+export interface IssuePublicationBatchPort {
+  prepareDesignBatch(projectId: number, drafts: readonly DesignIssueDraft[]): Promise<PreparedDesignBatch>;
+  commitPreparedDesignBatch<Result>(
+    prepared: PreparedDesignBatch,
+    dependencies: readonly PreparedIssueDependency[],
+    onCreatedInTransaction: (
+      issuesByNodeId: ReadonlyMap<string, EngineIssue>,
+    ) => SynchronousCallbackResult<Result>,
+  ): readonly EngineIssue[];
+  completeDesignBatch(
+    projectId: number,
+    issueIds: readonly number[],
+    outbox?: IssuePublicationPostCommitOutboxPort,
+    signal?: AbortSignal,
+  ): Promise<void>;
+}
+
+export interface IssuePublicationPostCommitOperation {
+  key: string;
+  kind: 'module-doc' | 'scheduler';
+  projectId: number;
+  issueId: number | null;
+  issueIds: readonly number[];
+  /** Immutable module target captured by the caller-owned publication outbox. */
+  moduleId?: number | null;
+  agent?: AgentKind;
+}
+
+/** Caller-owned durable outbox acknowledgement; completed items are skipped on whole-batch retry. */
+export interface IssuePublicationPostCommitOutboxPort {
+  /** When present, these durable intents are authoritative; the Issue row must not re-derive them. */
+  listOperations?(): readonly IssuePublicationPostCommitOperation[] | Promise<readonly IssuePublicationPostCommitOperation[]>;
+  isComplete(operation: IssuePublicationPostCommitOperation): boolean | Promise<boolean>;
+  markComplete(operation: IssuePublicationPostCommitOperation): void | Promise<void>;
+  markRetry(operation: IssuePublicationPostCommitOperation, error: string): void | Promise<void>;
+}
+
+/** The caller-owned durable outbox may retry completeDesignBatch when this error is returned. */
+export class IssuePublicationPostCommitError extends Error {
+  readonly retryable = true;
+  constructor(readonly failures: readonly string[]) {
+    super(`post-commit retry required: ${failures.join('; ')}`);
+    this.name = 'IssuePublicationPostCommitError';
+  }
+}
+
+export type IssueExecutionSyncState =
+  | 'requested'
+  | 'boundary_waiting'
+  | 'applied'
+  | 'ignored'
+  | 'supplemented'
+  | 'stale';
+
+export type IssueExecutionSyncDecision = 'apply' | 'ignore' | 'supplement';
+
+export interface IssueExecutionSyncRequest {
+  sourceKind: string;
+  sourceKey: string;
+  sourceRevision: string;
+  sourceDigest: string;
+  diff: unknown;
+  requestedBy?: number | null;
+}
+
+export interface IssueExecutionSync {
+  id: number;
+  issueId: number;
+  sourceKind: string;
+  sourceKey: string;
+  sourceRevision: string;
+  sourceDigest: string;
+  diffJson: string;
+  state: IssueExecutionSyncState;
+  boundaryKind: string | null;
+  deferredActionJson: string | null;
+  requestedBy: number | null;
+  requestedTs: number;
+  acknowledgedTs: number | null;
+  decidedBy: number | null;
+  decidedTs: number | null;
+  resumeState: 'idle' | 'pending' | 'running' | 'complete';
+  /** Stable across claims/restarts; deferred DB/event consumers must CAS/idempotently key on it. */
+  resumeKey: string | null;
+  resumeToken: string | null;
+  resumeClaimedTs: number | null;
+  resumedTs: number | null;
+}
+
+export interface IssueExecutionSyncEffectContext {
+  /** External I/O is represented by a stable intent committed with the database effect receipt. */
+  enqueueExternalEffect(intentKey: string, kind: string, payload: unknown): void;
+}
+
+export interface IssueExecutionSyncEffectReceipt {
+  syncId: number;
+  resumeKey: string;
+  result: unknown;
+  completedTs: number;
+}
+
+export interface IssueDesignSyncSnapshot {
+  issueId: number;
+  projectId: number;
+  status: IssueState;
+  title: string;
+  body: string;
+  moduleId: number | null;
+  agent: AgentKind;
+  implMode: DesignPublicationMode;
+  dependencyIssueIds: number[];
+  hasConversation: boolean;
+  manualReview: boolean;
+}
+
+export interface IssueDesignSyncUpdate {
+  issueId: number;
+  expectedStatus: 'pending' | 'blocked' | 'clarifying' | 'planning' | 'plan_review'
+    | 'implementing' | 'testing' | 'merge_review';
+  expected: Omit<IssueDesignSyncSnapshot, 'status' | 'hasConversation' | 'manualReview'>;
+  next: Pick<IssueDesignSyncSnapshot, 'title' | 'body' | 'moduleId' | 'agent' | 'implMode' | 'dependencyIssueIds'>;
+  sourceRevision: string;
+}
+
+export interface IssueExecutionSyncEffectOutboxItem {
+  resumeKey: string;
+  syncId: number;
+  intentKey: string;
+  kind: string;
+  payload: unknown;
+  createdTs: number;
+  deliveredTs: number | null;
+  deliveryState: 'pending' | 'dispatching' | 'delivered' | 'uncertain';
+  deliveryToken: string | null;
+  dispatchStartedTs: number | null;
+}
+
+export interface IssueDependencyBlocker {
+  issueId: number;
+  status: IssueState;
+}
+
+const MAX_PUBLICATION_BATCH = 200;
+const MAX_PUBLICATION_BODY = 8_000;
+const MAX_EXECUTION_SYNC_JSON = 200_000;
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === 'object' && value !== null) || typeof value === 'function'
+  ) && typeof (value as { then?: unknown }).then === 'function';
+}
+
+function isDeclaredAsyncFunction(value: Function): boolean {
+  return Object.prototype.toString.call(value) === '[object AsyncFunction]';
+}
+
+function encodeExecutionSyncEffectResult(value: unknown): string {
+  const encoded = JSON.stringify({ value });
+  if (encoded === undefined || encoded.length > MAX_EXECUTION_SYNC_JSON) {
+    throw new Error('execution sync effect result must be bounded JSON');
+  }
+  return encoded;
+}
+
+function decodeExecutionSyncEffectResult(encoded: string): unknown {
+  const wrapper = JSON.parse(encoded) as { value?: unknown };
+  return wrapper.value;
+}
+
+function validatePreparedDependencies(
+  prepared: PreparedDesignBatch,
+  dependencies: readonly PreparedIssueDependency[],
+): readonly Required<PreparedIssueDependency>[] {
+  if (!Array.isArray(dependencies) || dependencies.length > MAX_PUBLICATION_BATCH * MAX_PUBLICATION_BATCH) {
+    throw new Error('invalid publication dependency list');
+  }
+  const nodes = new Set(prepared.drafts.map((draft) => draft.nodeId));
+  const indegree = new Map([...nodes].map((nodeId) => [nodeId, 0]));
+  const successors = new Map([...nodes].map((nodeId) => [nodeId, [] as string[]]));
+  const seenEdges = new Set<string>();
+  const normalized: Required<PreparedIssueDependency>[] = [];
+  for (const dependency of dependencies) {
+    const fromNodeId = dependency?.fromNodeId?.trim();
+    const toNodeId = dependency?.toNodeId?.trim();
+    if (!fromNodeId || !toNodeId || !nodes.has(fromNodeId) || !nodes.has(toNodeId)) {
+      throw new Error('publication dependency references unknown node');
+    }
+    if (fromNodeId === toNodeId) throw new Error('publication dependency cannot reference itself');
+    if (dependency.kind !== undefined && dependency.kind !== 'blocks') {
+      throw new Error('unsupported publication dependency kind');
+    }
+    const edgeKey = `${fromNodeId}\0${toNodeId}`;
+    if (seenEdges.has(edgeKey)) throw new Error('duplicate publication dependency');
+    seenEdges.add(edgeKey);
+    successors.get(fromNodeId)!.push(toNodeId);
+    indegree.set(toNodeId, indegree.get(toNodeId)! + 1);
+    normalized.push({ fromNodeId, toNodeId, kind: 'blocks' });
+  }
+  const ready = [...nodes].filter((nodeId) => indegree.get(nodeId) === 0).sort();
+  let visited = 0;
+  while (ready.length > 0) {
+    const nodeId = ready.shift()!;
+    visited++;
+    for (const successor of successors.get(nodeId)!.slice().sort()) {
+      const next = indegree.get(successor)! - 1;
+      indegree.set(successor, next);
+      if (next === 0) {
+        ready.push(successor);
+        ready.sort();
+      }
+    }
+  }
+  if (visited !== nodes.size) throw new Error('publication dependency graph contains a cycle');
+  return Object.freeze(normalized.map((dependency) => Object.freeze(dependency)));
 }
 
 export interface Subtask {
@@ -382,12 +654,17 @@ export interface EngineNotifier {
 
 /** 对话管理最小接口（core/conversations.ts ConversationManager 结构兼容） */
 export interface EngineConvOps {
-  create(projectId: number, label: string, agent?: AgentKind): Conversation;
+  create(
+    projectId: number,
+    label: string,
+    agent?: AgentKind,
+    kind?: 'issue' | 'chat',
+  ): Conversation;
   get(id: string): Conversation | undefined;
   listByProject(projectId: number): Conversation[];
   currentConv(projectId: number): string | undefined;
   tmuxName(projectId: number, convId?: string | null): string;
-  activate(id: string): Promise<Conversation | null>;
+  activate(id: string, cwdOverride?: string): Promise<Conversation | null>;
   /**
    * 强制重启代理进程（issue #97，无存活短路）。缺省时退化为 activate——它自己也会做
    * 存活检测，只是判据独立、可能与引擎的判定不一致（旧装配/精简 stub 的兼容路径）。
@@ -403,6 +680,20 @@ export interface EngineLocator {
    * 活跃会话并重绑，返回新 jsonl 路径；无候选返回 null 且不动原绑定。
    */
   reclaim?(convId: string): Promise<string | null>;
+}
+
+export interface EngineExecutionWorkspace {
+  cwd: string;
+  kind: 'project' | 'design-worktree';
+  /** Fixed batch branch; required for a managed design worktree. */
+  branch: string | null;
+  runId: string | null;
+}
+
+export interface EngineExecutionWorkspaceOps {
+  resolve(issue: EngineIssue, project: Project): EngineExecutionWorkspace | Promise<EngineExecutionWorkspace>;
+  conversationFor(issue: EngineIssue, workspace: EngineExecutionWorkspace): Promise<Conversation>;
+  recordResult?(issue: EngineIssue, workspace: EngineExecutionWorkspace, summary: string): Promise<void>;
 }
 
 // ---------- 行映射 ----------
@@ -438,6 +729,8 @@ interface IssueRow {
   source_ref?: string | null;
   /** 038 迁移；同上，旧库兜底 'medium'（= 既有审批管道行为） */
   auto_approve?: string | null;
+  /** 039 迁移；发布节点禁止自动合并。 */
+  publication_locked?: number | null;
 }
 
 function mapIssue(r: IssueRow): EngineIssue {
@@ -469,6 +762,84 @@ function mapIssue(r: IssueRow): EngineIssue {
     sourceRef: r.source_ref ?? null,
     // 认不出的值（旧库无此列/脏数据）落回 'medium'——issue 侧的现状行为，不因脏数据变严或变松
     autoApprove: parseAutoApproveLevel(r.auto_approve) ?? 'medium',
+    publicationLocked: (r.publication_locked ?? 0) === 1,
+  };
+}
+
+interface ExecutionSyncRow {
+  id: number;
+  issue_id: number;
+  source_kind: string;
+  source_key: string;
+  source_revision: string;
+  source_digest: string;
+  diff_json: string;
+  state: string;
+  boundary_kind: string | null;
+  deferred_action_json: string | null;
+  requested_by: number | null;
+  requested_ts: number;
+  acknowledged_ts: number | null;
+  decided_by: number | null;
+  decided_ts: number | null;
+  resume_state: string;
+  resume_key: string | null;
+  resume_token: string | null;
+  resume_claimed_ts: number | null;
+  resumed_ts: number | null;
+}
+
+interface ExecutionSyncEffectReceiptRow {
+  resume_key: string;
+  sync_id: number;
+  result_json: string;
+  completed_ts: number;
+}
+
+interface ExecutionSyncEffectOutboxRow {
+  resume_key: string;
+  sync_id: number;
+  intent_key: string;
+  kind: string;
+  payload_json: string;
+  created_ts: number;
+  delivered_ts: number | null;
+  delivery_state: string;
+  delivery_token: string | null;
+  dispatch_started_ts: number | null;
+}
+
+function mapExecutionSync(row: ExecutionSyncRow): IssueExecutionSync {
+  return {
+    id: row.id,
+    issueId: row.issue_id,
+    sourceKind: row.source_kind,
+    sourceKey: row.source_key,
+    sourceRevision: row.source_revision,
+    sourceDigest: row.source_digest,
+    diffJson: row.diff_json,
+    state: row.state as IssueExecutionSyncState,
+    boundaryKind: row.boundary_kind,
+    deferredActionJson: row.deferred_action_json,
+    requestedBy: row.requested_by,
+    requestedTs: row.requested_ts,
+    acknowledgedTs: row.acknowledged_ts,
+    decidedBy: row.decided_by,
+    decidedTs: row.decided_ts,
+    resumeState: row.resume_state as IssueExecutionSync['resumeState'],
+    resumeKey: row.resume_key,
+    resumeToken: row.resume_token,
+    resumeClaimedTs: row.resume_claimed_ts,
+    resumedTs: row.resumed_ts,
+  };
+}
+
+function mapExecutionSyncEffectReceipt(row: ExecutionSyncEffectReceiptRow): IssueExecutionSyncEffectReceipt {
+  return {
+    syncId: row.sync_id,
+    resumeKey: row.resume_key,
+    result: decodeExecutionSyncEffectResult(row.result_json),
+    completedTs: row.completed_ts,
   };
 }
 
@@ -566,6 +937,42 @@ export function getProject(db: Database, id: number): Project | undefined {
   return r ? mapProject(r) : undefined;
 }
 
+interface PublicationModuleRow {
+  id: number;
+  project_id: number;
+  slug: string;
+  display_name: string;
+  agent: string;
+  source: string;
+  status: string;
+  conversation_id: string | null;
+  sync_status: string;
+  sync_error: string | null;
+  created_by: number | null;
+  created_ts: number;
+  last_used_ts: number | null;
+}
+
+function getPublicationModule(db: Database, id: number): ProjectModule | undefined {
+  const row = db.query<PublicationModuleRow, [number]>('SELECT * FROM project_modules WHERE id = ?').get(id);
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    slug: row.slug,
+    displayName: row.display_name,
+    agent: row.agent === 'codex' ? 'codex' : 'claude',
+    source: row.source === 'manual' ? 'manual' : row.source === 'legacy' ? 'legacy' : 'auto',
+    status: row.status === 'archived' ? 'archived' : 'active',
+    conversationId: row.conversation_id,
+    syncStatus: row.sync_status === 'error' ? 'error' : 'ready',
+    syncError: row.sync_error,
+    createdBy: row.created_by,
+    createdTs: row.created_ts,
+    lastUsedTs: row.last_used_ts,
+  };
+}
+
 /** git log 字段分隔符（提交信息里不会出现的控制符；与 web/routes/git.ts 同构） */
 const GIT_FIELD_SEP = '\x1f';
 
@@ -644,6 +1051,25 @@ export interface IssueInput {
   createdBy?: number | null;
   /** 创建时就定下的弹窗自动批准档位（#115）；缺省/非法 = 'medium'（既有行为） */
   autoApprove?: AutoApproveLevel;
+  /** 项目工作流模板；创建时复制当前版本，之后模板更新不影响本 issue。 */
+  workflowTemplateId?: number;
+}
+
+export type IssueWorkflowSelectionReason =
+  | 'not_found'
+  | 'inactive'
+  | 'graph_invalid'
+  | 'agent_unavailable';
+
+export class IssueWorkflowSelectionError extends Error {
+  constructor(
+    readonly reason: IssueWorkflowSelectionReason,
+    message: string,
+    readonly issues: WorkflowValidationIssue[] = [],
+  ) {
+    super(message);
+    this.name = 'IssueWorkflowSelectionError';
+  }
 }
 
 export interface IssueMetaPatch {
@@ -716,6 +1142,38 @@ export class IssueStore {
     return mapIssue(row);
   }
 
+  /** 039 publication-only insert: validated exact bytes, pending, locked, and no async side effects. */
+  createPublished(projectId: number, input: PreparedDesignIssue): EngineIssue {
+    const row = this.db
+      .query<IssueRow, [
+        number, string, string, string, string, number | null, string, string,
+        string | null, string | null, number | null, number,
+      ]>(
+        `INSERT INTO issues
+           (project_id, title, body, category, module, module_id, impl_mode, agent,
+            target_branch, source_ref, created_by, created_ts, publication_locked)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+         RETURNING *`,
+      )
+      .get(
+        projectId,
+        input.title,
+        input.body,
+        'task',
+        input.moduleSlug,
+        input.moduleId,
+        input.implMode === 'team' ? 'team' : 'seq',
+        input.agent,
+        input.targetBranch ?? null,
+        input.sourceRef ?? null,
+        input.createdBy ?? null,
+        Date.now(),
+      );
+    if (!row) throw new Error('insert published issue failed');
+    this.logEvent(row.id, 'created', { title: row.title, publication: true, nodeId: input.nodeId });
+    return mapIssue(row);
+  }
+
   get(id: number): EngineIssue | undefined {
     const r = this.db.query<IssueRow, [number]>('SELECT * FROM issues WHERE id = ?').get(id);
     return r ? mapIssue(r) : undefined;
@@ -729,6 +1187,682 @@ export class IssueStore {
   }
 
   /**
+   * Scheduler projection: retain every non-pending row for the project-wide busy predicate, but
+   * expose a pending row only when every persisted predecessor is exactly done. Pin/module order
+   * is applied later and therefore cannot bypass this predicate.
+   */
+  listRunnableByProject(projectId: number): EngineIssue[] {
+    return this.db
+      .query<IssueRow, [number]>(
+        `SELECT i.* FROM issues i
+         WHERE i.project_id = ? AND (
+           i.status <> 'pending'
+           OR NOT EXISTS (
+             SELECT 1 FROM issue_dependencies d
+             JOIN issues predecessor ON predecessor.id = d.depends_on_issue_id
+             WHERE d.issue_id = i.id AND predecessor.status <> 'done'
+           )
+         )
+         ORDER BY i.created_ts, i.id`,
+      )
+      .all(projectId)
+      .map(mapIssue);
+  }
+
+  addDependency(issueId: number, dependsOnIssueId: number, kind = 'blocks'): void {
+    if (kind !== 'blocks') throw new Error(`unsupported dependency kind: ${kind}`);
+    const scope = this.db
+      .query<{ issue_project: number; predecessor_project: number }, [number, number]>(
+        `SELECT dependent.project_id AS issue_project,
+                predecessor.project_id AS predecessor_project
+         FROM issues dependent, issues predecessor
+         WHERE dependent.id = ? AND predecessor.id = ?`,
+      )
+      .get(issueId, dependsOnIssueId);
+    if (!scope) throw new Error('dependency issue does not exist');
+    if (scope.issue_project !== scope.predecessor_project) {
+      throw new Error('dependency issues must belong to the same project');
+    }
+    this.db.query(
+      `INSERT INTO issue_dependencies (issue_id, depends_on_issue_id, kind, created_ts)
+       VALUES (?, ?, ?, ?)`,
+    ).run(issueId, dependsOnIssueId, kind, Date.now());
+  }
+
+  dependencyBlockers(issueId: number): IssueDependencyBlocker[] {
+    return this.db
+      .query<{ issue_id: number; status: string }, [number]>(
+        `SELECT predecessor.id AS issue_id, predecessor.status
+         FROM issue_dependencies d
+         JOIN issues predecessor ON predecessor.id = d.depends_on_issue_id
+         WHERE d.issue_id = ? AND predecessor.status <> 'done'
+         ORDER BY predecessor.created_ts, predecessor.id`,
+      )
+      .all(issueId)
+      .map((row) => ({ issueId: row.issue_id, status: row.status as IssueState }));
+  }
+
+  designSyncSnapshot(issueId: number): IssueDesignSyncSnapshot | null {
+    const issue = this.get(issueId);
+    if (!issue) return null;
+    const project = this.db.query<{ manual_review: number }, [number]>(
+      'SELECT manual_review FROM projects WHERE id = ?',
+    ).get(issue.projectId);
+    const dependencyIssueIds = this.db.query<{ id: number }, [number]>(
+      `SELECT depends_on_issue_id AS id FROM issue_dependencies
+       WHERE issue_id = ? ORDER BY depends_on_issue_id`,
+    ).all(issueId).map((row) => row.id);
+    return {
+      issueId,
+      projectId: issue.projectId,
+      status: issue.status,
+      title: issue.title,
+      body: issue.body ?? '',
+      moduleId: issue.moduleId ?? null,
+      agent: issue.agent,
+      implMode: issue.implMode === 'team' ? 'team' : 'direct',
+      dependencyIssueIds,
+      hasConversation: issue.convId !== null,
+      manualReview: project?.manual_review === 1,
+    };
+  }
+
+  updateFromDesignInTransaction<Result>(
+    input: IssueDesignSyncUpdate,
+    afterUpdate: (updated: IssueDesignSyncSnapshot) => SynchronousCallbackResult<Result>,
+  ): Result {
+    if (isDeclaredAsyncFunction(afterUpdate)) throw new Error('design sync callback must be synchronous');
+    const apply = this.db.transaction(() => {
+      const fresh = this.designSyncSnapshot(input.issueId);
+      if (!fresh || fresh.status !== input.expectedStatus) throw new Error('design sync issue status changed');
+      if (fresh.status === 'pending' && fresh.hasConversation) throw new Error('design sync pending issue already has a session');
+      const comparable = ({
+        issueId: fresh.issueId,
+        projectId: fresh.projectId,
+        title: fresh.title,
+        body: fresh.body,
+        moduleId: fresh.moduleId,
+        agent: fresh.agent,
+        implMode: fresh.implMode,
+        dependencyIssueIds: fresh.dependencyIssueIds,
+      });
+      if (JSON.stringify(comparable) !== JSON.stringify(input.expected)) {
+        throw new Error('design sync local contract changed');
+      }
+      if (!input.next.title.trim() || input.next.title.length > 200
+        || input.next.body.length === 0 || input.next.body.length > MAX_PUBLICATION_BODY) {
+        throw new Error('invalid design sync Issue content');
+      }
+      const project = this.db.query<{ id: number; status: string; kind: string }, [number]>(
+        'SELECT id, status, kind FROM projects WHERE id = ?',
+      ).get(fresh.projectId);
+      if (!project || project.status !== 'active' || project.kind !== 'issue') {
+        throw new Error('design sync project is not active');
+      }
+      const support = projectAgentSupport(this.db, project.id, input.next.agent);
+      if (!support.ok) throw new Error(support.error);
+      let moduleSlug = 'unclassified';
+      if (input.next.moduleId !== null) {
+        const module = getPublicationModule(this.db, input.next.moduleId);
+        if (!module || module.projectId !== project.id || module.status !== 'active'
+          || module.syncStatus !== 'ready' || module.agent !== input.next.agent) {
+          throw new Error('design sync module governance changed');
+        }
+        moduleSlug = module.slug;
+      }
+      const dependencyIds = [...new Set(input.next.dependencyIssueIds)].sort((a, b) => a - b);
+      if (dependencyIds.length !== input.next.dependencyIssueIds.length || dependencyIds.includes(input.issueId)) {
+        throw new Error('invalid design sync dependencies');
+      }
+      for (const dependencyId of dependencyIds) {
+        const dependency = this.get(dependencyId);
+        if (!dependency || dependency.projectId !== fresh.projectId) {
+          throw new Error('design sync dependency is outside project scope');
+        }
+      }
+      this.db.query(
+        `UPDATE issues SET title = ?, body = ?, module = ?, module_id = ?, impl_mode = ?, agent = ?
+         WHERE id = ? AND status = ?`,
+      ).run(
+        input.next.title,
+        input.next.body,
+        moduleSlug,
+        input.next.moduleId,
+        input.next.implMode === 'team' ? 'team' : 'seq',
+        input.next.agent,
+        input.issueId,
+        input.expectedStatus,
+      );
+      this.db.query('DELETE FROM issue_dependencies WHERE issue_id = ?').run(input.issueId);
+      for (const dependencyId of dependencyIds) {
+        this.addDependency(input.issueId, dependencyId, 'blocks');
+      }
+      this.logEvent(input.issueId, 'design_sync_applied', { sourceRevision: input.sourceRevision });
+      const updated = this.designSyncSnapshot(input.issueId)!;
+      const result = afterUpdate(updated);
+      if (isThenable(result)) throw new Error('design sync callback must be synchronous');
+      return result;
+    });
+    return apply();
+  }
+
+  requestExecutionSync(issueId: number, input: IssueExecutionSyncRequest): IssueExecutionSync {
+    if (!this.get(issueId)) throw new Error('issue does not exist');
+    const sourceKind = input.sourceKind.trim();
+    const sourceKey = input.sourceKey.trim();
+    const sourceRevision = input.sourceRevision.trim();
+    const sourceDigest = input.sourceDigest.trim();
+    if (!sourceKind || sourceKind.length > 40) throw new Error('invalid execution sync source kind');
+    if (!sourceKey || sourceKey.length > 240) throw new Error('invalid execution sync source key');
+    if (!sourceRevision || sourceRevision.length > 120) throw new Error('invalid execution sync source revision');
+    if (!sourceDigest || sourceDigest.length > 200) throw new Error('invalid execution sync source digest');
+    const diffJson = JSON.stringify(input.diff);
+    if (diffJson === undefined || diffJson.length > MAX_EXECUTION_SYNC_JSON) {
+      throw new Error('invalid execution sync diff');
+    }
+    const existing = this.db
+      .query<ExecutionSyncRow, [number, string, string, string]>(
+        `SELECT * FROM issue_execution_syncs
+         WHERE issue_id = ? AND source_kind = ? AND source_key = ? AND source_revision = ?`,
+      )
+      .get(issueId, sourceKind, sourceKey, sourceRevision);
+    if (existing) {
+      if (existing.source_digest !== sourceDigest || existing.diff_json !== diffJson) {
+        throw new Error('execution sync idempotency conflict');
+      }
+      return mapExecutionSync(existing);
+    }
+    const row = this.db
+      .query<ExecutionSyncRow, [number, string, string, string, string, string, number | null, number]>(
+        `INSERT INTO issue_execution_syncs
+           (issue_id, source_kind, source_key, source_revision, source_digest, diff_json,
+            state, requested_by, requested_ts)
+         VALUES (?, ?, ?, ?, ?, ?, 'requested', ?, ?)
+         RETURNING *`,
+      )
+      .get(
+        issueId,
+        sourceKind,
+        sourceKey,
+        sourceRevision,
+        sourceDigest,
+        diffJson,
+        input.requestedBy ?? null,
+        Date.now(),
+      );
+    if (!row) throw new Error('create execution sync failed');
+    return mapExecutionSync(row);
+  }
+
+  requestLatestExecutionSync(issueId: number, input: IssueExecutionSyncRequest): IssueExecutionSync {
+    const request = this.db.transaction(() => {
+      const existing = this.db.query<ExecutionSyncRow, [number, string, string, string]>(
+        `SELECT * FROM issue_execution_syncs
+         WHERE issue_id = ? AND source_kind = ? AND source_key = ? AND source_revision = ?`,
+      ).get(issueId, input.sourceKind.trim(), input.sourceKey.trim(), input.sourceRevision.trim());
+      if (existing) return this.requestExecutionSync(issueId, input);
+      this.db.query(
+        `UPDATE issue_execution_syncs SET state = 'stale', decided_ts = COALESCE(decided_ts, ?)
+         WHERE issue_id = ? AND source_kind = ? AND source_key = ?
+           AND state IN ('requested', 'boundary_waiting')`,
+      ).run(Date.now(), issueId, input.sourceKind.trim(), input.sourceKey.trim());
+      return this.requestExecutionSync(issueId, input);
+    });
+    return request();
+  }
+
+  latestExecutionSync(issueId: number, sourceKind: string, sourceKey: string): IssueExecutionSync | null {
+    const row = this.db.query<ExecutionSyncRow, [number, string, string]>(
+      `SELECT * FROM issue_execution_syncs
+       WHERE issue_id = ? AND source_kind = ? AND source_key = ?
+       ORDER BY requested_ts DESC, id DESC LIMIT 1`,
+    ).get(issueId, sourceKind, sourceKey);
+    return row ? mapExecutionSync(row) : null;
+  }
+
+  activeExecutionSyncBoundary(issueId: number): IssueExecutionSync | null {
+    const row = this.db.query<ExecutionSyncRow, [number]>(
+      `SELECT * FROM issue_execution_syncs
+       WHERE issue_id = ? AND state = 'boundary_waiting'
+       ORDER BY requested_ts DESC, id DESC LIMIT 1`,
+    ).get(issueId);
+    return row ? mapExecutionSync(row) : null;
+  }
+
+  hasUnresolvedExecutionSyncEffect(issueId: number): boolean {
+    return this.db.query<{ found: number }, [number]>(
+      `SELECT 1 AS found
+       FROM issue_execution_sync_effect_outbox effect
+       JOIN issue_execution_syncs sync ON sync.id = effect.sync_id
+       WHERE sync.issue_id = ? AND effect.delivery_state <> 'delivered'
+       LIMIT 1`,
+    ).get(issueId) !== null;
+  }
+
+  getExecutionSync(id: number): IssueExecutionSync | undefined {
+    const row = this.db.query<ExecutionSyncRow, [number]>('SELECT * FROM issue_execution_syncs WHERE id = ?').get(id);
+    return row ? mapExecutionSync(row) : undefined;
+  }
+
+  holdExecutionSyncBoundary(
+    issueId: number,
+    boundaryKind: string,
+    deferredAction: unknown,
+  ): IssueExecutionSync | null {
+    const boundary = boundaryKind.trim();
+    if (!boundary || boundary.length > 80) throw new Error('invalid execution sync boundary');
+    const actionJson = JSON.stringify(deferredAction);
+    if (actionJson === undefined || actionJson.length > MAX_EXECUTION_SYNC_JSON) {
+      throw new Error('invalid deferred execution action');
+    }
+    const hold = this.db.transaction(() => {
+      const requested = this.db
+        .query<ExecutionSyncRow, [number]>(
+          `SELECT * FROM issue_execution_syncs
+           WHERE issue_id = ? AND state IN ('requested', 'boundary_waiting')
+           ORDER BY requested_ts DESC, id DESC LIMIT 1`,
+        )
+        .get(issueId);
+      if (!requested) return null;
+      if (requested.state === 'boundary_waiting') {
+        if (requested.boundary_kind === boundary && requested.deferred_action_json === actionJson) {
+          return mapExecutionSync(requested);
+        }
+        let existingAction: { kind?: unknown } | null = null;
+        try {
+          existingAction = JSON.parse(requested.deferred_action_json ?? 'null') as { kind?: unknown } | null;
+        } catch {
+          // Malformed durable action fails closed below.
+        }
+        if (existingAction?.kind !== 'safe_state') throw new Error('execution sync boundary conflict');
+        const upgraded = this.db.query<ExecutionSyncRow, [string, string, number]>(
+          `UPDATE issue_execution_syncs SET boundary_kind = ?, deferred_action_json = ?
+           WHERE id = ? AND state = 'boundary_waiting' RETURNING *`,
+        ).get(boundary, actionJson, requested.id);
+        if (!upgraded) throw new Error('execution sync boundary race');
+        return mapExecutionSync(upgraded);
+      }
+      const row = this.db
+        .query<ExecutionSyncRow, [string, string, number, number]>(
+          `UPDATE issue_execution_syncs
+           SET state = 'boundary_waiting', boundary_kind = ?, deferred_action_json = ?,
+               acknowledged_ts = ?
+           WHERE id = ? AND state = 'requested'
+           RETURNING *`,
+        )
+        .get(boundary, actionJson, Date.now(), requested.id);
+      if (!row) throw new Error('execution sync boundary race');
+      return mapExecutionSync(row);
+    });
+    return hold();
+  }
+
+  decideExecutionSync(
+    id: number,
+    decision: IssueExecutionSyncDecision,
+    actor: number,
+  ): IssueExecutionSync {
+    const target: Exclude<IssueExecutionSyncState, 'requested' | 'boundary_waiting' | 'stale'> =
+      decision === 'apply' ? 'applied' : decision === 'ignore' ? 'ignored' : 'supplemented';
+    const decide = this.db.transaction(() => {
+      const existing = this.getExecutionSync(id);
+      if (!existing) throw new Error('execution sync does not exist');
+      if (existing.state === target) return existing;
+      if (existing.state !== 'boundary_waiting') throw new Error('execution sync decision conflict');
+      const resumeKey = `issue-sync:${randomUUID()}`;
+      const row = this.db
+        .query<ExecutionSyncRow, [string, number, number, string, number]>(
+          `UPDATE issue_execution_syncs
+           SET state = ?, decided_by = ?, decided_ts = ?, resume_state = 'pending', resume_key = ?
+           WHERE id = ? AND state = 'boundary_waiting'
+           RETURNING *`,
+        )
+        .get(target, actor, Date.now(), resumeKey, id);
+      if (!row) throw new Error('execution sync decision race');
+      return mapExecutionSync(row);
+    });
+    return decide();
+  }
+
+  listResumableExecutionSyncs(limit: number): IssueExecutionSync[] {
+    return this.db
+      .query<ExecutionSyncRow, [number]>(
+        `SELECT * FROM issue_execution_syncs
+         WHERE state IN ('applied', 'ignored', 'supplemented')
+           AND deferred_action_json IS NOT NULL
+           AND resume_state = 'pending'
+         ORDER BY decided_ts, id LIMIT ?`,
+      )
+      .all(limit)
+      .map(mapExecutionSync);
+  }
+
+  getExecutionSyncEffectReceipt(id: number): IssueExecutionSyncEffectReceipt | null {
+    const row = this.db
+      .query<ExecutionSyncEffectReceiptRow, [number]>(
+        'SELECT * FROM issue_execution_sync_effect_receipts WHERE sync_id = ?',
+      )
+      .get(id);
+    return row ? mapExecutionSyncEffectReceipt(row) : null;
+  }
+
+  claimExecutionSyncResume(id: number, now: number): IssueExecutionSync | null {
+    const claim = this.db.transaction(() => {
+      const receipt = this.getExecutionSyncEffectReceipt(id);
+      if (receipt) {
+        this.db.query(
+          `UPDATE issue_execution_syncs
+           SET resume_state = 'complete', resume_token = NULL, resume_claimed_ts = NULL,
+               resumed_ts = COALESCE(resumed_ts, ?)
+           WHERE id = ? AND resume_key = ? AND resume_state <> 'complete'`,
+        ).run(receipt.completedTs, id, receipt.resumeKey);
+        return null;
+      }
+      const token = randomUUID();
+      const row = this.db
+        .query<ExecutionSyncRow, [string, number, number]>(
+          `UPDATE issue_execution_syncs
+           SET resume_state = 'running', resume_token = ?, resume_claimed_ts = ?
+           WHERE id = ?
+             AND state IN ('applied', 'ignored', 'supplemented')
+             AND deferred_action_json IS NOT NULL
+             AND resume_state = 'pending'
+           RETURNING *`,
+        )
+        .get(token, now, id);
+      return row ? mapExecutionSync(row) : null;
+    });
+    return claim();
+  }
+
+  releaseExecutionSyncResume(id: number, token: string): void {
+    this.db.query(
+      `UPDATE issue_execution_syncs
+       SET resume_state = 'pending', resume_token = NULL, resume_claimed_ts = NULL
+       WHERE id = ? AND resume_state = 'running' AND resume_token = ?`,
+    ).run(id, token);
+  }
+
+  resetAbandonedExecutionSyncResume(id: number, resumeKey: string, abandonedToken: string): boolean {
+    if (!resumeKey || !abandonedToken) return false;
+    const reset = this.db.transaction(() => {
+      const owned = this.db.query<{ id: number }, [number, string, string]>(
+        `SELECT id FROM issue_execution_syncs
+         WHERE id = ? AND resume_state = 'running' AND resume_key = ? AND resume_token = ?`,
+      ).get(id, resumeKey, abandonedToken);
+      if (!owned) return false;
+      const receipt = this.getExecutionSyncEffectReceipt(id);
+      if (receipt) {
+        return this.db.query(
+          `UPDATE issue_execution_syncs
+           SET resume_state = 'complete', resume_token = NULL, resume_claimed_ts = NULL,
+               resumed_ts = COALESCE(resumed_ts, ?)
+           WHERE id = ? AND resume_state = 'running' AND resume_key = ? AND resume_token = ?`,
+        ).run(receipt.completedTs, id, resumeKey, abandonedToken).changes === 1;
+      }
+      return this.db.query(
+        `UPDATE issue_execution_syncs
+         SET resume_state = 'pending', resume_token = NULL, resume_claimed_ts = NULL
+         WHERE id = ? AND resume_state = 'running' AND resume_key = ? AND resume_token = ?`,
+      ).run(id, resumeKey, abandonedToken).changes === 1;
+    });
+    return reset();
+  }
+
+  completeExecutionSyncResume(id: number, token: string): boolean {
+    const result = this.db.query(
+      `UPDATE issue_execution_syncs
+       SET resume_state = 'complete', resume_token = NULL, resume_claimed_ts = NULL,
+           resumed_ts = COALESCE(resumed_ts, receipt.completed_ts)
+       FROM issue_execution_sync_effect_receipts receipt
+       WHERE issue_execution_syncs.id = ?
+         AND issue_execution_syncs.resume_state = 'running'
+         AND issue_execution_syncs.resume_token = ?
+         AND receipt.sync_id = issue_execution_syncs.id
+         AND receipt.resume_key = issue_execution_syncs.resume_key`,
+    ).run(id, token);
+    return result.changes === 1;
+  }
+
+  commitExecutionSyncEffect<Result>(
+    id: number,
+    token: string,
+    effect: (
+      sync: IssueExecutionSync,
+      context: IssueExecutionSyncEffectContext,
+    ) => SynchronousCallbackResult<Result>,
+  ): { applied: boolean; result: Result } {
+    if (isDeclaredAsyncFunction(effect)) {
+      throw new Error('execution sync effect callback must be synchronous');
+    }
+    const commit = this.db.transaction(() => {
+      const row = this.db.query<ExecutionSyncRow, [number, string]>(
+        `SELECT * FROM issue_execution_syncs
+         WHERE id = ? AND resume_state = 'running' AND resume_token = ?`,
+      ).get(id, token);
+      if (!row || !row.resume_key) throw new Error('execution sync resume claim lost');
+      const existing = this.getExecutionSyncEffectReceipt(id);
+      if (existing) {
+        if (!this.completeExecutionSyncResume(id, token)) throw new Error('execution sync resume claim lost');
+        return { applied: false, result: existing.result as Result };
+      }
+      const sync = mapExecutionSync(row);
+      const context: IssueExecutionSyncEffectContext = Object.freeze({
+        enqueueExternalEffect: (intentKey: string, kind: string, payload: unknown): void => {
+          if (!this.db.inTransaction) throw new Error('execution sync effect intent requires active transaction');
+          const stableIntentKey = intentKey.trim();
+          const stableKind = kind.trim();
+          if (!stableIntentKey || stableIntentKey.length > 120 || !stableKind || stableKind.length > 80) {
+            throw new Error('invalid execution sync effect intent');
+          }
+          const payloadJson = JSON.stringify(payload);
+          if (payloadJson === undefined || payloadJson.length > MAX_EXECUTION_SYNC_JSON) {
+            throw new Error('invalid execution sync effect intent payload');
+          }
+          this.db.query(
+            `INSERT INTO issue_execution_sync_effect_outbox
+               (resume_key, sync_id, intent_key, kind, payload_json, created_ts)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+          ).run(row.resume_key, id, stableIntentKey, stableKind, payloadJson, Date.now());
+        },
+      });
+      const result = effect(sync, context);
+      if (isThenable(result)) throw new Error('execution sync effect callback must be synchronous');
+      const resultJson = encodeExecutionSyncEffectResult(result);
+      const completedTs = Date.now();
+      this.db.query(
+        `INSERT INTO issue_execution_sync_effect_receipts
+           (resume_key, sync_id, result_json, completed_ts)
+         VALUES (?, ?, ?, ?)`,
+      ).run(row.resume_key, id, resultJson, completedTs);
+      if (!this.completeExecutionSyncResume(id, token)) throw new Error('execution sync resume claim lost');
+      return { applied: true, result };
+    });
+    return commit();
+  }
+
+  listExecutionSyncEffectOutbox(limit: number): IssueExecutionSyncEffectOutboxItem[] {
+    const bounded = Math.max(1, Math.min(500, Math.trunc(limit)));
+    return this.db.query<ExecutionSyncEffectOutboxRow, [number]>(
+      `SELECT * FROM issue_execution_sync_effect_outbox
+       WHERE delivery_state = 'pending' ORDER BY created_ts, sync_id, intent_key LIMIT ?`,
+    ).all(bounded).map((row) => ({
+      resumeKey: row.resume_key,
+      syncId: row.sync_id,
+      intentKey: row.intent_key,
+      kind: row.kind,
+      payload: JSON.parse(row.payload_json) as unknown,
+      createdTs: row.created_ts,
+      deliveredTs: row.delivered_ts,
+      deliveryState: row.delivery_state as IssueExecutionSyncEffectOutboxItem['deliveryState'],
+      deliveryToken: row.delivery_token,
+      dispatchStartedTs: row.dispatch_started_ts,
+    }));
+  }
+
+  listUncertainExecutionSyncEffects(limit: number): IssueExecutionSyncEffectOutboxItem[] {
+    const bounded = Math.max(1, Math.min(500, Math.trunc(limit)));
+    return this.db.query<ExecutionSyncEffectOutboxRow, [number]>(
+      `SELECT * FROM issue_execution_sync_effect_outbox
+       WHERE delivery_state IN ('dispatching', 'uncertain')
+       ORDER BY created_ts, sync_id, intent_key LIMIT ?`,
+    ).all(bounded).map((row) => ({
+      resumeKey: row.resume_key,
+      syncId: row.sync_id,
+      intentKey: row.intent_key,
+      kind: row.kind,
+      payload: JSON.parse(row.payload_json) as unknown,
+      createdTs: row.created_ts,
+      deliveredTs: row.delivered_ts,
+      deliveryState: row.delivery_state as IssueExecutionSyncEffectOutboxItem['deliveryState'],
+      deliveryToken: row.delivery_token,
+      dispatchStartedTs: row.dispatch_started_ts,
+    }));
+  }
+
+  getUncertainExecutionSyncEffect(syncId: number): IssueExecutionSyncEffectOutboxItem | null {
+    const row = this.db.query<ExecutionSyncEffectOutboxRow, [number]>(
+      `SELECT * FROM issue_execution_sync_effect_outbox
+       WHERE sync_id = ? AND delivery_state IN ('dispatching', 'uncertain')
+       ORDER BY created_ts, intent_key LIMIT 1`,
+    ).get(syncId);
+    return row ? {
+      resumeKey: row.resume_key,
+      syncId: row.sync_id,
+      intentKey: row.intent_key,
+      kind: row.kind,
+      payload: JSON.parse(row.payload_json) as unknown,
+      createdTs: row.created_ts,
+      deliveredTs: row.delivered_ts,
+      deliveryState: row.delivery_state as IssueExecutionSyncEffectOutboxItem['deliveryState'],
+      deliveryToken: row.delivery_token,
+      dispatchStartedTs: row.dispatch_started_ts,
+    } : null;
+  }
+
+  resolveUncertainExecutionSyncEffect(
+    resumeKey: string,
+    intentKey: string,
+    resolution: 'confirm_delivered' | 'retry',
+  ): boolean {
+    if (resolution === 'confirm_delivered') {
+      return this.db.query(
+        `UPDATE issue_execution_sync_effect_outbox
+         SET delivery_state = 'delivered', delivered_ts = COALESCE(delivered_ts, ?),
+             delivery_token = NULL, last_error = NULL
+         WHERE resume_key = ? AND intent_key = ?
+           AND delivery_state IN ('dispatching', 'uncertain')`,
+      ).run(Date.now(), resumeKey, intentKey).changes === 1;
+    }
+    return this.db.query(
+      `UPDATE issue_execution_sync_effect_outbox
+       SET delivery_state = 'pending', delivery_token = NULL, dispatch_started_ts = NULL,
+           last_error = NULL
+       WHERE resume_key = ? AND intent_key = ?
+         AND delivery_state IN ('dispatching', 'uncertain')`,
+    ).run(resumeKey, intentKey).changes === 1;
+  }
+
+  claimExecutionSyncEffectDelivery(
+    resumeKey: string,
+    intentKey: string,
+    now: number,
+  ): IssueExecutionSyncEffectOutboxItem | null {
+    const token = randomUUID();
+    const row = this.db.query<ExecutionSyncEffectOutboxRow, [string, number, string, string]>(
+      `UPDATE issue_execution_sync_effect_outbox
+       SET delivery_state = 'dispatching', delivery_token = ?, dispatch_started_ts = ?, last_error = NULL
+       WHERE resume_key = ? AND intent_key = ? AND delivery_state = 'pending'
+       RETURNING *`,
+    ).get(token, now, resumeKey, intentKey);
+    return row ? {
+      resumeKey: row.resume_key,
+      syncId: row.sync_id,
+      intentKey: row.intent_key,
+      kind: row.kind,
+      payload: JSON.parse(row.payload_json) as unknown,
+      createdTs: row.created_ts,
+      deliveredTs: row.delivered_ts,
+      deliveryState: 'dispatching',
+      deliveryToken: row.delivery_token,
+      dispatchStartedTs: row.dispatch_started_ts,
+    } : null;
+  }
+
+  recordExecutionSyncEffectStep(
+    resumeKey: string,
+    intentKey: string,
+    deliveryToken: string,
+    stepKey: string,
+    payload: unknown,
+  ): boolean {
+    const payloadJson = JSON.stringify(payload);
+    if (!stepKey || stepKey.length > 80 || payloadJson === undefined || payloadJson.length > MAX_EXECUTION_SYNC_JSON) {
+      throw new Error('invalid execution sync effect step');
+    }
+    const record = this.db.transaction(() => {
+      const owned = this.db.query<{ found: number }, [string, string, string]>(
+        `SELECT 1 AS found FROM issue_execution_sync_effect_outbox
+         WHERE resume_key = ? AND intent_key = ? AND delivery_state = 'dispatching' AND delivery_token = ?`,
+      ).get(resumeKey, intentKey, deliveryToken);
+      if (!owned) return false;
+      this.db.query(
+        `INSERT INTO issue_execution_sync_effect_steps
+           (resume_key, intent_key, step_key, payload_json, completed_ts)
+         VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+      ).run(resumeKey, intentKey, stepKey, payloadJson, Date.now());
+      return true;
+    });
+    return record();
+  }
+
+  reconcileCompletedExecutionSyncEffectDeliveries(limit: number): number {
+    const bounded = Math.max(1, Math.min(500, Math.trunc(limit)));
+    const rows = this.db.query<{ resume_key: string; intent_key: string }, [number]>(
+      `SELECT o.resume_key, o.intent_key
+       FROM issue_execution_sync_effect_outbox o
+       JOIN issue_execution_sync_effect_steps s
+         ON s.resume_key = o.resume_key AND s.intent_key = o.intent_key AND s.step_key = 'action-complete'
+       WHERE o.delivery_state IN ('dispatching', 'uncertain')
+       ORDER BY o.created_ts, o.sync_id, o.intent_key LIMIT ?`,
+    ).all(bounded);
+    let reconciled = 0;
+    for (const row of rows) {
+      reconciled += this.db.query(
+        `UPDATE issue_execution_sync_effect_outbox
+         SET delivery_state = 'delivered', delivered_ts = COALESCE(delivered_ts, ?),
+             delivery_token = NULL, last_error = NULL
+         WHERE resume_key = ? AND intent_key = ? AND delivery_state IN ('dispatching', 'uncertain')`,
+      ).run(Date.now(), row.resume_key, row.intent_key).changes;
+    }
+    return reconciled;
+  }
+
+  markExecutionSyncEffectDelivered(resumeKey: string, intentKey: string, deliveryToken: string): boolean {
+    return this.db.query(
+      `UPDATE issue_execution_sync_effect_outbox
+       SET delivery_state = 'delivered', delivered_ts = COALESCE(delivered_ts, ?),
+           delivery_token = NULL, last_error = NULL
+       WHERE resume_key = ? AND intent_key = ?
+         AND delivery_state = 'dispatching' AND delivery_token = ?`,
+    ).run(Date.now(), resumeKey, intentKey, deliveryToken).changes === 1;
+  }
+
+  markExecutionSyncEffectUncertain(
+    resumeKey: string,
+    intentKey: string,
+    deliveryToken: string,
+    error: string,
+  ): boolean {
+    return this.db.query(
+      `UPDATE issue_execution_sync_effect_outbox
+       SET delivery_state = 'uncertain', last_error = ?, delivery_token = NULL
+       WHERE resume_key = ? AND intent_key = ?
+         AND delivery_state = 'dispatching' AND delivery_token = ?`,
+    ).run(error.slice(0, 4000), resumeKey, intentKey, deliveryToken).changes === 1;
+  }
+
+  /**
    * 驱动中（planning/implementing/testing 且已绑对话）的 issue —— watcher 遍历对象。
    * M4：JOIN projects.status='active'——归档项目的 issue 不再被 tick 驱动/kickoff。
    */
@@ -737,7 +1871,12 @@ export class IssueStore {
       .query<IssueRow, []>(
         `SELECT i.* FROM issues i
          JOIN projects p ON p.id = i.project_id AND p.status = 'active'
-         WHERE i.status IN ('planning', 'implementing', 'testing') AND i.conv_id IS NOT NULL
+         WHERE (
+           i.status IN ('planning', 'implementing', 'testing') AND i.conv_id IS NOT NULL
+         ) OR (
+           i.status IN ('planning', 'plan_review', 'implementing', 'testing')
+           AND EXISTS (SELECT 1 FROM issue_workflows iw WHERE iw.issue_id = i.id)
+         )
          ORDER BY i.id`,
       )
       .all()
@@ -907,6 +2046,16 @@ export class IssueStore {
       .run(JSON.stringify(subs), JSON.stringify({ subtasks: texts, ts: Date.now() }), id);
   }
 
+  setSubtasksAtDesignBoundary(id: number, texts: string[]): IssueExecutionSync | null {
+    const persist = this.db.transaction(() => {
+      this.setSubtasks(id, texts);
+      return this.holdExecutionSyncBoundary(id, 'plan_ready', {
+        kind: 'issue-event', event: 'plan_ready', options: {},
+      });
+    });
+    return persist();
+  }
+
   /** 保留完成进度地替换计划文本；plan_review 时同步待确认卡点，避免详情与卡点显示两版计划。 */
   replaceSubtasks(id: number, subs: Subtask[], syncWaitingPlanGate: boolean): void {
     const issue = this.get(id);
@@ -957,6 +2106,31 @@ export class IssueStore {
       .query('UPDATE issues SET subtasks_json = ?, sub_index = ? WHERE id = ?')
       .run(JSON.stringify(subs), next, id);
     return { allDone: next >= subs.length, nextIdx: next };
+  }
+
+  /** Complete exactly the current seq subtask and atomically withhold its next injection if needed. */
+  advanceSubtaskAtDesignBoundary(
+    id: number,
+  ): { allDone: boolean; nextIdx: number; held: IssueExecutionSync | null } | null {
+    const advance = this.db.transaction(() => {
+      const issue = this.get(id);
+      if (!issue || issue.status !== 'implementing' || issue.implMode !== 'seq') return null;
+      const subs = this.subtasksOf(issue);
+      const idx = issue.subIndex;
+      if (!subs[idx] || subs[idx]!.done) return null;
+      subs[idx]!.done = true;
+      const nextIdx = idx + 1;
+      this.db.query('UPDATE issues SET subtasks_json = ?, sub_index = ? WHERE id = ? AND sub_index = ?')
+        .run(JSON.stringify(subs), nextIdx, id, idx);
+      const allDone = nextIdx >= subs.length;
+      const held = allDone
+        ? null
+        : this.holdExecutionSyncBoundary(id, 'inject_subtask', {
+          kind: 'inject_subtask', nextIndex: nextIdx,
+        });
+      return { allDone, nextIdx, held };
+    });
+    return advance();
   }
 
   markAllSubtasksDone(id: number): void {
@@ -1434,6 +2608,8 @@ export interface EngineDeps {
   driver: ExecutorDriver;
   convs: EngineConvOps;
   locator: EngineLocator;
+  /** Neutral adapter; omitted preserves legacy Issue behavior exactly. */
+  executionWorkspaces?: EngineExecutionWorkspaceOps;
   pmFor(project: Project): EnginePm;
   notify: EngineNotifier;
   mutex: KeyedMutex;
@@ -1448,7 +2624,12 @@ export interface EngineDeps {
       moduleName?: string;
       createdBy?: number | null;
     }): Promise<ProjectModule>;
-    recordIssue(module: ProjectModule, issue: EngineIssue, projectIssues: EngineIssue[]): Promise<void>;
+    recordIssue(
+      module: ProjectModule,
+      issue: EngineIssue,
+      projectIssues: EngineIssue[],
+      signal?: AbortSignal,
+    ): Promise<void>;
     recordResultSummary?(
       module: ProjectModule,
       issue: EngineIssue,
@@ -1578,6 +2759,9 @@ interface ProjectTickFlight {
 export class IssueEngine {
   readonly store: IssueStore;
   private readonly cfg: EngineConfig;
+  /** Engine-local prepare capability; a structurally identical or foreign-engine batch is untrusted. */
+  private readonly preparedDesignBatches = new WeakSet<object>();
+  private readonly workflowScheduler: WorkflowScheduler;
   private readonly watch = new Map<string, WatchState>();
   /** 同 issue 状态迁移尾队列；首项同步启动，后续项严格等待前项完成。 */
   private readonly issueTransitionTails = new Map<number, Promise<void>>();
@@ -1607,6 +2791,29 @@ export class IssueEngine {
   constructor(private readonly deps: EngineDeps) {
     this.store = new IssueStore(deps.db);
     this.cfg = { ...DEFAULT_ENGINE_CONFIG, ...(deps.config ?? {}) };
+    const nodes = new WorkflowNodeRunner({
+      db: deps.db,
+      driver: deps.driver,
+      conversations: deps.convs,
+      mutex: deps.mutex,
+      now: () => this.now(),
+    });
+    const worktrees = new WorkflowWorktreeManager({
+      db: deps.db,
+      driver: deps.driver,
+      conversations: deps.convs,
+      mutex: deps.mutex,
+      now: () => this.now(),
+      logEvent: (issueId, kind, data) => this.store.logEvent(issueId, kind, data),
+    });
+    this.workflowScheduler = new WorkflowScheduler({
+      db: deps.db,
+      nodes,
+      worktrees,
+      now: () => this.now(),
+      logEvent: (issueId, kind, data) =>
+        this.store.logEvent(issueId, kind, data as Record<string, unknown> | undefined),
+    });
   }
 
   private get reader(): JsonlReader {
@@ -1667,6 +2874,30 @@ export class IssueEngine {
     const proj = this.project(projectId);
     if (!proj) throw new Error(`项目 ${projectId} 不存在`);
     if (proj.kind === 'chat') throw new Error('对话模式项目不支持创建 issue');
+    const workflows = new WorkflowTemplateStore(this.deps.db, () => this.now());
+    let selectedWorkflow: WorkflowTemplateDetail | null = null;
+    if (input.workflowTemplateId !== undefined) {
+      const detail = workflows.get(projectId, input.workflowTemplateId);
+      if (!detail) {
+        throw new IssueWorkflowSelectionError('not_found', 'The selected workflow template does not exist in this project.');
+      }
+      if (detail.template.status !== 'active') {
+        throw new IssueWorkflowSelectionError('inactive', 'The selected workflow template is archived.');
+      }
+      const supportedAgents = (['claude', 'codex'] as const).filter(
+        (agent) => projectAgentSupport(this.deps.db, projectId, agent).ok,
+      );
+      const validation = validateWorkflowGraph(detail.version.graph, supportedAgents);
+      if (!validation.ok) {
+        const unavailable = validation.issues.some((issue) => issue.code === 'workflow.agent_unavailable');
+        throw new IssueWorkflowSelectionError(
+          unavailable ? 'agent_unavailable' : 'graph_invalid',
+          unavailable ? 'The workflow requires an Agent that is unavailable on this executor.' : 'The selected workflow template has an invalid graph.',
+          validation.issues,
+        );
+      }
+      selectedWorkflow = detail;
+    }
     const modules = this.deps.modulesFor?.(proj);
     const resolved = modules
       ? await modules.resolve({
@@ -1686,16 +2917,531 @@ export class IssueEngine {
           ? { module: resolved.slug, moduleId: resolved.id, agent: resolved.agent }
           : {}),
       });
+      if (selectedWorkflow) {
+        const context: IssueWorkflowSharedContext = {
+          schemaVersion: 1,
+          issue: {
+            id: issue.id,
+            title: issue.title,
+            body: issue.body,
+            category: issue.category,
+            createdTs: issue.createdTs,
+          },
+          project: {
+            id: proj.id,
+            name: proj.name,
+            goal: proj.goal,
+            readmeSummary: proj.readmeSummary,
+            understanding: proj.understanding,
+            understandingAgent: proj.understandingAgent,
+            understandingTs: proj.understandingTs,
+          },
+          module: resolved
+            ? {
+                id: resolved.id,
+                slug: resolved.slug,
+                displayName: resolved.displayName,
+                agent: resolved.agent,
+              }
+            : null,
+          documents: resolved
+            ? {
+                module: `.panda/modules/${resolved.slug}/MODULE.md`,
+                issueProcess: moduleIssueRelPath(resolved.slug, issue.id, issue.title),
+              }
+            : { module: null, issueProcess: null },
+        };
+        workflows.attachIssue(issue.id, selectedWorkflow, context);
+      }
       onCreatedInTransaction?.(issue);
       return issue;
     };
-    const issue = onCreatedInTransaction ? this.deps.db.transaction(create)() : create();
+    const issue = selectedWorkflow || onCreatedInTransaction
+      ? this.deps.db.transaction(create)()
+      : create();
     if (resolved && modules) {
       await modules.recordIssue(resolved, issue, this.store.listByProject(projectId));
     }
     if (autoStart) await this.scheduleNext(projectId, moduleKeyOf(issue));
     this.scheduleClarify(issue.id); // 建即开跑（项目空闲）的不分析——规划阶段自会对齐
     return this.store.get(issue.id)!;
+  }
+
+  /**
+   * Publication prepare phase: resolve no modules and write nothing. Explicit module ids are read
+   * from the authoritative Issue-domain table; unclassified nodes remain deliberately unclassified.
+   */
+  async prepareDesignBatch(
+    projectId: number,
+    drafts: readonly DesignIssueDraft[],
+  ): Promise<PreparedDesignBatch> {
+    const project = this.requirePublicationProject(projectId);
+    if (!Array.isArray(drafts) || drafts.length === 0 || drafts.length > MAX_PUBLICATION_BATCH) {
+      throw new Error(`publication batch must contain 1-${MAX_PUBLICATION_BATCH} nodes`);
+    }
+    const seen = new Set<string>();
+    const prepared: PreparedDesignIssue[] = [];
+    for (const draft of drafts) {
+      const nodeId = draft.nodeId?.trim();
+      if (!nodeId || nodeId.length > 120 || seen.has(nodeId)) {
+        throw new Error('publication node ids must be unique non-empty strings');
+      }
+      seen.add(nodeId);
+      prepared.push(this.validatePublicationDraft(project, { ...draft, nodeId }));
+    }
+    const batch = Object.freeze({
+      [PREPARED_DESIGN_BATCH_BRAND]: true as const,
+      projectId,
+      drafts: Object.freeze(prepared.map((draft) => Object.freeze({ ...draft }))),
+    });
+    this.preparedDesignBatches.add(batch);
+    return batch;
+  }
+
+  /**
+   * Publication commit phase. All issue rows/events, generic dependencies, and the caller-owned
+   * linkage callback share this one synchronous SQLite transaction. No clarify, module docs,
+   * conversation activation, or scheduler call is reachable from this method.
+   */
+  commitPreparedDesignBatch<Result>(
+    prepared: PreparedDesignBatch,
+    dependencies: readonly PreparedIssueDependency[],
+    onCreatedInTransaction: (
+      issuesByNodeId: ReadonlyMap<string, EngineIssue>,
+    ) => SynchronousCallbackResult<Result>,
+  ): readonly EngineIssue[] {
+    if (!this.preparedDesignBatches.has(prepared as object)) {
+      throw new Error('prepared publication batch belongs to a different IssueEngine');
+    }
+    if (typeof onCreatedInTransaction !== 'function') throw new Error('publication linkage callback is required');
+    if (isDeclaredAsyncFunction(onCreatedInTransaction)) {
+      throw new Error('publication linkage callback must be synchronous');
+    }
+    // Pure graph validation intentionally precedes the transaction and its first INSERT. The Issue
+    // domain never trusts a designs caller to have supplied a DAG.
+    const validatedDependencies = validatePreparedDependencies(prepared, dependencies);
+    const commit = this.deps.db.transaction(() => {
+      const project = this.requirePublicationProject(prepared.projectId);
+      const revalidated = prepared.drafts.map((draft) => this.validatePublicationDraft(project, draft));
+      const byNode = new Map<string, EngineIssue>();
+      for (const draft of revalidated) byNode.set(draft.nodeId, this.store.createPublished(project.id, draft));
+
+      for (const dependency of validatedDependencies) {
+        const predecessor = byNode.get(dependency.fromNodeId)!;
+        const dependent = byNode.get(dependency.toNodeId)!;
+        this.store.addDependency(dependent.id, predecessor.id, 'blocks');
+      }
+      const callbackResult = onCreatedInTransaction(byNode);
+      if (isThenable(callbackResult)) {
+        throw new Error('publication linkage callback must be synchronous');
+      }
+      return Object.freeze(revalidated.map((draft) => byNode.get(draft.nodeId)!));
+    });
+    return commit();
+  }
+
+  /**
+   * Retryable post-commit drain surface for the caller-owned publication outbox. Effects are
+   * idempotent: module pages are rewritten through ModuleManager and scheduleNext is a guarded kick.
+   * Committed issues are never compensated/deleted when an effect fails.
+   */
+  async completeDesignBatch(
+    projectId: number,
+    issueIds: readonly number[],
+    outbox?: IssuePublicationPostCommitOutboxPort,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const project = this.requirePublicationProject(projectId);
+    const uniqueIds = [...new Set(issueIds)];
+    if (uniqueIds.length !== issueIds.length || uniqueIds.length === 0 || uniqueIds.length > MAX_PUBLICATION_BATCH) {
+      throw new Error('invalid publication issue ids');
+    }
+    const issues = uniqueIds.map((id) => {
+      const issue = this.store.get(id);
+      if (!issue || issue.projectId !== projectId || !issue.publicationLocked) {
+        throw new Error('publication issue scope mismatch');
+      }
+      return issue;
+    });
+    const failures: string[] = [];
+    const requireActive = (): void => {
+      if (signal?.aborted) throw new Error('publication post-commit drain aborted');
+    };
+    const batchIssueIds = Object.freeze([...uniqueIds].sort((a, b) => a - b));
+    const perform = async (
+      operation: IssuePublicationPostCommitOperation,
+      effect: () => void | Promise<void>,
+    ): Promise<void> => {
+      requireActive();
+      if (outbox) {
+        try {
+          if (await outbox.isComplete(operation)) return;
+        } catch (error) {
+          failures.push(`${operation.kind} outbox read: ${String(error).slice(0, 240)}`);
+          return;
+        }
+      }
+      try {
+        await effect();
+        requireActive();
+        await outbox?.markComplete(operation);
+      } catch (error) {
+        const detail = String(error).slice(0, 240);
+        failures.push(`${operation.kind}${operation.issueId === null ? '' : ` issue ${operation.issueId}`}: ${detail}`);
+        if (outbox) {
+          try {
+            await outbox.markRetry(operation, detail);
+          } catch (outboxError) {
+            failures.push(`${operation.kind} outbox retry: ${String(outboxError).slice(0, 240)}`);
+          }
+        }
+      }
+    };
+    const durableOperations = outbox?.listOperations ? await outbox.listOperations() : null;
+    const legacyModules = durableOperations === null ? this.deps.modulesFor?.(project) : undefined;
+    const operations: readonly IssuePublicationPostCommitOperation[] = durableOperations ?? [
+      ...(legacyModules
+        ? issues.flatMap((issue): IssuePublicationPostCommitOperation[] => issue.moduleId === null ? [] : [{
+        key: `issue-publication:${projectId}:module-doc:${issue.id}`,
+        kind: 'module-doc',
+        projectId,
+        issueId: issue.id,
+        issueIds: batchIssueIds,
+        moduleId: issue.moduleId,
+        agent: issue.agent,
+          }])
+        : []),
+      {
+        key: `issue-publication:${projectId}:scheduler:${batchIssueIds.join(',')}`,
+        kind: 'scheduler',
+        projectId,
+        issueId: null,
+        issueIds: batchIssueIds,
+      },
+    ];
+    for (const operation of operations) {
+      if (operation.projectId !== projectId || operation.issueIds.some((id) => !uniqueIds.includes(id))) {
+        throw new Error('publication outbox operation scope mismatch');
+      }
+      if (operation.kind === 'module-doc') {
+        if (operation.issueId === null || !uniqueIds.includes(operation.issueId)
+          || !Number.isSafeInteger(operation.moduleId) || operation.moduleId! <= 0
+          || (operation.agent !== 'claude' && operation.agent !== 'codex')) {
+          throw new Error('invalid durable module-doc operation');
+        }
+        await perform(operation, async () => {
+          // Durable operations are authoritative and must remain retryable even when the module
+          // subsystem is temporarily unavailable. The legacy no-outbox path keeps its historical
+          // best-effort behaviour by deriving module operations only when that subsystem exists.
+          const modules = durableOperations === null ? legacyModules : this.deps.modulesFor?.(project);
+          if (!modules) throw new Error('module system unavailable');
+          const issue = this.store.get(operation.issueId!);
+          if (!issue || issue.projectId !== projectId || !issue.publicationLocked) {
+            throw new Error('publication Issue disappeared');
+          }
+          const module = getPublicationModule(this.deps.db, operation.moduleId!);
+          if (!module || module.projectId !== projectId) throw new Error('module scope changed');
+          if (module.status !== 'active' || module.syncStatus !== 'ready' || module.agent !== operation.agent) {
+            throw new Error('module governance changed');
+          }
+          await modules.recordIssue(module, issue, this.store.listByProject(projectId), signal);
+        });
+      } else {
+        await perform(operation, async () => {
+          requireActive();
+          await this.scheduleNext(projectId);
+          requireActive();
+        });
+      }
+    }
+    if (failures.length > 0) throw new IssuePublicationPostCommitError(failures);
+  }
+
+  requestExecutionSync(issueId: number, input: IssueExecutionSyncRequest): IssueExecutionSync {
+    return this.store.requestExecutionSync(issueId, input);
+  }
+
+  getDesignSyncSnapshot(issueId: number): IssueDesignSyncSnapshot | null {
+    return this.store.designSyncSnapshot(issueId);
+  }
+
+  updateFromDesign<Result>(
+    input: IssueDesignSyncUpdate,
+    afterUpdate: (updated: IssueDesignSyncSnapshot) => SynchronousCallbackResult<Result>,
+  ): Result {
+    return this.store.updateFromDesignInTransaction(input, afterUpdate);
+  }
+
+  requestLatestExecutionSync(issueId: number, input: IssueExecutionSyncRequest): IssueExecutionSync {
+    return this.store.requestLatestExecutionSync(issueId, input);
+  }
+
+  latestExecutionSync(issueId: number, sourceKind: string, sourceKey: string): IssueExecutionSync | null {
+    return this.store.latestExecutionSync(issueId, sourceKind, sourceKey);
+  }
+
+  getExecutionSync(syncId: number): IssueExecutionSync | null {
+    return this.store.getExecutionSync(syncId) ?? null;
+  }
+
+  hasExecutionSyncBoundary(issueId: number): boolean {
+    return this.store.activeExecutionSyncBoundary(issueId) !== null;
+  }
+
+  holdExecutionSyncBoundary(
+    issueId: number,
+    boundaryKind: string,
+    deferredAction: unknown,
+  ): IssueExecutionSync | null {
+    return this.store.holdExecutionSyncBoundary(issueId, boundaryKind, deferredAction);
+  }
+
+  decideExecutionSync(
+    syncId: number,
+    decision: IssueExecutionSyncDecision,
+    actor: number,
+  ): IssueExecutionSync {
+    return this.store.decideExecutionSync(syncId, decision, actor);
+  }
+
+  /**
+   * Explicit crash recovery for a claim whose owning process has been confirmed dead. Both the
+   * stable action key and exact abandoned token are required, so stale recovery observations cannot
+   * reset a newer owner. Running claims never expire or become automatically reclaimable.
+   */
+  resetAbandonedExecutionSyncResume(syncId: number, resumeKey: string, abandonedToken: string): boolean {
+    return this.store.resetAbandonedExecutionSyncResume(syncId, resumeKey, abandonedToken);
+  }
+
+  /**
+   * Atomically apply one synchronous database effect, persist its stable-key receipt, and complete
+   * the claim. External I/O must be represented through context.enqueueExternalEffect(). A crash
+   * cannot occur between committing the DB effect and receipt; duplicates return the stored result.
+   */
+  resumeExecutionSync<T>(
+    syncId: number,
+    resume: (
+      deferredAction: unknown,
+      sync: IssueExecutionSync,
+      context: IssueExecutionSyncEffectContext,
+    ) => SynchronousCallbackResult<T>,
+  ): { resumed: boolean; result?: T } {
+    if (isDeclaredAsyncFunction(resume)) {
+      throw new Error('execution sync effect callback must be synchronous');
+    }
+    const prior = this.store.getExecutionSyncEffectReceipt(syncId);
+    if (prior) return { resumed: false, result: prior.result as T };
+    const claimed = this.store.claimExecutionSyncResume(syncId, this.now());
+    if (!claimed) {
+      const reconciled = this.store.getExecutionSyncEffectReceipt(syncId);
+      return reconciled
+        ? { resumed: false, result: reconciled.result as T }
+        : { resumed: false };
+    }
+    const token = claimed.resumeToken!;
+    let action: unknown;
+    try {
+      action = JSON.parse(claimed.deferredActionJson!);
+    } catch {
+      this.store.releaseExecutionSyncResume(syncId, token);
+      throw new Error('malformed deferred execution action');
+    }
+    try {
+      const committed = this.store.commitExecutionSyncEffect(
+        syncId,
+        token,
+        (sync, context) => resume(action, sync, context),
+      );
+      return { resumed: committed.applied, result: committed.result };
+    } catch (error) {
+      this.store.releaseExecutionSyncResume(syncId, token);
+      throw error;
+    }
+  }
+
+  recoverExecutionSyncs<Result>(
+    resume: (
+      deferredAction: unknown,
+      sync: IssueExecutionSync,
+      context: IssueExecutionSyncEffectContext,
+    ) => SynchronousCallbackResult<Result>,
+    limit = 100,
+  ): { examined: number; resumed: number } {
+    if (isDeclaredAsyncFunction(resume)) {
+      throw new Error('execution sync effect callback must be synchronous');
+    }
+    const bounded = Math.max(1, Math.min(500, Math.trunc(limit)));
+    const rows = this.store.listResumableExecutionSyncs(bounded);
+    let resumed = 0;
+    for (const row of rows) {
+      const result = this.resumeExecutionSync(row.id, resume);
+      if (result.resumed) resumed++;
+    }
+    return { examined: rows.length, resumed };
+  }
+
+  async drainExecutionSyncEffectOutbox(
+    limit = 100,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{ examined: number; delivered: number }> {
+    if (options.signal?.aborted) return { examined: 0, delivered: 0 };
+    // Startup and timers may claim only pending effects. A dispatching/uncertain row is an
+    // explicit crash boundary and remains owner-resolved even when a partial step receipt exists.
+    const rows = this.store.listExecutionSyncEffectOutbox(limit);
+    let delivered = 0;
+    let examined = 0;
+    for (const row of rows) {
+      if (options.signal?.aborted) break;
+      const claimed = this.store.claimExecutionSyncEffectDelivery(row.resumeKey, row.intentKey, this.now());
+      if (!claimed?.deliveryToken) continue;
+      examined++;
+      try {
+        if (claimed.kind !== 'issue-sync-boundary') {
+          throw new Error(`unsupported execution sync effect: ${claimed.kind}`);
+        }
+        const payload = claimed.payload as {
+          issueId?: unknown;
+          action?: {
+            kind?: unknown; event?: unknown; options?: unknown; nextIndex?: unknown;
+            from?: unknown; to?: unknown;
+          };
+        };
+        if (!Number.isSafeInteger(payload.issueId) || typeof payload.action !== 'object' || payload.action === null) {
+          throw new Error('malformed execution sync boundary effect');
+        }
+        const issueId = payload.issueId as number;
+        if (payload.action.kind === 'issue-event') {
+          const event = payload.action.event as IssueMachineEvent;
+          const actionOptions = (payload.action.options ?? {}) as { note?: string; failCount?: number; actor?: number };
+          const result = await this.applyEvent(issueId, event, actionOptions);
+          if (options.signal?.aborted) break;
+          if (!result.ok) throw new Error(result.error);
+        } else if (payload.action.kind === 'inject_subtask') {
+          const nextIndex = payload.action.nextIndex;
+          const issue = this.store.get(issueId);
+          const project = issue ? this.project(issue.projectId) : undefined;
+          if (!issue || !project || issue.status !== 'implementing' || issue.implMode !== 'seq'
+            || issue.subIndex !== nextIndex || !Number.isSafeInteger(nextIndex)) {
+            throw new Error('stale deferred subtask injection');
+          }
+          if (!issue.convId) throw new Error('deferred subtask issue has no conversation');
+          const subtasks = this.store.subtasksOf(issue).map((subtask) => subtask.text);
+          if (!subtasks[nextIndex as number]) throw new Error('deferred subtask no longer exists');
+          const session = this.deps.convs.tmuxName(issue.projectId, issue.convId);
+          await this.inject(session, buildSubtaskPrompt({
+            issue,
+            subtasks,
+            idx: nextIndex as number,
+            branch: issue.branch ?? `issue/${issue.id}`,
+            locale: this.promptLocale(issue, project),
+            resumeKey: `${claimed.resumeKey}:${claimed.intentKey}`,
+          }));
+          if (options.signal?.aborted) break;
+          this.store.logEvent(issueId, 'injected', {
+            stage: 'implementing', kind: 'subtask', idx: nextIndex,
+            resumeKey: claimed.resumeKey, intentKey: claimed.intentKey,
+          });
+        } else if (payload.action.kind === 'resume_entry') {
+          const issue = this.store.get(issueId);
+          if (!issue || issue.status !== payload.action.to) throw new Error('stale deferred entry action');
+          await this.onEnter(issueId, payload.action.from as IssueState, payload.action.to as IssueState);
+          if (options.signal?.aborted) break;
+        } else if (payload.action.kind !== 'safe_state') {
+          throw new Error('unknown deferred execution sync action');
+        }
+        if (!this.store.recordExecutionSyncEffectStep(
+          claimed.resumeKey,
+          claimed.intentKey,
+          claimed.deliveryToken,
+          'action-complete',
+          { issueId, actionKind: payload.action.kind },
+        )) throw new Error('execution sync delivery claim lost before action receipt');
+        if (this.store.markExecutionSyncEffectDelivered(
+          claimed.resumeKey,
+          claimed.intentKey,
+          claimed.deliveryToken,
+        )) delivered++;
+      } catch (error) {
+        if (options.signal?.aborted) break;
+        this.store.markExecutionSyncEffectUncertain(
+          claimed.resumeKey,
+          claimed.intentKey,
+          claimed.deliveryToken,
+          String(error),
+        );
+      }
+    }
+    return { examined, delivered };
+  }
+
+  listUncertainExecutionSyncEffects(limit = 100): IssueExecutionSyncEffectOutboxItem[] {
+    return this.store.listUncertainExecutionSyncEffects(limit);
+  }
+
+  getUncertainExecutionSyncEffect(syncId: number): IssueExecutionSyncEffectOutboxItem | null {
+    return this.store.getUncertainExecutionSyncEffect(syncId);
+  }
+
+  resolveUncertainExecutionSyncEffect(
+    resumeKey: string,
+    intentKey: string,
+    resolution: 'confirm_delivered' | 'retry',
+  ): boolean {
+    return this.store.resolveUncertainExecutionSyncEffect(resumeKey, intentKey, resolution);
+  }
+
+  hasUnresolvedExecutionSyncEffect(issueId: number): boolean {
+    return this.store.hasUnresolvedExecutionSyncEffect(issueId);
+  }
+
+  private requirePublicationProject(projectId: number): Project {
+    const project = this.project(projectId);
+    if (!project) throw new Error(`project ${projectId} does not exist`);
+    if (project.kind !== 'issue') throw new Error('chat project cannot publish issues');
+    if (project.status !== 'active') throw new Error('archived project cannot publish issues');
+    return project;
+  }
+
+  private validatePublicationDraft(project: Project, input: DesignIssueDraft): PreparedDesignIssue {
+    const nodeId = input.nodeId.trim();
+    const title = input.title.trim();
+    if (!nodeId || nodeId.length > 120) throw new Error('invalid publication node id');
+    if (!title || title.length > 200) throw new Error('publication title must contain 1-200 characters');
+    if (typeof input.body !== 'string' || input.body.length === 0 || input.body.length > MAX_PUBLICATION_BODY) {
+      throw new Error(`publication body must contain 1-${MAX_PUBLICATION_BODY} characters`);
+    }
+    if (input.implMode !== 'direct' && input.implMode !== 'team') throw new Error('invalid publication mode');
+    if (input.agent !== 'claude' && input.agent !== 'codex') throw new Error('invalid publication agent');
+    const suppliedCategory = (input as DesignIssueDraft & { category?: unknown }).category;
+    if (suppliedCategory !== undefined && suppliedCategory !== 'task') {
+      throw new Error('published graph nodes must be ordinary task issues');
+    }
+    const support = projectAgentSupport(this.deps.db, project.id, input.agent);
+    if (!support.ok) throw new Error(support.error);
+    let moduleSlug = 'unclassified';
+    if (input.moduleId !== null) {
+      if (!Number.isSafeInteger(input.moduleId) || input.moduleId <= 0) throw new Error('invalid publication module id');
+      const module = getPublicationModule(this.deps.db, input.moduleId);
+      if (!module || module.projectId !== project.id) throw new Error('publication module is outside project scope');
+      if (module.status !== 'active') throw new Error('publication module is archived, not active');
+      if (module.syncStatus !== 'ready') throw new Error('publication module docs are not ready for sync');
+      if (module.agent !== input.agent) throw new Error('publication module Agent does not match node agent');
+      moduleSlug = module.slug;
+    }
+    return {
+      ...input,
+      nodeId,
+      title,
+      moduleSlug,
+    };
+  }
+
+  workflowSnapshot(issueId: number): IssueWorkflowSnapshot | null {
+    return new WorkflowTemplateStore(this.deps.db, () => this.now()).issueWorkflow(issueId);
+  }
+
+  workflowRuntime(issueId: number): IssueWorkflowRuntime | null {
+    return new WorkflowTemplateStore(this.deps.db, () => this.now()).issueWorkflowRuntime(issueId);
   }
 
   /** 只有 pending 可以换正式模块；模块固定代理，因此换绑时代理随模块原子更新。 */
@@ -1720,6 +3466,9 @@ export class IssueEngine {
   ): Promise<EngineIssue> {
     const initial = this.store.get(issueId);
     if (!initial) throw new Error('issue 不存在');
+    if (initial.publicationLocked) {
+      throw new Error('设计发布的 Issue 只能通过 revision-aware sync 修改 contract 字段');
+    }
     if (!isEditableStatus(initial.status)) {
       throw new Error(`只有待办、受阻或已取消的 issue 可以修改（当前 ${initial.status}）`);
     }
@@ -1746,6 +3495,9 @@ export class IssueEngine {
       const fresh = this.store.get(issueId);
       if (!fresh || !isEditableStatus(fresh.status)) {
         throw new Error(`只有待办、受阻或已取消的 issue 可以修改（当前 ${fresh?.status ?? 'missing'}）`);
+      }
+      if (fresh.publicationLocked) {
+        throw new Error('设计发布的 Issue 只能通过 revision-aware sync 修改 contract 字段');
       }
       const requestedAgent = moduleSelection?.requestedAgent ?? meta.agent;
       if (requestedAgent && requestedAgent !== fresh.agent && fresh.convId) {
@@ -2528,12 +4280,12 @@ export class IssueEngine {
     try {
       let preferred = preferModuleKey;
       for (;;) {
-        let next = pickNext(this.store.listByProject(projectId), preferred);
+        let next = pickNext(this.store.listRunnableByProject(projectId), preferred);
         if (!next) return;
         const pickedModule = moduleKeyOf(next); // 模块身份用键（module_id 优先），不用可能过期的文本列
         // 目标模块的 pending 先智能合并，再在同模块内重挑（合并后 host 仍是最早的一条）
         mergedHosts.push(...(await this.maybeMergeModule(projectId, pickedModule)));
-        next = pickNext(this.store.listByProject(projectId), pickedModule);
+        next = pickNext(this.store.listRunnableByProject(projectId), pickedModule);
         if (!next) return;
 
         const beforeStatus = next.status;
@@ -2585,8 +4337,13 @@ export class IssueEngine {
     // 只并「从未起跑」的 pending（convId=null）：已绑对话/分支的（如 unblock 回来的）
     // 可能已有落地改动，折叠会丢工作，绝不动。
     const pending = this.store
-      .listByProject(projectId)
-      .filter((i) => i.status === 'pending' && moduleKeyOf(i) === moduleKey && !i.convId);
+      .listRunnableByProject(projectId)
+      .filter((i) =>
+        i.status === 'pending'
+        && moduleKeyOf(i) === moduleKey
+        && !i.convId
+        && !i.publicationLocked
+      );
     if (pending.length < 2) return hosts;
     // LLM 提示词要人看得懂的模块名：优先模块行显示名，退回 issue 的文本列
     const label = this.moduleLabel(projectId, pending[0]!);
@@ -2651,7 +4408,14 @@ export class IssueEngine {
     const members = merge.members
       .map((id) => this.store.get(id))
       .filter((i): i is EngineIssue => {
-        if (!i || i.status !== 'pending' || i.convId || moduleKeyOf(i) !== moduleKey) return false;
+        if (
+          !i
+          || i.status !== 'pending'
+          || i.convId
+          || i.publicationLocked
+          || moduleKeyOf(i) !== moduleKey
+          || this.store.dependencyBlockers(i.id).length > 0
+        ) return false;
         const original = byId.get(i.id);
         return !!original
           && i.targetBranch === original.targetBranch
@@ -2682,6 +4446,25 @@ export class IssueEngine {
    * skip_clarifying 直进 planning。澄清已前置到创建时（scheduleClarify 后台分析），
    * 开跑不再判含糊；执行中真不清楚由 CC 输出 ISSUE_BLOCKED 转受阻来问。
    */
+  private async resolveExecutionWorkspace(
+    issue: EngineIssue,
+    project: Project,
+  ): Promise<EngineExecutionWorkspace> {
+    const resolved = this.deps.executionWorkspaces
+      ? await this.deps.executionWorkspaces.resolve(issue, project)
+      : { cwd: project.cwd, kind: 'project' as const, branch: null, runId: null };
+    if (!resolved
+      || typeof resolved.cwd !== 'string'
+      || !resolved.cwd.startsWith('/')
+      || resolved.cwd.trim() !== resolved.cwd
+      || (resolved.kind !== 'project' && resolved.kind !== 'design-worktree')
+      || (resolved.kind === 'project' && resolved.cwd !== project.cwd)
+      || (resolved.kind === 'design-worktree' && (!resolved.branch || !resolved.runId))) {
+      throw new Error('execution workspace contract mismatch');
+    }
+    return resolved;
+  }
+
   async startIssue(issueId: number): Promise<ApplyResult> {
     const issue = this.store.get(issueId);
     if (!issue) return { ok: false, error: '无此 issue' };
@@ -2730,16 +4513,50 @@ export class IssueEngine {
           immediate = { ok: false, error: `仅 pending 可开跑（当前 ${fresh.status}）` };
           return;
         }
+        const blockers = this.store.dependencyBlockers(fresh.id);
+        if (blockers.length > 0) {
+          immediate = {
+            ok: false,
+            error: `依赖尚未完成：${blockers.map((blocker) => `#${blocker.issueId}(${blocker.status})`).join(', ')}`,
+          };
+          return;
+        }
         const siblings = this.store.listByProject(fresh.projectId).filter((i) => i.id !== fresh.id);
-        if (isBusy(siblings)) {
+        const pausedWorkflow = siblings.some(
+          (candidate) => candidate.status === 'blocked' && this.workflowSnapshot(candidate.id)?.status === 'paused',
+        );
+        if (isBusy(siblings) || pausedWorkflow) {
           immediate = { ok: false, error: '项目忙（已有 issue 在跑），先排队' };
           return;
         }
 
+        let workspace: EngineExecutionWorkspace;
+        try {
+          workspace = await this.resolveExecutionWorkspace(fresh, project);
+        } catch (e) {
+          const detail = String(e).slice(0, 200);
+          this.store.logEvent(fresh.id, 'error', { where: 'execution-workspace', error: detail });
+          immediate = { ok: false, error: `执行工作区不可用：${detail}` };
+          return;
+        }
+
         // 正式模块永久绑定唯一逻辑对话；tmux 只是可随时休眠/恢复的运行容器。
-        if (!fresh.convId) {
+        if (!fresh.convId && !this.workflowSnapshot(fresh.id)) {
           let conv: Conversation | undefined;
-          if (fresh.moduleId) {
+          if (workspace.kind === 'design-worktree') {
+            try {
+              conv = await this.deps.executionWorkspaces!.conversationFor(fresh, workspace);
+            } catch (e) {
+              immediate = { ok: false, error: `设计执行会话不可用：${String(e).slice(0, 160)}` };
+              return;
+            }
+            if (conv.projectId !== fresh.projectId
+              || conv.agent !== fresh.agent
+              || conv.workspaceCwd !== workspace.cwd) {
+              immediate = { ok: false, error: '设计执行会话与工作区不匹配' };
+              return;
+            }
+          } else if (fresh.moduleId) {
             const module = this.deps.db
               .query<{ conversation_id: string | null; agent: string }, [number, number]>(
                 'SELECT conversation_id, agent FROM project_modules WHERE id = ? AND project_id = ?',
@@ -2786,6 +4603,21 @@ export class IssueEngine {
             this.store.setConv(fresh.id, conv.id);
           } catch (e) {
             immediate = { ok: false, error: `绑定会话失败：${String(e).slice(0, 160)}` };
+            return;
+          }
+        } else if (workspace.kind === 'design-worktree') {
+          let conv: Conversation;
+          try {
+            conv = await this.deps.executionWorkspaces!.conversationFor(fresh, workspace);
+          } catch (e) {
+            immediate = { ok: false, error: `设计执行会话不可用：${String(e).slice(0, 160)}` };
+            return;
+          }
+          if (conv.id !== fresh.convId
+            || conv.projectId !== fresh.projectId
+            || conv.agent !== fresh.agent
+            || conv.workspaceCwd !== workspace.cwd) {
+            immediate = { ok: false, error: '设计执行会话绑定不一致' };
             return;
           }
         }
@@ -3093,7 +4925,7 @@ export class IssueEngine {
       this.applyEventLocked(issueId, ev, opts, afterCommit),
     );
     // unblock → pending 的接力可能立刻重新 start 同一 issue，必须等 transition 锁释放后执行。
-    if (result.ok && result.to === 'pending') {
+    if (result.ok && result.to === 'pending' && result.from !== 'pending') {
       const issue = this.store.get(issueId);
       if (issue?.status === 'pending') await this.scheduleNext(issue.projectId, moduleKeyOf(issue));
     }
@@ -3142,6 +4974,19 @@ export class IssueEngine {
     const from = issue.status;
     const to = transition(from, ev, opts.failCount !== undefined ? { failCount: opts.failCount } : undefined);
     if (to === null) return { ok: false, error: `非法转换：${from} -[${ev}]->` };
+    const boundaryKind = this.executionSyncBoundaryKind(from, ev);
+    if (boundaryKind) {
+      const held = this.store.holdExecutionSyncBoundary(issueId, boundaryKind, {
+        kind: 'issue-event',
+        event: ev,
+        options: {
+          ...(opts.note !== undefined ? { note: opts.note } : {}),
+          ...(opts.failCount !== undefined ? { failCount: opts.failCount } : {}),
+          ...(opts.actor !== undefined ? { actor: opts.actor } : {}),
+        },
+      });
+      if (held) return { ok: true, from, to: from };
+    }
     const commitTransition = (fresh: EngineIssue): boolean => {
       if (!this.store.casStatus(issueId, from, to)) return false;
       this.store.logEvent(issueId, 'transition', {
@@ -3161,13 +5006,22 @@ export class IssueEngine {
     // watcher 永远看不到“状态已 planning、分支还没准备好”的半状态。pending→planning
     // 的调用方 startIssue 已按 issue-meta → transition → git 持锁；clarifying/plan_review
     // 的 Git 意图已不可编辑，无需反向再取 issue-meta。
-    if (to === 'planning' && issue.targetBranch) {
+    if (to === 'planning') {
       const project = this.project(issue.projectId);
       if (project) {
+        let workspace: EngineExecutionWorkspace;
+        try { workspace = await this.resolveExecutionWorkspace(issue, project); }
+        catch (e) {
+          this.store.logEvent(issueId, 'error', { where: 'execution-workspace', error: String(e).slice(0, 200) });
+          return this.applyEventLocked(issueId, 'block', { note: '执行工作区不可用' }, afterCommit);
+        }
+        if (workspace.kind === 'project' && !issue.targetBranch) {
+          // Preserve the legacy no-target path byte-for-byte: no Git observation or mutation.
+        } else {
         const prepared = await this.deps.mutex.runExclusive(gitLockKey(project.id), async () => {
           const fresh = this.store.get(issueId);
           if (!fresh || fresh.status !== from) return { kind: 'stale' as const };
-          const branch = await this.prepareIssueBranchLocked(project, fresh);
+          const branch = await this.prepareIssueBranchLocked(project, fresh, workspace);
           if (!branch.ok) {
             if (branch.actualBranch && fresh.branch !== branch.actualBranch) {
               this.store.setBranch(issueId, branch.actualBranch);
@@ -3193,6 +5047,7 @@ export class IssueEngine {
           return { ok: false, error: `状态已被并发修改（不再是 ${from}），事件 ${ev} 作废` };
         }
         committed = true;
+        }
       }
     }
     // implementing 状态发布前，在同一 Git 锁内确认实际分支并采样起点。CAS、issues.branch
@@ -3200,10 +5055,16 @@ export class IssueEngine {
     if (to === 'implementing') {
       const project = this.project(issue.projectId);
       if (project) {
+        let workspace: EngineExecutionWorkspace;
+        try { workspace = await this.resolveExecutionWorkspace(issue, project); }
+        catch (e) {
+          this.store.logEvent(issueId, 'error', { where: 'execution-workspace', error: String(e).slice(0, 200) });
+          return this.applyEventLocked(issueId, 'block', { note: '执行工作区不可用' }, afterCommit);
+        }
         const inspected = await this.deps.mutex.runExclusive(gitLockKey(project.id), async () => {
           const fresh = this.store.get(issueId);
           if (!fresh || fresh.status !== from) return { kind: 'stale' as const };
-          const branch = await this.inspectIssueBranchLocked(project, fresh);
+          const branch = await this.inspectIssueBranchLocked(project, fresh, workspace);
           if (!branch.ok) return { kind: 'blocked' as const, err: branch.err };
           if (!commitTransition(fresh)) return { kind: 'stale' as const };
           if (fresh.branch !== branch.branch) this.store.setBranch(issueId, branch.branch);
@@ -3256,6 +5117,17 @@ export class IssueEngine {
     return { ok: true, from, to };
   }
 
+  private executionSyncBoundaryKind(from: IssueState, ev: IssueMachineEvent): string | null {
+    if (from === 'pending' && ev === 'skip_clarifying') return 'skip_clarifying';
+    if (from === 'clarifying' && ev === 'clarified') return 'clarified';
+    if (from === 'planning' && ev === 'plan_ready') return 'plan_ready';
+    if (from === 'plan_review' && (ev === 'plan_approved' || ev === 'plan_rejected')) return ev;
+    if (from === 'implementing' && ev === 'impl_done') return 'impl_done';
+    if (from === 'testing' && (ev === 'tests_passed' || ev === 'tests_failed')) return ev;
+    if (from === 'merge_review' && (ev === 'review_approved' || ev === 'review_rejected')) return ev;
+    return null;
+  }
+
   private async syncModuleIssue(issueId: number): Promise<void> {
     const issue = this.store.get(issueId);
     if (!issue?.moduleId) return;
@@ -3287,9 +5159,21 @@ export class IssueEngine {
     if (!issue || issue.status !== to) return;
     const project = this.project(issue.projectId);
     if (!project) return;
+    let workspace: EngineExecutionWorkspace;
+    try { workspace = await this.resolveExecutionWorkspace(issue, project); }
+    catch (e) {
+      this.store.logEvent(issue.id, 'error', {
+        where: 'execution-workspace', error: String(e).slice(0, 200),
+      });
+      return;
+    }
 
     switch (to) {
       case 'planning': {
+        if (this.workflowSnapshot(issueId)) {
+          await this.applyEventLocked(issueId, 'plan_ready', { note: '工作流快照已就绪' });
+          break;
+        }
         // 配置目标分支的新 issue 已在 planning CAS 发布前准备好 Git 现场；历史 issue
         // （targetBranch=null）完全沿用“开发者当前分支”行为。
         // 首次（pending/clarifying 进入）激活对话；plan_rejected 回炉时进程通常已在——
@@ -3309,9 +5193,17 @@ export class IssueEngine {
         break;
       }
       case 'plan_review': {
+        if (this.workflowSnapshot(issueId)) {
+          this.store.logEvent(issueId, 'auto_approved', { kind: 'workflow_plan' });
+          await this.applyEventLocked(issueId, 'plan_approved', { note: '工作流模板已确认' });
+          break;
+        }
         // 默认（manual_review 关）：不建卡点，记 auto_approved 直接放行开工——
         // 卡点等人批会占死项目队列（实测过夜 12h+）。开了手动确认才走老流程。
         if (!project.manualReview) {
+          if (this.store.holdExecutionSyncBoundary(issueId, 'plan_approved', {
+            kind: 'resume_entry', from, to: 'plan_review',
+          })) return;
           this.store.logEvent(issueId, 'auto_approved', {
             kind: 'plan',
             n: this.store.subtasksOf(issue).length,
@@ -3335,6 +5227,21 @@ export class IssueEngine {
         break;
       }
       case 'implementing': {
+        const workflow = this.workflowSnapshot(issueId);
+        if (workflow) {
+          const result = await this.workflowScheduler.begin(
+            issueId,
+            this.promptLocale(issue, project),
+          );
+          if (result?.state === 'completed') {
+            await this.applyEventLocked(issueId, 'impl_done', { note: '工作流已完成' });
+          } else if (result?.state === 'failed' || result?.state === 'paused') {
+            await this.applyEventLocked(issueId, 'block', {
+              note: `${result.state === 'paused' ? '工作流已暂停' : '工作流执行失败'}：${result.reason}`,
+            });
+          }
+          break;
+        }
         // targetBranch 非空的新 issue 已在 planning 前准备好分支；历史 issue 仍沿用开发者当前分支。
         // 实际分支校验、issues.branch 与首条 impl_base 已在 implementing CAS 发布前原子准备。
         // I1：plan_review approve 等路径进 implementing 时项目可能没有激活对话
@@ -3343,18 +5250,25 @@ export class IssueEngine {
         break;
       }
       case 'testing':
+        if (this.workflowSnapshot(issueId)) {
+          await this.applyEventLocked(issueId, 'tests_passed', { note: '工作流节点已全部完成' });
+          break;
+        }
         if (!(await this.ensureActiveConv(issue))) return; // I1 同上
         break; // kickoff 注入测试 prompt
       case 'merge_review': {
         // 默认（manual_review 关）：不建卡点——自动 commit/push 收尾后直接放行到 done。
         // 先 commit 再 stampImplTip：自动提交要落进本 issue 的 impl_base..impl_tip 范围。
         if (!project.manualReview) {
+          if (this.store.holdExecutionSyncBoundary(issueId, 'merge_review_auto', {
+            kind: 'resume_entry', from, to: 'merge_review',
+          })) return;
           const finished = await this.deps.mutex
             .runExclusive(gitLockKey(project.id), async () => {
-              const branch = await this.inspectIssueBranchLocked(project, issue);
+              const branch = await this.inspectIssueBranchLocked(project, issue, workspace);
               if (!branch.ok) return branch;
-              const autoFailure = await this.autoCommitPushLocked(project, issue);
-              await this.stampImplTip(project, issue);
+              const autoFailure = await this.autoCommitPushLocked(project, issue, workspace);
+              await this.stampImplTip(project, issue, workspace);
               return { ok: true as const, autoFailure };
             })
             .catch((e: unknown) => ({ ok: false as const, err: String(e).slice(0, 300) }));
@@ -3387,10 +5301,10 @@ export class IssueEngine {
         }
         const review = await this.deps.mutex
           .runExclusive(gitLockKey(project.id), async () => {
-            const branch = await this.inspectIssueBranchLocked(project, issue);
+            const branch = await this.inspectIssueBranchLocked(project, issue, workspace);
             if (!branch.ok) return branch;
-            await this.stampImplTip(project, issue); // 定格本 issue 终点：范围收在 impl_base..impl_tip
-            return { ok: true as const, payload: await this.buildMergeReviewPayload(project, issue) };
+            await this.stampImplTip(project, issue, workspace); // 定格本 issue 终点：范围收在 impl_base..impl_tip
+            return { ok: true as const, payload: await this.buildMergeReviewPayload(project, issue, workspace) };
           })
           .catch((e: unknown) => ({ ok: false as const, err: String(e).slice(0, 300) }));
         if (!review.ok) {
@@ -3422,6 +5336,8 @@ export class IssueEngine {
       case 'done':
       case 'blocked':
       case 'cancelled': {
+        if (to === 'blocked') this.workflowScheduler.pause(issueId, note ?? 'issue.blocked');
+        if (to === 'cancelled') this.workflowScheduler.cancel(issueId);
         if (issue.convId) this.watch.delete(issue.convId);
         this.store.expireWaitingGates(issueId);
         // 定格本 issue 终点 + 提交快照——仅作**兜底**：blocked/cancelled 若没走过 merge_review
@@ -3430,9 +5346,9 @@ export class IssueEngine {
         if (this.implTipSha(issueId) === null) {
           const stamped = await this.deps.mutex
             .runExclusive(gitLockKey(project.id), async () => {
-              const branch = await this.inspectIssueBranchLocked(project, issue);
+              const branch = await this.inspectIssueBranchLocked(project, issue, workspace);
               if (!branch.ok) return branch;
-              await this.stampImplTip(project, issue);
+              await this.stampImplTip(project, issue, workspace);
               return { ok: true as const };
             })
             .catch((e: unknown) => ({ ok: false as const, err: String(e).slice(0, 300) }));
@@ -3442,7 +5358,7 @@ export class IssueEngine {
         }
         // 执行结果总结：必须在接力**之前**（下一条 issue 会接管同一 tmux 会话）；
         // cancelled 不总结；超时/失败降级记事件，不阻断收尾。
-        if (to !== 'cancelled') await this.collectResultSummary(project, issue, to);
+        if (to !== 'cancelled') await this.collectResultSummary(project, issue, to, workspace);
         if (
           issue.moduleId &&
           issue.convId &&
@@ -3454,7 +5370,10 @@ export class IssueEngine {
             status: to,
           });
         }
-        await this.scheduleNext(issue.projectId, moduleKeyOf(issue)); // done/blocked 接力
+        const reservesProject = to === 'blocked' && this.workflowSnapshot(issueId)?.status === 'paused';
+        if (!reservesProject) {
+          await this.scheduleNext(issue.projectId, moduleKeyOf(issue)); // done/普通 blocked 接力
+        }
         if (
           issue.convId &&
           !isBusy(this.store.listByProject(issue.projectId)) &&
@@ -3487,14 +5406,24 @@ export class IssueEngine {
   private async prepareIssueBranchLocked(
     project: Project,
     issue: EngineIssue,
+    workspace: EngineExecutionWorkspace,
   ): Promise<
     | { ok: true; branch: string; mode: 'current' | 'existing' | 'created' }
     | { ok: false; err: string; actualBranch?: string }
   > {
     // 调用方已持有 git:<projectId>；这里不得再次获取同 key（KeyedMutex 非重入）。
-      const cwd = project.cwd;
-      const target = issue.targetBranch?.trim() ?? '';
+      const cwd = workspace.cwd;
+      const target = workspace.kind === 'design-worktree'
+        ? workspace.branch ?? ''
+        : issue.targetBranch?.trim() ?? '';
       if (!target) return { ok: false, err: '目标分支为空' };
+
+      if (workspace.kind === 'design-worktree') {
+        const inspected = await this.inspectIssueBranchLocked(project, issue, workspace);
+        return inspected.ok
+          ? { ok: true, branch: inspected.branch, mode: 'current' }
+          : inspected;
+      }
 
       const repo = await this.deps.driver.git(cwd, ['rev-parse', '--is-inside-work-tree']);
       if (repo.code !== 0 || repo.out.trim() !== 'true') {
@@ -3593,9 +5522,13 @@ export class IssueEngine {
    *  2) 历史 issue 未配置目标时，读**开发者当前所在分支**——这就是改动真正落地的分支；
    *  3) detached / 读不到 → 退回项目 work_branch 或空串（仅作展示标签，不影响 commit 范围记录）。
    */
-  private async currentBranch(project: Project, issue: EngineIssue): Promise<string> {
+  private async currentBranch(
+    project: Project,
+    issue: EngineIssue,
+    workspace: EngineExecutionWorkspace,
+  ): Promise<string> {
     if (issue.branch) return issue.branch;
-    const cur = await this.deps.driver.git(project.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    const cur = await this.deps.driver.git(workspace.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
     const b = cur.code === 0 ? cur.out.trim() : '';
     if (b && b !== 'HEAD') return b;
     return (project.workBranch ?? '').trim();
@@ -3609,18 +5542,21 @@ export class IssueEngine {
   private async inspectIssueBranchLocked(
     project: Project,
     issue: EngineIssue,
+    workspace: EngineExecutionWorkspace,
   ): Promise<
     | { ok: true; branch: string; head: string | null }
     | { ok: false; err: string }
   > {
-    const currentResult = await this.deps.driver.git(project.cwd, [
+    const currentResult = await this.deps.driver.git(workspace.cwd, [
       'symbolic-ref',
       '--quiet',
       '--short',
       'HEAD',
     ]);
     const actual = currentResult.code === 0 ? currentResult.out.trim() : '';
-    const expected = (issue.branch ?? issue.targetBranch ?? '').trim();
+    const expected = (workspace.kind === 'design-worktree'
+      ? workspace.branch ?? ''
+      : issue.branch ?? issue.targetBranch ?? '').trim();
     if (expected && actual !== expected) {
       return {
         ok: false,
@@ -3628,7 +5564,7 @@ export class IssueEngine {
       };
     }
     const branch = expected || actual || (project.workBranch ?? '').trim();
-    const headResult = await this.deps.driver.git(project.cwd, ['rev-parse', '--verify', 'HEAD']);
+    const headResult = await this.deps.driver.git(workspace.cwd, ['rev-parse', '--verify', 'HEAD']);
     const head = headResult.code === 0 && headResult.out.trim() ? headResult.out.trim() : null;
     return { ok: true, branch, head };
   }
@@ -3695,17 +5631,21 @@ export class IssueEngine {
    * 有了显式 commit id，per-issue 视图/评审就永远按本 issue 自己的提交算，不必再和 main 对比。
    * 无起点（impl_base）则无从定范围，跳过。
    */
-  private async stampImplTip(project: Project, issue: EngineIssue): Promise<void> {
+  private async stampImplTip(
+    project: Project,
+    issue: EngineIssue,
+    workspace: EngineExecutionWorkspace,
+  ): Promise<void> {
     const startSha = this.implBaseSha(issue.id);
     if (startSha === null) return; // 无起点则无从定范围
-    const head = await this.deps.driver.git(project.cwd, ['rev-parse', 'HEAD']);
+    const head = await this.deps.driver.git(workspace.cwd, ['rev-parse', 'HEAD']);
     const tip = head.code === 0 ? head.out.trim() : '';
     if (!tip) return;
     this.store.logEvent(issue.id, 'impl_tip', { sha: tip });
     // 耐久快照：本 issue 净提交（commit ids）+ 逐文件改动。同一 base..tip 已记过则不重复
     // （merge_review 与终态各会调一次 stampImplTip）。
     if (!this.hasCommitSnapshot(issue.id, startSha, tip)) {
-      const snap = await this.collectImplCommits(project.cwd, startSha, tip);
+      const snap = await this.collectImplCommits(workspace.cwd, startSha, tip);
       this.store.logEvent(issue.id, 'impl_commits', { base: startSha, tip, ...snap });
     }
   }
@@ -3758,8 +5698,9 @@ export class IssueEngine {
   private async autoCommitPushLocked(
     project: Project,
     issue: EngineIssue,
+    workspace: EngineExecutionWorkspace,
   ): Promise<{ where: 'auto_commit' | 'auto_push'; detail: string } | null> {
-    const cwd = project.cwd;
+    const cwd = workspace.cwd;
     const fail = (where: 'auto_commit' | 'auto_push', detail: string) => {
       this.store.logEvent(issue.id, 'error', { where, error: detail.slice(0, 300) });
       return { where, detail };
@@ -3778,7 +5719,16 @@ export class IssueEngine {
       }
       this.store.logEvent(issue.id, 'auto_commit', { message: msg });
     }
-    const push = await this.deps.driver.git(cwd, ['push', 'origin', 'HEAD']);
+    let pushArgs = ['push', 'origin', 'HEAD'];
+    if (workspace.kind === 'design-worktree') {
+      const upstream = await this.deps.driver.git(cwd, [
+        'rev-parse', '--symbolic-full-name', '@{upstream}',
+      ]);
+      if (upstream.code !== 0 || !upstream.out.trim().startsWith('refs/remotes/')) {
+        pushArgs = ['push', '--set-upstream', 'origin', 'HEAD'];
+      }
+    }
+    const push = await this.deps.driver.git(cwd, pushArgs);
     if (push.code !== 0) {
       return fail('auto_push', push.err || push.out);
     }
@@ -3786,8 +5736,12 @@ export class IssueEngine {
     return null;
   }
 
-  private async buildMergeReviewPayload(project: Project, issue: EngineIssue): Promise<Record<string, unknown>> {
-    const branch = issue.branch ?? (await this.currentBranch(project, issue));
+  private async buildMergeReviewPayload(
+    project: Project,
+    issue: EngineIssue,
+    workspace: EngineExecutionWorkspace,
+  ): Promise<Record<string, unknown>> {
+    const branch = issue.branch ?? (await this.currentBranch(project, issue, workspace));
     const base = this.cfg.baseBranch;
     // 一律按「本 issue 自己的提交范围」出 diff：impl_base(起点)..impl_tip(终点，缺省用分支 tip)——
     // 改动落在 issue 的实际工作分支上且引擎不做本地合并；仅当从未记到起点（老 issue / 异常）
@@ -3795,10 +5749,10 @@ export class IssueEngine {
     const startSha = this.implBaseSha(issue.id);
     const endSha = this.implTipSha(issue.id) ?? branch;
     const range = startSha ? `${startSha}..${endSha}` : `${base}...${branch}`;
-    const stat = await this.deps.driver.git(project.cwd, ['diff', '--stat', range]);
-    const diff = await this.deps.driver.git(project.cwd, ['diff', range]);
+    const stat = await this.deps.driver.git(workspace.cwd, ['diff', '--stat', range]);
+    const diff = await this.deps.driver.git(workspace.cwd, ['diff', range]);
     // 本 issue 涉及的 commit ids + 逐文件改动随卡点②一并给出（评审直接看到具体提交）。
-    const snap = startSha ? await this.collectImplCommits(project.cwd, startSha, endSha) : null;
+    const snap = startSha ? await this.collectImplCommits(workspace.cwd, startSha, endSha) : null;
     return {
       branch,
       base,
@@ -3824,6 +5778,7 @@ export class IssueEngine {
     project: Project,
     issue: EngineIssue,
     kind: 'done' | 'blocked',
+    workspace: EngineExecutionWorkspace,
   ): Promise<void> {
     if (this.cfg.resultSummaryTimeoutMs <= 0) return; // 关闭
     if (!issue.convId) {
@@ -3831,7 +5786,7 @@ export class IssueEngine {
       return;
     }
     const session = this.deps.convs.tmuxName(issue.projectId, issue.convId);
-    const p = resultSummaryPaths(project.cwd, issue.id);
+    const p = resultSummaryPaths(workspace.cwd, issue.id);
     try {
       // 统一门禁（issue #97）：会话没了不必说，**窗格里只剩 bash 也不能发**——
       // 总结 prompt 会被 shell 当命令跑掉，然后干等到超时。此处不重启：issue 已经收尾，
@@ -3873,9 +5828,16 @@ export class IssueEngine {
         return;
       }
       this.store.setResultSummary(issue.id, text);
+      if (workspace.kind === 'design-worktree') {
+        await this.deps.executionWorkspaces?.recordResult?.(issue, workspace, text).catch((e) => {
+          this.store.logEvent(issue.id, 'error', {
+            where: 'design-result', error: String(e).slice(0, 200),
+          });
+        });
+      }
       const module = issue.moduleId === null ? null : this.moduleRow(issue.projectId, issue.moduleId);
       const modules = this.deps.modulesFor?.(project);
-      if (module && modules?.recordResultSummary) {
+      if (workspace.kind === 'project' && module && modules?.recordResultSummary) {
         await modules.recordResultSummary(module, { ...issue, status: kind }, text).catch((e) => {
           this.store.logEvent(issue.id, 'error', {
             where: 'resultSummaryDoc',
@@ -4158,9 +6120,57 @@ export class IssueEngine {
     await Promise.allSettled(started);
   }
 
+  /**
+   * 工作流 issue 不依赖单一 conv_id；每次只根据耐久快照和节点 run 推进一步。
+   * planning/plan_review/testing 也纳入恢复，覆盖服务恰好停在嵌套 entry action 之间的窗口。
+   */
+  private async tickWorkflowIssue(issue: EngineIssue, project: Project): Promise<void> {
+    switch (issue.status) {
+      case 'planning':
+        await this.applyEvent(issue.id, 'plan_ready', { note: '工作流快照已就绪' });
+        return;
+      case 'plan_review':
+        await this.applyEvent(issue.id, 'plan_approved', { note: '工作流模板已确认' });
+        return;
+      case 'implementing': {
+        const result = await this.workflowScheduler.tick(issue.id, this.promptLocale(issue, project));
+        if (result?.state === 'completed') {
+          await this.applyEvent(issue.id, 'impl_done', { note: '工作流已完成' });
+        } else if (result?.state === 'failed' || result?.state === 'paused') {
+          await this.applyEvent(issue.id, 'block', {
+            note: `${result.state === 'paused' ? '工作流已暂停' : '工作流执行失败'}：${result.reason}`,
+          });
+        }
+        return;
+      }
+      case 'testing': {
+        const workflow = this.workflowSnapshot(issue.id);
+        if (workflow?.status === 'completed') {
+          await this.applyEvent(issue.id, 'tests_passed', { note: '工作流节点已全部完成' });
+        } else if (workflow?.status === 'failed') {
+          await this.applyEvent(issue.id, 'block', {
+            note: `工作流执行失败：${workflow.pauseReason ?? 'workflow.failed'}`,
+          });
+        }
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
   private async tickIssue(issue: EngineIssue): Promise<void> {
+    // A durable design-sync boundary freezes every watcher-driven side effect, including session
+    // recovery, kickoff and nudge. Restart therefore cannot drive past an undecided revision.
+    if (this.store.activeExecutionSyncBoundary(issue.id)
+      || this.store.hasUnresolvedExecutionSyncEffect(issue.id)) return;
     const project = this.project(issue.projectId);
-    if (!project || !issue.convId) return;
+    if (!project) return;
+    if (this.workflowSnapshot(issue.id)) {
+      await this.tickWorkflowIssue(issue, project);
+      return;
+    }
+    if (!issue.convId) return;
     const convId = issue.convId;
     const current = this.deps.convs.currentConv(issue.projectId);
     if (current === undefined) {
@@ -4493,7 +6503,16 @@ export class IssueEngine {
     try {
       const fresh = this.store.get(issue.id);
       if (!fresh || fresh.status !== stage) return;
-      const built = this.buildKickoffPrompt(fresh, project);
+      let workspace: EngineExecutionWorkspace;
+      try { workspace = await this.resolveExecutionWorkspace(fresh, project); }
+      catch (e) {
+        this.store.logEvent(fresh.id, 'error', {
+          where: 'execution-workspace', error: String(e).slice(0, 200),
+        });
+        await this.applyEvent(fresh.id, 'block', { note: '执行工作区不可用' });
+        return;
+      }
+      const built = this.buildKickoffPrompt(fresh, project, workspace);
       if (!built) return;
       await this.inject(session, built.text);
       this.store.logEvent(fresh.id, 'injected', { stage, ...built.meta });
@@ -4509,14 +6528,14 @@ export class IssueEngine {
     return entry?.event === 'tests_failed' || entry?.event === 'review_rejected';
   }
 
-  private absImages(project: Project, issue: EngineIssue): string[] {
+  private absImages(workspace: EngineExecutionWorkspace, issue: EngineIssue): string[] {
     if (!issue.imagesJson) return [];
     try {
       const arr = JSON.parse(issue.imagesJson) as string[];
       if (!Array.isArray(arr)) return [];
       return arr
         .filter((p) => typeof p === 'string' && p)
-        .map((p) => (p.startsWith('/') ? p : `${project.cwd.replace(/\/+$/, '')}/${p}`));
+        .map((p) => (p.startsWith('/') ? p : `${workspace.cwd.replace(/\/+$/, '')}/${p}`));
     } catch {
       return [];
     }
@@ -4529,9 +6548,10 @@ export class IssueEngine {
   private buildKickoffPrompt(
     issue: EngineIssue,
     project: Project,
+    workspace: EngineExecutionWorkspace,
   ): { text: string; meta: Record<string, unknown> } | null {
     const branch = issue.branch ?? ''; // 进 implementing 时已记下目标分支或历史 issue 的当前分支
-    const imgHint = imageReadHint(this.absImages(project, issue));
+    const imgHint = imageReadHint(this.absImages(workspace, issue));
     const locale = this.promptLocale(issue, project);
     switch (issue.status) {
       case 'planning': {
@@ -4642,6 +6662,8 @@ export class IssueEngine {
   private async handleAssistantTexts(issueId: number, texts: string[], session: string): Promise<void> {
     const issue = this.store.get(issueId); // 重读最新状态（哨兵与判定竞态的读端）
     if (!issue || !DRIVING_STATES.includes(issue.status)) return;
+    if (this.store.activeExecutionSyncBoundary(issueId)
+      || this.store.hasUnresolvedExecutionSyncEffect(issueId)) return;
     const id = issue.id;
 
     // ISSUE_BLOCKED 在任何驱动阶段都认
@@ -4676,8 +6698,9 @@ export class IssueEngine {
         for (const t of texts) {
           const subs = parseSubtasksBlock(t);
           if (subs) {
-            this.store.setSubtasks(id, subs);
+            const held = this.store.setSubtasksAtDesignBoundary(id, subs);
             this.store.logEvent(id, 'sentinel', { kind: 'subtasks', n: subs.length });
+            if (held) return;
             await this.applyEvent(id, 'plan_ready');
             return;
           }
@@ -4693,10 +6716,11 @@ export class IssueEngine {
           let advanced = false;
           while (n > 0) {
             n--;
-            const r = this.store.advanceSubtask(id);
+            const r = this.store.advanceSubtaskAtDesignBoundary(id);
             if (!r) break;
             advanced = true;
             this.store.logEvent(id, 'subtask_done', { idx: r.nextIdx - 1 });
+            if (r.held) return;
             if (r.allDone) {
               stageDone = true;
               break;

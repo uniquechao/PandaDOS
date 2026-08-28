@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { openDb } from './db';
 import { migrate } from './migrate';
 import { migrateIssueEngine } from '../issues/engine';
+import { migrateDesigns } from '../designs/store';
 import type { JsonlReader } from './jsonl';
 import {
   buildHistoryDigest,
@@ -63,6 +64,7 @@ function setup() {
   const db = openDb(':memory:');
   migrate(db);
   migrateIssueEngine(db);
+  migrateDesigns(db);
   db.run(
     `INSERT INTO users (id, username, token_hash, role, created_ts) VALUES (1, 'admin', 'x', 'admin', 0)`,
   );
@@ -120,6 +122,30 @@ describe('formatMessageLine', () => {
 // ---------- buildHistoryDigest ----------
 
 describe('buildHistoryDigest', () => {
+  test('excludes design-bound conversations from the ordinary project digest', async () => {
+    const db = setup();
+    insertConv(db, 'ordinary', 'Ordinary chat', 1000);
+    insertConv(db, 'design', 'Private design', 2000);
+    db.query(
+      `INSERT INTO design_tasks
+         (project_id, title, original_request, agent, conversation_id, created_ts, updated_ts)
+       VALUES (1, 'Design', 'Private', 'claude', 'design', 1, 1)`,
+    ).run();
+    const reader = mkReader({
+      '/j/ordinary.jsonl': jsonl(userLine('ordinary history')),
+      '/j/design.jsonl': jsonl(userLine('secret design history')),
+    });
+    const digest = await buildHistoryDigest({
+      db,
+      reader,
+      locator: mkLocator({ ordinary: '/j/ordinary.jsonl', design: '/j/design.jsonl' }),
+    }, 1);
+
+    expect(digest).toContain('ordinary history');
+    expect(digest).not.toContain('secret design history');
+    expect(digest).toContain('共 1 条会话，本摘要纳入 1 条');
+  });
+
   test('两条会话：含 label + 关键往来，新→旧排序，噪声被过滤', async () => {
     const db = setup();
     insertConv(db, 'c-old', '旧会话', 1000);

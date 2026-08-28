@@ -12,7 +12,8 @@
  * - 其余 tmux/git/mkdir 全走 exec，参数一律 shq 严格转义。
  * - openPty：exec channel + PTY 分配（term=xterm-256color），resize 走 channel.setWindow。
  */
-import { dirname } from 'node:path/posix';
+import { dirname, isAbsolute, join, normalize } from 'node:path/posix';
+import { createHash, randomUUID } from 'node:crypto';
 import type { AgentKind } from '../core/types';
 import {
   SshConn,
@@ -31,6 +32,7 @@ import type {
   GitResult,
   PathStat,
   PtyChannel,
+  TmuxScrollDirection,
   TmuxSession,
 } from './driver';
 import {
@@ -43,6 +45,7 @@ import {
   sanitizeInjectText,
   tmuxNewSessionArgs,
   tmuxResizeWindowArgs,
+  tmuxScrollPaneArgs,
 } from './driver';
 import { shq } from './shq';
 
@@ -127,6 +130,27 @@ function sftpRead(
   });
 }
 
+function sftpWrite(
+  sftp: SftpLike,
+  handle: unknown,
+  buffer: Buffer,
+  offset: number,
+  length: number,
+  position: number,
+): Promise<void> {
+  if (typeof sftp.write !== 'function') throw new Error('executor secure write capability unavailable');
+  return new Promise((resolve, reject) => {
+    sftp.write!(handle, buffer, offset, length, position, (error) => error ? reject(error) : resolve());
+  });
+}
+
+function sftpMkdir(sftp: SftpLike, path: string): Promise<void> {
+  if (typeof sftp.mkdir !== 'function') throw new Error('executor secure write capability unavailable');
+  return new Promise((resolve, reject) => {
+    sftp.mkdir!(path, { mode: 0o755 }, (error) => error ? reject(error) : resolve());
+  });
+}
+
 function sftpClose(sftp: SftpLike, handle: unknown): Promise<void> {
   return new Promise((resolve, reject) => {
     sftp.close(handle, (err) => (err ? reject(err) : resolve()));
@@ -136,6 +160,13 @@ function sftpClose(sftp: SftpLike, handle: unknown): Promise<void> {
 function sftpStat(sftp: SftpLike, path: string): Promise<SftpStatsLike> {
   return new Promise((resolve, reject) => {
     sftp.stat(path, (err, st) => (err ? reject(err) : resolve(st)));
+  });
+}
+
+function sftpLstat(sftp: SftpLike, path: string): Promise<SftpStatsLike> {
+  if (typeof sftp.lstat !== 'function') throw new Error('executor secure read capability unavailable');
+  return new Promise((resolve, reject) => {
+    sftp.lstat!(path, (err, st) => (err ? reject(err) : resolve(st)));
   });
 }
 
@@ -155,6 +186,16 @@ function sftpChmod(sftp: SftpLike, path: string, mode: number): Promise<void> {
   return new Promise((resolve, reject) => {
     sftp.chmod(path, mode, (err) => (err ? reject(err) : resolve()));
   });
+}
+
+function sftpRename(sftp: SftpLike, oldPath: string, newPath: string): Promise<void> {
+  if (typeof sftp.rename !== 'function') throw new Error('executor secure replace capability unavailable');
+  return new Promise((resolve, reject) => sftp.rename!(oldPath, newPath, (error) => error ? reject(error) : resolve()));
+}
+
+function sftpUnlink(sftp: SftpLike, path: string): Promise<void> {
+  if (typeof sftp.unlink !== 'function') throw new Error('executor secure remove capability unavailable');
+  return new Promise((resolve, reject) => sftp.unlink!(path, (error) => error ? reject(error) : resolve()));
 }
 
 /** SFTP「路径不存在」判定：SSH_FX_NO_SUCH_FILE=2（ssh2 err.code），兜底看 message。 */
@@ -302,6 +343,11 @@ export class SshDriver implements ExecutorDriver {
     await this.exec('tmux', tmuxResizeWindowArgs(session, size));
   }
 
+  async scrollPane(session: string, direction: TmuxScrollDirection, lines: number): Promise<void> {
+    const r = await this.exec('tmux', tmuxScrollPaneArgs(session, direction, lines));
+    if (r.code !== 0) throw new Error(`tmux scroll-pane 失败: ${r.err || r.out}`);
+  }
+
   // ---- 文件（sftp channel）----
 
   /**
@@ -328,6 +374,189 @@ export class SshDriver implements ExecutorDriver {
       await sftpClose(sftp, handle).catch(() => {
         /* 关闭句柄失败不掩盖主结果 */
       });
+    }
+  }
+
+  /**
+   * SFTP has no portable O_NOFOLLOW/openat2 equivalent. We lstat the trusted root and every path
+   * component, then fstat the opened file. This rejects persistent links but leaves an honest
+   * residual race between the final lstat and open (and between intermediate component checks).
+   */
+  async readFileNoFollowWithin(root: string, relativePath: string, limit: number): Promise<FileRange> {
+    if (!isAbsolute(root) || !Number.isSafeInteger(limit) || limit < 0) {
+      throw new Error('invalid secure read arguments');
+    }
+    const parts = relativePath.split('/');
+    if (parts.length === 0 || parts.some((part) => part.length === 0 || part === '.' || part === '..')) {
+      throw new Error('unsafe relative path');
+    }
+    const rootPath = normalize(root);
+    const sftp = await this.conn.sftp();
+    const rootStat = await sftpLstat(sftp, rootPath);
+    if (typeFromMode(rootStat.mode) !== 'dir') throw new Error('secure read root is not a real directory');
+    let current = rootPath;
+    for (let index = 0; index < parts.length; index++) {
+      current = join(current, parts[index]!);
+      const st = await sftpLstat(sftp, current);
+      const expected = index === parts.length - 1 ? 'file' : 'dir';
+      if (typeFromMode(st.mode) !== expected) throw new Error('secure read rejects links and non-regular paths');
+    }
+    const handle = await sftpOpen(sftp, current, 'r');
+    try {
+      const st = await sftpFstat(sftp, handle);
+      if (typeFromMode(st.mode) !== 'file') throw new Error('secure read target is not a regular file');
+      const want = Math.min(limit, st.size);
+      const buf = Buffer.alloc(want);
+      let got = 0;
+      while (got < want) {
+        const n = await sftpRead(sftp, handle, buf, got, want - got, got);
+        if (n <= 0) break;
+        got += n;
+      }
+      return { data: new Uint8Array(buf.buffer, buf.byteOffset, got), size: st.size };
+    } finally {
+      await sftpClose(sftp, handle).catch(() => {});
+    }
+  }
+
+  /** SFTP counterpart to LocalDriver's exclusive publish primitive; residual lstat/open TOCTOU remains. */
+  async writeFileNoFollowWithin(
+    root: string,
+    relativePath: string,
+    data: Uint8Array | string,
+    mode = 0o644,
+  ): Promise<'created' | 'unchanged' | 'conflict'> {
+    if (!isAbsolute(root)) throw new Error('invalid secure write root');
+    const parts = relativePath.split('/');
+    if (parts.length === 0 || parts.some((part) => !part || part === '.' || part === '..')) {
+      throw new Error('unsafe relative path');
+    }
+    const rootPath = normalize(root);
+    const sftp = await this.conn.sftp();
+    const rootStat = await sftpLstat(sftp, rootPath);
+    if (typeFromMode(rootStat.mode) !== 'dir') throw new Error('secure write root is not a real directory');
+    let current = rootPath;
+    for (const part of parts.slice(0, -1)) {
+      current = join(current, part);
+      let st: SftpStatsLike;
+      try {
+        st = await sftpLstat(sftp, current);
+      } catch (error) {
+        if (!isNoSuchFile(error)) throw error;
+        await sftpMkdir(sftp, current);
+        st = await sftpLstat(sftp, current);
+      }
+      if (typeFromMode(st.mode) !== 'dir') throw new Error('secure write rejects links and non-directories');
+    }
+    const target = join(current, parts.at(-1)!);
+    const bytes = typeof data === 'string' ? Buffer.from(data) : Buffer.from(data);
+    try {
+      const existingStat = await sftpLstat(sftp, target);
+      if (typeFromMode(existingStat.mode) !== 'file') throw new Error('secure write rejects links and non-regular files');
+      if (existingStat.size !== bytes.length) return 'conflict';
+      const handle = await sftpOpen(sftp, target, 'r');
+      try {
+        const existing = Buffer.alloc(existingStat.size);
+        let got = 0;
+        while (got < existing.length) {
+          const count = await sftpRead(sftp, handle, existing, got, existing.length - got, got);
+          if (count <= 0) break;
+          got += count;
+        }
+        return got === bytes.length && existing.equals(bytes) ? 'unchanged' : 'conflict';
+      } finally {
+        await sftpClose(sftp, handle).catch(() => {});
+      }
+    } catch (error) {
+      if (!isNoSuchFile(error)) throw error;
+    }
+    const handle = await sftpOpen(sftp, target, 'wx');
+    try {
+      await sftpWrite(sftp, handle, bytes, 0, bytes.length, 0);
+      if (mode !== 0o644) await sftpChmod(sftp, target, mode);
+      return 'created';
+    } finally {
+      await sftpClose(sftp, handle).catch(() => {});
+    }
+  }
+
+  async listDirectoryNoFollowWithin(root: string, relativePath: string): Promise<DirEntry[] | null> {
+    if (!isAbsolute(root)) throw new Error('invalid secure list root');
+    const parts = relativePath === '' ? [] : relativePath.split('/');
+    if (parts.some((part) => !part || part === '.' || part === '..')) throw new Error('unsafe relative path');
+    const sftp = await this.conn.sftp();
+    let current = normalize(root);
+    try {
+      const rootStat = await sftpLstat(sftp, current);
+      if (typeFromMode(rootStat.mode) !== 'dir') throw new Error('secure list root is not a real directory');
+      for (const part of parts) {
+        current = join(current, part);
+        if (typeFromMode((await sftpLstat(sftp, current)).mode) !== 'dir') {
+          throw new Error('secure list rejects links and non-directories');
+        }
+      }
+      return (await sftpReaddir(sftp, current)).map((entry) => ({
+        name: entry.filename,
+        type: typeFromMode(entry.attrs.mode),
+      }));
+    } catch (error) {
+      if (isNoSuchFile(error)) return null;
+      throw error;
+    }
+  }
+
+  async replaceFileNoFollowWithin(
+    root: string,
+    relativePath: string,
+    data: Uint8Array,
+    expectedSha256: string | null,
+  ): Promise<'written' | 'unchanged' | 'conflict'> {
+    if (expectedSha256 === null) {
+      const result = await this.writeFileNoFollowWithin(root, relativePath, data);
+      return result === 'created' ? 'written' : result;
+    }
+    if (!/^[a-f0-9]{64}$/.test(expectedSha256)) throw new Error('invalid expected digest');
+    const first = await this.readFileNoFollowWithin(root, relativePath, 100 * 1024 * 1024).catch((error) => {
+      if (isNoSuchFile(error)) return null;
+      throw error;
+    });
+    if (!first || first.data.byteLength !== first.size) return 'conflict';
+    if (createHash('sha256').update(first.data).digest('hex') !== expectedSha256) return 'conflict';
+    if (Buffer.from(data).equals(Buffer.from(first.data))) return 'unchanged';
+    const parts = relativePath.split('/');
+    const tempRelative = [...parts.slice(0, -1), `.${parts.at(-1)!}.panda-${randomUUID()}.tmp`].join('/');
+    const created = await this.writeFileNoFollowWithin(root, tempRelative, data);
+    if (created === 'conflict') return 'conflict';
+    const target = join(normalize(root), relativePath);
+    const temp = join(normalize(root), tempRelative);
+    try {
+      const latest = await this.readFileNoFollowWithin(root, relativePath, 100 * 1024 * 1024).catch(() => null);
+      if (!latest || latest.data.byteLength !== latest.size
+        || createHash('sha256').update(latest.data).digest('hex') !== expectedSha256) return 'conflict';
+      await sftpRename(await this.conn.sftp(), temp, target);
+      return 'written';
+    } finally { await sftpUnlink(await this.conn.sftp(), temp).catch(() => {}); }
+  }
+
+  async removeFileNoFollowWithin(
+    root: string,
+    relativePath: string,
+    expectedSha256: string,
+  ): Promise<'removed' | 'missing' | 'conflict'> {
+    if (!/^[a-f0-9]{64}$/.test(expectedSha256)) throw new Error('invalid expected digest');
+    const current = await this.readFileNoFollowWithin(root, relativePath, 100 * 1024 * 1024).catch((error) => {
+      if (isNoSuchFile(error)) return null;
+      throw error;
+    });
+    if (!current) return 'missing';
+    if (current.data.byteLength !== current.size
+      || createHash('sha256').update(current.data).digest('hex') !== expectedSha256) return 'conflict';
+    try {
+      await sftpUnlink(await this.conn.sftp(), join(normalize(root), relativePath));
+      return 'removed';
+    } catch (error) {
+      if (isNoSuchFile(error)) return 'missing';
+      throw error;
     }
   }
 

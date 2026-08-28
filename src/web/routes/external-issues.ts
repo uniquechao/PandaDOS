@@ -26,7 +26,12 @@ import {
   normalizeInstanceUrl,
   parseGitRemoteUrl,
 } from '../../issues/external-provider';
-import { getProject, type IssueEngine, type ImplMode } from '../../issues/engine';
+import {
+  getProject,
+  IssueWorkflowSelectionError,
+  type IssueEngine,
+  type ImplMode,
+} from '../../issues/engine';
 import { apiError } from '../errors';
 import { json, type RouteDef } from '../middleware';
 import { parseIssueGitPatch } from './issues';
@@ -52,6 +57,12 @@ async function readBody(req: Request): Promise<Record<string, unknown>> {
 
 function fail(code: string, fallback: string, status: number, details?: unknown): Response {
   return json(apiError(code, fallback, status, {}, details), status);
+}
+
+function optionalPositiveId(value: unknown): number | null | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : null;
 }
 
 function redactSecret(value: unknown, secret: string | null): unknown {
@@ -313,6 +324,10 @@ export function externalIssuesRoutes(deps: ExternalIssuesRoutesDeps): RouteDef[]
         }
         const title = typeof body.title === 'string' ? body.title.trim() : '';
         if (!title) return fail('external_issue.title_required', '请填写导入后的 issue 标题', 400);
+        const workflowTemplateId = optionalPositiveId(body.workflowTemplateId);
+        if (workflowTemplateId === null) {
+          return fail('workflow.selection_invalid', 'Choose a valid workflow template.', 400);
+        }
         const category: IssueCategory =
           body.category === 'debug' ? 'debug' : body.category === 'design' ? 'design' : 'task';
         const implMode: ImplMode = body.implMode === 'team' ? 'team' : 'seq';
@@ -347,6 +362,7 @@ export function externalIssuesRoutes(deps: ExternalIssuesRoutesDeps): RouteDef[]
               autoApprove: parseAutoApproveLevel(body.autoApprove) ?? 'medium',
               ...git.patch,
               createdBy: user!.id,
+              ...(workflowTemplateId !== undefined ? { workflowTemplateId } : {}),
             },
             true,
             (created) => {
@@ -355,10 +371,18 @@ export function externalIssuesRoutes(deps: ExternalIssuesRoutesDeps): RouteDef[]
               }
             },
           );
-          return json({ ok: true, issue });
+          return json({ ok: true, issue, workflow: deps.engine.workflowSnapshot(issue.id) });
         } catch (error) {
           if (error instanceof DuplicateExternalIssueError) {
             return fail('external_issue.already_imported', error.message, 409);
+          }
+          if (error instanceof IssueWorkflowSelectionError) {
+            return fail(
+              `workflow.${error.reason}`,
+              error.message,
+              error.reason === 'not_found' ? 404 : 409,
+              error.issues,
+            );
           }
           return fail(
             'external_issue.import_failed',

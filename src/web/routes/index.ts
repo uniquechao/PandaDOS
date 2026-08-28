@@ -2,7 +2,7 @@
  * web/routes —— 全部路由工厂的聚合点（集成接线，spec §9）。
  * 各域模块只 export 自己的 RouteDef[] 工厂；这里按 createDispatcher 约定统一编排：
  *   auth（登录/登出/me）→ me（我的设定）→ admin（用户/执行机/归属/活跃）→
- *   projects（CRUD+属主自动订阅）→ issues（CRUD/卡点/时间线）→
+ *   projects（CRUD+属主自动订阅）→ issues（CRUD/卡点/时间线）→ designs（设计工作区）→
  *   uploads（截图落执行机）→ files（文件浏览/编辑/上传下载）→ git（提交图概览）→
  *   subscriptions（订阅+飞书绑定）
  * 鉴权在 middleware.runRoute 统一执行（默认 deny），未命中路由返回 null（调用方 404）。
@@ -19,6 +19,13 @@ import type { SkillsDriver } from '../../core/skills';
 import type { AgentKind, Conversation, Executor, Project } from '../../core/types';
 import type { UserStore } from '../../core/users';
 import type { UploadFs } from '../../core/uploads';
+import type { DesignEngine } from '../../designs/engine';
+import type { DesignStore } from '../../designs/store';
+import type { DesignSyncCoordinator } from '../../designs/sync';
+import type { DesignRunCoordinator } from '../../designs/run-coordinator';
+import type { DesignWorktreeService } from '../../designs/worktree';
+import type { DesignFilesService } from '../../designs/files';
+import type { DesignAssetService } from '../../designs/assets';
 import type { ExecutorDriver } from '../../executor/driver';
 import type { SummaryTarget } from '../../core/agent-summary';
 import type { EngineIssue, IssueEngine } from '../../issues/engine';
@@ -30,6 +37,13 @@ import { authDepsFromDb, createDispatcher, type RouteDef } from '../middleware';
 import { adminRoutes } from './admin';
 import { authRoutes } from './auth';
 import { conversationsRoutes, type ConvManagerPort, type ConvModelPort } from './conversations';
+import { designsRoutes } from './designs';
+import { designPersonaRoutes } from './design-personas';
+import { DesignPersonaRegistry } from '../../designs/personas';
+import { designRunRoutes } from './design-runs';
+import { designWorktreeRoutes } from './design-worktrees';
+import { designFilesRoutes } from './design-files';
+import { designAssetsRoutes } from './design-assets';
 import { executorsRoutes } from './executors';
 import { externalIssuesRoutes } from './external-issues';
 import { feishuOauthRoutes } from './feishu-oauth';
@@ -43,12 +57,23 @@ import { projectsRoutes, type CwdMigrateDriver } from './projects';
 import { skillsRoutes } from './skills';
 import { subscriptionsRoutes, type FeishuBindVerifier } from './subscriptions';
 import { uploadsRoutes } from './uploads';
+import { workflowsRoutes } from './workflows';
 
 /** 聚合所有路由工厂需要的依赖全集（server.ts 装配后传入） */
 export interface ApiDeps {
   db: Database;
   users: UserStore;
   engine: IssueEngine;
+  designs: {
+    engine: DesignEngine;
+    store: DesignStore;
+    sync: DesignSyncCoordinator;
+    personas: DesignPersonaRegistry;
+    runs: DesignRunCoordinator;
+    worktrees: DesignWorktreeService;
+    files: DesignFilesService;
+    assets: DesignAssetService;
+  };
   modules?: ModuleStore;
   /** 主执行机 Driver（uploads 落盘用；多执行机路由是后续 wave） */
   driver: UploadFs;
@@ -132,6 +157,7 @@ export function allRoutes(deps: ApiDeps): RouteDef[] {
       summaryOrchestrator: deps.summaryOrchestrator,
       ...(deps.waitingIssueIds ? { waitingIssueIds: deps.waitingIssueIds } : {}),
     }),
+    ...workflowsRoutes({ db: deps.db }),
     ...issuesRoutes({
       db: deps.db,
       engine: deps.engine,
@@ -140,6 +166,30 @@ export function allRoutes(deps: ApiDeps): RouteDef[] {
       usernameById: (id) => deps.users.byId(id)?.username ?? null,
       ...(deps.waitingInput ? { waitingInput: deps.waitingInput } : {}),
     }),
+    ...designsRoutes({
+      db: deps.db,
+      engine: deps.designs.engine,
+      store: deps.designs.store,
+      sync: deps.designs.sync,
+      personas: deps.designs.personas,
+      runs: deps.designs.runs,
+      assetCapability: () => deps.designs.assets.capability(),
+    }),
+    ...designPersonaRoutes({
+      db: deps.db,
+      registry: deps.designs.personas,
+      driverForProject: deps.driverForProject,
+    }),
+    ...designRunRoutes({ coordinator: deps.designs.runs }),
+    ...designWorktreeRoutes({
+      db: deps.db,
+      service: deps.designs.worktrees,
+      onExecuted: async (run) => {
+        try { await deps.engine.scheduleNext(run.projectId); } catch { /* durable pending Issues retry on tick */ }
+      },
+    }),
+    ...designFilesRoutes({ store: deps.designs.store, service: deps.designs.files }),
+    ...designAssetsRoutes({ store: deps.designs.store, service: deps.designs.assets }),
     ...externalIssuesRoutes({
       db: deps.db,
       engine: deps.engine,

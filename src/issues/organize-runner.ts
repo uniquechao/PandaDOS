@@ -16,21 +16,17 @@
  *
  * scratch 按项目隔离（.panda/tmp/organize/<projectId>/）；每项目单飞由引擎保证。
  */
-import { DEFAULT_CODEX_ARGS } from '../core/conversations';
 import {
-  isCodexUpdatePrompt,
-  pickAffirmative,
-  type SummaryDriver,
-} from '../core/agent-summary';
-import { detectSelection } from '../core/screen';
-import { readDriverText } from '../core/skills';
+  runAgentArtifacts,
+  type AgentArtifactDriver,
+} from '../core/agent-artifact-runner';
 import type { AgentKind } from '../core/types';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
 import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/language';
 import { normalizeModuleSlug } from './modules';
 
 /** runner 需要的 Driver 子集 = clarify-runner 同款（tmux + 受限文件） */
-export type OrganizeDriver = SummaryDriver;
+export type OrganizeDriver = AgentArtifactDriver;
 
 /** scratch 根目录名（挂在项目 cwd 下；子目录按 projectId 隔离） */
 export const ORGANIZE_SCRATCH_BASE = '.panda/tmp/organize';
@@ -323,15 +319,6 @@ export type RunOrganizeResult =
   | { ok: true; planText: string }
   | { ok: false; reason: 'timeout' | 'no-output' | 'error'; error?: string };
 
-const DEFAULT_OPTIONS: Required<OrganizeRunOptions> = {
-  pollIntervalMs: 5000,
-  timeoutMs: 15 * 60 * 1000,
-  readyDelayMs: 12000, // 与 clarify-runner 同：给 claude/codex 足够启动再注入提示词
-  claudeArgs: '--permission-mode acceptEdits',
-  codexArgs: DEFAULT_CODEX_ARGS,
-  maxPlanBytes: MAX_PLAN_BYTES,
-};
-
 export class OrganizeRunner {
   private readonly driver: OrganizeDriver;
   private readonly now: () => number;
@@ -343,99 +330,41 @@ export class OrganizeRunner {
     this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   }
 
-  private startCommand(agent: AgentKind, o: Required<OrganizeRunOptions>): string {
-    return agent === 'codex' ? `codex ${o.codexArgs}`.trim() : `claude ${o.claudeArgs}`.trim();
-  }
-
-  /** 抓屏清菜单一轮（clarify-runner 同款） */
-  private async clearMenusOnce(session: string): Promise<void> {
-    const pane = await this.driver.capturePane(session).catch(() => '');
-    if (isCodexUpdatePrompt(pane)) {
-      await this.driver.sendKeys(session, '2').catch(() => {});
-      return;
-    }
-    const sel = detectSelection(pane);
-    if (!sel) return;
-    const target = pickAffirmative(sel.options);
-    const delta = target - sel.cursorIndex;
-    const key = delta < 0 ? 'Up' : 'Down';
-    for (let i = 0; i < Math.abs(delta); i++) {
-      await this.driver.sendKey(session, key).catch(() => {});
-    }
-    await this.driver.sendKey(session, 'Enter').catch(() => {});
-  }
-
-  private async killQuiet(session: string): Promise<void> {
-    await this.driver.killSession(session).catch(() => {});
-  }
-
-  private async removeQuiet(path: string): Promise<void> {
-    await this.driver.removeTree(path).catch(() => {});
-  }
-
-  private async waitReady(session: string, readyDelayMs: number, pollMs: number): Promise<void> {
-    let waited = 0;
-    while (waited < readyDelayMs) {
-      await this.clearMenusOnce(session);
-      await this.sleep(pollMs);
-      waited += pollMs;
-    }
-    await this.clearMenusOnce(session);
-  }
-
-  private async pollUntilDone(
-    session: string,
-    donePath: string,
-    timeoutMs: number,
-    pollMs: number,
-  ): Promise<boolean> {
-    const deadline = this.now() + timeoutMs;
-    while (this.now() < deadline) {
-      await this.clearMenusOnce(session);
-      const st = await this.driver.statPath(donePath).catch(() => null);
-      if (st) return true;
-      await this.sleep(pollMs);
-    }
-    return false;
-  }
-
   async run(input: RunOrganizeInput, options: OrganizeRunOptions = {}): Promise<RunOrganizeResult> {
-    const o: Required<OrganizeRunOptions> = { ...DEFAULT_OPTIONS, ...options };
     const session = organizeSessionName(input.projectId);
     const p = organizePaths(input.cwd, input.projectId);
-
-    try {
-      // 0) 清残留会话与旧 scratch（上一轮超时/崩溃遗留）
-      await this.killQuiet(session);
-      await this.removeQuiet(p.scratch);
-
-      // 1) 写任务文件（writeFile 自动建父目录 = 重建 scratch）
-      await this.driver.writeFile(p.task, buildOrganizeTaskMd(input));
-
-      // 2) 起代理
-      await this.driver.createSession(session, input.cwd);
-      await this.driver.sendKeys(session, this.startCommand(input.agent, o));
-
-      // 3) 等就绪 + 过信任弹窗
-      await this.waitReady(session, o.readyDelayMs, o.pollIntervalMs);
-
-      // 4) 注入任务提示词
-      await this.driver.sendKeys(session, buildOrganizePrompt(input.agent, input.projectId, input.locale));
-
-      // 5) 轮询 done 标记
-      const done = await this.pollUntilDone(session, p.done, o.timeoutMs, o.pollIntervalMs);
-      if (!done) return { ok: false, reason: 'timeout' };
-
-      // 6) 读回方案原文（清洗交给引擎按当时库内事实做）
-      const planText = ((await readDriverText(this.driver, p.plan, o.maxPlanBytes)) ?? '').trim();
-      if (!planText) return { ok: false, reason: 'no-output' };
-      return { ok: true, planText };
-    } catch (e) {
-      return { ok: false, reason: 'error', error: String(e).slice(0, 300) };
-    } finally {
-      await this.killQuiet(session);
-      await this.removeQuiet(p.scratch);
+    const result = await runAgentArtifacts(
+      { driver: this.driver, now: this.now, sleep: this.sleep },
+      {
+        agent: input.agent,
+        cwd: input.cwd,
+        session,
+        scratch: p.scratch,
+        prompt: buildOrganizePrompt(input.agent, input.projectId, input.locale),
+        inputFiles: [{ path: p.task, data: buildOrganizeTaskMd(input) }],
+        donePath: p.done,
+        artifacts: [{
+          key: 'plan',
+          path: p.plan,
+          maxBytes: options.maxPlanBytes ?? MAX_PLAN_BYTES,
+          required: false,
+        }],
+      },
+      {
+        pollIntervalMs: options.pollIntervalMs ?? 5000,
+        timeoutMs: options.timeoutMs ?? 15 * 60 * 1000,
+        readyDelayMs: options.readyDelayMs,
+        claudeArgs: options.claudeArgs,
+        codexArgs: options.codexArgs,
+      },
+    );
+    if (!result.ok) {
+      return result.reason === 'timeout'
+        ? { ok: false, reason: 'timeout' }
+        : { ok: false, reason: 'error', ...(result.error ? { error: result.error } : {}) };
     }
+    const planText = typeof result.artifacts.plan === 'string' ? result.artifacts.plan.trim() : '';
+    return planText ? { ok: true, planText } : { ok: false, reason: 'no-output' };
   }
 }
 

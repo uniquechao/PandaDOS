@@ -469,6 +469,8 @@ export interface IssueDetail {
   subtasks: Subtask[];
   gates: Gate[];
   conversationSegments: ConversationSegment[];
+  workflow: IssueWorkflowSnapshot | null;
+  workflowRuntime: IssueWorkflowRuntime | null;
 }
 
 // ---------- 订阅 ----------
@@ -765,6 +767,173 @@ export type ChatClientFrame =
   | { type: 'history'; before?: number }
   // 请求解读当前菜单（issue #112「解释一下」，点了才生成）
   | { type: 'explain'; sig: string };
+
+// ---------- 项目工作流模板 ----------
+
+export type WorkflowNodeKind = 'issue' | 'agent' | 'fork' | 'join' | 'end';
+export type WorkflowNodeExecutionMode = 'read' | 'write';
+
+export interface WorkflowNodeDefinition {
+  key: string;
+  kind: WorkflowNodeKind;
+  title: string;
+  instructions: string | null;
+  agent: AgentKind | null;
+  executionMode: WorkflowNodeExecutionMode;
+  maxVisits: number;
+  positionX: number;
+  positionY: number;
+  config: Record<string, unknown> | null;
+}
+
+export interface WorkflowEdgeDefinition {
+  key: string;
+  fromNodeKey: string;
+  toNodeKey: string;
+  conditionText: string | null;
+  priority: number;
+  isDefault: boolean;
+}
+
+export interface WorkflowGraphSnapshot {
+  schemaVersion: 1;
+  entryNodeKey: string;
+  maxLoopIterations: number;
+  nodes: WorkflowNodeDefinition[];
+  edges: WorkflowEdgeDefinition[];
+}
+
+export interface ProjectWorkflowTemplate {
+  id: number;
+  projectId: number;
+  name: string;
+  description: string | null;
+  status: 'active' | 'archived';
+  currentVersion: number;
+  createdBy: number | null;
+  createdTs: number;
+  updatedTs: number;
+}
+
+export interface WorkflowTemplateDetail {
+  template: ProjectWorkflowTemplate;
+  version: {
+    id: number;
+    templateId: number;
+    version: number;
+    graph: WorkflowGraphSnapshot;
+    graphHash: string;
+    createdBy: number | null;
+    createdTs: number;
+  };
+  nodeCount: number;
+  edgeCount: number;
+}
+
+export type WorkflowValidationCode =
+  | 'workflow.graph_required' | 'workflow.schema_version_invalid'
+  | 'workflow.entry_invalid' | 'workflow.entry_must_be_issue'
+  | 'workflow.node_count_invalid' | 'workflow.node_invalid' | 'workflow.node_key_duplicate'
+  | 'workflow.edge_count_invalid' | 'workflow.edge_invalid' | 'workflow.edge_key_duplicate' | 'workflow.edge_node_missing'
+  | 'workflow.issue_node_count_invalid' | 'workflow.issue_degree_invalid'
+  | 'workflow.agent_required' | 'workflow.agent_unavailable' | 'workflow.agent_degree_invalid'
+  | 'workflow.control_agent_forbidden' | 'workflow.control_write_forbidden'
+  | 'workflow.fork_degree_invalid' | 'workflow.fork_edge_conditional' | 'workflow.fork_join_invalid' | 'workflow.fork_branch_misses_join'
+  | 'workflow.join_degree_invalid' | 'workflow.end_required' | 'workflow.end_degree_invalid'
+  | 'workflow.default_edge_required' | 'workflow.default_edge_duplicate' | 'workflow.condition_required'
+  | 'workflow.node_unreachable' | 'workflow.node_cannot_finish'
+  | 'workflow.loop_limit_invalid' | 'workflow.loop_limit_required' | 'workflow.cycle_node_limit_required';
+
+export interface WorkflowValidationIssue {
+  code: WorkflowValidationCode | (string & {});
+  nodeKey?: string;
+  edgeKey?: string;
+  params?: Record<string, string | number>;
+}
+
+export type IssueWorkflowStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
+export type WorkflowNodeRunStatus = 'queued' | 'running' | 'routing' | 'waiting_join' | 'succeeded' | 'failed' | 'blocked' | 'cancelled' | 'skipped';
+export type WorkflowWorktreeStatus = 'preparing' | 'active' | 'merging' | 'resolving' | 'merged' | 'paused' | 'cleanup_pending' | 'cleaned' | 'failed';
+
+export interface IssueWorkflowSnapshot {
+  id: number;
+  issueId: number;
+  templateId: number | null;
+  templateVersionId: number | null;
+  templateName: string;
+  templateVersion: number;
+  graph: WorkflowGraphSnapshot;
+  graphHash: string;
+  context: Record<string, unknown>;
+  status: IssueWorkflowStatus;
+  pauseReason: string | null;
+  maxLoopIterations: number;
+  createdTs: number;
+  updatedTs: number;
+  startedTs: number | null;
+  completedTs: number | null;
+}
+
+export interface IssueWorkflowNodeRun {
+  id: number;
+  issueWorkflowId: number;
+  nodeKey: string;
+  attempt: number;
+  iteration: number;
+  tokenKey: string;
+  parentRunId: number | null;
+  predecessorRunIds: number[];
+  parallelGroupKey: string | null;
+  agent: AgentKind | null;
+  conversationId: string | null;
+  status: WorkflowNodeRunStatus;
+  selectedEdgeKeys: string[];
+  outputText: string | null;
+  routeReason: string | null;
+  errorCode: string | null;
+  errorDetails: string | null;
+  createdTs: number;
+  updatedTs: number;
+  startedTs: number | null;
+  finishedTs: number | null;
+}
+
+export interface IssueWorkflowTransition {
+  id: number;
+  issueWorkflowId: number;
+  fromRunId: number;
+  edgeKey: string;
+  toNodeKey: string;
+  decisionText: string | null;
+  iteration: number;
+  parallelGroupKey: string | null;
+  createdTs: number;
+}
+
+export interface IssueWorkflowWorktree {
+  id: number;
+  issueWorkflowId: number;
+  nodeRunId: number;
+  path: string;
+  branch: string;
+  baseRef: string;
+  baseSha: string | null;
+  headSha: string | null;
+  status: WorkflowWorktreeStatus;
+  conflictDetails: string | null;
+  resolutionConversationId: string | null;
+  createdTs: number;
+  updatedTs: number;
+  mergedTs: number | null;
+  cleanedTs: number | null;
+}
+
+export interface IssueWorkflowRuntime {
+  workflow: IssueWorkflowSnapshot;
+  runs: IssueWorkflowNodeRun[];
+  transitions: IssueWorkflowTransition[];
+  worktrees: IssueWorkflowWorktree[];
+}
 
 // ---------- 展示映射 ----------
 

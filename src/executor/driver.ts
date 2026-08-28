@@ -66,6 +66,8 @@ export interface PtyChannel {
   close(): void;
 }
 
+export type TmuxScrollDirection = 'up' | 'down';
+
 // ---------- 接口 ----------
 
 export interface ExecutorDriver {
@@ -104,6 +106,9 @@ export interface ExecutorDriver {
    */
   resizeWindow(session: string, size: { cols: number; rows: number } | null): Promise<void>;
 
+  /** 滚动 tmux 历史；up 进入 copy-mode，down 到底时退出。 */
+  scrollPane(session: string, direction: TmuxScrollDirection, lines: number): Promise<void>;
+
   // ---- 文件（限定用途，非通用 shell）----
 
   /**
@@ -111,6 +116,43 @@ export interface ExecutorDriver {
    * @returns data: 读到的字节；size: 当前文件总大小（控制面据此推进 offset）
    */
   readFileRange(path: string, offset: number, limit: number): Promise<FileRange>;
+
+  /**
+   * Read one regular file beneath an explicitly trusted directory without following symlinks.
+   * Implementations validate the root, every relative component, and the final opened handle.
+   * The method is optional for compatibility with narrow test doubles; security-sensitive callers
+   * must reject unsupported drivers and must never fall back to statPath/readFileRange.
+   */
+  readFileNoFollowWithin?(root: string, relativePath: string, limit: number): Promise<FileRange>;
+
+  /** Create a bounded file below root without following links or overwriting differing content. */
+  writeFileNoFollowWithin?(
+    root: string,
+    relativePath: string,
+    data: Uint8Array | string,
+    mode?: number,
+  ): Promise<'created' | 'unchanged' | 'conflict'>;
+
+  /** List one real directory beneath root without following any symlink component. */
+  listDirectoryNoFollowWithin?(
+    root: string,
+    relativePath: string,
+  ): Promise<DirEntry[] | null>;
+
+  /** Compare-and-swap a regular file beneath root, replacing only the expected digest. */
+  replaceFileNoFollowWithin?(
+    root: string,
+    relativePath: string,
+    data: Uint8Array,
+    expectedSha256: string | null,
+  ): Promise<'written' | 'unchanged' | 'conflict'>;
+
+  /** Remove a regular file beneath root only when its bytes still match the expected digest. */
+  removeFileNoFollowWithin?(
+    root: string,
+    relativePath: string,
+    expectedSha256: string,
+  ): Promise<'removed' | 'missing' | 'conflict'>;
 
   /** stat；路径不存在返回 null（不抛错）。 */
   statPath(path: string): Promise<PathStat | null>;
@@ -193,6 +235,9 @@ export const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 export const TMUX_WIN_COLS = 220;
 export const TMUX_WIN_ROWS = 50;
 
+/** 单个终端滚动控制帧允许推进的最大行数。 */
+export const MAX_TMUX_SCROLL_LINES = 100;
+
 /**
  * 建 detached 会话的统一 tmux 参数（I6）：显式 -x 220 -y 50 + 锁成 manual。
  * v1 [M5] 地雷：默认 80×24 会把 CC 长选项换行腰斩、打断菜单检测——两实现共用本函数，
@@ -225,6 +270,26 @@ export function tmuxResizeWindowArgs(session: string, size: { cols: number; rows
   return size
     ? ['resize-window', '-t', session, '-x', String(size.cols), '-y', String(size.rows)]
     : ['set-window-option', '-t', session, 'window-size', 'latest'];
+}
+
+/**
+ * 一次原子 tmux 历史滚动。if-shell 会把目标上下文传给分支命令，因此命令串内
+ * 无需再次拼接 session；上滚进入 `copy-mode -e`，下滚在未进 mode 时为 no-op。
+ */
+export function tmuxScrollPaneArgs(
+  session: string,
+  direction: TmuxScrollDirection,
+  lines: number,
+): string[] {
+  if (!Number.isSafeInteger(lines) || lines < 1 || lines > MAX_TMUX_SCROLL_LINES) {
+    throw new Error(`invalid tmux scroll lines: ${lines}`);
+  }
+  const action = `send-keys -X -N ${lines} scroll-${direction}`;
+  return [
+    'if-shell', '-t', session, '-F', '#{pane_in_mode}',
+    action,
+    direction === 'up' ? `copy-mode -e; ${action}` : '',
+  ];
 }
 
 /** 单次注入最大字符数（v1 injector.ts:27 的 slice(0, 2000)，超出直接截断） */

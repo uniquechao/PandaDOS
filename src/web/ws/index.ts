@@ -31,6 +31,7 @@ import type { ExecutorDriver } from '../../executor/driver';
 import { getProject } from '../../issues/engine';
 import type { KeyedMutex } from '../../issues/mutex';
 import { resolveUser, type SessionLookup } from '../auth';
+import { apiError } from '../errors';
 import { json } from '../middleware';
 import {
   chatClose,
@@ -85,10 +86,37 @@ function targetDeny(error: string, status: number): TermTargetResult {
   return { deny: json({ ok: false, error }, status) };
 }
 
+function designConversationDeny(conversationId: string): Response {
+  return json(apiError(
+    'design.conversation_reserved',
+    'This conversation is managed by the design workspace.',
+    409,
+    { conversationId },
+  ), 409);
+}
+
 function parseIssueId(raw: string): number | null {
   if (!/^[1-9]\d*$/.test(raw)) return null;
   const id = Number(raw);
   return Number.isSafeInteger(id) ? id : null;
+}
+
+/** Design conversations share the chat storage shape but remain outside ordinary chat/terminal entry points. */
+function isDesignConversation(db: Database, conversationId: string): boolean {
+  const hasDesignTasks = db.query<{ n: number }, []>(
+    `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'design_tasks'`,
+  ).get()!.n > 0;
+  if (hasDesignTasks && db.query<{ found: number }, [string]>(
+    'SELECT 1 AS found FROM design_tasks WHERE conversation_id = ?',
+  ).get(conversationId)?.found === 1) return true;
+  const hasOwners = db.query<{ found: number }, []>(
+    `SELECT COUNT(*) AS found FROM sqlite_master
+     WHERE type = 'table' AND name = 'design_saga_conversation_owners'`,
+  ).get()!.found > 0;
+  return hasOwners && db.query<{ found: number }, [string]>(
+    `SELECT 1 AS found FROM design_saga_conversation_owners
+     WHERE conversation_id = ?`,
+  ).get(conversationId)?.found === 1;
 }
 
 /**
@@ -176,6 +204,7 @@ function resolveTermTarget(deps: WsDeps, projectId: number, url: URL, ded: strin
     .get(convId);
   if (!scope) return targetDeny('对话不存在', 404);
   if (scope.project_id !== projectId) return targetDeny('对话不属于该项目', 403);
+  if (isDesignConversation(deps.db, convId)) return { deny: designConversationDeny(convId) };
   const conv = deps.db
     .query<{ kind: string }, [string, number]>('SELECT kind FROM conversations WHERE id = ? AND project_id = ?')
     .get(convId, projectId);
@@ -259,6 +288,7 @@ export async function handleWsUpgrade(
       driver,
       pty: null,
       pending: [],
+      scrollQueue: Promise.resolve(),
       closed: false,
     };
     return server.upgrade(req, { data }) ? undefined : json({ ok: false, error: 'upgrade failed' }, 400);
@@ -279,6 +309,9 @@ export async function handleWsUpgrade(
       )
       .get(pinnedConv, pid);
     if (!row) return json({ ok: false, error: '对话不属于该项目' }, 403);
+    if (isDesignConversation(deps.db, pinnedConv)) {
+      return designConversationDeny(pinnedConv);
+    }
     pinnedAgent = row.agent === 'codex' ? 'codex' : 'claude';
     if (row.kind === 'chat') {
       chatMode = true;

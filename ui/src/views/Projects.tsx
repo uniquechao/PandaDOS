@@ -8,7 +8,7 @@
  * - GET /api/executors/:id/tmux-sessions（导入候选 + 托管/已导入/越权标注）
  * - GET /api/executors/:id/agent-projects?agent=claude|codex（本地历史项目候选）
  * - POST /api/projects {name?, executorId, gitUrl?, goal?, cwd?, runUser?, withConversation?}
- * - POST /api/projects/import {source, executorId, session|cwd, name?, goal?, runUser?}
+ * - POST /api/projects/import {source, executorId, kind, session|cwd, name?, goal?, runUser?}
  */
 import { useEffect, useState } from 'preact/hooks';
 import { api, ApiError } from '../lib/api';
@@ -30,6 +30,7 @@ import type {
   Project,
   ProjectImportResponse,
   ProjectIssueSummary,
+  ProjectKind,
   ProjectsSummary,
   TmuxSessionInfo,
 } from '../lib/types';
@@ -125,6 +126,45 @@ function RunUserSelect({
         ))}
       </select>
     </label>
+  );
+}
+
+function ProjectKindField({
+  kind,
+  onChange,
+  helpId,
+}: {
+  kind: ProjectKind;
+  onChange: (kind: ProjectKind) => void;
+  helpId: string;
+}) {
+  return (
+    <fieldset class="project-kind-group">
+      <legend>{tr('project.projectType')}</legend>
+      <div class="seg project-kind-options">
+        <button
+          type="button"
+          class={`seg-btn ${kind === 'issue' ? 'on' : ''}`}
+          aria-pressed={kind === 'issue'}
+          aria-describedby={helpId}
+          onClick={() => onChange('issue')}
+        >
+          {tr('project.issueBoard')}
+        </button>
+        <button
+          type="button"
+          class={`seg-btn ${kind === 'chat' ? 'on' : ''}`}
+          aria-pressed={kind === 'chat'}
+          aria-describedby={helpId}
+          onClick={() => onChange('chat')}
+        >
+          {tr('view.conversation')}
+        </button>
+      </div>
+      <div id={helpId} class="project-kind-help" role="status" aria-live="polite">
+        {tr(kind === 'issue' ? 'project.issueModeHelp' : 'project.chatModeHelp')}
+      </div>
+    </fieldset>
   );
 }
 
@@ -698,20 +738,7 @@ function CreateProjectModal({
   return (
     <Modal title={tr('project.newProject')} onClose={onClose}>
       <div class="formcol">
-        <label class="field">
-          {tr('project.projectType')}
-          <div class="seg" role="tablist">
-            <button class={`seg-btn ${kind === 'issue' ? 'on' : ''}`} onClick={() => setKind('issue')}>
-              {tr('project.issueBoard')}
-            </button>
-            <button class={`seg-btn ${kind === 'chat' ? 'on' : ''}`} onClick={() => setKind('chat')}>
-              {tr('view.conversation')}
-            </button>
-          </div>
-        </label>
-        {kind === 'chat' && (
-          <div class="mut small">{tr('project.chatModeHelp')}</div>
-        )}
+        <ProjectKindField kind={kind} onChange={setKind} helpId="create-project-kind-help" />
         <div class="seg" role="tablist">
           <button
             class={`seg-btn ${source === 'blank' ? 'on' : ''}`}
@@ -842,6 +869,7 @@ function ImportProjectModal({
 }) {
   const executors = useExecutors();
   const [executorId, setExecutorId] = useState('');
+  const [kind, setKind] = useState<ProjectKind>('issue');
   const [source, setSource] = useState<ImportSource>('tmux');
   const [sessions, setSessions] = useState<TmuxSessionInfo[] | null>(null);
   const [agentProjects, setAgentProjects] = useState<AgentProjectImportCandidate[] | null>(null);
@@ -938,6 +966,7 @@ function ImportProjectModal({
         {
           source,
           executorId: eid,
+          kind,
           ...(source === 'tmux'
             ? { session: (picked as TmuxSessionInfo).name }
             : { cwd: (picked as AgentProjectImportCandidate).cwd }),
@@ -977,6 +1006,7 @@ function ImportProjectModal({
   return (
     <Modal title={tr('project.importTitle')} onClose={onClose} wide>
       <div class="formcol import-project" aria-busy={busy ? 'true' : 'false'}>
+        <ProjectKindField kind={kind} onChange={setKind} helpId="import-project-kind-help" />
         <label class="field">
           {tr('project.executor')}
           <ExecutorSelect executors={executors} value={executorId} onChange={setExecutorId} />

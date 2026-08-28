@@ -5,11 +5,13 @@ import path from 'node:path';
 import { ExternalIssueStore } from '../../core/external-issues';
 import { openDb } from '../../core/db';
 import { migrate } from '../../core/migrate';
+import type { WorkflowGraphSnapshot } from '../../core/types';
 import { UserStore } from '../../core/users';
 import { LocalDriver } from '../../executor/local';
 import { IssueEngine, migrateIssueEngine } from '../../issues/engine';
 import type { ExternalIssueFetch } from '../../issues/external-provider';
 import { KeyedMutex } from '../../issues/mutex';
+import { validateWorkflowGraph, WorkflowTemplateStore } from '../../issues/workflows';
 import { authDepsFromDb, createDispatcher } from '../middleware';
 import { externalIssuesRoutes } from './external-issues';
 
@@ -129,6 +131,32 @@ async function configure(s: Awaited<ReturnType<typeof setup>>) {
   );
 }
 
+function createWorkflow(db: ReturnType<typeof openDb>) {
+  const graph: WorkflowGraphSnapshot = {
+    schemaVersion: 1,
+    entryNodeKey: 'issue',
+    maxLoopIterations: 5,
+    nodes: [
+      { key: 'issue', kind: 'issue', title: 'Issue', instructions: null, agent: null, executionMode: 'read', maxVisits: 1, positionX: 0, positionY: 0, config: null },
+      { key: 'work', kind: 'agent', title: '实现', instructions: '完成任务', agent: 'claude', executionMode: 'write', maxVisits: 1, positionX: 100, positionY: 0, config: null },
+      { key: 'end', kind: 'end', title: '完成', instructions: null, agent: null, executionMode: 'read', maxVisits: 1, positionX: 200, positionY: 0, config: null },
+    ],
+    edges: [
+      { key: 'issue-work', fromNodeKey: 'issue', toNodeKey: 'work', conditionText: null, priority: 0, isDefault: false },
+      { key: 'work-end', fromNodeKey: 'work', toNodeKey: 'end', conditionText: null, priority: 0, isDefault: false },
+    ],
+  };
+  const validated = validateWorkflowGraph(graph, ['claude', 'codex']);
+  if (!validated.ok) throw new Error('测试工作流无效');
+  return new WorkflowTemplateStore(db).create({
+    projectId: 1,
+    name: '导入流程',
+    graph: validated.graph,
+    graphJson: validated.graphJson,
+    graphHash: validated.graphHash,
+  });
+}
+
 describe('外部 issue 路由', () => {
   test('来源配置限属主，读取只返回脱敏 token；成员可列 remote', async () => {
     const s = await setup();
@@ -219,6 +247,7 @@ describe('外部 issue 路由', () => {
   test('确认导入原子创建正式 pending issue，并发重复确认只成功一次', async () => {
     const s = await setup();
     await configure(s);
+    const workflow = createWorkflow(s.db);
     const payload = {
       externalId: '101',
       externalNumber: '8',
@@ -228,6 +257,7 @@ describe('外部 issue 路由', () => {
       category: 'debug',
       agent: 'claude',
       autoApprove: 'cautious',
+      workflowTemplateId: workflow.template.id,
     };
     const results = await Promise.all([
       call(s.dispatch, 'POST', '/api/projects/1/external-issues/import', s.member.token, payload),
@@ -249,6 +279,19 @@ describe('外部 issue 路由', () => {
       .listRecords(1, 'github', 'github:github.com/octo/repo');
     expect(records).toHaveLength(1);
     expect(records[0]).toMatchObject({ disposition: 'imported', localIssueId: rows[0]!.id });
+    const snapshots = s.db.query<
+      { issue_id: number; template_version_id: number; context_json: string },
+      []
+    >('SELECT issue_id, template_version_id, context_json FROM issue_workflows').all();
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]).toMatchObject({
+      issue_id: rows[0]!.id,
+      template_version_id: workflow.version.id,
+    });
+    expect(JSON.parse(snapshots[0]!.context_json)).toMatchObject({
+      issue: { id: rows[0]!.id, title: '修改后的标题', body: '修改后的正文' },
+      documents: { module: null, issueProcess: null },
+    });
   });
 
   test('非法远端身份在创建 issue 前被拒绝且不泄露 token', async () => {

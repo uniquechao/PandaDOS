@@ -11,6 +11,7 @@ import {
   resolveUser,
   tokenFromReq,
 } from './auth';
+import { UPGRADE_COOKIE_NAME } from './auth-upgrade-compat';
 
 function req(headers: Record<string, string> = {}, url = 'http://x/api/me'): Request {
   return new Request(url, { headers });
@@ -36,6 +37,15 @@ describe('tokenFromReq', () => {
       tokenFromReq(req({ cookie: `${COOKIE}=fromcookie`, authorization: 'Bearer frombearer' })),
     ).toBe('fromcookie');
     expect(tokenFromReq(req({}, 'http://x/api/me?token=leak'))).toBeNull();
+  });
+
+  test('升级期兼容旧 cookie，但新 cookie 仍优先', () => {
+    expect(tokenFromReq(req({ cookie: `${UPGRADE_COOKIE_NAME}=old-session` }))).toBe('old-session');
+    expect(
+      tokenFromReq(
+        req({ cookie: `${UPGRADE_COOKIE_NAME}=old-session; ${COOKIE}=new-session` }),
+      ),
+    ).toBe('new-session');
   });
 });
 

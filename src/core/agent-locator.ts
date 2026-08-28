@@ -13,7 +13,8 @@
  *      timestamp 解析不出则保守跳过——Driver.statPath 无 mtime，且死会话被续写时
  *      mtime 会「复活」，不能当创建时间用）；
  *   3. 读首行 session_meta 核对 cwd == 项目 cwd（同机多项目不串线）；
- *   4. 排除已被其他对话绑走的 session id，取 meta 时间最早者；
+ *   4. 排除已被其他对话绑走的 session id，优先取锚点后最早者；锚点前容差候选需等待
+ *      短确认期且仍无后置候选时，才按最接近锚点者兜底（兼容执行机时钟偏差）；
  *   5. 回填 conversations.agent_session_id / agent_jsonl_path（重启不丢，失效重扫）。
  */
 import type { Database } from 'bun:sqlite';
@@ -33,6 +34,8 @@ export function rolloutSessionId(name: string): string | null {
 
 /** 发现窗口：meta 时间允许早于 launch_ts 的富余（执行机/控制面时钟与创建耗时偏差） */
 const LAUNCH_SLACK_MS = 2 * 60 * 1000;
+/** fresh 启动后等待当前 rollout 落盘的确认期；期间不让锚点前旧会话抢先固化绑定。 */
+const DISCOVERY_SETTLE_MS = 10 * 1000;
 /** findBySessionId 全树回扫的日目录上限（新→旧；超过视为会话过老，交人工） */
 const MAX_SCAN_DAY_DIRS = 90;
 /**
@@ -51,6 +54,7 @@ interface ConvAgentRow {
   agent_launch_ts: number | null;
   project_id: number;
   created_ts: number;
+  execution_cwd: string;
 }
 
 export class AgentJsonlLocator {
@@ -71,10 +75,14 @@ export class AgentJsonlLocator {
   }
 
   async locate(convId: string): Promise<string | null> {
+    const executionCwd = this.executionCwdSql();
     const row = this.db
       .query<ConvAgentRow, [string]>(
-        `SELECT agent, agent_session_id, agent_jsonl_path, agent_launch_ts, project_id, created_ts
-         FROM conversations WHERE id = ?`,
+        `SELECT conversations.agent, agent_session_id, agent_jsonl_path, agent_launch_ts,
+                conversations.project_id, conversations.created_ts,
+                ${executionCwd} AS execution_cwd
+         FROM conversations JOIN projects ON projects.id = conversations.project_id
+         WHERE conversations.id = ?`,
       )
       .get(convId);
     if (!row || row.agent !== 'codex') {
@@ -106,10 +114,6 @@ export class AgentJsonlLocator {
 
     // 3) 未知 session id → 按 launch_ts + cwd 发现（无锚点不猜，防错绑）
     if (!row.agent_launch_ts) return null;
-    const proj = this.db
-      .query<{ cwd: string }, [number]>('SELECT cwd FROM projects WHERE id = ?')
-      .get(row.project_id);
-    if (!proj) return null;
     const bound = new Set(
       this.db
         .query<{ agent_session_id: string }, [string]>(
@@ -119,7 +123,7 @@ export class AgentJsonlLocator {
         .all(convId)
         .map((r) => r.agent_session_id),
     );
-    const found = await this.discover(row.agent_launch_ts, proj.cwd, bound);
+    const found = await this.discover(row.agent_launch_ts, row.execution_cwd, bound);
     if (!found) return null;
     this.db
       .query('UPDATE conversations SET agent_session_id = ?, agent_jsonl_path = ? WHERE id = ?')
@@ -139,20 +143,20 @@ export class AgentJsonlLocator {
    * 无候选返回 null 且不动原绑定（调用方冷却重试/告警）。
    */
   async reclaim(convId: string): Promise<string | null> {
+    const executionCwd = this.executionCwdSql();
     const row = this.db
       .query<ConvAgentRow, [string]>(
-        `SELECT agent, agent_session_id, agent_jsonl_path, agent_launch_ts, project_id, created_ts
-         FROM conversations WHERE id = ?`,
+        `SELECT conversations.agent, agent_session_id, agent_jsonl_path, agent_launch_ts,
+                conversations.project_id, conversations.created_ts,
+                ${executionCwd} AS execution_cwd
+         FROM conversations JOIN projects ON projects.id = conversations.project_id
+         WHERE conversations.id = ?`,
       )
       .get(convId);
     if (!row) return null;
-    const proj = this.db
-      .query<{ cwd: string }, [number]>('SELECT cwd FROM projects WHERE id = ?')
-      .get(row.project_id);
-    if (!proj) return null;
     const sinceTs = Math.max(row.created_ts - LAUNCH_SLACK_MS, this.now() - RECLAIM_LOOKBACK_MS);
     return row.agent === 'codex'
-      ? this.reclaimCodex(convId, row, proj.cwd, sinceTs)
+      ? this.reclaimCodex(convId, row, row.execution_cwd, sinceTs)
       : this.reclaimClaude(convId, row, sinceTs);
   }
 
@@ -160,6 +164,15 @@ export class AgentJsonlLocator {
 
   private root(): string {
     return this.codexSessionsDir.replace(/\/+$/, '');
+  }
+
+  private executionCwdSql(): string {
+    const available = this.db.query<{ n: number }, []>(
+      `SELECT COUNT(*) AS n FROM pragma_table_info('conversations') WHERE name = 'workspace_cwd'`,
+    ).get()!.n === 1;
+    return available
+      ? "COALESCE(NULLIF(conversations.workspace_cwd, ''), projects.cwd)"
+      : 'projects.cwd';
   }
 
   /** 文件尾 4KB 的最后一条 "timestamp" → epoch ms（活跃度判据）；读不出返回 null */
@@ -376,7 +389,8 @@ export class AgentJsonlLocator {
     boundIds: Set<string>,
   ): Promise<{ sessionId: string; path: string } | null> {
     const wantCwd = projectCwd.replace(/\/+$/, '');
-    let best: { sessionId: string; path: string; ts: number } | null = null;
+    let bestAfter: { sessionId: string; path: string; ts: number } | null = null;
+    let bestBefore: { sessionId: string; path: string; ts: number } | null = null;
     for (const dir of this.dayDirsSince(launchTs)) {
       for (const f of await this.listDirSafe(dir)) {
         if (f.type === 'dir') continue;
@@ -388,10 +402,15 @@ export class AgentJsonlLocator {
         if (!meta || meta.ts === null || meta.ts < launchTs - LAUNCH_SLACK_MS) continue;
         if (meta.cwd.replace(/\/+$/, '') !== wantCwd) continue;
         if (boundIds.has(meta.sessionId)) continue;
-        if (best && meta.ts >= best.ts) continue;
-        best = { sessionId: meta.sessionId, path, ts: meta.ts };
+        const candidate = { sessionId: meta.sessionId, path, ts: meta.ts };
+        if (meta.ts >= launchTs) {
+          if (!bestAfter || meta.ts < bestAfter.ts) bestAfter = candidate;
+        } else if (!bestBefore || meta.ts > bestBefore.ts) {
+          bestBefore = candidate;
+        }
       }
     }
+    const best = bestAfter ?? (this.now() - launchTs >= DISCOVERY_SETTLE_MS ? bestBefore : null);
     return best ? { sessionId: best.sessionId, path: best.path } : null;
   }
 }

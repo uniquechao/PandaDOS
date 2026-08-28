@@ -7,6 +7,14 @@ import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
 import { projectSettingsMessages } from '../domains/project-settings';
 import { externalImportMessages } from '../domains/external-import';
+import { designWorkbenchMessages } from '../domains/design-workbench';
+import { designWorkbenchAdvancedMessages } from '../domains/design-workbench-advanced';
+import { designAssetsUiMessages } from '../domains/design-assets-ui';
+import { designFinalUiMessages } from '../domains/design-final-ui';
+import { designReviewFixMessages } from '../domains/design-review-fixes';
+import { designSnapshotUiMessages } from '../domains/design-snapshot-ui';
+import { designConfirmationUiMessages } from '../domains/design-confirmation-ui';
+import { workflowMessages } from '../domains/workflows';
 
 export const koCatalog = {
   ...shellMessages.ko,
@@ -19,6 +27,14 @@ export const koCatalog = {
   ...notifyMessages.ko,
   ...projectSettingsMessages.ko,
   ...externalImportMessages.ko,
+  ...designWorkbenchMessages.ko,
+  ...designWorkbenchAdvancedMessages.ko,
+  ...designAssetsUiMessages.ko,
+  ...designFinalUiMessages.ko,
+  ...designReviewFixMessages.ko,
+  ...designSnapshotUiMessages.ko,
+  ...designConfirmationUiMessages.ko,
+  ...workflowMessages.ko,
   'issue.editSubtask': '하위 작업 {number} 편집', 'issue.subtaskText': '하위 작업 내용',
   'view.importLocalHistory':'로컬 기록 가져오기','view.localHistoryHelp':'작업 디렉터리가 현재 프로젝트와 정확히 일치하는 Claude/Codex 기록만 표시합니다.','view.localHistoryAgentFilter':'에이전트별 기록 필터','view.historySelected':'{count, plural, other {#개 선택됨}}','view.selectAllHistory':'모두 선택','view.clearHistorySelection':'지우기','view.readingLocalHistory':'로컬 기록 읽는 중…','view.noLocalHistory':'현재 프로젝트와 일치하는 로컬 기록이 없습니다.','view.noFilteredLocalHistory':'이 에이전트 필터와 일치하는 기록이 없습니다.','view.localHistoryCandidates':'로컬 기록 세션','view.untitledHistory':'제목 없는 기록 세션','view.historyAlreadyImported':'가져옴','view.noImportedConversation':'가져온 뒤 사용할 수 있는 대화가 반환되지 않았습니다.','view.localHistoryImported':'{count, plural, other {기록 #개를 가져왔습니다}}','view.importSelectedHistory':'선택 항목 가져오기',
   'project.importTitle':'가져오기','project.importShort':'가져오기','project.importSource':'가져올 대상','project.importTmuxSource':'tmux 세션','project.importClaudeSource':'Claude 프로젝트','project.importCodexSource':'Codex 프로젝트',
@@ -148,7 +164,7 @@ export const koCatalog = {
   'project.archivedCount': '보관됨({count})', 'project.gitRequired': 'Git 저장소 URL을 입력하세요',
   'project.clonedCreated': '저장소를 복제하고 프로젝트를 만들었습니다', 'project.createdWarnings': '경고와 함께 생성됨:\n{warnings}',
   'project.newProject': '새 프로젝트',
-  'project.chatModeHelp': '채팅 모드: issue 없이 질문하거나 프로젝트 디렉터리에 파일을 만들 수 있으며, 프로젝트마다 여러 대화를 둘 수 있습니다.',
+  'project.issueModeHelp':'issue 모드: Issue 보드에서 작업을 정리하고 Agent가 프로젝트 워크플로에 따라 실행하도록 합니다.','project.chatModeHelp': '채팅 모드: issue 없이 질문하거나 프로젝트 디렉터리에 파일을 만들 수 있으며, 프로젝트마다 여러 대화를 둘 수 있습니다.',
   'project.projectName': '프로젝트 이름', 'project.repoNameDefault': ' (비워 두면 저장소 이름 사용)', 'project.cloneTo': '복제 위치',
   'project.selectedUserHome': '선택한 사용자의 홈', 'project.yourWorkspace': '내 작업 공간', 'project.pickDirectory': '디렉터리 선택',
   'project.branchFallbackHelp': '작업은 현재 브랜치에서 진행됩니다. PandaDOS는 브랜치를 만들거나 전환하거나 병합하지 않으며, 현재 브랜치를 읽을 수 없을 때만 이 값을 대신 사용합니다.',

@@ -13,6 +13,7 @@ import { parseAutoApproveLevel, type AgentKind, type IssueCategory, type Project
 import { isUploadRel } from '../../core/uploads';
 import {
   isEditableStatus,
+  IssueWorkflowSelectionError,
   MAX_SUBTASK_TEXT_LENGTH,
   type IssueEngine,
   type EngineIssue,
@@ -54,6 +55,20 @@ async function readBody(req: Request): Promise<Record<string, unknown>> {
 function num(v: string | undefined): number | null {
   const n = Number(v);
   return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+function optionalPositiveId(value: unknown): number | null | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+function workflowSelectionError(error: IssueWorkflowSelectionError): Response {
+  const status = error.reason === 'not_found' ? 404 : 409;
+  return json(
+    apiError(`workflow.${error.reason}`, error.message, status, {}, error.issues),
+    status,
+  );
 }
 
 function zeroBasedIndex(v: string | undefined): number | null {
@@ -351,6 +366,10 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
         const b = await readBody(req);
         const title = typeof b.title === 'string' ? b.title.trim() : '';
         if (!title) return json({ ok: false, error: '缺 title' }, 400);
+        const workflowTemplateId = optionalPositiveId(b.workflowTemplateId);
+        if (workflowTemplateId === null) {
+          return json(apiError('workflow.selection_invalid', 'Choose a valid workflow template.', 400), 400);
+        }
         const category: IssueCategory =
           b.category === 'debug' ? 'debug' : b.category === 'design' ? 'design' : 'task';
         const implMode: ImplMode = b.implMode === 'team' ? 'team' : 'seq';
@@ -391,9 +410,15 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
             ...git.patch,
             imagesJson: images.length ? JSON.stringify(images) : null,
             createdBy: user!.id,
+            ...(workflowTemplateId !== undefined ? { workflowTemplateId } : {}),
           });
-          return json({ ok: true, issue: { ...issue, createdByName: createdByName(issue) } });
+          return json({
+            ok: true,
+            issue: { ...issue, createdByName: createdByName(issue) },
+            workflow: engine.workflowSnapshot(issue.id),
+          });
         } catch (e) {
+          if (e instanceof IssueWorkflowSelectionError) return workflowSelectionError(e);
           return json({ ok: false, error: String(e).slice(0, 200) }, 400);
         }
       },
@@ -418,6 +443,8 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
           conversationSegments: issue.convId
             ? engine.store.listConversationSegments(issue.convId)
             : [],
+          workflow: engine.workflowSnapshot(issue.id),
+          workflowRuntime: engine.workflowRuntime(issue.id),
         });
       },
     },

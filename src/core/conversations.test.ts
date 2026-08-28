@@ -5,14 +5,16 @@ import path from 'node:path';
 import { openDb } from './db';
 import { migrate } from './migrate';
 import { migrateIssueEngine } from '../issues/engine';
+import { DesignStore, migrateDesigns } from '../designs/store';
 import { UserStore } from './users';
-import { ConversationManager, chatTmux, dedTmux, moduleTmux, type ConvDriver } from './conversations';
+import { ConversationManager, chatTmux, dedTmux, moduleTmux, worktreeTmux, type ConvDriver } from './conversations';
 
 /** 录制型假 Driver：tmux 操作进内存，文件操作走真 fs（LocalDriver 语义子集） */
 class RecDriver implements ConvDriver {
   sessions = new Set<string>();
   sent: Array<{ session: string; text: string }> = [];
   killed: string[] = [];
+  killFailures = 0;
   executables = new Map([
     ['claude', 'claude'],
     ['codex', 'codex'],
@@ -21,6 +23,7 @@ class RecDriver implements ConvDriver {
   paneText = '';
   /** 每会话的 #{pane_current_command}（不设 = 老实现/解析失败，判活退化成只看屏） */
   commands = new Map<string, string>();
+  created: Array<{ name: string; cwd: string }> = [];
   async findExecutable(agent: 'claude' | 'codex') {
     return this.executables.get(agent) ?? null;
   }
@@ -33,10 +36,12 @@ class RecDriver implements ConvDriver {
   async capturePane(_session: string) {
     return this.paneText;
   }
-  async createSession(name: string, _cwd: string) {
+  async createSession(name: string, cwd: string) {
+    this.created.push({ name, cwd });
     this.sessions.add(name);
   }
   async killSession(name: string) {
+    if (this.killFailures-- > 0) throw new Error('kill failed');
     if (!this.sessions.delete(name)) throw new Error('no session');
     this.killed.push(name);
   }
@@ -108,12 +113,106 @@ describe('dedTmux：project 维度命名（弃 hashCwd）', () => {
 });
 
 describe('ConversationManager', () => {
+  test('managed workspace maps, owns a unique tmux name, and never falls back when missing', async () => {
+    const { db, driver, cwd } = setup();
+    migrateDesigns(db);
+    const convs = new ConversationManager(db, driver, { locate: async () => null });
+    const workspace = path.join(path.dirname(cwd), 'managed-design-worktree');
+    await fsp.mkdir(workspace, { recursive: true });
+    const first = convs.createInWorkspace(1, 'design run', 'codex', workspace);
+    const second = convs.createInWorkspace(1, 'design run 2', 'codex', workspace);
+    expect(first.workspaceCwd).toBe(workspace);
+    expect(convs.sessionName(first)).toBe(worktreeTmux(1, first.id));
+    expect(convs.sessionName(first)).not.toBe(convs.sessionName(second));
+    expect(convs.sessionName(first)).not.toBe(dedTmux(1));
+    expect(convs.listByProject(1).map((conversation) => conversation.id)).not.toContain(first.id);
+    await convs.activate(first.id);
+    expect(driver.created.at(-1)).toEqual({ name: worktreeTmux(1, first.id), cwd: workspace });
+
+    const missing = convs.createInWorkspace(1, 'missing', 'claude', `${workspace}-missing`);
+    const writesBefore = driver.sent.length;
+    await expect(convs.activate(missing.id)).rejects.toThrow('managed conversation workspace is unavailable');
+    expect(driver.sent).toHaveLength(writesBefore);
+  });
+  test('design saga ownership proof prevents an ID collision from killing or deleting an existing conversation', async () => {
+    const { db, driver, convs } = setup();
+    migrateDesigns(db);
+    const store = new DesignStore(db);
+    const id = '00000000-0000-4000-8000-000000000001';
+    store.ensureCreationSaga({
+      sagaToken: 'saga-collision', projectId: 1, idempotencyKey: 'collision-key',
+      requestJson: '{}', conversationId: id,
+    });
+    convs.createWithId(id, 1, 'Existing conversation', 'codex', 'chat');
+    driver.sessions.add(chatTmux(id));
+
+    const collision = convs.createOwnedWithId(
+      id, 1, 'Design collision', 'codex', 'chat', 'saga-collision',
+    );
+    expect(collision).toEqual({ conversationId: id, created: false, ownershipProof: null });
+    expect(db.query<{ n: number }, []>(
+      'SELECT COUNT(*) AS n FROM design_saga_conversation_owners',
+    ).get()!.n).toBe(0);
+    expect(await convs.deleteStrictOwned(id, 'saga-collision')).toBe(false);
+    expect(convs.get(id)).toMatchObject({ id, label: 'Existing conversation' });
+    expect(driver.sessions.has(chatTmux(id))).toBe(true);
+    expect(driver.killed).toEqual([]);
+
+    const ownedId = '00000000-0000-4000-8000-000000000002';
+    store.ensureCreationSaga({
+      sagaToken: 'saga-owner', projectId: 1, idempotencyKey: 'owner-key',
+      requestJson: '{}', conversationId: ownedId,
+    });
+    expect(convs.createOwnedWithId(
+      ownedId, 1, 'Owned design', 'codex', 'chat', 'saga-owner',
+    )).toEqual({ conversationId: ownedId, created: true, ownershipProof: 'saga-owner' });
+    expect(convs.createOwnedWithId(
+      ownedId, 1, 'Owned design', 'codex', 'chat', 'saga-owner',
+    )).toEqual({ conversationId: ownedId, created: false, ownershipProof: 'saga-owner' });
+    expect(db.query<{ sagaToken: string }, [string]>(
+      `SELECT saga_token AS sagaToken FROM design_saga_conversation_owners
+       WHERE conversation_id = ?`,
+    ).get(ownedId)).toEqual({ sagaToken: 'saga-owner' });
+    expect(convs.listByProject(1).map((conversation) => conversation.id)).not.toContain(ownedId);
+    expect(convs.listChats(1).map((conversation) => conversation.id)).not.toContain(ownedId);
+    driver.sessions.add(chatTmux(ownedId));
+    expect(await convs.deleteStrictOwned(ownedId, 'foreign-saga')).toBe(false);
+    expect(db.query<{ n: number }, [string]>(
+      'SELECT COUNT(*) AS n FROM design_saga_conversation_owners WHERE conversation_id = ?',
+    ).get(ownedId)!.n).toBe(1);
+    expect(await convs.deleteStrictOwned(ownedId, 'saga-owner')).toBe(true);
+    expect(convs.get(ownedId)).toBeUndefined();
+    expect(db.query<{ n: number }, [string]>(
+      'SELECT COUNT(*) AS n FROM design_saga_conversation_owners WHERE conversation_id = ?',
+    ).get(ownedId)!.n).toBe(0);
+    expect(driver.killed).toEqual([chatTmux(ownedId)]);
+
+    const rolledBackId = '00000000-0000-4000-8000-000000000003';
+    expect(() => convs.createOwnedWithId(
+      rolledBackId, 1, 'Missing saga', 'codex', 'chat', 'missing-saga',
+    )).toThrow();
+    expect(convs.get(rolledBackId)).toBeUndefined();
+    db.close();
+  });
+
   test('create/list/get 入库', () => {
     const { convs } = setup();
     const c = convs.create(1, '第一条');
     expect(convs.get(c.id)?.label).toBe('第一条');
     expect(convs.listByProject(1).map((x) => x.id)).toContain(c.id);
     expect(c.id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  test('ordinary project conversation lists exclude design-bound chat rows', () => {
+    const { db, convs } = setup();
+    const ordinary = convs.create(1, 'ordinary', 'claude', 'chat');
+    const design = convs.create(1, 'design', 'codex', 'chat');
+    db.run('CREATE TABLE design_tasks (conversation_id TEXT)');
+    db.query('INSERT INTO design_tasks (conversation_id) VALUES (?)').run(design.id);
+
+    expect(convs.listByProject(1).map((conversation) => conversation.id)).toEqual([ordinary.id]);
+    expect(convs.listChats(1).map((conversation) => conversation.id)).toEqual([ordinary.id]);
+    expect(convs.get(design.id)?.id).toBe(design.id);
   });
 
   test('首次 activate：--session-id + 建会话 + cwd 物化 + current 入库', async () => {
@@ -373,6 +472,25 @@ describe('ConversationManager chat 独立对话（009）', () => {
     await convs.archive(c.id);
     expect(convs.get(c.id)!.archived).toBe(true);
     expect(driver.sessions.has(`chat-${c.id}`)).toBe(false);
+  });
+
+  test('strict design cleanup preserves retry state on kill failure and deletes only after success', async () => {
+    const { convs, driver } = setup();
+    const archived = convs.create(1, 'strict archive', 'claude', 'chat');
+    await convs.activate(archived.id);
+    driver.killFailures = 1;
+    await expect(convs.archiveStrict(archived.id)).rejects.toThrow('kill failed');
+    expect(convs.get(archived.id)?.archived).toBe(false);
+    await convs.archiveStrict(archived.id);
+    expect(convs.get(archived.id)?.archived).toBe(true);
+
+    const deleted = convs.create(1, 'strict delete', 'codex', 'chat');
+    await convs.activate(deleted.id);
+    driver.killFailures = 1;
+    await expect(convs.deleteStrict(deleted.id)).rejects.toThrow('kill failed');
+    expect(convs.get(deleted.id)?.id).toBe(deleted.id);
+    await convs.deleteStrict(deleted.id);
+    expect(convs.get(deleted.id)).toBeUndefined();
   });
 });
 
