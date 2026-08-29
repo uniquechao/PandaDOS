@@ -59,19 +59,25 @@ Use only Issue data committed at `source_tag`.
    to cross-check coverage.
 4. Summarize outcomes; never copy prompts, terminal logs, internal reasoning, private Issue IDs,
    production identifiers, or credentials.
-5. Write `docs/releases/<source_tag>.md` in the public repository with this shape:
+5. Write one bilingual `docs/releases/<source_tag>.md` file in the public repository. Every
+   heading and release-note item must contain both languages with equivalent factual scope, with
+   English first and Chinese immediately after. Keep product names, commands, and technical terms
+   unchanged between the two versions. Use this shape:
 
    ```markdown
    # PandaDOS <source_tag>
-   ## 版本亮点
-   ## 新功能
-   ## 改进
-   ## 修复
-   ## 升级说明
+   ## Highlights / 版本亮点
+   - **English:** User-facing outcome.<br>
+     **中文：**面向用户的结果。
+   ## New Features / 新功能
+   ## Improvements / 改进
+   ## Fixes / 修复
+   ## Upgrade Notes / 升级说明
    ```
 
-   Omit empty sections. Combine related Issues into user-facing capabilities instead of listing
-   implementation chronology.
+   Within each bullet, write the English text first and its Chinese counterpart immediately below
+   it. Omit empty sections in both languages. Combine related Issues into user-facing capabilities
+   instead of listing implementation chronology.
 
 ## Validate and publish
 
