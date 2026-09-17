@@ -15,6 +15,7 @@ import type { AgentKind, Me, Project, ProjectModule } from '../lib/types';
 import { timeAgo } from '../lib/fmt';
 import { nav } from '../lib/router';
 import { useContainerWide } from '../lib/useContainerWide';
+import { AgentLogo } from '../components/AgentLogo';
 import { Modal } from '../components/Modal';
 import { Loading } from '../components/Loaders';
 import { toast } from '../lib/toast';
@@ -37,17 +38,7 @@ const STAGE_KEYS: Record<DesignTaskStage, MessageKey> = {
 function DesignAgentLogo({ kind }: { kind: AgentKind }) {
   return (
     <span class={`design-agent-logo ${kind}`} aria-hidden="true">
-      {kind === 'claude' ? (
-        <svg viewBox="0 0 24 24" focusable="false">
-          <path d="M12 4v16M4 12h16M6.3 6.3l11.4 11.4M17.7 6.3 6.3 17.7" />
-        </svg>
-      ) : (
-        <svg viewBox="0 0 24 24" focusable="false">
-          <rect x="7.4" y="3.4" width="9.2" height="17.2" rx="4.6" />
-          <rect x="7.4" y="3.4" width="9.2" height="17.2" rx="4.6" transform="rotate(60 12 12)" />
-          <rect x="7.4" y="3.4" width="9.2" height="17.2" rx="4.6" transform="rotate(120 12 12)" />
-        </svg>
-      )}
+      <AgentLogo agent={kind} decorative />
     </span>
   );
 }
@@ -273,7 +264,7 @@ function DesignCreateModal({
                   key={kind}
                 >
                   <DesignAgentLogo kind={kind} />
-                  <span class="design-agent-name">{kind === 'claude' ? 'Claude Code' : 'Codex'}</span>
+                  <span class="design-agent-name sr-only">{kind === 'claude' ? 'Claude Code' : 'Codex'}</span>
                   <input
                     type="radio"
                     name="design-agent"
@@ -511,7 +502,7 @@ export function DesignsView({ pid, selDid, me }: { pid: number; selDid?: number;
           <div class="design-header-meta">
             <span class="design-stage">{t(STAGE_KEYS[selected.stage])}</span>
             <span>{t('design.revision', { revision: selected.currentRevision })}</span>
-            <span>{selected.agent === 'claude' ? 'Claude Code' : 'Codex'}</span>
+            <AgentLogo agent={selected.agent} size="xs" />
           </div>
         )}
         <div class="design-header-action">{headerAction}</div>

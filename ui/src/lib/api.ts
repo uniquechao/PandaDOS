@@ -26,6 +26,12 @@ export interface ApiErrorDescriptor {
 }
 
 const ERROR_MESSAGE_KEYS: Readonly<Record<string, MessageKey>> = {
+  'feishu.config_invalid': 'errors.feishu.config_invalid',
+  'feishu.app_id_invalid': 'errors.feishu.app_id_invalid',
+  'feishu.public_url_invalid': 'errors.feishu.public_url_invalid',
+  'feishu.secret_invalid': 'errors.feishu.secret_invalid',
+  'feishu.secret_conflict': 'errors.feishu.secret_conflict',
+  'feishu.credentials_required': 'errors.feishu.credentials_required',
   'auth.invalid_credentials': 'errors.auth.invalid_credentials',
   'auth.required': 'errors.auth.required',
   'auth.admin_required': 'errors.auth.admin_required',
@@ -251,26 +257,107 @@ export async function getProjectExecutorAgents(projectId: number, signal?: Abort
   return executors.find((x) => x.id === project.executorId)?.supportedAgents ?? [];
 }
 
+/** 上传进度回调入参；total=0 表示浏览器给不出总长（lengthComputable=false），此时 ratio 恒 0 */
+export interface UploadProgress {
+  loaded: number;
+  total: number;
+  /** 0~1，UI 直接乘 100 当百分比 */
+  ratio: number;
+}
+
+export interface UploadOpts {
+  /** 上传进度回调（xhr.upload.onprogress 驱动，节流由调用方自理） */
+  onProgress?: (p: UploadProgress) => void;
+  /** 取消上传；已 abort 的 signal 立即拒绝（与 fetch 同款 AbortError 语义） */
+  signal?: AbortSignal;
+}
+
+function abortError(): Error {
+  // 与 fetch 对齐：调用方按 err.name === 'AbortError' 区分「用户取消」与「真失败」
+  const e = new Error('Upload aborted');
+  e.name = 'AbortError';
+  return e;
+}
+
+/**
+ * multipart 上传的统一底座。**必须用 XMLHttpRequest**：fetch 拿不到上传进度
+ * （没有 request-side 的 progress 事件），而进度条正是这里存在的理由。
+ * 错误口径与 api() 完全一致：401 触发全局登出回调，其余走 descriptorFromBody + localizedError，
+ * 网络层失败按 network.unreachable(status 0)。
+ */
+export function uploadWithProgress<T extends { ok: boolean }>(
+  url: string,
+  file: File,
+  fallbackName: string,
+  opts: UploadOpts = {},
+): Promise<T> {
+  const { onProgress, signal } = opts;
+  if (signal?.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const fd = new FormData();
+    fd.append('file', file, file.name || fallbackName);
+
+    const xhr = new XMLHttpRequest();
+    const onAbort = (): void => xhr.abort();
+    const done = (): void => signal?.removeEventListener('abort', onAbort);
+
+    xhr.upload.onprogress = (e: ProgressEvent): void => {
+      const total = e.lengthComputable ? e.total : 0;
+      onProgress?.({ loaded: e.loaded, total, ratio: total > 0 ? Math.min(1, e.loaded / total) : 0 });
+    };
+    xhr.onload = (): void => {
+      done();
+      // 字节已全部发完才算 100%——服务端还在落盘时进度条停在满格，比停在 99% 更符合直觉
+      onProgress?.({ loaded: file.size, total: file.size, ratio: 1 });
+      if (xhr.status === 401) onUnauthorized?.();
+      let body: unknown = null;
+      try {
+        body = JSON.parse(xhr.responseText) as unknown;
+      } catch {
+        /* 非 JSON（网关错误页等）→ 交给 descriptorFromBody 兜底 */
+      }
+      const ok2xx = xhr.status >= 200 && xhr.status < 300;
+      if (!ok2xx || typeof body !== 'object' || body === null || !(body as { ok?: unknown }).ok) {
+        reject(localizedError(descriptorFromBody(body, xhr.status), xhr.status));
+        return;
+      }
+      resolve(body as T);
+    };
+    xhr.onerror = (): void => {
+      done();
+      reject(
+        localizedError(
+          {
+            code: 'network.unreachable',
+            params: {},
+            fallback: 'Could not reach the server. Check your connection and try again.',
+          },
+          0,
+        ),
+      );
+    };
+    xhr.onabort = (): void => {
+      done();
+      reject(abortError());
+    };
+
+    signal?.addEventListener('abort', onAbort);
+    xhr.open('POST', url);
+    xhr.send(fd);
+  });
+}
+
 /** 截图上传：multipart file → { path(rel), abs, name, size }；rel 随建 issue images 提交 */
-export async function uploadImage(projectId: number, file: File): Promise<UploadResult> {
-  const fd = new FormData();
-  fd.append('file', file, file.name || 'image.png');
-  let r: Response;
-  try {
-    r = await fetch(`/api/projects/${projectId}/upload`, { method: 'POST', body: fd });
-  } catch (cause) {
-    throw localizedError({
-      code: 'network.unreachable', params: {},
-      fallback: 'Could not reach the server. Check your connection and try again.',
-      details: cause instanceof Error ? cause.message : undefined,
-    }, 0);
-  }
-  if (r.status === 401) onUnauthorized?.();
-  const j = await r.json().catch(() => null) as unknown;
-  if (!r.ok || typeof j !== 'object' || j === null || !(j as UploadResult).ok) {
-    throw localizedError(descriptorFromBody(j, r.status), r.status);
-  }
-  return j as UploadResult;
+export function uploadImage(projectId: number, file: File, opts: UploadOpts = {}): Promise<UploadResult> {
+  return uploadWithProgress<UploadResult>(`/api/projects/${projectId}/upload`, file, 'image.png', opts);
+}
+
+/**
+ * 对话附件上传（任意类型 ≤20MB）：落点与截图同为 .panda/uploads/<随机子目录>/，
+ * 返回的 rel 随对话 text 帧的 files 字段提交（见 web/ws/chat.ts）。
+ */
+export function uploadChatFile(projectId: number, file: File, opts: UploadOpts = {}): Promise<UploadResult> {
+  return uploadWithProgress<UploadResult>(`/api/projects/${projectId}/upload/file`, file, 'file', opts);
 }
 
 // ---------- 项目成员（关联多用户） ----------

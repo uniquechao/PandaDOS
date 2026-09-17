@@ -173,9 +173,20 @@ inspect and intervene at any time.
 - Persistent module conversations and project knowledge
 - Browser workspace for chat, native terminal, files, images, Git history, diffs, and progress
 - Local and SSH executors
-- Project members, subscriptions, Feishu login/binding, notifications, and approval cards
+- Project members, subscriptions, same-company Feishu login/binding, private project Q&A, notifications, and approval cards
 - Ten UI locales with localized product text while preserving issues, code, commands, paths,
   terminal output, Git data, and existing conversation history verbatim
+
+## Feishu integration
+
+Configure a company app in **Admin → Feishu** to let colleagues sign in with their own identities,
+select an authorized project in bot private chat, ask the project PM questions, and receive
+subscription notifications and approval cards. Login and messaging have independent switches;
+the admin page provides credential verification, connection status, reconnection, and a test
+message to the current administrator's linked account.
+
+See the [Feishu setup and user guide (Chinese)](docs/feishu.md) for permissions, setup, private-chat
+commands, configuration precedence, troubleshooting, and current limitations.
 
 ## Run PandaDOS 24/7
 

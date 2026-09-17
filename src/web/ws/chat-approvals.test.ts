@@ -24,6 +24,7 @@ const MENU_DANGER = [' Bash command\n rm -rf node_modules', ' ❯ 1. Yes', '   2
 class FakeDriver {
   panes = new Map<string, string>();
   keys: Array<{ session: string; key: string }> = [];
+  texts: Array<{ session: string; text: string }> = [];
   async capturePane(session: string): Promise<string> {
     const p = this.panes.get(session);
     if (p === undefined) throw new Error(`can't find session: ${session}`);
@@ -32,7 +33,9 @@ class FakeDriver {
   async sendKey(session: string, key: string): Promise<void> {
     this.keys.push({ session, key });
   }
-  async sendKeys(): Promise<void> {}
+  async sendKeys(session: string, text: string): Promise<void> {
+    this.texts.push({ session, text });
+  }
 }
 
 /** LLM 只在 medium 档被调用；这里恒 approve 第 1 项，好和本地规则区分开 */
@@ -47,7 +50,10 @@ function fakeLlm(reply = '{"action":"approve","option":1,"reason":"安全"}') {
   };
 }
 
-function setup(convs: Array<{ id: string; level: AutoApproveLevel; kind?: 'chat' | 'issue'; archived?: boolean }>) {
+function setup(
+  convs: Array<{ id: string; level: AutoApproveLevel; kind?: 'chat' | 'issue'; archived?: boolean }>,
+  llmReply?: string,
+) {
   const db = openDb(':memory:');
   migrate(db);
   migrateIssueEngine(db);
@@ -67,8 +73,9 @@ function setup(convs: Array<{ id: string; level: AutoApproveLevel; kind?: 'chat'
     ).run(c.id, c.id, c.archived ? 1 : 0, c.kind ?? 'chat', c.level);
   }
   const driver = new FakeDriver();
-  const llm = fakeLlm();
+  const llm = fakeLlm(llmReply);
   const decisions: ChatApprovalDecision[] = [];
+  const textDecisions: Array<{ outcome: { action: string }; result?: string }> = [];
   const watcher = new ChatApprovalWatcher({
     db,
     llm,
@@ -77,8 +84,9 @@ function setup(convs: Array<{ id: string; level: AutoApproveLevel; kind?: 'chat'
     retryDelayMs: 1,
     tickMs: 10,
     onDecision: (d) => decisions.push(d),
+    onTextDecision: (d) => textDecisions.push(d),
   });
-  return { db, driver, llm, watcher, decisions };
+  return { db, driver, llm, watcher, decisions, textDecisions };
 }
 
 describe('对话自动批准巡检：扫描面', () => {
@@ -102,20 +110,20 @@ describe('对话自动批准巡检：扫描面', () => {
 });
 
 describe('对话自动批准巡检：分级与注入', () => {
-  test('全自动档 + 普通弹窗 → 本地放行并注入（LLM 不被调用）', async () => {
+  test('全自动档 + 普通弹窗 → 管家放行并注入', async () => {
     const t = setup([{ id: 'c-1', level: 'auto' }]);
     t.driver.panes.set(chatTmux('c-1'), MENU_YES_NO);
 
     await t.watcher.tick();
 
     expect(t.driver.keys.map((k) => k.key)).toEqual(['Enter']); // cursor 已在 0，直接回车
-    expect(t.llm.calls.length).toBe(0);
+    expect(t.llm.calls.length).toBe(1);
     expect(t.decisions[0]?.outcome.rule).toBe('auto_affirm');
     expect(t.decisions[0]?.result).toBe('Yes');
   });
 
   test('全自动档 + 危险不可逆 → 判需人工：一个键都不发，菜单留给网页', async () => {
-    const t = setup([{ id: 'c-1', level: 'auto' }]);
+    const t = setup([{ id: 'c-1', level: 'auto' }], '{"action":"escalate","reason":"不可逆删除"}');
     t.driver.panes.set(chatTmux('c-1'), MENU_DANGER);
 
     await t.watcher.tick();
@@ -189,5 +197,45 @@ describe('对话自动批准巡检：生命周期', () => {
 
     await Bun.sleep(160);
     expect(t.decisions.length).toBe(n);
+  });
+});
+
+describe('对话自动批准巡检：纯文本执行确认', () => {
+  const prompt = [
+    '请选择执行方式：',
+    '1. 子代理分任务实施',
+    '2. 当前会话直接实施',
+    '回复 `2` 我就立即开始。',
+  ].join('\n');
+
+  test('全自动档经管家判定后锁内复核并发送短回复，同一提示只处理一次', async () => {
+    const t = setup(
+      [{ id: 'c-1', level: 'auto' }],
+      '{"action":"reply","reply":"2","reason":"继续既定计划"}',
+    );
+    const session = chatTmux('c-1');
+    t.driver.panes.set(session, prompt);
+    await t.watcher.tick();
+    await t.watcher.tick();
+    expect(t.driver.texts).toEqual([{ session, text: '2' }]);
+    expect(t.textDecisions).toHaveLength(1);
+    expect(t.textDecisions[0]?.result).toBe('2');
+  });
+
+  test('管家判为需人工或档位不是全自动时不发送文本', async () => {
+    const hold = setup(
+      [{ id: 'c-auto', level: 'auto' }],
+      '{"action":"hold","reason":"业务取舍"}',
+    );
+    hold.driver.panes.set(chatTmux('c-auto'), prompt);
+    await hold.watcher.tick();
+    expect(hold.driver.texts).toEqual([]);
+    expect(hold.textDecisions[0]?.outcome.action).toBe('hold');
+
+    const medium = setup([{ id: 'c-medium', level: 'medium' }]);
+    medium.driver.panes.set(chatTmux('c-medium'), prompt);
+    await medium.watcher.tick();
+    expect(medium.driver.texts).toEqual([]);
+    expect(medium.llm.calls).toHaveLength(0);
   });
 });

@@ -72,6 +72,20 @@ class FakeDriver implements ClarifyDriver {
     const bytes = new TextEncoder().encode(this.files.get(path) ?? '');
     return { data: bytes.subarray(offset, offset + limit), size: bytes.length };
   }
+  /** 诊断用：列 scratch 目录（#280）——按 files 里的路径前缀推出直接子项 */
+  async listDir(path: string) {
+    const prefix = `${path}/`;
+    const names = new Set<string>();
+    for (const key of this.files.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      const rest = key.slice(prefix.length);
+      const [head] = rest.split('/');
+      if (head) names.add(rest.includes('/') ? `${head}/` : head);
+    }
+    return [...names].map((name) => name.endsWith('/')
+      ? { name: name.slice(0, -1), type: 'dir' as const }
+      : { name, type: 'file' as const });
+  }
   async removeTree(path: string) {
     this.removed.push(path);
     for (const k of [...this.files.keys()]) {
@@ -269,6 +283,48 @@ describe('ClarifyRunner.run', () => {
     if (!r.ok) expect(r.reason).toBe('timeout');
     expect(driver.killed).toContain('clr-3');
     expect(driver.removed).toContain(p.scratch);
+  });
+
+  // #280 / B-06：生产上 49 次澄清以 reason=timeout 收场，产物写没写出来无人知晓——
+  // 独立会话已经完整读过一遍代码库，钱早花完了，结果不能整体丢。
+  test('抢救：done 没写出来但 feedback 已落盘 → 按成功用并标 salvaged', async () => {
+    const driver = new FakeDriver();
+    const cwd = '/repo/proj';
+    const p = clarifyPaths(cwd, 11);
+    driver.paneAt = () => '正在分析…';
+    driver.onCapture = (n, files) => {
+      if (n >= 5) {
+        files.set(p.feedback, '理解：把门禁挪出会话；风险：执行机负载。');
+        files.set(p.questions, '1. 超时调到多少？');
+      } // 就是不写 done
+    };
+    const r = await runClarify({ driver, ...mkClock() }, { issueId: 11, cwd, agent: 'claude', title: 't' }, FAST);
+
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.salvaged).toBe(true);
+      expect(r.feedback).toContain('把门禁挪出会话');
+      expect(r.questions).toEqual(['超时调到多少？']);
+      // 现场证据跟着回来，供引擎落事件排查「为什么没写 done」
+      expect(r.diagnostics?.hadArtifacts).toBe(2);
+      expect(r.diagnostics?.paneTail).toContain('正在分析');
+      expect(r.diagnostics?.files.map((f) => f.name).sort()).toEqual(['feedback.md', 'questions.md', 'task.md']);
+    }
+  });
+
+  test('抢救不到（产物一个都没写）→ 仍是 timeout，但带回现场证据', async () => {
+    const driver = new FakeDriver();
+    const cwd = '/repo/proj';
+    driver.paneAt = () => '❯ 等待权限确认';
+    const r = await runClarify({ driver, ...mkClock() }, { issueId: 12, cwd, agent: 'claude', title: 't' }, FAST);
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toBe('timeout');
+      expect(r.diagnostics?.hadArtifacts).toBe(0);
+      expect(r.diagnostics?.paneTail).toContain('等待权限确认');
+      expect(r.diagnostics?.elapsedMs).toBeGreaterThan(0);
+    }
   });
 
   test('done 出现但反馈/问题都空 → reason=no-output', async () => {

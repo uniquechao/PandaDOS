@@ -10,9 +10,10 @@ import { LocalDriver } from '../../executor/local';
 import { authDepsFromDb, createDispatcher } from '../middleware';
 import { projectsRoutes, projectSlug } from './projects';
 
-function setup() {
+function setup(projectDataSync?: Parameters<typeof projectsRoutes>[0]['projectDataSync']) {
   const db = openDb(':memory:');
   migrate(db);
+  migrateIssueEngine(db); // 门禁命令列（047）在 issues 迁移链里；生产两条链都跑
   const users = new UserStore(db);
   const admin = users.create('admin', 'admin');
   const alice = users.create('alice');
@@ -37,11 +38,31 @@ function setup() {
   };
   // waiting_input 数据源：测试用集合模拟（生产 = 审批管道登记 ∪ 菜单滞留）
   const waitingSet = new Set<number>();
+  const gitCalls: Array<{ cwd: string; args: string[] }> = [];
+  const mkdirCalls: string[] = [];
   const dispatch = createDispatcher(
-    projectsRoutes({ db, convs, waitingIssueIds: () => waitingSet }),
+    projectsRoutes({
+      db,
+      convs,
+      waitingIssueIds: () => waitingSet,
+      projectDataSync,
+      driverFor: () => ({
+        listSessions: async () => [],
+        readFileRange: async () => ({ data: new Uint8Array(), size: 0 }),
+        statPath: async () => null,
+        listDir: async () => [],
+        writeFile: async () => {},
+        mkdirp: async (p: string) => { mkdirCalls.push(p); },
+        ensureGitAvailable: async () => {},
+        git: async (cwd: string, args: string[]) => {
+          gitCalls.push({ cwd, args });
+          return { code: 0, out: '', err: '' };
+        },
+      }),
+    }),
     authDepsFromDb(db, users),
   );
-  return { db, users, admin, alice, bob, dispatch, waitingSet };
+  return { db, users, admin, alice, bob, dispatch, waitingSet, gitCalls, mkdirCalls };
 }
 
 function req(method: string, path: string, token?: string, body?: unknown): Request {
@@ -60,7 +81,36 @@ async function j(r: Response | Promise<Response> | null): Promise<{ status: numb
   return { status: resp.status, body: await resp.json() };
 }
 
+/** 只用于需要先经项目创建 API 建夹具的测试；不触碰真实文件系统。 */
+function projectCreationDriver() {
+  return {
+    listSessions: async () => [],
+    readFileRange: async () => ({ data: new Uint8Array(), size: 0 }),
+    statPath: async () => null,
+    listDir: async () => [],
+    writeFile: async () => {},
+    mkdirp: async () => {},
+    ensureGitAvailable: async () => {},
+    git: async () => ({ code: 0, out: '', err: '' }),
+  };
+}
+
 describe('projects 路由', () => {
+  test('同步状态接口遵循项目权限，手动同步后返回最新摘要', async () => {
+    let calls = 0;
+    const status = { state: 'success' as const, lastAttemptTs: 10, lastSuccessTs: 10,
+      detectedUpdates: 2, imported: 1, archived: 1, unchanged: 3, conflicts: 0, parseErrors: 0, details: [] };
+    const s = setup({ async sync() { calls += 1; }, status: () => status });
+    const created = await j(s.dispatch(req('POST', '/api/projects', s.alice.token, { name: 'Sync', executorId: 1 })));
+    const pid = created.body.project.id;
+    expect((await j(s.dispatch(req('GET', `/api/projects/${pid}/sync`)))).status).toBe(401);
+    expect((await j(s.dispatch(req('GET', `/api/projects/${pid}/sync`, s.bob.token)))).status).toBe(403);
+    expect((await j(s.dispatch(req('GET', `/api/projects/${pid}/sync`, s.alice.token)))).body.status).toEqual(status);
+    const before = calls;
+    expect((await j(s.dispatch(req('POST', `/api/projects/${pid}/sync`, s.alice.token)))).body.status).toEqual(status);
+    expect(calls).toBe(before + 1);
+  });
+
   test('未登录 401；建项目默认 cwd 落自己 workspace；属主隔离', async () => {
     const s = setup();
     expect((await j(s.dispatch(req('GET', '/api/projects')))).status).toBe(401);
@@ -71,6 +121,8 @@ describe('projects 路由', () => {
     expect(created.status).toBe(200);
     expect(created.body.project.ownerUserId).toBe(s.alice.user.id);
     expect(created.body.project.cwd).toBe(`/ws/u${s.alice.user.id}/My-App`);
+    expect(s.mkdirCalls).toContain(`/ws/u${s.alice.user.id}/My-App`);
+    expect(s.gitCalls).toContainEqual({ cwd: `/ws/u${s.alice.user.id}/My-App`, args: ['init'] });
 
     // 列表隔离：alice 见 1，bob 见 0，admin 全见
     expect((await j(s.dispatch(req('GET', '/api/projects', s.alice.token)))).body).toHaveLength(1);
@@ -143,6 +195,29 @@ describe('projects 路由', () => {
     expect(mrOn.body.project.manualReview).toBe(true);
     const mrOff = await j(s.dispatch(req('PATCH', `/api/projects/${pid}`, s.alice.token, { manualReview: false })));
     expect(mrOff.body.project.manualReview).toBe(false);
+
+    // 门禁命令（#279 / I-03）：默认未配置；数组落库；null 清回未配置；坏输入 400
+    expect(patched.body.project.validationCommands).toBeNull();
+    const vc = await j(s.dispatch(req('PATCH', `/api/projects/${pid}`, s.alice.token, {
+      validationCommands: [
+        { label: 'typecheck', argv: ['bun', 'run', 'typecheck'] },
+        { label: '空的', argv: [] }, // 空命令直接丢
+      ],
+    })));
+    expect(vc.body.project.validationCommands).toEqual([
+      { label: 'typecheck', argv: ['bun', 'run', 'typecheck'] },
+    ]);
+    const vcEmpty = await j(s.dispatch(req('PATCH', `/api/projects/${pid}`, s.alice.token, {
+      validationCommands: [],
+    })));
+    expect(vcEmpty.body.project.validationCommands).toEqual([]); // 显式不跑门禁
+    const vcNull = await j(s.dispatch(req('PATCH', `/api/projects/${pid}`, s.alice.token, {
+      validationCommands: null,
+    })));
+    expect(vcNull.body.project.validationCommands).toBeNull(); // 回到未配置（按 package.json 探测）
+    expect((await j(s.dispatch(req('PATCH', `/api/projects/${pid}`, s.alice.token, {
+      validationCommands: 'bun test',
+    })))).status).toBe(400);
 
     const del = await j(s.dispatch(req('DELETE', `/api/projects/${pid}`, s.alice.token)));
     expect(del.body.archived).toBe(true);
@@ -235,21 +310,30 @@ describe('projects 路由', () => {
     expect(cleared.body.project.workBranch).toBeNull();
   });
 
-  test('kind（009）：默认 issue；建可设 chat 且忽略 workBranch；非法 400；PATCH 可改', async () => {
+  test('项目类型固定为 issue：缺省和显式 issue 可用，chat 与非法值拒绝', async () => {
     const s = setup();
     // 默认 issue
     const def = await j(s.dispatch(req('POST', '/api/projects', s.alice.token, { name: 'k0', executorId: 1 })));
     expect(def.body.project.kind).toBe('issue');
 
-    // 建 chat 项目：kind=chat，且 chat 忽略 work_branch（issue 专属项）
+    // 旧客户端请求 chat 项目 → 明确拒绝
     const chat = await j(
       s.dispatch(
         req('POST', '/api/projects', s.alice.token, { name: 'k1', executorId: 1, kind: 'chat', workBranch: 'feature/x' }),
       ),
     );
-    expect(chat.status).toBe(200);
-    expect(chat.body.project.kind).toBe('chat');
-    expect(chat.body.project.workBranch).toBeNull();
+    expect(chat.status).toBe(400);
+    expect(chat.body.error.details).toBe('项目类型已固定为 issue');
+
+    // 显式 issue 仍兼容，并保留 issue 专属 workBranch
+    const explicit = await j(
+      s.dispatch(
+        req('POST', '/api/projects', s.alice.token, { name: 'k1i', executorId: 1, kind: 'issue', workBranch: 'feature/x' }),
+      ),
+    );
+    expect(explicit.status).toBe(200);
+    expect(explicit.body.project.kind).toBe('issue');
+    expect(explicit.body.project.workBranch).toBe('feature/x');
 
     // 非法 kind → 400
     const bad = await j(
@@ -257,11 +341,11 @@ describe('projects 路由', () => {
     );
     expect(bad.status).toBe(400);
 
-    // PATCH 改回 issue
-    const pid = chat.body.project.id;
-    const patched = await j(s.dispatch(req('PATCH', `/api/projects/${pid}`, s.alice.token, { kind: 'issue' })));
-    expect(patched.status).toBe(200);
-    expect(patched.body.project.kind).toBe('issue');
+    // PATCH 不再允许切换为 chat
+    const pid = explicit.body.project.id;
+    const patched = await j(s.dispatch(req('PATCH', `/api/projects/${pid}`, s.alice.token, { kind: 'chat' })));
+    expect(patched.status).toBe(400);
+    expect(patched.body.error.details).toBe('项目类型已固定为 issue');
   });
 });
 
@@ -269,7 +353,9 @@ describe('projects 路由', () => {
 
 import type { TmuxSession } from '../../executor/driver';
 
-function setupImport(sessions: TmuxSession[]) {
+type GitStub = (cwd: string, args: string[]) => { code: number; out: string; err: string };
+
+function setupImport(sessions: TmuxSession[], gitStub?: GitStub) {
   const db = openDb(':memory:');
   migrate(db);
   const users = new UserStore(db);
@@ -279,6 +365,7 @@ function setupImport(sessions: TmuxSession[]) {
     `INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir)
      VALUES ('local', '127.0.0.1', 22, 'root', 'k', '/ws', '/claude')`,
   );
+  const gitCalls: Array<{ cwd: string; args: string[] }> = [];
   const dispatch = createDispatcher(
     projectsRoutes({
       db,
@@ -289,12 +376,32 @@ function setupImport(sessions: TmuxSession[]) {
         listDir: async () => [],
         writeFile: async () => {},
         mkdirp: async () => {},
-        git: async () => ({ code: 0, out: '', err: '' }),
+        ensureGitAvailable: async () => {},
+        git: async (cwd: string, args: string[]) => {
+          gitCalls.push({ cwd, args });
+          return gitStub ? gitStub(cwd, args) : { code: 0, out: '', err: '' };
+        },
       }),
     }),
     authDepsFromDb(db, users),
   );
-  return { db, admin, alice, dispatch };
+  return { db, admin, alice, dispatch, gitCalls };
+}
+
+/** 导入路径的 git 替身：既有仓库、提交身份为空；writeFails 时 `config --local` 一律失败 */
+function importedRepoGit(opts: { writeFails?: string } = {}): GitStub {
+  return (_cwd, args) => {
+    if (args[0] === 'rev-parse' && args[1] === '--is-inside-work-tree') {
+      return { code: 0, out: 'true\n', err: '' };
+    }
+    if (args[0] === 'config' && args[1] === '--get') return { code: 1, out: '', err: '' };
+    if (args[0] === 'config' && args[1] === '--local') {
+      return opts.writeFails
+        ? { code: 4, out: '', err: opts.writeFails }
+        : { code: 0, out: '', err: '' };
+    }
+    return { code: 0, out: '', err: '' };
+  };
 }
 
 async function setupAgentImport() {
@@ -365,6 +472,7 @@ async function setupAgentImport() {
       archiveWrites.set(p, typeof data === 'string' ? new TextEncoder().encode(data) : data.slice());
     },
     mkdirp: (p: string) => local.mkdirp(p),
+    ensureGitAvailable: () => local.ensureGitAvailable(),
     git: (cwd: string, args: string[]) => local.git(cwd, args),
   };
   const dispatch = createDispatcher(
@@ -409,6 +517,53 @@ describe('POST /api/projects/import', () => {
     expect(again.body.project.id).toBe(r.body.project.id);
   });
 
+  // B-01：导入路径以前完全不写 Git 身份，导进来的项目第一次自动提交必然 Author identity unknown
+  test('导入既有 Git 仓库且身份为空：补齐 local 身份（run_user 优先），只对新登记的项目做', async () => {
+    const s = setupImport(live, importedRepoGit());
+    const r = await j(s.dispatch(req('POST', '/api/projects/import', s.admin.token, {
+      executorId: 1, session: 'ontology', runUser: 'developer',
+    })));
+    expect(r.status).toBe(200);
+    expect(r.body.created).toBe(true);
+    expect(r.body.warnings).toBeUndefined();
+    expect(s.gitCalls).toContainEqual({
+      cwd: '/home/developer/onto', args: ['config', '--local', 'user.name', 'developer'],
+    });
+    expect(s.gitCalls).toContainEqual({
+      cwd: '/home/developer/onto',
+      args: ['config', '--local', 'user.email', 'developer@users.noreply.pandados.local'],
+    });
+    // 身份只写仓库本地，绝不落 global（否则先导项目的人会变成整机默认提交人）
+    expect(s.gitCalls.some(({ args }) => args[1] === '--global')).toBe(false);
+
+    // 幂等再导一次 = 并入既有项目，身份早已就位，不再重复预检
+    const before = s.gitCalls.length;
+    const again = await j(s.dispatch(req('POST', '/api/projects/import', s.admin.token, {
+      executorId: 1, session: 'ontology',
+    })));
+    expect(again.body.created).toBe(false);
+    expect(s.gitCalls.slice(before).some(({ args }) => args[0] === 'config')).toBe(false);
+  });
+
+  test('导入时身份写不进去只降级成 warning，不阻塞导入；非 Git 目录静默跳过', async () => {
+    const failed = setupImport(live, importedRepoGit({ writeFails: 'config denied' }));
+    const r = await j(failed.dispatch(req('POST', '/api/projects/import', failed.admin.token, {
+      executorId: 1, session: 'ontology',
+    })));
+    expect(r.status).toBe(200);
+    expect(r.body.created).toBe(true); // 项目照常登记
+    expect(r.body.warnings.join('\n')).toContain('config denied');
+
+    // 非 Git 目录（默认替身 rev-parse 不回 true）：不写身份，也不该报警
+    const plain = setupImport(live);
+    const ok = await j(plain.dispatch(req('POST', '/api/projects/import', plain.admin.token, {
+      executorId: 1, session: 'ontology',
+    })));
+    expect(ok.status).toBe(200);
+    expect(ok.body.warnings).toBeUndefined();
+    expect(plain.gitCalls.some(({ args }) => args[0] === 'config')).toBe(false);
+  });
+
   test('同 cwd 已有活跃项目 → 并入不重建；普通用户只能导自己 workspace；托管/不存在会话拒绝', async () => {
     const s = setupImport(live);
     // 预置同 cwd 项目（alice 的）
@@ -424,7 +579,7 @@ describe('POST /api/projects/import', () => {
     expect(merged.status).toBe(200);
     expect(merged.body.created).toBe(false);
     expect(merged.body.project.name).toBe('已有');
-    expect(merged.body.project.kind).toBe('chat');
+    expect(merged.body.project.kind).toBe('issue');
 
     // 普通用户导 workspace 外 → 403
     const out = await j(
@@ -534,16 +689,16 @@ describe('POST /api/projects/import', () => {
     }
   });
 
-  test('显式 chat 类型适用于 Agent 导入，历史仍登记为可恢复 chat 对话', async () => {
+  test('Agent 导入固定为 issue 项目，历史仍登记为可恢复 chat 对话', async () => {
     const s = await setupAgentImport();
     try {
       const imported = await j(
         s.dispatch(req('POST', '/api/projects/import', s.alice.token, {
-          source: 'codex', executorId: 1, cwd: '/ws/u2/app', kind: 'chat',
+          source: 'codex', executorId: 1, cwd: '/ws/u2/app', kind: 'issue',
         })),
       );
       expect(imported.status).toBe(200);
-      expect(imported.body.project.kind).toBe('chat');
+      expect(imported.body.project.kind).toBe('issue');
       expect(imported.body.importedConversations).toBe(1);
       expect(
         s.db.query<{ kind: string }, [string]>(
@@ -636,7 +791,7 @@ describe('POST /api/projects/import', () => {
         })),
       );
       expect(badKind.status).toBe(400);
-      expect(badKind.body.error.details).toBe('kind 必须是 issue 或 chat');
+      expect(badKind.body.error.details).toBe('项目类型已固定为 issue');
     } finally {
       await fsp.rm(s.root, { recursive: true, force: true });
     }
@@ -797,7 +952,15 @@ import { repoNameFromGitUrl } from './projects';
 const CLONE_PASSWD = ['root:x:0:0::/root:/bin/bash', 'developer:x:1002:1002::/home/developer:/bin/bash'].join('\n');
 
 /** 可控 driver：记录 git clone 调用；existingDirs 决定 statPath/listDir（模拟目标目录已存在/非空） */
-function setupClone(opts: { existingDirs?: Record<string, string[]> } = {}) {
+function setupClone(opts: {
+  existingDirs?: Record<string, string[]>;
+  passwd?: string;
+  gitResult?: { code: number; out: string; err: string };
+  ensureError?: Error;
+  repoExists?: boolean;
+  gitConfig?: { name?: string | null; email?: string | null };
+  configWriteResult?: { code: number; out: string; err: string };
+} = {}) {
   const db = openDb(':memory:');
   migrate(db);
   const users = new UserStore(db);
@@ -809,29 +972,64 @@ function setupClone(opts: { existingDirs?: Record<string, string[]> } = {}) {
   );
   const dirs = new Map<string, string[]>(Object.entries(opts.existingDirs ?? {}));
   const gitCalls: Array<{ cwd: string; args: string[] }> = [];
+  const mkdirCalls: string[] = [];
+  const repos = new Set<string>();
+  const config = new Map<string, string | null>([
+    ['user.name', opts.gitConfig?.name === undefined ? 'Existing User' : opts.gitConfig.name],
+    ['user.email', opts.gitConfig?.email === undefined ? 'existing@example.com' : opts.gitConfig.email],
+  ]);
+  let ensureCalls = 0;
   const dispatch = createDispatcher(
     projectsRoutes({
       db,
       driverFor: () => ({
         listSessions: async () => [],
         readFileRange: async () => {
-          const data = new TextEncoder().encode(CLONE_PASSWD);
+          const data = new TextEncoder().encode(opts.passwd ?? CLONE_PASSWD);
           return { data, size: data.length };
         },
         statPath: async (p: string) =>
           dirs.has(p) ? { size: 0, mtimeMs: 0, isDirectory: true, isFile: false, mode: 0o755 } : null,
         listDir: async (p: string) => (dirs.get(p) ?? []).map((n) => ({ name: n, type: 'dir' as const })),
         writeFile: async () => {},
-        mkdirp: async () => {},
+        mkdirp: async (path: string) => { mkdirCalls.push(path); },
+        ensureGitAvailable: async () => {
+          ensureCalls++;
+          if (opts.ensureError) throw opts.ensureError;
+        },
         git: async (cwd: string, args: string[]) => {
           gitCalls.push({ cwd, args });
+          if (args.includes('clone')) {
+            const result = opts.gitResult ?? { code: 0, out: '', err: '' };
+            if (result.code === 0) repos.add(path.posix.join(cwd, args.at(-1)!));
+            return result;
+          }
+          if (args[0] === 'rev-parse') {
+            return opts.repoExists || repos.has(cwd)
+              ? { code: 0, out: 'true\n', err: '' }
+              : { code: 128, out: '', err: 'fatal: not a git repository' };
+          }
+          if (args[0] === 'init') {
+            const result = opts.gitResult ?? { code: 0, out: '', err: '' };
+            if (result.code === 0) repos.add(cwd);
+            return result;
+          }
+          if (args[0] === 'config' && args[1] === '--get') {
+            const value = config.get(args[2]!);
+            return value ? { code: 0, out: `${value}\n`, err: '' } : { code: 1, out: '', err: '' };
+          }
+          if (args[0] === 'config' && args[1] === '--local') {
+            const result = opts.configWriteResult ?? { code: 0, out: '', err: '' };
+            if (result.code === 0) config.set(args[2]!, args[3]!);
+            return result;
+          }
           return { code: 0, out: '', err: '' };
         },
       }),
     }),
     authDepsFromDb(db, users),
   );
-  return { db, admin, alice, dispatch, gitCalls };
+  return { db, admin, alice, dispatch, gitCalls, mkdirCalls, ensureCalls: () => ensureCalls };
 }
 
 describe('repoNameFromGitUrl', () => {
@@ -844,6 +1042,72 @@ describe('repoNameFromGitUrl', () => {
 });
 
 describe('POST /api/projects：从 git clone 新建', () => {
+  test('无 gitUrl：仅对非 Git 目录 init，失败时不写项目记录', async () => {
+    const s = setupClone();
+    const ok = await j(s.dispatch(req('POST', '/api/projects', s.alice.token, { name: 'blank', executorId: 1 })));
+    expect(ok.status).toBe(200);
+    expect(s.mkdirCalls).toContain(`/ws/u${s.alice.user.id}/blank`);
+    expect(s.ensureCalls()).toBe(1);
+    expect(s.gitCalls).toContainEqual({ cwd: `/ws/u${s.alice.user.id}/blank`, args: ['init'] });
+
+    const unavailable = setupClone({ ensureError: new Error('没有免密 sudo') });
+    const noGit = await j(unavailable.dispatch(
+      req('POST', '/api/projects', unavailable.alice.token, { name: 'no-git', executorId: 1 }),
+    ));
+    expect(noGit.status).toBe(502);
+    expect(noGit.body.error.details).toContain('没有免密 sudo');
+    expect(unavailable.gitCalls).toHaveLength(0);
+    expect(unavailable.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM projects').get()!.n).toBe(0);
+
+    const failed = setupClone({ gitResult: { code: 128, out: '', err: 'init denied' } });
+    const noInit = await j(failed.dispatch(
+      req('POST', '/api/projects', failed.alice.token, { name: 'bad-init', executorId: 1 }),
+    ));
+    expect(noInit.status).toBe(502);
+    expect(noInit.body.error.details).toContain('git init 失败');
+    expect(failed.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM projects').get()!.n).toBe(0);
+  });
+
+  test('已有 Git 工作区不重复 init；仅补齐缺失身份且使用项目属主用户名', async () => {
+    const s = setupClone({ repoExists: true, gitConfig: { name: null, email: null } });
+    const created = await j(s.dispatch(req('POST', '/api/projects', s.admin.token, {
+      name: 'owned',
+      executorId: 1,
+      cwd: '/opt/owned',
+      ownerUserId: s.alice.user.id,
+    })));
+    expect(created.status).toBe(200);
+    expect(s.gitCalls).not.toContainEqual({ cwd: '/opt/owned', args: ['init'] });
+    expect(s.gitCalls).toContainEqual({
+      cwd: '/opt/owned', args: ['config', '--local', 'user.name', 'alice'],
+    });
+    expect(s.gitCalls).toContainEqual({
+      cwd: '/opt/owned', args: ['config', '--local', 'user.email', 'alice@users.noreply.pandados.local'],
+    });
+  });
+
+  test('已有有效 Git 身份保持不变，写入身份失败时不写项目记录', async () => {
+    const existing = setupClone({ repoExists: true });
+    const kept = await j(existing.dispatch(
+      req('POST', '/api/projects', existing.alice.token, { name: 'kept', executorId: 1 }),
+    ));
+    expect(kept.status).toBe(200);
+    expect(existing.gitCalls.some(({ args }) => args[0] === 'config' && args[1] === '--local')).toBe(false);
+
+    const failed = setupClone({
+      repoExists: true,
+      gitConfig: { name: null, email: null },
+      configWriteResult: { code: 1, out: '', err: 'config denied' },
+    });
+    const rejected = await j(failed.dispatch(
+      req('POST', '/api/projects', failed.alice.token, { name: 'config-failed', executorId: 1 }),
+    ));
+    expect(rejected.status).toBe(502);
+    expect(rejected.body.error.details).toContain('写入 Git 配置 user.name 失败');
+    expect(rejected.body.error.details).toContain('config denied');
+    expect(failed.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM projects').get()!.n).toBe(0);
+  });
+
   test('普通用户 clone 到默认 workspace：name 从 URL 推导；git clone 参数正确；cloned:true', async () => {
     const s = setupClone();
     const r = await j(
@@ -853,10 +1117,50 @@ describe('POST /api/projects：从 git clone 新建', () => {
     expect(r.body.cloned).toBe(true);
     expect(r.body.project.name).toBe('bar');
     expect(r.body.project.cwd).toBe(`/ws/u${s.alice.user.id}/bar`);
+    expect(s.ensureCalls()).toBe(1);
     // git clone -- <url> <basename> 在父目录执行
-    expect(s.gitCalls).toHaveLength(1);
-    expect(s.gitCalls[0]!.cwd).toBe(`/ws/u${s.alice.user.id}`);
-    expect(s.gitCalls[0]!.args).toEqual(['clone', '--', 'https://github.com/foo/bar.git', 'bar']);
+    const clone = s.gitCalls.find(({ args }) => args.includes('clone'))!;
+    expect(clone.cwd).toBe(`/ws/u${s.alice.user.id}`);
+    expect(clone.args).toEqual(['clone', '--', 'https://github.com/foo/bar.git', 'bar']);
+  });
+
+  test('SSH clone 以 accept-new 持久化首次主机密钥，后续密钥变化仍保持严格校验', async () => {
+    for (const gitUrl of ['git@github.com:foo/bar.git', 'ssh://git@github.com/foo/bar.git']) {
+      const s = setupClone();
+      const r = await j(s.dispatch(req('POST', '/api/projects', s.alice.token, { executorId: 1, gitUrl })));
+      expect(r.status).toBe(200);
+      expect(s.mkdirCalls).toContain('/root/.ssh');
+      expect(s.gitCalls[0]!.args).toEqual([
+        '-c',
+        "core.sshCommand=ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile='/root/.ssh/known_hosts'",
+        'clone',
+        '--',
+        gitUrl,
+        'bar',
+      ]);
+      expect(s.gitCalls[0]!.args.join(' ')).not.toContain('StrictHostKeyChecking=no');
+    }
+  });
+
+  test('SSH clone 无法解析执行机用户 Home 时停止，主机密钥变化返回明确拒绝原因', async () => {
+    const noHome = setupClone({ passwd: 'nobody:x:65534:65534::/nonexistent:/usr/sbin/nologin' });
+    const missing = await j(noHome.dispatch(req('POST', '/api/projects', noHome.alice.token, {
+      executorId: 1,
+      gitUrl: 'git@github.com:foo/bar.git',
+    })));
+    expect(missing.status).toBe(502);
+    expect(missing.body.error.details).toContain('无法解析执行机用户 root 的 Home');
+    expect(noHome.gitCalls).toHaveLength(0);
+
+    const changed = setupClone({
+      gitResult: { code: 128, out: '', err: 'WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!' },
+    });
+    const rejected = await j(changed.dispatch(req('POST', '/api/projects', changed.alice.token, {
+      executorId: 1,
+      gitUrl: 'git@github.com:foo/bar.git',
+    })));
+    expect(rejected.status).toBe(502);
+    expect(rejected.body.error.details).toContain('主机密钥与 known_hosts 不一致，已拒绝连接');
   });
 
   test('非法 gitUrl → 400；目标目录已存在且非空 → 400；未接 driver → 503', async () => {
@@ -977,6 +1281,7 @@ function setupSummary(
       db,
       llm: fakeLlm(llmReply),
       driverForProject: () => readmeDriver(readme),
+      driverFor: () => projectCreationDriver(),
       ...(summaryOrchestrator ? { summaryOrchestrator } : {}),
     }),
     authDepsFromDb(db, users),
@@ -1062,7 +1367,10 @@ describe('POST /api/projects/:projectId/readme-summary', () => {
       `INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir)
        VALUES ('local', '127.0.0.1', 22, 'root', 'k', '/ws', '/claude')`,
     );
-    const dispatch = createDispatcher(projectsRoutes({ db }), authDepsFromDb(db, users));
+    const dispatch = createDispatcher(
+      projectsRoutes({ db, driverFor: () => projectCreationDriver() }),
+      authDepsFromDb(db, users),
+    );
     const p = (await j(dispatch(req('POST', '/api/projects', alice.token, { name: 'demo', executorId: 1 }))))
       .body.project;
     const r = await j(dispatch(req('POST', `/api/projects/${p.id}/readme-summary`, alice.token)));

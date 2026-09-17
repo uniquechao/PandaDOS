@@ -50,7 +50,7 @@ export function canEditSubtask(
 ): boolean {
   if (subtask.done) return false;
   if (status === 'plan_review') return true;
-  if (status === 'blocked') return index >= subIndex;
+  if (status === 'blocked' || status === 'paused') return index >= subIndex;
   return implMode === 'seq' && status === 'implementing' && index > subIndex;
 }
 
@@ -66,7 +66,7 @@ export function execProgressState(subs: Subtask[], subIndex: number, status: Iss
       ? 'done'
       : status === 'cancelled'
         ? 'cancelled'
-        : status === 'blocked' && i === subIndex
+        : (status === 'blocked' || status === 'paused') && i === subIndex
           ? 'blocked'
           : running && i === subIndex
             ? 'cur'

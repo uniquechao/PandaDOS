@@ -71,6 +71,20 @@ class FakeDriver implements SummaryDriver {
     const bytes = new TextEncoder().encode(this.files.get(path) ?? '');
     return { data: bytes.subarray(offset, offset + limit), size: bytes.length };
   }
+  /** 诊断用：列 scratch 目录（#280）——按 files 里的路径前缀推出直接子项 */
+  async listDir(path: string) {
+    const prefix = `${path}/`;
+    const names = new Set<string>();
+    for (const key of this.files.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      const rest = key.slice(prefix.length);
+      const [head] = rest.split('/');
+      if (head) names.add(rest.includes('/') ? `${head}/` : head);
+    }
+    return [...names].map((name) => name.endsWith('/')
+      ? { name: name.slice(0, -1), type: 'dir' as const }
+      : { name, type: 'file' as const });
+  }
   async removeTree(path: string) {
     this.removed.push(path);
     for (const k of [...this.files.keys()]) {

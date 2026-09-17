@@ -44,4 +44,10 @@ describe('cmdHeadView', () => {
     expect(h.dur).toBe('');
     expect(h.hasOut).toBe(false);
   });
+
+  test('已完成但输出为空：仍可展开查看无输出状态', () => {
+    const h = cmdHeadView(cmd({ input: '$ true', result: '' }), false);
+    expect(h.preview).toBe('');
+    expect(h.hasOut).toBe(true);
+  });
 });

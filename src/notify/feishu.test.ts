@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import type { Database } from 'bun:sqlite';
 import { catalogs } from '../../shared/i18n/catalogs';
 import { createI18n } from '../../shared/i18n/formatter';
@@ -10,6 +10,9 @@ import {
   BIND_TEST_TEXT,
   CARD_REJECT_NOTE,
   FeishuChannel,
+  FEISHU_MESSAGE_DEDUP_MAX,
+  FEISHU_MESSAGE_DEDUP_TTL_MS,
+  type FeishuConnectionState,
   type FeishuEventHandlers,
   type FeishuMessageCreateArgs,
   type FeishuSdk,
@@ -21,7 +24,7 @@ import {
 function fakeSdk() {
   const sent: FeishuMessageCreateArgs[] = [];
   let handlers: FeishuEventHandlers | null = null;
-  const state = { fail: false, connects: 0, stopped: 0 };
+  const state = { fail: false, connects: 0, stopped: 0, response: {} as unknown, connection: 'connecting' as FeishuConnectionState };
   const sdk: FeishuSdk = {
     async connect(_cfg, h) {
       state.connects++;
@@ -34,12 +37,13 @@ function fakeSdk() {
                 create: async (args: FeishuMessageCreateArgs) => {
                   if (state.fail) throw new Error('net down');
                   sent.push(args);
-                  return {};
+                  return state.response;
                 },
               },
             },
           },
         },
+        status: () => state.connection,
         stop: () => {
           state.stopped++;
         },
@@ -111,7 +115,7 @@ async function wire(db: Database, opts: { noDecide?: boolean } = {}): Promise<Wi
               return decideResult;
             },
           }),
-      onInbound: (openid, text) => inbound.push({ openid, text }),
+      onInbound: (openid, text) => { inbound.push({ openid, text }); },
       onSelection: (requestId, optionIndex, openid) => selections.push({ requestId, optionIndex, openid }),
     },
   );
@@ -173,7 +177,7 @@ describe('FeishuChannel 收发（SDK mock）', () => {
     expect(ch.sendText({ userId: 1, address: 'x' }, 'hi')).rejects.toThrow('未连接');
   });
 
-  test('入站：text 解析正文；非文本降级占位', async () => {
+  test('入站：text 解析正文；非文本忽略', async () => {
     const s = seed();
     const w = await wire(s.db);
     await w.fk.handlers().onInbound({
@@ -187,7 +191,6 @@ describe('FeishuChannel 收发（SDK mock）', () => {
     await w.fk.handlers().onInbound({ message: { message_type: 'text', content: '{}' } }); // 无 openid：丢
     expect(w.inbound).toEqual([
       { openid: 'ou_alice', text: '进展如何' },
-      { openid: 'ou_alice', text: '[image]' },
     ]);
   });
 
@@ -355,4 +358,95 @@ describe('selection 回调（v1 兼容 + 严格校验）', () => {
     const r = await w.fk.handlers().onCard({ operator: { open_id: 'x' }, action: { value: { forge: 'other' } } });
     expect(r).toBeUndefined();
   });
+});
+
+
+describe('飞书连接状态与事件边界', () => {
+  test('状态取 SDK 实际状态，只有发送成功更新时间', async () => {
+    const s = seed(); const w = await wire(s.db);
+    expect(w.ch.status()).toEqual({ state: 'connecting', lastReceivedAt: null, lastSentAt: null, lastError: null });
+    for (const state of ['connected', 'reconnecting', 'failed'] as const) {
+      w.fk.state.connection = state;
+      expect(w.ch.status().state).toBe(state);
+    }
+    expect(w.ch.status().lastError).toBe('connection_failed');
+    w.fk.state.connection = 'connected'; w.fk.state.response = { code: 0 };
+    await w.ch.sendText({ userId: 1, address: 'ou_alice' }, 'hello');
+    const sentAt = w.ch.status().lastSentAt;
+    expect(sentAt).toBeGreaterThan(0);
+    expect(w.ch.status().lastError).toBeNull();
+    for (const response of [{ code: 999, msg: 'secret' }, { code: '0' }, { code: null }, null, 'bad']) {
+      w.fk.state.response = response;
+      await expect(w.ch.sendCard('ou_alice', {})).rejects.toThrow('send_failed');
+      expect(await w.ch.verifyBinding('ou_alice')).toBe(false);
+      expect(w.ch.status().lastSentAt).toBe(sentAt);
+      expect(w.ch.status().lastError).toBe('send_failed');
+    }
+  });
+  test('只处理个人文本，拒绝机器人、群聊、畸形正文并按消息 ID 去重', async () => {
+    const s = seed(); const w = await wire(s.db);
+    const valid = { sender: { sender_type: 'user', sender_id: { open_id: 'ou_alice' } },
+      message: { message_id: 'm1', chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text: 'hello' }) } };
+    for (const data of [
+      { ...valid, sender: { ...valid.sender, sender_type: 'app' } },
+      { ...valid, message: { ...valid.message, chat_type: 'group' } },
+      ...['{', '{}', '{"text":42}', '{"text":"  "}'].map(content => ({ ...valid, message: { ...valid.message, content } })),
+    ]) await w.fk.handlers().onInbound(data);
+    expect(w.inbound).toHaveLength(0);
+    expect(w.ch.status().lastReceivedAt).toBeNull();
+    await Promise.all([w.fk.handlers().onInbound(valid), w.fk.handlers().onInbound(valid)]);
+    expect(w.inbound).toEqual([{ openid: 'ou_alice', text: 'hello' }]);
+    expect(w.ch.status().lastReceivedAt).toBeGreaterThan(0);
+    await w.ch.stop();
+    await w.fk.handlers().onInbound({ ...valid, message: { ...valid.message, message_id: 'm2' } });
+    await w.fk.handlers().onCard({ operator: { open_id: 'ou_alice' }, action: { value: { forge: 'selection', requestId: 'r', optionIndex: 0 } } });
+    expect(w.inbound).toHaveLength(1); expect(w.selections).toHaveLength(0);
+  });
+  test('异步入站回调被等待，异常不会逃逸', async () => {
+    const s = seed(); const fk = fakeSdk(); let release!: () => void; let completed = false;
+    const ch = new FeishuChannel({ appId: 'app', appSecret: 'sec' }, { db: s.db, sdk: fk.sdk,
+      onInbound: async () => { await new Promise<void>(resolve => { release = resolve; }); throw new Error('private-secret'); } });
+    await ch.start();
+    const pending = fk.handlers().onInbound({ sender: { sender_id: { open_id: 'ou_alice' } },
+      message: { message_type: 'text', content: '{"text":"hello"}' } }).then(() => { completed = true; });
+    const log = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await Promise.resolve(); expect(completed).toBe(false); release(); await pending; expect(completed).toBe(true);
+      expect(log).toHaveBeenCalledWith('[feishu] inbound_failed');
+      expect(JSON.stringify(log.mock.calls)).not.toContain('private-secret');
+    } finally { log.mockRestore(); }
+  });
+  test('连接尚未完成时 stop，迟到连接关闭且不能恢复回调', async () => {
+    const s = seed(); const fk = fakeSdk(); let release!: () => void; let inbound = 0;
+    const ch = new FeishuChannel({ appId: 'app', appSecret: 'sec' }, { db: s.db,
+      sdk: { connect: async (cfg, handlers) => { await new Promise<void>(resolve => { release = resolve; }); return fk.sdk.connect(cfg, handlers); } },
+      onInbound: () => { inbound++; } });
+    const pending = ch.start(); await ch.stop(); release(); await pending;
+    expect(fk.state.stopped).toBe(1);
+    await fk.handlers().onInbound({ sender: { sender_id: { open_id: 'ou_alice' } }, message: { message_type: 'text', content: '{"text":"hi"}' } });
+    expect(inbound).toBe(0);
+    await expect(ch.sendText({ userId: 1, address: 'ou_alice' }, 'hi')).rejects.toThrow('未连接');
+  });
+});
+
+
+test('消息去重有 TTL 与容量上限', async () => {
+  const s = seed(); const w = await wire(s.db);
+  const now = spyOn(Date, 'now'); let time = 1_000_000; now.mockImplementation(() => time);
+  const deliver = (id: string) => w.fk.handlers().onInbound({ sender: { sender_id: { open_id: 'ou_alice' } },
+    message: { message_id: id, message_type: 'text', content: '{"text":"hello"}' } });
+  try {
+    await deliver('old'); await deliver('old'); expect(w.inbound).toHaveLength(1);
+    time += FEISHU_MESSAGE_DEDUP_TTL_MS; await deliver('old'); expect(w.inbound).toHaveLength(2);
+    for (let i = 0; i < FEISHU_MESSAGE_DEDUP_MAX; i++) await deliver(`m${i}`);
+    await deliver('old'); expect(w.inbound).toHaveLength(FEISHU_MESSAGE_DEDUP_MAX + 3);
+  } finally { now.mockRestore(); }
+});
+
+test('连接失败只返回安全错误和失败状态', async () => {
+  const s = seed();
+  const ch = new FeishuChannel({ appId: 'app', appSecret: 'sec' }, { db: s.db,
+    sdk: { connect: async () => { throw new Error('private-secret'); } } });
+  await expect(ch.start()).rejects.toThrow('connection_failed');
+  expect(ch.status()).toEqual({ state: 'failed', lastReceivedAt: null, lastSentAt: null, lastError: 'connection_failed' });
 });

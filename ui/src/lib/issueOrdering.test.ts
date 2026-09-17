@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { Issue } from './types';
-import { filterIssueList, pageSlice, sortBoardGroup } from './issueOrdering';
+import { filterIssueList, pageSlice, pickDefaultIssueId, sortBoardGroup } from './issueOrdering';
 
 function issue(id: number, patch: Partial<Issue> = {}): Issue {
   return {
@@ -28,6 +28,7 @@ function issue(id: number, patch: Partial<Issue> = {}): Issue {
     pinnedTs: null,
     clarifyFeedback: null,
     resultSummary: null,
+    completionReport: null,
     autoApprove: 'medium',
     ...patch,
   };
@@ -107,5 +108,33 @@ describe('pageSlice（收尾组 50/页）', () => {
     // 空列表也有 1 页（渲染侧 pages>1 才出分页脚）
     expect(pageSlice([], 0)).toMatchObject({ page: 0, pages: 1, rows: [] });
     expect(pageSlice(nums, 1, 30).rows[0]).toBe(30);
+  });
+});
+
+describe('pickDefaultIssueId', () => {
+  test('有待处理的 issue 时仍优先它，而不是最近完成的', () => {
+    const list = [
+      issue(1, { status: 'done', doneTs: 100 }),
+      issue(2, { status: 'pending' }),
+      issue(3, { status: 'implementing' }),
+    ];
+    expect(pickDefaultIssueId(list)).toBe(3);
+    expect(pickDefaultIssueId([list[0], list[1]])).toBe(2);
+  });
+
+  test('只剩已完成等收尾 issue 时选完成时间最新的那条', () => {
+    const list = [
+      issue(1, { status: 'cancelled' }),
+      issue(2, { status: 'done', doneTs: 300 }),
+      issue(3, { status: 'done', doneTs: 500 }),
+      issue(4, { status: 'done', doneTs: 400 }),
+      issue(5, { status: 'blocked' }),
+    ];
+    expect(pickDefaultIssueId(list)).toBe(3);
+  });
+
+  test('没有已完成 issue 时退回列表第一条，空列表为 null', () => {
+    expect(pickDefaultIssueId([issue(7, { status: 'cancelled' }), issue(8, { status: 'blocked' })])).toBe(7);
+    expect(pickDefaultIssueId([])).toBeNull();
   });
 });

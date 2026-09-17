@@ -16,6 +16,7 @@
  *   其兜底是调用方的 no_menu 自愈路径（下一 tick / 客户端重试）。
  */
 import type {
+  CommandResult,
   DirEntry,
   ExecutorDriver,
   FileRange,
@@ -212,12 +213,20 @@ export class PaneCacheDriver implements ExecutorDriver {
     return this.inner.movePath(src, dst);
   }
 
+  ensureGitAvailable(): Promise<void> {
+    return this.inner.ensureGitAvailable();
+  }
+
   git(cwd: string, args: string[]): Promise<GitResult> {
     return this.inner.git(cwd, args);
   }
 
   readGitBlob(cwd: string, rev: string, path: string): Promise<GitBlobResult> {
     return this.inner.readGitBlob(cwd, rev, path);
+  }
+
+  runCommand(cwd: string, argv: string[], timeoutMs: number): Promise<CommandResult> {
+    return this.inner.runCommand(cwd, argv, timeoutMs); // 门禁输出不缓存：每次都要现跑
   }
 
   openPty(cmd: string, cols: number, rows: number): Promise<PtyChannel> {

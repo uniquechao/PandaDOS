@@ -1,3 +1,5 @@
+import { feishuChatMessages } from '../domains/feishu-chat';
+import { feishuLoginMessages } from '../domains/feishu-login';
 import type { MessageCatalog } from '../messages';
 import { shellMessages } from '../domains/shell';
 import { actionMessages } from '../domains/actions';
@@ -17,11 +19,15 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const koCatalog = {
+  ...feishuChatMessages["ko"],
+  ...feishuLoginMessages["ko"],
   ...shellMessages.ko,
   ...actionMessages.ko,
   ...commonUiMessages.ko,
+  'issue.validation': '게이트', 'issue.validationTargeted': '선별({files}개 파일)', 'issue.validationFull': '전체', 'issue.validationPassed': '통과', 'issue.validationFailed': '실패({label}, 종료 코드 {code})', 'issue.validationSkipped': '건너뜀', 'issue.validationPending': '아직 실행 안 함', 'issue.pushFailedTitle':'완료되었지만 변경 사항이 원격에 푸시되지 않았습니다','issue.pushFailedHint':'변경 사항은 로컬에 커밋되어 있습니다. 수동으로 푸시한 뒤 확인하세요.','issue.pushFailedBranch':'브랜치 {branch}',
+  'issue.completionReport':'완료 보고서','issue.reportOutcomeComplete':'목표 달성','issue.reportOutcomePartial':'일부 완료','issue.reportOutcomeBlocked':'차단됨','issue.reportOutcomeUnverified':'검증되지 않은 이전 요약','issue.reportObjective':'구현 목표','issue.reportImplementation':'구현 방법','issue.reportAdvantages':'장점','issue.reportDisadvantages':'단점 및 절충점','issue.reportVerification':'검증 근거','issue.reportCompletion':'완료 상태','issue.reportUnmetGoals':'달성하지 못한 목표','issue.reportRemainingWork':'필수 후속 작업','issue.reportAttentionTitle':'이 issue는 아직 완전히 완료되지 않았습니다','issue.reportLegacyWarningTitle':'이 완료 기록은 구조적으로 검증되지 않았습니다','issue.reportLegacyWarning':'이전 기록에는 자유 형식 요약만 있어 PandaDOS가 모든 목표 달성과 필수 후속 작업 여부를 확인할 수 없습니다.','issue.continueProcessing':'계속 처리','issue.continueProcessingTitle':'완료 상태 수정 후 계속','issue.continueProcessingWarningTitle':'issue를 다시 엽니다','issue.continueProcessingWarning':'완료되지 않은 내용을 입력하세요. issue는 계획 단계로 돌아가 즉시 실행될 수 있습니다.','issue.continueGuidance':'미달성 목표 또는 후속 작업 지침','issue.continueGuidancePlaceholder':'달성하지 못한 목표와 다음에 완료할 작업을 입력하세요…','issue.continueGuidanceRequired':'계속하기 전에 미달성 목표 또는 필수 후속 작업을 입력하세요.','issue.confirmContinueProcessing':'다시 열고 계속',
   'issue.recoveryLength':'{current} / {max}자',
-  'issue.recoveryTitle':'차단 해결','issue.recoveryReason':'실행이 중단된 이유','issue.recoveryHelp':'구체적인 해결 지침을 추가하거나 issue와 차단된 하위 작업을 수정하세요. 편집 내용을 저장해도 자동으로 다시 실행되지 않습니다.','issue.recoveryGuidance':'추가 의견 또는 해결 방법','issue.recoveryGuidancePlaceholder':'변경할 내용, 사용할 방법 또는 차단 해결 방법을 입력하세요…','issue.recoveryGuidanceRequired':'계속하기 전에 추가 의견 또는 해결 방법을 입력하세요.','issue.editBlockedIssue':'issue 편집','issue.editBlockedIssueHint':'제목, 세부 정보, 설정 또는 이미지 수정','issue.editBlockedSubtask':'차단된 하위 작업 편집','issue.editBlockedSubtaskHint':'다시 시도하기 전에 현재 단계를 수정','issue.noEditableBlockedSubtask':'편집할 수 있는 미완료 하위 작업이 없습니다','issue.recoveryQueueHint':'확인하면 issue가 계획 단계로 돌아가 즉시 실행될 수 있습니다.','issue.confirmRecovery':'의견 제출 후 다시 실행','issue.openRecovery':'차단 해결',
+  'issue.recoveryTitle':'차단 해결','issue.recoveryReason':'실행이 중단된 이유','issue.recoveryHelp':'구체적인 처리 지침을 추가하거나 계속하기 전에 issue와 차단된 하위 작업을 수정하세요. 편집 내용을 저장해도 실행이 자동으로 재개되지는 않습니다.','issue.recoveryGuidance':'추가 의견 또는 해결 방법','issue.recoveryGuidancePlaceholder':'변경할 내용, 사용할 방법 또는 차단 해결 방법을 입력하세요…','issue.recoveryGuidanceRequired':'계속하기 전에 추가 의견 또는 해결 방법을 입력하세요.','issue.editBlockedIssue':'issue 편집','issue.editBlockedIssueHint':'제목, 세부 정보, 설정 또는 이미지 수정','issue.editBlockedSubtask':'차단된 하위 작업 편집','issue.editBlockedSubtaskHint':'계속하기 전에 현재 차단된 단계 수정','issue.noEditableBlockedSubtask':'편집할 수 있는 미완료 하위 작업이 없습니다','issue.recoveryQueueHint':'확인 후 issue는 중단된 단계부터 계속됩니다. 복구 정보를 사용할 수 없는 경우에만 안전하게 계획 단계로 돌아갑니다.','issue.confirmRecovery':'지침을 제출하고 계속','issue.mergedFrom': '여러 issue를 병합한 항목', 'issue.unmerge': '병합 되돌리기', 'issue.unmergeLocked': '이미 실행 중이라 병합을 되돌릴 수 없습니다.', 'issue.unblockQueued': '대기 중입니다. 현재 작업이 끝나면 자동으로 재개됩니다.', 'issue.unblockQueuedCancel': '대기 취소', 'issue.openRecovery':'차단 해결',
   ...statusMessages.ko,
   ...errorMessages.ko,
   ...notifyMessages.ko,
@@ -98,7 +104,7 @@ export const koCatalog = {
   'ui.dragList': '드래그하여 목록 크기 조절', 'ui.dragListReset': '드래그하여 목록 크기 조절 · 두 번 클릭하여 초기화',
   'ui.terminalDisconnected': '터미널 연결이 끊겼습니다', 'ui.terminalEnded': '터미널 세션이 종료되었습니다',
   'ui.subtaskProgress': '하위 작업 진행률', 'ui.completedProgress': '{done}/{total} 완료', 'ui.endpoint': '엔드포인트',
-  'ui.collapse': '접기', 'ui.expandCount': '펼치기 · {count}', 'ui.issueNoMessages': '이 issue에는 아직 채팅 메시지가 없습니다',
+  'ui.collapse': '접기', 'ui.expandCount': '펼치기 · {count}', 'ui.reasoningEffort': '추론 강도', 'ui.reasoningInherit': '상속', 'ui.reasoningCodexOnly': 'codex에만 적용되며 다음 세션 시작부터 반영됩니다.', 'issue.reasoningEffective': '적용: {effort}({source, select, issue {이 issue} module {모듈} other {기본값}}에서)', 'ui.moduleSkills': '스킬', 'ui.moduleSkillsDefault': '미설정: 프로젝트 기본값을 따릅니다(superpowers 같은 무거운 스킬은 기본적으로 꺼져 있으며 여기서 선택해야 합니다).', 'ui.moduleSkillsExplicit': '이 모듈에 대해 명시적으로 설정됨.', 'ui.useProjectDefault': '프로젝트 기본값 사용', 'ui.noSkills': '설치된 스킬이 없습니다', 'ui.moduleHistory': '이 모듈의 이전 기록', 'ui.segmentInEarlierConv': '이 기록은 이전 대화에 있습니다. 해당 issue를 열면 볼 수 있습니다.', 'ui.issueNoMessages': '이 issue에는 아직 채팅 메시지가 없습니다',
   'ui.directoryPicker': '실행기 디렉터리 선택', 'ui.parentDirectory': '상위',
   'ui.directoryMissing': '이 디렉터리는 아직 없습니다. 여기에서 만들 수 있습니다.', 'ui.reading': '읽는 중…',
   'ui.noSubdirectories': '하위 디렉터리 없음', 'ui.tooManyDirectories': '디렉터리가 너무 많아 처음 1,000개만 표시합니다.',
@@ -141,7 +147,7 @@ export const koCatalog = {
   'view.noConversations': '아직 대화가 없습니다. 에이전트를 선택하고 새로 만들기를 누르세요.',
   'view.updateProjectMemory': '채팅 기록과 저장소에서 프로젝트 메모리를 업데이트하고 CLAUDE.md/AGENTS.md를 새로 고칩니다.',
   'view.filesPreview': '파일 및 미리 보기', 'view.memoryUpdateFailed': '메모리 업데이트 실패: {error}',
-  'view.conversationListWidth': '대화 목록 너비', 'view.chooseConversation': '대화를 선택하거나 만드세요.',
+  'view.conversationListWidth': '대화 목록 너비', 'view.chooseConversation': '대화를 선택하거나 만드세요.', 'view.copyConversationId': '대화 ID {id} 복사',
   'view.startingNative': '네이티브 세션 시작 중…', 'view.uploadCurrentDirectory': '현재 디렉터리에 업로드',
   'view.collapsePreview': '미리 보기 접기', 'view.openFullFiles': '전체 파일 보기에서 열기', 'view.downloadToOpen': '보려면 다운로드하세요',
   'view.personaHelp': '페르소나(어시스턴트가 사용자를 부르고 함께 일하는 방식)',
@@ -164,7 +170,7 @@ export const koCatalog = {
   'project.archivedCount': '보관됨({count})', 'project.gitRequired': 'Git 저장소 URL을 입력하세요',
   'project.clonedCreated': '저장소를 복제하고 프로젝트를 만들었습니다', 'project.createdWarnings': '경고와 함께 생성됨:\n{warnings}',
   'project.newProject': '새 프로젝트',
-  'project.issueModeHelp':'issue 모드: Issue 보드에서 작업을 정리하고 Agent가 프로젝트 워크플로에 따라 실행하도록 합니다.','project.chatModeHelp': '채팅 모드: issue 없이 질문하거나 프로젝트 디렉터리에 파일을 만들 수 있으며, 프로젝트마다 여러 대화를 둘 수 있습니다.',
+
   'project.projectName': '프로젝트 이름', 'project.repoNameDefault': ' (비워 두면 저장소 이름 사용)', 'project.cloneTo': '복제 위치',
   'project.selectedUserHome': '선택한 사용자의 홈', 'project.yourWorkspace': '내 작업 공간', 'project.pickDirectory': '디렉터리 선택',
   'project.branchFallbackHelp': '작업은 현재 브랜치에서 진행됩니다. PandaDOS는 브랜치를 만들거나 전환하거나 병합하지 않으며, 현재 브랜치를 읽을 수 없을 때만 이 값을 대신 사용합니다.',
@@ -176,7 +182,7 @@ export const koCatalog = {
   'project.importing': '가져오는 중…', 'project.import': '가져오기', 'project.linuxUser': 'Linux 사용자(프로젝트 디렉터리 소유자)',
   'project.startedSummary': '{mode}(으)로 생성을 시작했습니다. 잠시 걸릴 수 있습니다…',
   'project.archiveConfirm': '프로젝트 “{name}”을(를) {verb}할까요? {hint}', 'project.archiveSuccess': '“{name}” {verb} 완료',
-  'project.projectType': '프로젝트 유형', 'project.issueBoard': 'Issue 보드', 'project.blankProject': '빈 프로젝트',
+    'project.blankProject': '빈 프로젝트',
   'project.cloneFromGit': 'Git에서 복제', 'project.gitUrl': 'Git 저장소 URL',
   'project.gitUrlPlaceholder': 'https://github.com/owner/repo.git 또는 git@host:owner/repo.git', 'project.executor': '실행기',
   'project.goalOptional': '목표(프로젝트 어시스턴트용, 선택 사항)', 'project.locationOptional': '{target}(선택 사항, 기본값: {home})',
@@ -239,7 +245,7 @@ export const koCatalog = {
   'issue.committed': '커밋됨', 'issue.commitHistory': '커밋 기록 · {count}',
   'issue.noChangesRunning': '진행 중이며 아직 변경 사항이 없습니다. 에이전트의 변경 사항은 자동 커밋 전에 여기에 표시됩니다.',
   'issue.noChanges': '이 issue에서 아직 변경 사항이 생성되지 않았습니다.', 'issue.changeTreeWidth': '변경 트리 너비',
-  'issue.collapseDiff': 'diff 접기', 'issue.chooseChange': 'diff를 볼 파일이나 세부 정보를 볼 커밋을 선택하세요.',
+  'issue.collapseDiff': 'diff 접기', 'issue.chooseChange': 'diff를 볼 파일을 선택해 주세요.',
   'issue.planReview': '계획 승인', 'issue.mergeReview': '병합 전 검토',
   'issue.feedbackPlaceholder': '거절할 때는 피드백이 필요하며 Claude에 전송됩니다.',
   'issue.approvePlan': '계획 승인', 'issue.approveMerge': '병합 승인',
@@ -265,7 +271,7 @@ export const koCatalog = {
   'issue.agentFeedback': '에이전트 피드백(최근 분석)', 'issue.agentReanalyzingInline': '에이전트가 다시 분석 중입니다…',
   'issue.planProgress': '계획({done}/{total})', 'issue.rejectWithFeedback': '피드백과 함께 거절',
   'issue.cancelTask': 'issue 취소', 'issue.regenerateReview': '검토 다시 생성', 'issue.blocked': '차단됨',
-  'issue.cancelIssue': 'issue 취소', 'issue.unblockRerun': '차단 해제 후 재실행', 'issue.start': '시작',
+  'issue.cancelIssue': 'issue 취소', 'issue.unblockContinue': '차단 해제 후 계속', 'issue.start': '시작',
   'issue.submitClarification': '확인 답변 제출', 'issue.runAgainConfirm': '이 issue를 다시 실행할까요?\n\n{hint}.',
   'issue.deleteConfirm': 'issue #{id}을(를) 삭제할까요?',
   'issue.cancelledCanRerun': '취소됨 — 요청을 편집한 뒤 다시 실행하세요', 'issue.editAction': '편집', 'issue.runAgain': '다시 실행',
@@ -336,7 +342,8 @@ export const koCatalog = {
   'skills.globalSkillsPath': '실행기의 ~/.claude/skills 및 번들 플러그인 스킬', 'skills.noGlobalSkills': '전역 스킬 없음',
 
   'admin.users': '사용자', 'admin.executors': '실행기', 'admin.llm': '구동 모델', 'admin.ownership': '프로젝트 소유권',
-  'admin.overview': '활동 개요', 'admin.configApplied': '구동 모델 구성이 활성화되었습니다',
+  'admin.scope': '구분', 'admin.costAmount': '금액(USD)', 'admin.costRescan': '다시 스캔', 'admin.cost': '비용', 'admin.costTokens': '토큰(입력 / 캐시 / 출력 / 추론)', 'admin.costRequests': '요청 수', 'admin.costTools': '도구 호출', 'admin.costCompactions': '압축 횟수', 'admin.costChat': 'Issue 외 세션', 'admin.costUnattributed': '미귀속', 'admin.costGateTime': '게이트 소요 시간', 'admin.costRetries': '재시도 횟수', 'admin.costWindowNote': '합계는 모든 세션의 누적값이며, 기간 필터는 아래 issue 목록에만 적용됩니다.',
+  'admin.costWeekly': '주간 보기', 'admin.costWeekPrev': '이전 주', 'admin.costWeekThis': '이번 주', 'admin.costWeekNext': '다음 주', 'admin.costWeekRange': '{start} ~ {end}', 'admin.costDay': '날짜', 'admin.costModule': '모듈', 'admin.costDone': '완료 수', 'admin.costFailureRate': '실패율', 'admin.costRecoveryRate': '복구율', 'admin.costUnmoduled': '모듈 없음', 'admin.costWeeklyNote': '하루는 베이징 시간 자정에 시작하고 주는 월요일부터입니다. 실패율 = 이번 주에 결과가 나온 이슈 중 차단 또는 취소된 비율, 복구율 = 차단 후 완료로 돌아온 비율입니다.', 'admin.overview': '활동 개요', 'admin.configApplied': '구동 모델 구성이 활성화되었습니다',
   'admin.configIncomplete': '구성이 저장되었지만 완전하지 않습니다',
   'admin.clearKeyConfirm': '현재 API 키를 지울까요? 구동 모델을 사용하는 기능이 일시 중지됩니다.',
   'admin.keyCleared': 'API 키를 지웠습니다',

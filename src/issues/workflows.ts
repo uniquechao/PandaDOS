@@ -65,6 +65,7 @@ export interface CreateWorkflowTemplateInput {
 
 interface TemplateRow {
   id: number;
+  sync_uid?: string | null;
   project_id: number;
   name: string;
   description: string | null;
@@ -205,6 +206,7 @@ function positiveInteger(value: unknown, fallback: number, max: number): number 
 function mapTemplate(row: TemplateRow): ProjectWorkflowTemplate {
   return {
     id: row.id,
+    ...(row.sync_uid ? { syncUid: row.sync_uid } : {}),
     projectId: row.project_id,
     name: row.name,
     description: row.description,

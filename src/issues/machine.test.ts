@@ -9,7 +9,7 @@ import {
 
 /** 全事件清单——新增事件时**必须**同步这里，终态穷举用例才不会漏检 */
 const ALL_EVENTS: IssueMachineEvent[] = [
-  'start_clarifying', 'skip_clarifying', 'clarified', 'plan_ready', 'plan_approved',
+  'work_remaining', 'start_direct', 'request_plan', 'pause', 'start_clarifying', 'skip_clarifying', 'clarified', 'plan_ready', 'plan_approved',
   'plan_rejected', 'impl_done', 'tests_passed', 'tests_failed', 'review_approved',
   'review_rejected', 'merged', 'merge_conflict', 'block', 'cancel', 'unblock', 'reopen',
 ];
@@ -42,12 +42,16 @@ describe('issue 状态机：合法转换', () => {
     expect(transition('merging', 'merge_conflict')).toBe('blocked');
   });
 
-  test('blocked 可人工重启回 pending', () => {
+  test('blocked 按持久化来源阶段继续，缺少有效来源时安全回到 planning', () => {
+    expect(transition('blocked', 'unblock', { resumeState: 'implementing' })).toBe('implementing');
+    expect(transition('blocked', 'unblock', { resumeState: 'testing' })).toBe('testing');
     expect(transition('blocked', 'unblock')).toBe('pending');
+    expect(transition('blocked', 'unblock', { resumeState: 'blocked' })).toBe('pending');
   });
 
-  test('cancelled 可人工复活回 pending（#93）', () => {
+  test('cancelled 或历史误标 done 可人工退回 pending', () => {
     expect(transition('cancelled', 'reopen')).toBe('pending');
+    expect(transition('done', 'reopen')).toBe('pending');
   });
 
   test('复活后能重新走完整条流程（不是死路）', () => {
@@ -79,8 +83,9 @@ describe('issue 状态机：非法转换返回 null', () => {
     expect(transition('testing', 'plan_ready')).toBeNull();
   });
 
-  test('done 是真终态：拒绝一切事件（含 reopen）', () => {
+  test('done 除人工 reopen 外拒绝其他事件', () => {
     for (const e of ALL_EVENTS) {
+      if (e === 'reopen') continue;
       expect(transition('done', e)).toBeNull();
     }
   });
@@ -111,8 +116,8 @@ describe('issue 状态机：testing 失败回退计数（上限 3）', () => {
   });
 
   test('第 4 次失败（超限）→ blocked', () => {
-    expect(transition('testing', 'tests_failed', { failCount: MAX_TEST_FAILURES + 1 })).toBe('blocked');
-    expect(transition('testing', 'tests_failed', { failCount: 99 })).toBe('blocked');
+    expect(transition('testing', 'tests_failed', { failCount: MAX_TEST_FAILURES + 1 })).toBe('paused');
+    expect(transition('testing', 'tests_failed', { failCount: 99 })).toBe('paused');
   });
 
   test('缺省 ctx 按第 1 次失败处理', () => {

@@ -10,6 +10,8 @@
  * - UPLOAD_DIR 是与 issue 引擎（images_json 存相对路径）和前端的三方契约，改名三处同步（评审 5.4#10）。
  * - absImages 拼出的是**执行机侧**绝对路径，控制面禁止对其做本地 fs 操作（评审 5.4#11）。
  * - imageReadHint 与 issues/prompts.ts 已平移的一份同文（引擎侧消费那份）；文案改动两处同步。
+ * - 通用文件附件（对话窗口「附文件」）复用同一个上传目录与 git exclude：saveUploadFile /
+ *   fileReadHint / extractUploadFileRels 与截图三件套同构，只按扩展名是否在图片白名单里分流。
  * - addGitExclude 相对 v1 补了 worktree 分支（v1 遇 .git 是文件直接跳过 → 截图污染
  *   worktree 的 git status，评审 5.4 资产表「addGitExclude 需改造」项）。
  */
@@ -37,6 +39,30 @@ export function safeImageName(name: string): string | null {
   return cleaned;
 }
 
+/**
+ * 通用文件附件（对话窗口附文件）大小上限。与文件页 fs/upload 的 MAX_FS_UPLOAD_BYTES 同为 20MB，
+ * 但那是「传进工作区某目录」的口径、这是「传进 .panda/uploads 当消息附件」的口径，故各自持有常量。
+ */
+export const MAX_UPLOAD_FILE_BYTES = 20 * 1024 * 1024;
+
+/**
+ * 净化通用附件的文件名：与 safeImageName 同款严格白名单（仅 \w . -），但**不限扩展名**、
+ * 也允许无扩展名（Makefile 这类）。空名/只剩点 → null。
+ *
+ * 这里不能沿用 core/files.ts 的宽松 safeFsFileName（它保留空格与中文）：对话附件的路径要拼进
+ * 注入给代理的提示、再从终端回显里用正则抠回来（extractUploadFileRels），文件名里一旦有空格，
+ * sendKeys 把换行压成空格后就再也切不出边界了。
+ */
+export function safeUploadFileName(name: string): string | null {
+  const base = (name || '').split(/[/\\]/).pop() ?? '';
+  const cleaned = base
+    .replace(/[^\w.\-]+/g, '_') // 仅留字母数字下划线点连字符
+    .replace(/^\.+/, '') // 去前导点，防止隐藏文件/“..”
+    .slice(0, 100);
+  if (!cleaned || /^\.+$/.test(cleaned)) return null;
+  return cleaned;
+}
+
 /** 每次上传的随机子目录名（避免同名截图互相覆盖） */
 export function uploadId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -60,6 +86,17 @@ export function imageReadHint(absPaths: string[]): string {
   return `\n\n（这条任务附了 ${list.length} 张截图，请先用 Read 工具逐张查看，再据此判断和动手）\n${lines}`;
 }
 
+/**
+ * 把若干附件绝对路径拼成给代理的提示后缀：让它先用 Read 工具逐个看文件再判断。
+ * 与 imageReadHint 同构（措辞随本函数改动同步 IMAGE/FILE_HINT_PREAMBLE_RE）。
+ */
+export function fileReadHint(absPaths: string[]): string {
+  const list = (absPaths || []).filter(Boolean);
+  if (!list.length) return '';
+  const lines = list.map((p) => '· ' + p).join('\n');
+  return `\n\n（这条消息附了 ${list.length} 个文件，请先用 Read 工具逐个查看，再据此判断和动手）\n${lines}`;
+}
+
 // ---------- imageReadHint 的逆运算（把注入回显的用户消息还原成「正文 + 附图 rel」） ----------
 // 对话里的附图不落库（见 web/ws/chat.ts）：发送时经 imageReadHint 把 rel→执行机绝对路径拼成
 // AI 向提示注入会话，回读 jsonl 时用户消息里就是「提示前言 + `· 路径` 列表 + 正文」。下面两个纯函数
@@ -76,6 +113,19 @@ const IMAGE_HINT_PREAMBLE_RE = /（这条任务附了[^）]*张截图[^）]*）/
 const UPLOAD_BULLET_RE = new RegExp(`·\\s*\\S*${UPLOAD_DIR_RE}\\S*`, 'g');
 /** 兜底：任意残留的裸上传路径 token（含可选 abs 前缀） */
 const UPLOAD_TOKEN_RE = new RegExp(`\\S*${UPLOAD_DIR_RE}/[\\w.\\-]+/[\\w.\\-]+\\.(?:${UPLOAD_EXT_RE})`, 'gi');
+/** 上传路径尾段（不限扩展名，含无扩展名）：图片/文件共用，靠 isImageRel 事后分流 */
+const UPLOAD_ANY_REL_RE = new RegExp(`${UPLOAD_DIR_RE}/[\\w.\\-]+/[\\w.\\-]+`, 'g');
+/** fileReadHint 的前言括号块（措辞随 fileReadHint 改动两处同步） */
+const FILE_HINT_PREAMBLE_RE = /（这条消息附了[^）]*个文件[^）]*）/g;
+/** 兜底：任意残留的裸上传路径 token（不限扩展名；bullet 已被 UPLOAD_BULLET_RE 吃掉，这里收剩下的） */
+const UPLOAD_ANY_TOKEN_RE = new RegExp(`\\S*${UPLOAD_DIR_RE}/[\\w.\\-]+/[\\w.\\-]+`, 'g');
+
+/** rel/abs 路径的扩展名是否落在图片白名单里（附件分流：命中=截图，未命中=通用文件） */
+function isImageRel(p: string): boolean {
+  const name = p.split('/').pop() ?? '';
+  const i = name.lastIndexOf('.');
+  return i > 0 && ALLOWED_IMAGE_EXT.has(name.slice(i + 1).toLowerCase());
+}
 
 /**
  * 从「注入回显的用户消息文本」里抠出附图的 cwd 相对路径（供前端缩略图/灯箱预览）。
@@ -96,15 +146,36 @@ export function extractUploadRels(text: string): string[] {
 }
 
 /**
- * 把「注入回显的用户消息文本」里 AI 向的附图提示（前言 + `· 路径` 列表）剥掉，只留用户真正输入的正文。
- * 纯图消息（无正文、只有提示）→ 空串；无附图提示（无任何匹配）→ 原样返回，绝不改动用户文本。
+ * 从「注入回显的用户消息文本」里抠出**非图片**附件的 cwd 相对路径（供前端文件 chip 展示）。
+ * 与 extractUploadRels 同款口径（abs 前缀切片、isUploadRel 复核、顺序去重、上限 6），
+ * 差别只在分流：扩展名命中图片白名单的归 extractUploadRels，其余（含无扩展名）归这里。
+ */
+export function extractUploadFileRels(text: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const m of (text || '').matchAll(UPLOAD_ANY_REL_RE)) {
+    const rel = m[0];
+    if (!isUploadRel(rel) || isImageRel(rel) || seen.has(rel)) continue;
+    seen.add(rel);
+    out.push(rel);
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
+/**
+ * 把「注入回显的用户消息文本」里 AI 向的附件提示（截图前言 / 文件前言 + `· 路径` 列表）剥掉，
+ * 只留用户真正输入的正文。纯附件消息（无正文、只有提示）→ 空串；
+ * 无附件提示（无任何匹配）→ 原样返回，绝不改动用户文本。
  */
 export function stripImageHint(text: string): string {
   const orig = text || '';
   let s = orig.replace(IMAGE_HINT_PREAMBLE_RE, '');
+  s = s.replace(FILE_HINT_PREAMBLE_RE, '');
   s = s.replace(UPLOAD_BULLET_RE, '');
   s = s.replace(UPLOAD_TOKEN_RE, '');
-  if (s === orig) return orig; // 无提示/无图：原样返回（含用户自己的空白/换行）
+  s = s.replace(UPLOAD_ANY_TOKEN_RE, '');
+  if (s === orig) return orig; // 无提示/无附件：原样返回（含用户自己的空白/换行）
   return s.replace(/\s{2,}/g, ' ').trim(); // 有剥离才收拾留下的空白间隙
 }
 
@@ -205,5 +276,26 @@ export async function saveUploadImage(
   const abs = `${base}/${rel}`;
   await fs.writeFile(abs, data); // Driver 自动建父目录
   await addGitExclude(fs, base); // 尽力让截图不进 git status
+  return { rel, abs, name: clean };
+}
+
+/**
+ * 把一个通用附件经 Driver 落到执行机：<cwd>/.panda/uploads/<随机子目录>/<净化名>，
+ * 并尽力把上传目录加进 git exclude。与 saveUploadImage 唯一的差别是文件名净化不限扩展名
+ * （路由层先用 safeUploadFileName 拦 400）。
+ */
+export async function saveUploadFile(
+  fs: UploadFs,
+  cwd: string,
+  name: string,
+  data: Uint8Array,
+): Promise<SavedUpload> {
+  const clean = safeUploadFileName(name);
+  if (!clean) throw new Error(`不支持的文件名: ${name}`);
+  const base = cwd.replace(/\/+$/, '');
+  const rel = `${UPLOAD_DIR}/${uploadId()}/${clean}`;
+  const abs = `${base}/${rel}`;
+  await fs.writeFile(abs, data); // Driver 自动建父目录
+  await addGitExclude(fs, base); // 尽力让附件不进 git status
   return { rel, abs, name: clean };
 }

@@ -149,11 +149,11 @@ CREATE TABLE design_assets (
   path               TEXT,
   mime_type          TEXT,
   width              INTEGER,
-  height             INTEGER,
+  height              INTEGER,
   metadata_json      TEXT,
   error              TEXT,
-  created_ts         INTEGER NOT NULL,
-  updated_ts         INTEGER NOT NULL,
+  created_ts          INTEGER NOT NULL,
+  updated_ts          INTEGER NOT NULL,
   FOREIGN KEY (design_task_id, design_revision)
     REFERENCES design_revisions(design_task_id, revision) ON DELETE RESTRICT
 );

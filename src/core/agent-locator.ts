@@ -32,6 +32,24 @@ export function rolloutSessionId(name: string): string | null {
   return name.match(ROLLOUT_RE)?.[1] ?? null;
 }
 
+/**
+ * 这条 rollout 是不是**子代理线程**（codex multi-agent：主线程派生的 subagent 各写一个文件）。
+ *
+ * 子代理文件的 `payload.session_id` 是**父线程**的 id、`payload.id` 才是自己的，文件名后缀
+ * 又用的是自己的 id——不识别就会出现「sid 记成主线程、path 指着子代理」的错配，网页于是
+ * 显示某个子代理的流水而不是主对话。发现/重认领都只该认主线程，故一律跳过。
+ */
+function isSubagentMeta(p: {
+  session_id?: string;
+  id?: string;
+  parent_thread_id?: string;
+  thread_source?: string;
+}): boolean {
+  if (p.parent_thread_id) return true;
+  if (p.thread_source === 'subagent') return true;
+  return Boolean(p.session_id && p.id && p.session_id !== p.id);
+}
+
 /** 发现窗口：meta 时间允许早于 launch_ts 的富余（执行机/控制面时钟与创建耗时偏差） */
 const LAUNCH_SLACK_MS = 2 * 60 * 1000;
 /** fresh 启动后等待当前 rollout 落盘的确认期；期间不让锚点前旧会话抢先固化绑定。 */
@@ -220,7 +238,7 @@ export class AgentJsonlLocator {
         if (!nameSid || bound.has(nameSid)) continue;
         const path = `${dir}/${f.name}`;
         const meta = await this.readMeta(path);
-        if (!meta || meta.ts === null || meta.ts < sinceTs) continue;
+        if (!meta || meta.subagent || meta.ts === null || meta.ts < sinceTs) continue;
         if (meta.cwd.replace(/\/+$/, '') !== wantCwd) continue;
         if (bound.has(meta.sessionId)) continue;
         if (best && meta.ts <= best.ts) continue; // 取最新
@@ -343,7 +361,9 @@ export class AgentJsonlLocator {
    * timestamp（该行落盘）次之——两者都是带 Z 的 UTC ISO，跨时区解析无歧义；
    * 都解析不出则 ts=null（discover 保守跳过该候选）。
    */
-  private async readMeta(path: string): Promise<{ sessionId: string; cwd: string; ts: number | null } | null> {
+  private async readMeta(
+    path: string,
+  ): Promise<{ sessionId: string; cwd: string; ts: number | null; subagent: boolean } | null> {
     let text: string;
     try {
       const { data } = await this.reader.readFileRange(path, 0, 64 * 1024);
@@ -365,11 +385,26 @@ export class AgentJsonlLocator {
         const e = JSON.parse(text.slice(0, nl)) as {
           type?: string;
           timestamp?: string;
-          payload?: { session_id?: string; id?: string; cwd?: string; timestamp?: string };
+          payload?: {
+            session_id?: string;
+            id?: string;
+            cwd?: string;
+            timestamp?: string;
+            parent_thread_id?: string;
+            thread_source?: string;
+          };
         };
         if (e.type === 'session_meta' && e.payload?.cwd) {
-          const sid = e.payload.session_id ?? e.payload.id;
-          if (sid) return { sessionId: sid, cwd: e.payload.cwd, ts: parseTs(e.payload.timestamp, e.timestamp) };
+          const p = e.payload;
+          const sid = p.session_id ?? p.id;
+          if (sid) {
+            return {
+              sessionId: sid,
+              cwd: e.payload.cwd,
+              ts: parseTs(p.timestamp, e.timestamp),
+              subagent: isSubagentMeta(p),
+            };
+          }
         }
         return null;
       } catch {
@@ -380,7 +415,13 @@ export class AgentJsonlLocator {
     const cwd = text.match(/"cwd":"((?:[^"\\]|\\.)*)"/)?.[1];
     if (!sid || !cwd) return null;
     // 兜底正则取首个 timestamp（session_meta 行内顶层在前，语义同上）
-    return { sessionId: sid, cwd: cwd.replace(/\\(.)/g, '$1'), ts: parseTs(text.match(/"timestamp":"([^"]+)"/)?.[1]) };
+    return {
+      sessionId: sid,
+      cwd: cwd.replace(/\\(.)/g, '$1'),
+      ts: parseTs(text.match(/"timestamp":"([^"]+)"/)?.[1]),
+      // 兜底路径同样要认出子代理：它的 session_meta 里带 parent_thread_id / thread_source
+      subagent: /"parent_thread_id":"[^"]/.test(text) || /"thread_source":"subagent"/.test(text),
+    };
   }
 
   private async discover(
@@ -399,7 +440,7 @@ export class AgentJsonlLocator {
         // 时间判定只信 meta 的 UTC timestamp（文件名时间时区不可靠，见文件头）
         const path = `${dir}/${f.name}`;
         const meta = await this.readMeta(path);
-        if (!meta || meta.ts === null || meta.ts < launchTs - LAUNCH_SLACK_MS) continue;
+        if (!meta || meta.subagent || meta.ts === null || meta.ts < launchTs - LAUNCH_SLACK_MS) continue;
         if (meta.cwd.replace(/\/+$/, '') !== wantCwd) continue;
         if (boundIds.has(meta.sessionId)) continue;
         const candidate = { sessionId: meta.sessionId, path, ts: meta.ts };

@@ -23,8 +23,11 @@ import {
   ensureProjectBridge,
 } from './agent-compat';
 import { judgeAgentLiveness } from './agent-liveness';
+import { codexReasoningArg, resolveReasoningEffort, supportsReasoningEffort } from './reasoning';
 import { isCodexUpdatePrompt } from './screen';
-import type { AgentKind, AutoApproveLevel, Conversation, ProjectKind } from './types';
+import { parseReasoningEffort } from './types';
+import { effectiveSkillPolicy, skillSessionSettings } from './skill-policy';
+import type { AgentKind, AutoApproveLevel, Conversation, ConversationKind } from './types';
 
 // ---------- Driver 最小接口（与 ExecutorDriver 结构兼容） ----------
 
@@ -91,6 +94,7 @@ interface ConvRow {
   /** 014 迁移；旧库兜底 'cautious' */
   auto_approve?: string | null;
   workspace_cwd?: string | null;
+  shared_read_only?: number | null;
 }
 
 function mapConv(r: ConvRow): Conversation {
@@ -106,6 +110,7 @@ function mapConv(r: ConvRow): Conversation {
     // 认不出的值（旧库无此列/脏数据）一律落到最保守档，宁可多问人也不误批
     autoApprove: r.auto_approve === 'medium' || r.auto_approve === 'auto' ? r.auto_approve : 'cautious',
     workspaceCwd: typeof r.workspace_cwd === 'string' && r.workspace_cwd.trim() ? r.workspace_cwd : null,
+    sharedReadOnly: r.shared_read_only === 1,
   };
 }
 
@@ -150,7 +155,10 @@ export const CODEX_NO_UPDATE_FLAG = '-c check_for_update_on_startup=false';
 
 export class AgentExecutableNotFoundError extends Error {
   constructor(readonly agent: AgentKind) {
-    super(`执行机 PATH 中找不到 ${agent === 'claude' ? 'Claude' : 'Codex'} 可执行文件`);
+    super(
+      `执行机 PATH 与登录 shell 中均找不到 ${agent === 'claude' ? 'Claude' : 'Codex'} 可执行文件；` +
+      '请确认已为执行机用户安装，并在执行机设置中重新探测 Agent 能力',
+    );
     this.name = 'AgentExecutableNotFoundError';
   }
 }
@@ -257,6 +265,18 @@ export class ConversationManager {
         )
         .get(projectId, convId);
       if (row) return moduleTmux(projectId, row.slug);
+      // 轮换下来的历史模块会话（#277 / I-01）：模块指针已挪到新 conv，但这条旧 conv 仍
+      // 属于同一个模块，tmux 名必须照旧由 slug 派生。否则它会退化成项目级 `cc-<pid>`——
+      // sleepIssue(旧 conv) 就会去 kill 项目会话，把别的模块正在跑的活儿一起打死。
+      const legacy = this.db
+        .query<{ slug: string }, [number, string]>(
+          `SELECT pm.slug FROM issues i
+             JOIN project_modules pm ON pm.id = i.module_id
+            WHERE pm.project_id = ? AND i.conv_id = ?
+            ORDER BY i.id DESC LIMIT 1`,
+        )
+        .get(projectId, convId);
+      if (legacy) return moduleTmux(projectId, legacy.slug);
     }
     return dedTmux(projectId);
   }
@@ -276,7 +296,7 @@ export class ConversationManager {
     projectId: number,
     label: string,
     agent: AgentKind = 'claude',
-    kind: ProjectKind = 'issue',
+    kind: ConversationKind = 'issue',
   ): Conversation {
     return this.createWithId(crypto.randomUUID(), projectId, label, agent, kind);
   }
@@ -327,7 +347,7 @@ export class ConversationManager {
     projectId: number,
     label: string,
     agent: AgentKind = 'claude',
-    kind: ProjectKind = 'issue',
+    kind: ConversationKind = 'issue',
   ): Conversation {
     const row = this.db
       .query<ConvRow, [string, number, string, number, string, string]>(
@@ -352,7 +372,7 @@ export class ConversationManager {
     projectId: number,
     label: string,
     agent: AgentKind,
-    kind: ProjectKind,
+    kind: ConversationKind,
     sagaToken: string,
   ): { conversationId: string; created: boolean; ownershipProof: string | null } {
     return this.db.transaction(() => {
@@ -589,6 +609,43 @@ export class ConversationManager {
     }
   }
 
+  /**
+   * 这条会话该用哪个推理档（#281 / I-04）。
+   *
+   * **只在启动命令里定档**：codex 的 `model_reasoning_effort` 是进程启动参数，跑起来就改不了；
+   * 所以 fresh 与 resume 两条路径都要带上它，而且**绝不为了切档去重启会话**——
+   * 重建上下文的代价远大于省下的推理 token。
+   *
+   * 档位来源：本会话当前绑定的 issue（`issues.conv_id`）→ 它所属模块 → 控制面默认档。
+   * 这里直接读表而不经 issues 层，与 `tmuxName` 读 `project_modules` 是同一个既有口径
+   * （core 不 import issues，只做只读查询）。查不到就用默认档，绝不因此挡住启动。
+   */
+  private reasoningArg(c: Conversation): string {
+    if (!supportsReasoningEffort(c.agent)) return ''; // 能力位：claude 没有对应开关
+    let issue: string | null = null;
+    let module: string | null = null;
+    try {
+      const row = this.db
+        .query<{ issue_effort: string | null; module_effort: string | null }, [string]>(
+          `SELECT i.reasoning_effort AS issue_effort, m.reasoning_effort AS module_effort
+             FROM issues i
+             LEFT JOIN project_modules m ON m.id = i.module_id
+            WHERE i.conv_id = ? AND i.status NOT IN ('done', 'cancelled')
+            ORDER BY i.id DESC LIMIT 1`,
+        )
+        .get(c.id);
+      issue = row?.issue_effort ?? null;
+      module = row?.module_effort ?? null;
+    } catch {
+      /* 旧库没有这两列（048 之前）或查询失败：用默认档，别挡住启动 */
+    }
+    const resolved = resolveReasoningEffort({
+      issue: parseReasoningEffort(issue),
+      module: parseReasoningEffort(module),
+    });
+    return codexReasoningArg(resolved.effort);
+  }
+
   /** 按对话 agent 组装启动命令；codex fresh/resume 一律重盖 launch_ts 锚点并清 path 缓存（会话发现/重定位用） */
   private async buildCommand(c: Conversation): Promise<string> {
     const executable = await this.driver.findExecutable(c.agent);
@@ -615,7 +672,9 @@ export class ConversationManager {
       const exists = (await this.locator.locate(c.id)) !== null;
       return exists ? `${command} --resume ${c.id}` : `${command} --session-id ${c.id}`;
     }
-    const args = this.opts.codexArgs ?? DEFAULT_CODEX_ARGS;
+    const args = [this.opts.codexArgs ?? DEFAULT_CODEX_ARGS, this.reasoningArg(c)]
+      .filter((x) => x.length > 0)
+      .join(' ');
     const sid = row?.agent_session_id;
     // fresh 与 resume 都重盖 launch_ts 并清 path 缓存（issue #48：旧绑定粘连是卡死元凶）：
     // resume 后按 sid 回扫重定位（resume 若换了文件，缓存路径已是死的）；fresh 后按新
@@ -653,7 +712,41 @@ export class ConversationManager {
       await this.driver.writeFile(`${cwd.replace(/\/+$/, '')}/.panda/keep`, '');
     }
 
-    const cmd = await this.buildCommand(c);
+    let cmd = await this.buildCommand(c);
+    // Core-only databases and ordinary chat sessions have no issue skill snapshot.
+    const hasPolicies = this.db.query("SELECT name FROM sqlite_master WHERE name='skill_session_policies'").get();
+    const policyRow = hasPolicies ? this.db.query<{snapshot_json:string},[string]>(
+      'SELECT snapshot_json FROM skill_session_policies WHERE conv_id=?').get(c.id) : null;
+    if (policyRow) {
+      let snapshot=JSON.parse(policyRow.snapshot_json);
+      // Re-evaluate saved choices on each actual launch; a running process keeps its settings.
+      const issue = this.db.query<{id:number;module_id:number|null},[string]>(
+        'SELECT i.id,i.module_id FROM issues i JOIN skill_session_policies s ON s.issue_id=i.id WHERE s.conv_id=?').get(c.id);
+      if (issue && Array.isArray(snapshot.inventory)) {
+        const policy = effectiveSkillPolicy(this.db,{projectId:c.projectId,moduleId:issue.module_id ?? undefined,issueId:issue.id});
+        const row = issue.module_id ? this.db.query<{skills_json:string|null},[number]>(
+          'SELECT skills_json FROM project_modules WHERE id=?').get(issue.module_id) : null;
+        let legacy:unknown = null;
+        try { legacy=JSON.parse(row?.skills_json ?? 'null'); } catch {}
+        if (Array.isArray(legacy)) for (const skill of snapshot.inventory) {
+          if (!(skill.name in policy)) policy[skill.name]=legacy.includes(skill.name)?'auto':'manual';
+        }
+        snapshot=skillSessionSettings(c.agent,snapshot.inventory,policy);
+        this.db.run('UPDATE skill_session_policies SET snapshot_json=? WHERE conv_id=?',[JSON.stringify(snapshot),c.id]);
+      }
+      if (c.agent === 'codex') {
+        const entries = snapshot.config.skills.config as Array<{path:string;enabled:boolean}>;
+        if (entries.length) cmd += ' -c ' + quoteShellWord('skills.config=[' + entries.map(e=>
+          '{path='+JSON.stringify(e.path)+',enabled=false}').join(',') + ']');
+      } else {
+        cmd += ' --settings ' + quoteShellWord(JSON.stringify(snapshot.config));
+      }
+      // The tmux injection protocol caps input at 2000 chars; execute long flags from a private script.
+      const scriptPath = `${cwd.replace(/\/+$/, '')}/.panda/tmp/skill-sessions/${c.id}.sh`;
+      await this.driver.writeFile(`${cwd.replace(/\/+$/, '')}/.panda/tmp/skill-sessions/.gitignore`, '*\n');
+      await this.driver.writeFile(scriptPath, '#!/bin/sh\nexec ' + cmd + '\n', 0o700);
+      cmd = '/bin/sh ' + quoteShellWord(scriptPath);
+    }
 
     try {
       await this.driver.killSession(session);
@@ -683,6 +776,7 @@ export class ConversationManager {
   async activate(id: string, cwdOverride?: string): Promise<Conversation | null> {
     const c = this.get(id);
     if (!c) return null;
+    if (c.sharedReadOnly) throw new Error('共享归档对话为只读历史，不能启动或恢复 Agent 会话');
     const cwd = cwdOverride ?? await this.conversationCwd(c);
 
     if (c.kind === 'chat') {
@@ -723,6 +817,7 @@ export class ConversationManager {
   async relaunch(id: string): Promise<Conversation | null> {
     const c = this.get(id);
     if (!c) return null;
+    if (c.sharedReadOnly) throw new Error('共享归档对话为只读历史，不能启动或恢复 Agent 会话');
     await this.launchInto(this.sessionName(c), c, await this.conversationCwd(c));
     if (c.kind === 'chat') this.touch(id);
     else this.setActiveConv(c.projectId, id); // 重启后这条就是项目的当前对话（幂等）

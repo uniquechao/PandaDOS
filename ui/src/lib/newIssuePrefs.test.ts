@@ -6,9 +6,13 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   NEW_ISSUE_AA_DEFAULT,
   NEW_ISSUE_AA_KEY,
+  NEW_ISSUE_AGENT_KEY,
+  readNewIssueAgent,
+  writeNewIssueAgent,
   readNewIssueAutoApprove,
   writeNewIssueAutoApprove,
 } from './newIssuePrefs';
+import { readChatAgent, writeChatAgent } from './chatPrefs';
 
 class MemStorage {
   private m = new Map<string, string>();
@@ -30,6 +34,49 @@ const mem = (): MemStorage => (globalThis as unknown as { localStorage: MemStora
 
 beforeEach(() => {
   (globalThis as unknown as { localStorage: MemStorage }).localStorage = new MemStorage();
+});
+
+describe('新建 issue 的独立代理偏好', () => {
+  test('无记录沿用 claude，手动选择可回读', () => {
+    expect(readNewIssueAgent()).toBe('claude');
+    writeNewIssueAgent('codex');
+    expect(readNewIssueAgent()).toBe('codex');
+    writeNewIssueAgent('claude');
+    expect(readNewIssueAgent()).toBe('claude');
+  });
+
+  test('与对话页代理和批准档位分别记忆，互不覆盖', () => {
+    writeChatAgent('codex');
+    writeNewIssueAgent('claude');
+    writeNewIssueAutoApprove('cautious');
+    expect(readChatAgent()).toBe('codex');
+    expect(readNewIssueAgent()).toBe('claude');
+    writeNewIssueAgent('codex');
+    writeChatAgent('claude');
+    expect(readNewIssueAgent()).toBe('codex');
+    expect(readNewIssueAutoApprove()).toBe('cautious');
+  });
+
+  test('非法写入不覆盖偏好，脏记录回退默认代理', () => {
+    writeNewIssueAgent('codex');
+    writeNewIssueAgent('invalid' as never);
+    expect(readNewIssueAgent()).toBe('codex');
+    mem().setItem(NEW_ISSUE_AGENT_KEY, 'invalid');
+    expect(readNewIssueAgent()).toBe('claude');
+  });
+
+  test('存储不存在时读默认、写入不阻断表单', () => {
+    delete (globalThis as unknown as { localStorage?: MemStorage }).localStorage;
+    expect(readNewIssueAgent()).toBe('claude');
+    expect(() => writeNewIssueAgent('codex')).not.toThrow();
+  });
+
+  test('存储读写抛错时安全回退', () => {
+    mem().getItem = () => { throw new Error('禁止读取'); };
+    mem().setItem = () => { throw new Error('空间不足'); };
+    expect(readNewIssueAgent()).toBe('claude');
+    expect(() => writeNewIssueAgent('codex')).not.toThrow();
+  });
 });
 afterEach(() => {
   delete (globalThis as unknown as { localStorage?: MemStorage }).localStorage;

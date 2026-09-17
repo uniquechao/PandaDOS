@@ -10,7 +10,7 @@
  *   调用反向依赖飞书的教训——通知路由必须是独立接口）；
  * - 节流做真的：per-user 聚合窗（v1 lastNotifyTs 写而不读的死字段教训，评审 M12
  *   「要么做要么别留字段」）；gate_waiting 是交互卡不可聚合，绕过窗口直发；
- * - 卡点一次性 requestId 落 DB（notify_gate_requests，060 迁移）而非内存：评审 H4
+ * - 卡点一次性 requestId 落 DB（notify_gate_requests，063 迁移）而非内存：评审 H4
  *   重启后待决卡作废的教训；消费 = consumed_ts NULL→ts 的 CAS，天然防重放；
  * - 发送失败按用户隔离（一个用户失败不拦其他人），错误进日志不逃逸——引擎侧
  *   还有 notifySafe 兜底，双保险。
@@ -33,9 +33,9 @@ import { catalogs } from '../../shared/i18n/catalogs';
 import { isSupportedLocale, isValidTimeZone } from '../../shared/i18n/locales';
 import type { MessageKey } from '../../shared/i18n/messages';
 
-// ---------- 模块自带迁移（060 编号空间，同 issues/030 模式） ----------
+// ---------- 模块自带迁移（编号取全局唯一的 063，同 issues/030 模式） ----------
 
-/** 通知模块的增量迁移目录（notify/migrations/060_*.sql） */
+/** 通知模块的增量迁移目录（notify/migrations/063_*.sql） */
 export const NOTIFY_MIGRATIONS_DIR = join(import.meta.dir, 'migrations');
 
 /**
@@ -58,6 +58,10 @@ export type NotifySummaryCode =
   | 'conversation_displaced'
   | 'menu_stuck'
   | 'rate_limited'
+  | 'auto_retry_exhausted'
+  | 'stop_loss_paused'
+  | 'regression_failed'
+  | 'clarify_success_low'
   | 'clarification_needed'
   | 'module_organization'
   | 'analysis_clarification'
@@ -66,7 +70,7 @@ export type NotifySummaryCode =
   | 'approval_selection';
 
 export interface NotifyEvent {
-  kind: 'status_change' | 'gate_waiting' | 'issue_done' | 'issue_blocked';
+  kind: 'status_change' | 'gate_waiting' | 'issue_done' | 'issue_blocked' | 'choice_waiting';
   projectId: number;
   issueId: number;
   /** status_change 专用 */
@@ -103,7 +107,7 @@ const STATUS_KEYS: Partial<Record<IssueState, MessageKey>> = {
   pending: 'status.pending', clarifying: 'status.clarifying', planning: 'status.planning',
   plan_review: 'status.planReview', implementing: 'status.implementing', testing: 'status.testing',
   merge_review: 'status.mergeReview', merging: 'status.merging', done: 'status.done',
-  blocked: 'status.blocked', cancelled: 'status.cancelled',
+  paused: 'status.paused', blocked: 'status.blocked', cancelled: 'status.cancelled',
 };
 
 function stateText(state: IssueState | undefined, i18n: I18nApi): string {
@@ -136,6 +140,38 @@ export function eventSummary(e: NotifyEvent, i18n: I18nApi): string {
       });
     case 'merge_review':
       return i18n.t('notify.summary.mergeReview', { title: summaryParam(e, 'title') });
+    // #274 止损闸：花销触顶主动停下，不是执行失败——文案必须把这点说清楚
+    case 'stop_loss_paused':
+      return i18n.t('notify.summary.stopLossPaused', {
+        title: summaryParam(e, 'title'),
+        reason: summaryParam(e, 'reason'),
+        blocks: summaryParam(e, 'blocks'),
+        reentries: summaryParam(e, 'reentries'),
+        hours: summaryParam(e, 'hours'),
+      });
+    // #280：创建时澄清一直失败。这类故障最要命的地方是**一直在烧钱但一直没产出**，
+    // 单条失败没人在意，成功率跌破才需要有人看一眼。
+    case 'clarify_success_low':
+      return i18n.t('notify.summary.clarifySuccessLow', {
+        project: summaryParam(e, 'project'),
+        ok: summaryParam(e, 'ok'),
+        total: summaryParam(e, 'total'),
+      });
+    // #279：批次全量回归红了。它**不属于任何一条 issue 的失败**——文案要说清没建 issue、
+    // 也没人被 block，只是提醒有人去看一眼。
+    case 'regression_failed':
+      return i18n.t('notify.summary.regressionFailed', {
+        project: summaryParam(e, 'project'),
+        label: summaryParam(e, 'label'),
+        code: summaryParam(e, 'code'),
+      });
+    // #273：nudge / judge 自动重试到顶转人工（issue 未 block，文案里会说明仍在运行）
+    case 'auto_retry_exhausted':
+      return i18n.t('notify.summary.autoRetryExhausted', {
+        title: summaryParam(e, 'title'),
+        reason: summaryParam(e, 'reason'),
+        count: summaryParam(e, 'count'),
+      });
     case 'conversation_displaced':
       return i18n.t('notify.summary.conversationDisplaced', { title: summaryParam(e, 'title') });
     case 'menu_stuck':
@@ -183,7 +219,7 @@ export function eventSummary(e: NotifyEvent, i18n: I18nApi): string {
   }
   if (e.summary !== undefined) return e.summary;
   if (e.kind === 'status_change') return `${stateText(e.from, i18n)} → ${stateText(e.to, i18n)}`;
-  if (e.kind === 'issue_blocked') return i18n.t('notify.notExplained');
+  if (e.kind === 'issue_blocked' || e.kind === 'choice_waiting') return i18n.t('notify.notExplained');
   if (e.kind === 'gate_waiting') return i18n.t('notify.gateWaiting');
   return '';
 }
@@ -198,6 +234,9 @@ export function formatEventText(e: NotifyEvent, i18n: I18nApi): string {
       return i18n.t('notify.blocked', { id: e.issueId, summary: eventSummary(e, i18n) });
     case 'gate_waiting':
       return `🚦 [issue #${e.issueId}] ${eventSummary(e, i18n)}`;
+    // #275 / B-07：弹窗等人选与「受阻」是两回事，文案必须分开
+    case 'choice_waiting':
+      return i18n.t('notify.choiceWaiting', { id: e.issueId, summary: eventSummary(e, i18n) });
   }
 }
 
@@ -239,6 +278,35 @@ export function userByFeishuOpenid(
     )
     .get(openid);
   return r ?? null;
+}
+
+export interface ChatProject { id: number; name: string }
+
+/** Never expose inactive projects or treat a subscription as authorization. */
+export function accessibleChatProjects(db: Database, userId: number): ChatProject[] {
+  return db.query<ChatProject, [number]>(`
+    SELECT p.id, p.name FROM projects p JOIN users u ON u.id = ?
+    WHERE p.status = 'active' AND (u.role = 'admin' OR p.owner_user_id = u.id
+      OR EXISTS (SELECT 1 FROM project_members m WHERE m.project_id = p.id AND m.user_id = u.id))
+    ORDER BY p.id
+  `).all(userId);
+}
+
+/** Longest exact name allows spaces; duplicate accessible names remain ambiguous. */
+export function resolveChatProject(projects: ChatProject[], text: string): {
+  matches: ChatProject[]; question: string;
+} | null {
+  if (!text.startsWith('#')) return null;
+  const body = text.slice(1);
+  const numeric = body.match(/^(\d+)(?:\s|$)/);
+  if (numeric) return {
+    matches: projects.filter((p) => p.id === Number(numeric[1])),
+    question: body.slice(numeric[1]!.length).trim(),
+  };
+  const candidates = projects.filter((p) => body === p.name ||
+    (body.startsWith(p.name) && /^\s/.test(body.slice(p.name.length))));
+  const length = Math.max(0, ...candidates.map((p) => p.name.length));
+  return { matches: candidates.filter((p) => p.name.length === length), question: body.slice(length).trim() };
 }
 
 // ---------- SubscriptionStore ----------
@@ -319,7 +387,7 @@ export class SubscriptionStore {
   }
 }
 
-// ---------- GateRequestStore：卡点卡一次性 requestId（060 表） ----------
+// ---------- GateRequestStore：卡点卡一次性 requestId（063 表） ----------
 
 /** 生成 requestId（v1 agent.ts:117 生成式平移 + 加强随机位） */
 export function genRequestId(): string {
@@ -422,7 +490,18 @@ export class NotifyRouter {
   }
 
   register(channel: NotifyChannel): void {
+    this.unregister(channel.name);
     this.channels.set(channel.name, channel);
+  }
+
+  /** Cancel pending sends belonging to a removed/replaced connection. */
+  unregister(name: string): void {
+    this.channels.delete(name);
+    for (const [key, buf] of this.bufs) {
+      if (buf.channel.name !== name) continue;
+      if (buf.timer) clearTimeout(buf.timer);
+      this.bufs.delete(key);
+    }
   }
 
   /** 项目创建者自动订阅（便捷转发，集成建项目处调用） */
@@ -447,7 +526,8 @@ export class NotifyRouter {
     for (const channel of this.channels.values()) {
       for (const userId of userIds) {
         const address = this.addressOf(channel.name, userId);
-        if (!address) continue; // 无绑定：静默跳过（spec §8）
+        if (!address || this.channels.get(channel.name) !== channel ||
+          !accessibleChatProjects(this.db, userId).some((p) => p.id === event.projectId)) continue;
         const target: NotifyTarget = { userId, address };
         try {
           if (event.kind === 'gate_waiting' && event.gate) {
@@ -465,30 +545,15 @@ export class NotifyRouter {
 
   /**
    * 入站消息路由：`#<项目id|项目名> ...` 定位到对应项目 PM（spec §6 全局路由的飞书侧）。
-   * 安全：发送者必须是已绑定用户；普通用户只能定位自己的项目，admin 任意。
+   * 安全：发送者必须是已绑定用户；属主、成员与 admin 可访问 active 项目；重名不猜测。
    * 无法定位/无权限返回 null（调用方决定回复话术）。
    */
   async routeInbound(channelName: string, senderAddress: string, text: string): Promise<number | null> {
     if (channelName !== 'feishu') return null;
     const user = userByFeishuOpenid(this.db, senderAddress);
     if (!user) return null;
-    const m = text.trim().match(/^#(\S+)/);
-    if (!m) return null;
-    const token = m[1]!;
-    const row = /^\d+$/.test(token)
-      ? this.db
-          .query<{ id: number; owner_user_id: number }, [number]>(
-            'SELECT id, owner_user_id FROM projects WHERE id = ?',
-          )
-          .get(Number(token))
-      : this.db
-          .query<{ id: number; owner_user_id: number }, [string]>(
-            'SELECT id, owner_user_id FROM projects WHERE name = ?',
-          )
-          .get(token);
-    if (!row) return null;
-    if (user.role !== 'admin' && row.owner_user_id !== user.id) return null;
-    return row.id;
+    const resolved = resolveChatProject(accessibleChatProjects(this.db, user.id), text.trim());
+    return resolved?.matches.length === 1 ? resolved.matches[0]!.id : null;
   }
 
   // ---- per-user 节流（聚合窗） ----
@@ -504,7 +569,13 @@ export class NotifyRouter {
       b = { lastSentTs: 0, pending: [], timer: null, channel, target };
       this.bufs.set(key, b);
     }
-    b.target = target; // openid 可能换绑，发送用最新地址
+    if (b.target.address !== target.address) {
+      if (b.timer) clearTimeout(b.timer);
+      b.timer = null;
+      b.pending = [];
+      b.lastSentTs = 0;
+    }
+    b.target = target;
     return b;
   }
 
@@ -548,10 +619,13 @@ export class NotifyRouter {
     const events = b.pending.splice(0);
     if (events.length === 0) return;
     const address = this.addressOf(b.channel.name, b.target.userId);
-    if (!address) return;
+    if (!address || address !== b.target.address || this.channels.get(b.channel.name) !== b.channel) return;
+    const accessible = new Set(accessibleChatProjects(this.db, b.target.userId).map((p) => p.id));
+    const allowedEvents = events.filter((event) => accessible.has(event.projectId));
+    if (allowedEvents.length === 0) return;
     b.target = { ...b.target, address };
     const i18n = userI18n(this.db, b.target.userId);
-    const text = events.map((event) => formatEventText(event, i18n)).join('\n');
+    const text = allowedEvents.map((event) => formatEventText(event, i18n)).join('\n');
     b.lastSentTs = this.now();
     try {
       await b.channel.sendText(b.target, text);

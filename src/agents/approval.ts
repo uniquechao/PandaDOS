@@ -11,8 +11,8 @@
  *   5. 第 4 层不可用时的本地兜底 localFallback（issue #91）→ 危险交人工 / 普通放行。
  *      它长在第 4 层的 catch 里而不是独立一层，因为它的触发条件是「上一层调不通」而非菜单形态。
  *
- * 档位（issue #108）插在第 3 层与第 4 层之间：谨慎档到这里就转人工，全自动档到这里走
- * autoDecide（红线仍转人工、其余本地放行），只有中等档才继续走第 4/5 层。前三层与档位无关。
+ * 档位（issue #108/#34）插在第 3 层与第 4 层之间：谨慎档到这里就转人工；中等与
+ * 全自动都由管家按完整语义分级，全自动仅在模型不可用时走本地红线兜底。前三层与档位无关。
  *
  * 第 3 层为什么排在 trust 之后：trust 是「必须答应否则寸步难行」的目录信任弹窗，语义比
  * 推荐标记更强，且真实 trust 弹窗从不带 recommended 标记，两层实际不重叠——排后面纯粹是
@@ -28,6 +28,7 @@ import {
   APPROVAL_POLICY,
   isDangerousMenu,
   isMultiSelectMenu,
+  isNeverPick,
   pickRecommended,
   pickSafeAffirmative,
 } from './approval-policy';
@@ -44,13 +45,25 @@ Claude Code 弹出了一个选择/审批菜单。替主人判断：自动批准�
 {"action":"approve"|"escalate","option":选项编号(从1起,approve时必填),"reason":"≤20字中文理由"}
 
 # 规则（拿不准一律 escalate）
-- approve（安全·可逆·在任务范围内）：读文件/浏览、跑测试或只读命令、普通代码编辑、新建文件/目录、git add/commit/普通 push（非 force、不改历史）、装任务明确需要的依赖、确认计划继续。选最能推进【当前任务】的那项。
-- escalate（危险·不可逆·超范围）：删文件/数据(rm/drop/truncate)、git reset --hard / force push / 改历史、部署/发布/上线、改生产配置或密钥、对外改外部状态（普通 git push 除外）、关机/重启、与当前任务无关的操作、任何看不懂或拿不准的。
+- approve（安全·可逆·在任务范围内）：读文件/浏览、跑测试或 production build、普通代码编辑、新建文件/目录、清理 /tmp 或项目 .panda/tmp 内临时文件、git add/commit/普通 push（非 force、不改历史）、装任务明确需要的依赖、确认计划继续。按完整语义判断，不得因命令正文恰含 submit、production 等单词升级。选最能推进【当前任务】的那项。
+- escalate（危险·不可逆·超范围）：删除非临时文件或数据(drop/truncate)、git reset --hard / force push / 改历史、实际部署/发布/上线、改生产配置或密钥、对外改外部状态（普通 git push 除外）、关机/重启、与当前任务无关的操作、任何看不懂或拿不准的。
 - 宁可 escalate，也别误批。`;
 export const AUTOPILOT_APPROVAL_SYS_EN = `# Task: grade an autopilot approval request
 Claude Code displayed a choice or approval menu. Decide whether to approve one option automatically or escalate to the user. Return JSON only:
 {"action":"approve"|"escalate","option":one-based option number when approving,"reason":"concise reason"}
-Approve only safe, reversible, in-scope reading, tests, ordinary edits, file creation, non-force git add/commit/push, required dependencies, or plan continuation. Escalate deletion, destructive Git history changes, deployments, production/secrets changes, external side effects, unrelated work, and anything uncertain.`;
+Approve safe, reversible, in-scope reading, tests, production builds (building is not deployment), ordinary edits, file creation, cleanup strictly inside /tmp or the project's .panda/tmp, non-force git add/commit/push, required dependencies, or plan continuation. Judge the full meaning; words such as submit or production alone are not risks. Escalate non-temporary deletion, destructive Git history changes, actual deployments, production configuration or secrets changes, external side effects, unrelated work, and anything uncertain.`;
+
+export const TEXT_APPROVAL_SYS = `# 任务：判断编码代理的纯文本提问能否由全自动管家代答
+编码代理没有弹出结构化菜单，而是在最终回复里要求主人确认、选择执行方式或回复短文本。只输出 JSON：
+{"action":"reply"|"hold","reply":"reply 时要发送的最短原样答案","reason":"≤30字中文理由"}
+
+- reply：仅限任务范围内、不会改变需求的流程继续确认或执行方式选择；答案必须由原文明确给出，优先采用代理明确推荐且能继续当前目标的选项。
+- hold：业务需求澄清、架构/产品取舍、范围变化、脏工作区/分支处置、删除非临时数据、改 Git 历史、密钥/生产配置、超出原目标的发布或外部副作用，以及任何拿不准的情况。
+- 已明确要求交付、部署或上线时，选择“继续执行既定计划/当前会话实施”本身可 reply；不得据此扩大到原目标外的发布。
+- reply 只能是一个编号、短选项文字或 yes/no，不得添加解释、命令或多行内容。`;
+export const TEXT_APPROVAL_SYS_EN = `# Task: decide whether autopilot may answer a coding agent's plain-text question
+Return JSON only: {"action":"reply"|"hold","reply":"short exact answer when replying","reason":"concise reason"}.
+Reply only to an explicit, in-scope workflow continuation or execution-mode choice whose answer is present in the text. Hold for requirement clarification, architecture/product tradeoffs, scope changes, dirty-worktree or branch decisions, destructive actions, secrets/production configuration, out-of-scope external effects, or uncertainty. If delivery/deployment is already the stated goal, choosing to continue that established plan is allowed. The reply must be a single number, short option label, or yes/no.`;
 
 /** 选项解读 prompt（v1 agent.ts:124-125 逐字）——升级人工时给通知卡生成人话摘要 */
 export const EXPLAIN_SELECTION_SYS = `# 任务：说清 CC 在让主人选什么
@@ -100,9 +113,9 @@ export type ApprovalRule =
   | 'local_fallback'
   /** 谨慎档：过了 trust/推荐两层还没定论 → 直接等人工，连 LLM 都不问（issue #108） */
   | 'cautious_hold'
-  /** 全自动档：命中危险·不可逆大类 → 仍交人工（红线，档位再高也不越） */
+  /** 全自动档：管家判为危险，或模型不可用时命中本地危险红线 */
   | 'auto_danger'
-  /** 全自动档：本地规则选同意项直接放行（不问 LLM）；找不到同意项时同 rule 转人工 */
+  /** 全自动档：管家判为安全，或模型不可用时本地规则选同意项 */
   | 'auto_affirm';
 
 function approvalReason(locale: SupportedLocale, zh: string, en: string): string {
@@ -126,6 +139,61 @@ export type ApprovalOutcome =
   | { requestId: string; action: 'approve'; optionIndex: number; reason: string; rule: ApprovalRule }
   | { requestId: string; action: 'escalate'; reason: string; rule: ApprovalRule };
 
+export type TextApprovalOutcome =
+  | { action: 'reply'; reply: string; reason: string }
+  | { action: 'hold'; reason: string };
+
+/**
+ * 低成本候选门禁：只把明确要求回复/确认/选择的屏幕交给 LLM，避免后台每 3 秒分析普通输出。
+ * 最终是否可代答完全由管家模型按安全规则判断，不靠关键词直接授权。
+ */
+export function textApprovalCandidate(pane: string): string | null {
+  const lines = pane.slice(-5000).split('\n');
+  const directive = /(回复\s*[`'“\"]?\w+|reply\s+(?:with\s+)?[`'\"]?\w+|是否.*(?:继续|确认)|请选择|选择.*方式)/i;
+  let end = -1;
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 12); i--) {
+    if (directive.test(lines[i]!)) { end = i; break; }
+  }
+  if (end < 0) return null;
+  const context = lines.slice(Math.max(0, end - 24), end + 1).join('\n').trim();
+  if (!/(?:^|\n)\s*\d+[.、)]\s+\S|回复\s*[`'“\"]?\w+|reply\s+(?:with\s+)?[`'\"]?\w+/im.test(context)) return null;
+  return context;
+}
+
+/** 全自动档的纯文本确认分级；失败、脏 JSON 和不安全回复一律 hold。 */
+export async function decideTextApproval(
+  llm: LlmClient,
+  input: { pane: string; goal?: string | null; taskText?: string | null; locale?: SupportedLocale },
+): Promise<TextApprovalOutcome> {
+  const locale = input.locale ?? 'zh-Hans';
+  const context = textApprovalCandidate(input.pane);
+  if (!context) return { action: 'hold', reason: approvalReason(locale, '不是明确的纯文本确认', 'Not an explicit plain-text confirmation') };
+  try {
+    const r = await llm.chat([
+      {
+        role: 'system',
+        content: (promptLanguage(locale) === 'zh' ? TEXT_APPROVAL_SYS : TEXT_APPROVAL_SYS_EN) +
+          `\n${outputLanguageInstruction(locale)}`,
+      },
+      {
+        role: 'user',
+        content: promptLanguage(locale) === 'zh'
+          ? `总目标：${input.goal || '(未设)'}\n当前任务：${input.taskText || '(未设)'}\n\n代理屏幕：\n${context}`
+          : `Overall goal: ${input.goal || '(not set)'}\nCurrent task: ${input.taskText || '(not set)'}\n\nAgent screen:\n${context}`,
+      },
+    ], { jsonMode: true });
+    const parsed = JSON.parse(r.content || '{}') as Record<string, unknown>;
+    const reply = String(parsed.reply ?? '').trim();
+    const safeReply = reply.length > 0 && reply.length <= 80 && !/[\r\n\x00-\x1f\x7f]/.test(reply);
+    if (parsed.action === 'reply' && safeReply) {
+      return { action: 'reply', reply, reason: String(parsed.reason ?? '').slice(0, 100) || approvalReason(locale, '安全的流程继续确认', 'Safe workflow continuation') };
+    }
+    return { action: 'hold', reason: String(parsed.reason ?? '').slice(0, 100) || approvalReason(locale, '需要主人判断', 'User judgment is required') };
+  } catch {
+    return { action: 'hold', reason: approvalReason(locale, '纯文本确认分级失败', 'Plain-text confirmation grading failed') };
+  }
+}
+
 /** 一次性 requestId（v1 agent.ts:117 式样 + 加宽随机位防同毫秒碰撞） */
 export function genRequestId(): string {
   return `a${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
@@ -138,7 +206,8 @@ export function genRequestId(): string {
  * `level`（issue #108）只决定**第 1~3 层之后怎么走**，前三层三档完全一致：
  *   - 'cautious'：直接转人工（不问 LLM）——只有 trust/推荐这种零风险项才自动点；
  *   - 'medium'（缺省，历史行为）：驱动大模型 分级 + 分级不可用时本地兜底；
- *   - 'auto'：危险·不可逆大类仍转人工，其余本地选同意项直接放行，不问 LLM。
+ *   - 'auto'：管家结合任务与完整菜单语义分级；模型不可用时才以本地红线保守兜底，
+ *     其中只豁免简单的 `/tmp` 与项目 `.panda/tmp` 临时文件清理。
  * 多选/交互表单在第 1 层就转人工，任何档位都不例外（驱动不了且会死循环）。
  */
 export async function decideApproval(
@@ -178,8 +247,8 @@ export async function decideApproval(
     };
   }
 
-  // 3.5) 档位分流（issue #108）。谨慎/全自动都不问 LLM——一个是「拿不准就别自动」，
-  //      另一个是「除了红线都别烦我」，两者都不需要分级模型参与。
+  // 3.5) 档位分流（issue #108/#34）。谨慎档不问 LLM；中等和全自动均由管家按完整
+  //      语义分级。全自动仅在模型不可用时采用本地红线兜底，避免关键词误判常态化。
   if (level === 'cautious') {
     return {
       requestId,
@@ -188,8 +257,6 @@ export async function decideApproval(
       rule: 'cautious_hold',
     };
   }
-  if (level === 'auto') return autoDecide(requestId, menu, locale);
-
   // 4) 驱动大模型 分级（裸 system，评审 M17；user 模板 v1 agent.ts:643 平移）
   const optionsText = menu.options.map((o, i) => `${i + 1}. ${o}`).join('\n');
   let decision: { action?: unknown; option?: unknown; reason?: unknown } | null = null;
@@ -211,24 +278,25 @@ export async function decideApproval(
     // LLM 挂了/解析不出 JSON → 本地兜底分级（issue #91）。
     // 原先这里无条件升级人工，看着保守，实际后果更糟：驱动大模型 一挂（如 2026-07-25
     // llm-chat 下线），跑测试、改文件、git commit 这种日常弹窗全部堵在等人点，
-    // 全自动流直接瘫痪。改为「危险的仍交人工，普通的本地放行」。
-    return localFallback(requestId, menu, locale);
+    // 自动执行流直接瘫痪。中等档改为「危险的仍交人工，普通的本地放行」；全自动档
+    // 也只在模型不可用时进入自己的保守兜底，正常路径始终由管家按完整语义判断。
+    return level === 'auto' ? autoFallback(requestId, menu, locale) : localFallback(requestId, menu, locale);
   }
   const opt = Number(decision?.option);
-  if (decision?.action === 'approve' && Number.isInteger(opt) && opt >= 1 && opt <= menu.options.length) {
+  if (decision?.action === 'approve' && Number.isInteger(opt) && opt >= 1 && opt <= menu.options.length && !isNeverPick(menu.options[opt - 1]!)) {
     return {
       requestId,
       action: 'approve',
       optionIndex: opt - 1,
       reason: String(decision?.reason ?? '').slice(0, 100),
-      rule: 'llm',
+      rule: level === 'auto' ? 'auto_affirm' : 'llm',
     };
   }
   return {
     requestId,
     action: 'escalate',
     reason: String(decision?.reason ?? '').slice(0, 100) || approvalReason(locale, '需判断', 'Needs user judgment'),
-    rule: 'llm',
+    rule: level === 'auto' ? 'auto_danger' : 'llm',
   };
 }
 
@@ -262,11 +330,10 @@ function localFallback(requestId: string, menu: ApprovalMenu, locale: SupportedL
 }
 
 /**
- * 全自动档的本地判定（issue #108）：和 localFallback 同一套规则、不同触发条件与审计口径——
- * 那个是「LLM 挂了才退到本地」，这个是主人主动选了「除红线外别烦我」。所以规则一致（危险
- * 不可逆仍交人工、没有明确同意项也交人工），rule 分开记，事后能看出到底是谁放的行。
+ * 全自动档在管家不可用时的本地兜底：危险不可逆仍交人工、没有明确同意项也交人工；
+ * rule 与中等档分开，事后能看出具体审批档位。
  */
-function autoDecide(requestId: string, menu: ApprovalMenu, locale: SupportedLocale): ApprovalOutcome {
+function autoFallback(requestId: string, menu: ApprovalMenu, locale: SupportedLocale): ApprovalOutcome {
   if (isDangerousMenu(menu.context, menu.options)) {
     return { requestId, action: 'escalate', reason: approvalReason(locale, '全自动档红线：危险不可逆操作仍需人工', 'Automatic mode safety boundary: dangerous irreversible work still requires the user'), rule: 'auto_danger' };
   }

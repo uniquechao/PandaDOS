@@ -1,13 +1,76 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import type { IssueEvent, IssueWorkflowRuntime } from '../lib/types';
+import type { CompletionReport, IssueEvent, IssueWorkflowRuntime } from '../lib/types';
 import { CLARIFY_ANALYZING_MAX_AGE_MS, clarifyPanelState } from '../lib/issueStatus';
-import { workflowConflictFiles, workflowParallelProgress } from './IssueDetail';
+import { completionReportState, workflowConflictFiles, workflowParallelProgress } from './IssueDetail';
 
 const source = readFileSync(new URL('./IssueDetail.tsx', import.meta.url), 'utf8');
 const styles = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
 
+describe('「已完成但未推送」警示条（#272 / B-02）', () => {
+  test('与澄清条同层常驻，红 tint 区分「已出事」与「等你处理」，git 原话限高滚动', () => {
+    expect(source).toContain('function PushFailedBar');
+    // 挂在澄清条同一层（tab 栏之上，任何 tab 都看得到）
+    expect(source).toContain('{pushFailure && <PushFailedBar');
+    expect(source).toContain('pushFailureState(events)');
+    for (const key of ['issue.pushFailedTitle', 'issue.pushFailedHint', 'issue.pushFailedBranch']) {
+      expect(source).toContain(`tr('${key}'`);
+    }
+    // 不做成按钮：这里没有一键能替用户解决的动作
+    expect(source).not.toContain('class="push-failed-bar" onClick');
+    expect(source).toContain('role="alert"');
+
+    // 琥珀是「等你处理」，这条必须是红档，且与澄清条同一套度量
+    const bar = styles.match(/\.push-failed-bar \{[^}]*\}/)![0];
+    expect(bar).toContain('rgba(220, 38, 38');
+    expect(bar).toContain('margin: 0 12px 9px');
+    expect(bar).toContain('border-radius: var(--r-md)');
+    // 长报错不许把 tab 内容顶飞
+    const detail = styles.match(/\.push-failed-d \{[^}]*\}/)![0];
+    expect(detail).toContain('max-height');
+    expect(detail).toContain('overflow: auto');
+  });
+});
+
 describe('Issue 工作台信息架构', () => {
+  test('完成报告按结构分区，未达目标与历史总结提供继续处理入口', () => {
+    expect(source).toContain('function CompletionReportCard');
+    for (const key of [
+      'issue.reportObjective', 'issue.reportImplementation', 'issue.reportAdvantages',
+      'issue.reportDisadvantages', 'issue.reportVerification', 'issue.reportCompletion',
+      'issue.reportUnmetGoals', 'issue.reportRemainingWork',
+    ]) expect(source).toContain(`tr('${key}')`);
+    expect(source).toContain("tr('issue.continueProcessing')");
+    expect(source).toContain("guidance: doneReopenGuidance.trim()");
+
+    const complete: CompletionReport = {
+      version: 1, outcome: 'complete', objective: '目标', implementation: ['方案'],
+      advantages: ['优点'], disadvantages: [], verification: ['测试'], completion: '已完成',
+      unmetGoals: [], remainingWork: [],
+    };
+    expect(completionReportState(complete, true, 'done')).toEqual({ tone: 'success', canContinue: false });
+    expect(completionReportState({ ...complete, outcome: 'partial', remainingWork: ['部署'] }, true, 'blocked'))
+      .toEqual({ tone: 'warning', canContinue: true });
+    expect(completionReportState(null, true, 'done')).toEqual({ tone: 'legacy', canContinue: true });
+  });
+  // #301：这块红底「此 issue 尚未全部完成」被用户当成受阻，实际只是告知
+  test('未达目标/后续动作是告知块，不是 alert，也不用受阻的红档', () => {
+    expect(source).toContain('class="completion-report-note wide"');
+    expect(source).toContain("tr('issue.reportAttentionFyi')");
+    expect(source).toContain("tr('issue.reportAttentionNote')");
+    // 只是告知就别打断读屏，也别复用红档告警块
+    expect(source).not.toContain('class="completion-report-alert wide" role="alert"');
+    // 红档留给真出事的：历史记录未经验证、重开 issue 的警告
+    expect(source).toContain("tr('issue.reportLegacyWarningTitle')");
+
+    const note = styles.match(/\.completion-report-note \{[^}]*\}/)![0];
+    expect(note).toContain('background: var(--fill)');       // 中性 tint，不用 rgba(220, 38, 38…)
+    expect(note).not.toContain('220, 38, 38');
+    expect(note).toContain('border-left: 3px solid var(--line-2)');
+    expect(styles).toContain('.crn-fyi {');                  // 「告知」胶囊：不靠颜色单独表意
+    expect(styles).toContain('.completion-report-alert, .completion-report-note { margin: 12px 14px; }');
+  });
+
   test('执行页复用“对话/原生”切换，原生严格钉住当前 issue 且移除暂停/接管重复动作', () => {
     expect(source).toContain('<NativeModeSwitch mode={mode} onChange={setMode} />');
     expect(source).toContain('target={{ kind: \'issue\', issueId: issue.id }}');
@@ -70,72 +133,51 @@ describe('Issue 工作台信息架构', () => {
     expect(source).not.toContain('（卡点数据加载中…）');
   });
 
-  test('提交併入改动（#80）：四 tab→三 tab，改动 tab = 未提交树 + 已提交树 + 提交记录区', () => {
-    // tab 收敛：不再有独立提交 tab / IssueCommitsTab
+  test('改动 tab 统一展示本 issue 的改动文件，不再呈现 commit 视图', () => {
     expect(source).toContain("type WbTab = 'detail' | 'workflow' | 'exec' | 'changes'");
     expect(source).not.toContain('IssueCommitsTab');
-    // 双树都走 ChangeTree（构树/折叠在组件与 lib/changetree），worktree 两列码先归一
-    expect(source).toContain('<ChangeTree leaves={wtLeaves}');
-    expect(source).toContain('<ChangeTree leaves={rangeLeaves}');
+    expect(source).toContain('const byPath = new Map<string, IssueChangeLeaf>()');
     expect(source).toContain('dedupWorktree');
-    // 分区标题：未提交 / 已提交 / 提交记录
-    expect(source).toContain("tr('issue.runningUncommitted')");
-    expect(source).toContain("tr('issue.committed')");
-    expect(source).toContain("tr('issue.commitHistory', { count: info.commits.length })");
-    // 提交钻入保留（全屏 CommitPanel + 返回）
-    expect(source).toContain('<CommitPanel key={sha}');
+    expect(source).toContain('leaves={leaves}');
+    expect(source).toContain('key: `issue:${f.path}`');
+    expect(source).toContain("source: 'range'");
+    expect(source).toContain("source: 'wt'");
+    expect(source).not.toContain('<CommitPanel');
+    expect(source).not.toContain("tr('issue.commitHistory'");
   });
 
-  test('宽屏分栏：左列树+提交记录可拖宽，右栏 diff/CommitPanel/占位；窄屏维持全屏钻入', () => {
-    // 宽窄两态：useWide 判宽，左列宽度复用文件页文件树偏好（lib/treewidth）+ ListSplitter 拖拽
+  test('宽屏左树右 diff，窄屏维持文件 diff 全屏钻入', () => {
     expect(source).toContain('useWide()');
     expect(source).toContain('useTreeWidth()');
     expect(source).toContain('<ListSplitter containerRef={splitRef} list={treeW}');
     expect(source).toContain('wb-split');
     expect(source).toContain('wb-list-col');
     expect(source).toContain('wb-main');
-    // 右栏三态：提交详情 / 文件 diff（可收起）/ 未选占位
     expect(source).toContain("tr('issue.chooseChange')");
     expect(source).toContain("tr('issue.collapseDiff')");
-    // 文件与提交互斥选中；选中项在左列高亮（树 selKey / 提交行 .on）
-    expect(source).toContain('setSha(null); // 文件与提交互斥选中');
-    expect(source).toContain('selKey={fd.file?.leaf.key}');
-    expect(source).toContain("wide && sha === c.sha ? ' on'");
-    // 窄屏才走全屏钻入分支
-    expect(source).toContain('!wide && sha');
+    expect(source).toContain('selKey={fd.file?.key}');
     expect(source).toContain('!wide && fd.file');
   });
 
-  test('改动 tab 选中路由：wt 走项目级 worktree diff（untracked 由码 ? 判定），range 走本 issue 范围端点', () => {
-    expect(source).toContain("{ kind: 'range' | 'wt'; leaf: ChangeLeaf }");
-    expect(source).toContain("s.leaf.code === '?'");
+  test('合并后仍按文件来源选择工作区或本 issue 范围 diff', () => {
+    expect(source).toContain("type IssueChangeLeaf = ChangeLeaf & { source: 'range' | 'wt' }");
+    expect(source).toContain("leaf.source === 'wt'");
+    expect(source).toContain("leaf.code === '?'");
     expect(source).toContain('/git/worktree/diff?${q}');
     expect(source).toContain('/git/diff?${q}');
-    expect(source).toContain("openLeaf('wt', l)");
-    expect(source).toContain("openLeaf('range', l)");
-    // 空态按状态区分：未启动 / 执行中尚未提交 / 已并入
     expect(source).toContain("tr('issue.noChangesRunning')");
     expect(source).toContain("tr('issue.noChanges')");
     expect(source).toContain("tr('issue.mergedNoChanges', { base: info.base })");
-    // 「正在进行」视角以后端 worktree 字段有无为准（仅活跃 issue 附带）
     expect(source).toContain('info.worktree !== undefined');
   });
 
-  test('状态头单行（#101）：提交数 · 推送状态 · 已提交文件数 · 工作区未提交数 + 快照来源标注', () => {
-    expect(source).toContain('function IssueGitStatus');
-    // 状态段只在 IssueGitHead 内行内渲染一次（并成单行），不再独立成行；↑N 徽标与「N 条提交」重复已删
-    expect(source.split('<IssueGitStatus info={info} />').length - 1).toBe(1);
-    expect(source).not.toContain('↑{info.ahead}');
-    expect(source).toContain("tr('issue.commitCount', { count: info.ahead })");
-    // 推送状态全谱文案（badge 配色按语义：绿=已推送，琥珀=有未推送，灰=无远程）
-    expect(source).toContain("{ text: tr('issue.pushed'), cls: 'b-green' }");
-    expect(source).toContain("tr('issue.aheadOrigin', { count: p.n })");
-    expect(source).toContain("tr('issue.notPushed')");
-    expect(source).toContain("tr('issue.noRemote')");
-    expect(source).toContain("tr('issue.fileCount', { count: info.files.length })");
-    expect(source).toContain("tr('issue.uncommittedFiles', { count: wtN })");
-    // 快照兜底提示
-    expect(source).toContain("tr('issue.snapshot')");
+  test('状态头只显示本 issue 文件数，不显示提交、推送或分支元数据', () => {
+    expect(source).toContain('function IssueGitHead({ count, onRefresh }');
+    expect(source).toContain("tr('issue.fileCount', { count })");
+    expect(source).not.toContain('function IssueGitStatus');
+    expect(source).not.toContain("tr('issue.commitCount'");
+    expect(source).not.toContain("tr('issue.aheadOrigin'");
+    expect(source).not.toContain('⎇ {info.branch}');
   });
 
   test('角标常显：进详情即预取 git info；改动角标 = 已提交∪未提交去重文件数', () => {
@@ -195,10 +237,32 @@ describe('Issue 工作台信息架构', () => {
     expect(source).toContain("tr('issue.recoveryGuidanceRequired')");
     expect(source).toContain("tr('issue.editBlockedIssue')");
     expect(source).toContain("tr('issue.editBlockedSubtask')");
-    expect(source).toContain("issue.status === 'pending' || issue.status === 'blocked'");
+    expect(source).toContain("issue.status === 'pending' || ['blocked', 'paused'].includes(issue.status)");
     expect(source).not.toContain('onUnblock={() => void post(`/api/projects/${pid}/issues/${iid}/unblock`)}');
     expect(styles).toContain('.blocked-recovery');
     expect(styles).toContain('.recovery-tools');
+  });
+
+  // #301：受阻只显示一句原因时，用户看不出「这是告知还是要我动手」
+  test('受阻原因按三段拆成三行，行动指引单独强调，解析不出来退回原句', () => {
+    expect(source).toContain('function BlockedReason');
+    expect(source).toContain("parseBlockedNote(reason)");
+    // 解析失败（老 issue、引擎自判的受阻）原样显示那句话
+    expect(source).toContain("if (!parts) return <div class=\"block-box\">{reason}</div>;");
+    for (const key of ['issue.blockedDoing', 'issue.blockedStuck', 'issue.blockedAction']) {
+      expect(source).toContain(`tr('${key}')`);
+    }
+    // 卡点条与恢复弹窗共用同一个渲染，别再各写各的
+    expect(source.match(/<BlockedReason reason=\{props\.blockedReason\} \/>/g)!.length).toBe(2);
+    expect(source).not.toContain('<div class="block-box">{props.blockedReason}</div>');
+    // 标题明说「需要你处理」+ 一句说明：受阻不是告知，系统不会自己继续
+    expect(source).toContain("tr('issue.blockedNeedsYou')");
+    expect(source).toContain("tr('issue.blockedNeedsYouHint')");
+
+    // 三行结构：标签列定宽对齐，行动行加重且窄屏退成上下两行
+    expect(styles).toContain('.block-lines {');
+    expect(styles).toContain('.block-line.act .block-line-v { font-weight: 650; }');
+    expect(styles).toMatch(/@media \(max-width: 380px\) \{ \.block-line \{ flex-direction: column;/);
   });
 
   test('当前子任务旋转环使用带居中位移的旋转关键帧，不再依赖负 margin 猜测中心', () => {
@@ -433,5 +497,113 @@ describe('Issue 详情头部：当前模型徽标（issue #109）', () => {
     const idxBadge = source.indexOf('<ModelBadge model={model} />');
     expect(idxBadge).toBeGreaterThan(idxHead);
     expect(idxBadge).toBeLessThan(idxTabs);
+  });
+});
+
+describe('执行页门禁一行（#279 / I-03）', () => {
+  test('只读展示：接详情接口的 validation，不给「重跑」按钮', () => {
+    expect(source).toContain('validation={detail?.validation ?? null}');
+    expect(source).toContain('<ValidationLine validation={validation} />');
+    // 范围 / 结果 / 耗时三段都在
+    expect(source).toContain("tr('issue.validationTargeted'");
+    expect(source).toContain("tr('issue.validationFull')");
+    expect(source).toContain("tr('issue.validationPassed')");
+    expect(source).toContain("tr('issue.validationFailed'");
+    expect(source).toContain('fmtDuration(last.durationMs)');
+    // 门禁由引擎自己跑，界面上不该出现任何触发按钮——手动重跑正是本条要消灭的开销
+    const line = source.slice(source.indexOf('function ValidationLine'), source.indexOf('function PushFailedBar'));
+    expect(line).not.toContain('<button');
+    expect(line).not.toContain('onClick');
+  });
+
+  test('没有门禁信息时整行不渲染，不占位', () => {
+    const line = source.slice(source.indexOf('function ValidationLine'), source.indexOf('function PushFailedBar'));
+    expect(line).toContain('return null');
+  });
+});
+
+describe('执行页推理档一行（#281 / I-04）', () => {
+  test('可选覆盖档 + 显示生效档与来源，并说明「下次启动才生效」', () => {
+    expect(source).toContain('reasoning={detail?.reasoning ?? null}');
+    expect(source).toContain('<ReasoningLine reasoning={reasoning} onChange={onReasoning} />');
+    expect(source).toContain("tr('ui.reasoningInherit')"); // 继承模块 = 清空覆盖
+    expect(source).toContain("tr('issue.reasoningEffective'");
+    expect(source).toContain("tr('ui.reasoningCodexOnly')");
+    // 改档走 PATCH reasoningEffort，且改完只刷新详情——不重启会话（effort 是启动参数）
+    expect(source).toContain("'PATCH', { reasoningEffort: next }");
+    const line = source.slice(source.indexOf('function ReasoningLine'), source.indexOf('function ValidationLine'));
+    expect(line).not.toContain('relaunch');
+  });
+});
+
+describe('执行页工具条合成一行（#300）', () => {
+  test('门禁 / 推理档内联进 .runctl 的 seg 插槽，不再各占一整行', () => {
+    const seg = source.slice(source.indexOf('const seg = ('), source.indexOf('<div class="wb-exec-body">'));
+    // 顺序：对话/原生 → 审批 → 门禁 → 推理档 → 子任务进度
+    expect(seg.indexOf('<NativeModeSwitch')).toBeLessThan(seg.indexOf('<AutoApproveSwitch'));
+    expect(seg.indexOf('<AutoApproveSwitch')).toBeLessThan(seg.indexOf('<ValidationLine'));
+    expect(seg.indexOf('<ValidationLine')).toBeLessThan(seg.indexOf('<ReasoningLine'));
+    expect(seg.indexOf('<ReasoningLine')).toBeLessThan(seg.indexOf('<ExecProgress'));
+    // .wb-exec 里不再有独立成行的门禁/推理档（seg 是三条渲染路径共用的唯一出处）
+    const exec = source.slice(source.indexOf('<div class="wb-exec">'), source.indexOf('type TermPaneComp'));
+    expect(exec).not.toContain('<ValidationLine');
+    expect(exec).not.toContain('<ReasoningLine');
+  });
+
+  test('内联件是紧凑组：无整行 padding / 下边框，且不被进度链挤扁', () => {
+    const line = styles.match(/\.val-line \{[^}]*\}/)![0];
+    expect(line).not.toContain('border-bottom');
+    expect(line).toContain('flex: 0 0 auto');
+    expect(line).toContain('inline-flex');
+    // 推理档下拉用工具条尺寸，不借模块面板的宽下拉
+    expect(source).toContain('class="rc-sel"');
+    expect(styles).toContain('.rc-sel {');
+  });
+
+  test('「运行中」只留呼吸绿点，文案进 title / aria-label（项目对话页同一控件条）', () => {
+    const runctl = readFileSync(new URL('../components/RunControls.tsx', import.meta.url), 'utf8');
+    expect(runctl).not.toContain(">{t('ui.runRunning')}<");
+    expect(runctl).toContain("aria-label={t('ui.runRunning')}");
+    expect(runctl).toContain('role="status"');
+    // 没有文字撑开了，点自身要有确定尺寸
+    const label = styles.match(/\.rc-label \{[^}]*\}/)![0];
+    expect(label).toContain('width: 7px');
+    expect(label).toContain('height: 7px');
+  });
+
+  test('文案只留必要的：生效档只显示档位值，整句与「仅 codex 生效」进 title', () => {
+    const line = source.slice(source.indexOf('function ReasoningLine'), source.indexOf('function ValidationLine'));
+    expect(line).toContain("tr('issue.reasoningEffective'");
+    expect(line).toContain("tr('ui.reasoningCodexOnly')");
+    expect(line).toContain('title={hint}');
+    expect(line).toContain('>{reasoning.effort}</span>');
+  });
+});
+
+describe('已排队等待恢复（#283 / B-10）', () => {
+  test('详情页常驻提示条：说清不用再点第二次，并给撤销入口', () => {
+    expect(source).toContain('detail?.unblockRequest && (');
+    expect(source).toContain('<UnblockQueuedBar request={detail.unblockRequest} onCancel={cancelUnblockQueue} />');
+    expect(source).toContain("tr('issue.unblockQueued')");
+    expect(source).toContain("tr('issue.unblockQueuedCancel')");
+    expect(source).toContain("/unblock/cancel`, 'POST'");
+  });
+
+  test('提示条是 status 角色而不是 alert：这不是故障，只是在排队', () => {
+    const bar = source.slice(source.indexOf('function UnblockQueuedBar'), source.indexOf('function ReasoningLine'));
+    expect(bar).toContain('role="status"');
+    expect(bar).not.toContain('role="alert"');
+  });
+});
+
+describe('一键拆回智能合并（#289 / B-14）', () => {
+  test('详情页给出拆回入口，并在宿主已开跑时置灰说明原因', () => {
+    expect(source).toContain('detail?.mergedFrom && <MergedFromBar');
+    expect(source).toContain("tr('issue.mergedFrom')");
+    expect(source).toContain("tr('issue.unmerge')");
+    expect(source).toContain("tr('issue.unmergeLocked')");
+    expect(source).toContain("/unmerge`, 'POST'");
+    const bar = source.slice(source.indexOf('function MergedFromBar'), source.indexOf('function UnblockQueuedBar'));
+    expect(bar).toContain('disabled={!info.canUnmerge}'); // 开跑后不给点，比点了报错强
   });
 });

@@ -18,6 +18,7 @@
 import type { Database } from 'bun:sqlite';
 import {
   ApprovalRegistry,
+  decideTextApproval,
   explainSelection,
   type ApprovalOutcome,
 } from '../../agents/approval';
@@ -26,11 +27,23 @@ import type { LlmClient } from '../../agents/llm';
 import { ProjectMemberStore } from '../../core/members';
 import type { SelectionPayload } from '../../core/screen';
 import type { AutoApproveLevel, Project } from '../../core/types';
-import { getProject, type EngineIssue, type EngineMenuCtx } from '../../issues/engine';
+import {
+  getProject,
+  type EngineIssue,
+  type EngineMenuCtx,
+  type EngineTextPromptCtx,
+} from '../../issues/engine';
 import type { KeyedMutex } from '../../issues/mutex';
 import { buildSelectionCard } from '../../notify/cards';
 import { feishuOpenidOf, userByFeishuOpenid, userI18n } from '../../notify/router';
-import { actOnMenu, optionsSigOf, type MenuActResult, type MenuDriver } from './inject';
+import {
+  actOnMenu,
+  actOnTextApproval,
+  optionsSigOf,
+  textApprovalSigOf,
+  type MenuActResult,
+  type MenuDriver,
+} from './inject';
 import { userPromptLocale } from '../../agents/prompts/language';
 
 // ---------- 依赖最小面（结构化依赖，PM/通知全可 mock） ----------
@@ -90,6 +103,7 @@ export type ConsumeResult =
 interface SessionState {
   /** 已处理（已注入或已升级发卡）的菜单签名——同一菜单不重复分级/刷卡 */
   handledSig: string;
+  handledTextSig: string;
   inFlight: boolean;
 }
 
@@ -115,6 +129,18 @@ export class ApprovalPipeline {
   onMenu(ctx: EngineMenuCtx): void {
     void this.process(ctx).catch((e) => {
       this.log(ctx.issue.id, 'error', { where: 'approval-pipeline', error: String(e).slice(0, 300) });
+    });
+  }
+
+  /** 引擎无结构化菜单时的纯文本确认入口；仅全自动档会进入模型判定。 */
+  onTextPrompt(ctx: EngineTextPromptCtx): void {
+    if (ctx.issue.autoApprove !== 'auto') {
+      const st = this.state.get(ctx.session);
+      if (st) st.handledTextSig = '';
+      return;
+    }
+    void this.processTextPrompt(ctx).catch((e) => {
+      this.log(ctx.issue.id, 'error', { where: 'text-approval-pipeline', error: String(e).slice(0, 300) });
     });
   }
 
@@ -147,7 +173,7 @@ export class ApprovalPipeline {
     const sig = optionsSigOf(sel.options);
     let st = this.state.get(session);
     if (!st) {
-      st = { handledSig: '', inFlight: false };
+      st = { handledSig: '', handledTextSig: '', inFlight: false };
       this.state.set(session, st);
     }
     if (st.inFlight || st.handledSig === sig) return;
@@ -229,6 +255,56 @@ export class ApprovalPipeline {
         context: sel.context.slice(0, 200),
       });
       st.handledSig = sig;
+    } finally {
+      st.inFlight = false;
+    }
+  }
+
+  async processTextPrompt(ctx: EngineTextPromptCtx): Promise<void> {
+    const { issue, project, session, pane } = ctx;
+    const sig = textApprovalSigOf(pane);
+    let st = this.state.get(session);
+    if (!st) {
+      st = { handledSig: '', handledTextSig: '', inFlight: false };
+      this.state.set(session, st);
+    }
+    if (!sig) {
+      st.handledTextSig = '';
+      return;
+    }
+    if (st.inFlight || st.handledTextSig === sig) return;
+    st.inFlight = true;
+    try {
+      const outcome = await decideTextApproval(this.deps.llm, {
+        pane,
+        goal: project.goal,
+        taskText: issueText(issue),
+        locale: userPromptLocale(this.deps.db, issue.createdBy, project.ownerUserId),
+      });
+      if (outcome.action !== 'reply') {
+        st.handledTextSig = sig;
+        this.log(issue.id, 'text_approval_hold', {
+          level: issue.autoApprove,
+          reason: outcome.reason,
+          context: sig.slice(-200),
+        });
+        return;
+      }
+      const driver = this.deps.driverFor(project);
+      const result = await actOnTextApproval(
+        { driver, mutex: this.deps.mutex },
+        session,
+        outcome.reply,
+        sig,
+      );
+      if (result.ok) st.handledTextSig = sig;
+      this.log(issue.id, 'text_approval_auto', {
+        level: issue.autoApprove,
+        reason: outcome.reason,
+        reply: outcome.reply,
+        result: result.ok ? 'injected' : result.reason,
+        context: sig.slice(-200),
+      });
     } finally {
       st.inFlight = false;
     }

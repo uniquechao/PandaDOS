@@ -13,6 +13,7 @@ import { migratePmAgent } from '../../agents/pm';
 import { COOKIE } from '../auth';
 import { authDepsFromDb, createDispatcher } from '../middleware';
 import { adminRoutes } from './admin';
+import { dayStartMs, weekWindowOf } from '../../core/usage-weekly';
 import type { Executor } from '../../core/types';
 
 function makeApp(driver: ExecutorDriver = new LocalDriver()) {
@@ -411,11 +412,11 @@ describe('执行机 CRUD', () => {
       authDepsFromDb(app.db, app.users),
     );
     const connection = {
-      name: 'runner',
-      host: 'runner.example.com',
+      name: 'build-host',
+      host: 'build.example.com',
       port: 22,
       sshUser: 'developer',
-      keyRef: '/Users/developer/.ssh/id_ed25519',
+      keyRef: '/Users/example/.ssh/id_ed25519',
     };
 
     const detected = await call(
@@ -708,5 +709,291 @@ describe('项目归属调整 + 活跃概览', () => {
     expect(byName.alice!.projectCount).toBe(0);
     expect(byName.bob!.projectCount).toBe(1);
     expect(byName.root!.projectCount).toBe(0);
+  });
+});
+
+describe('用量周度视图（#295）', () => {
+  /** 2026-09-07 是周一 */
+  const MON = '2026-09-07';
+  const at = (day: string, hour = 10): number => dayStartMs(day) + hour * 3_600_000;
+
+  /**
+   * 造一周的现场：两个模块 + 一条未归模块的 issue + 未归因用量 + 各类结局事件。
+   * 钱都用整百万 token，方便按默认单价（input 1.25 / output 10 每 M）心算。
+   */
+  function seedWeek(db: ReturnType<typeof openDb>) {
+    db.run(`INSERT INTO executors (id, name, host, port, ssh_user, key_ref, workspace_root, claude_dir)
+      VALUES (1, 'local', '127.0.0.1', 22, 'root', 'k', '/ws', '/c')`);
+    db.run(`INSERT INTO projects (id, name, executor_id, cwd, owner_user_id, created_ts)
+      VALUES (1, '项目甲', 1, '/ws/a', 1, 1), (2, '项目乙', 1, '/ws/b', 1, 1)`);
+    db.run(`INSERT INTO project_modules (id, project_id, slug, display_name, agent, source, created_ts)
+      VALUES (5, 1, 'issue-engine', 'issue 引擎与调度', 'claude', 'manual', 1),
+             (6, 1, 'web-ui', '前端', 'codex', 'manual', 1)`);
+    db.run(`INSERT INTO issues (id, project_id, title, module_id, status, created_ts)
+      VALUES (10, 1, '引擎甲', 5, 'done', 1), (11, 1, '引擎乙', 5, 'blocked', 1),
+             (12, 1, '前端甲', 6, 'done', 1), (13, 1, '没归模块', NULL, 'done', 1),
+             (20, 2, '别的项目', NULL, 'done', 1)`);
+    const daily = (day: string, projectId: number, issueId: number, out: number, input = 0) =>
+      db.run(`INSERT INTO usage_daily (day, project_id, issue_id, output_tokens, input_tokens, updated_ts)
+        VALUES (?, ?, ?, ?, ?, 1)`, [day, projectId, issueId, out, input]);
+    daily(MON, 1, 10, 1_000_000);            // 引擎模块：$10
+    daily('2026-09-09', 1, 11, 0, 2_000_000); // 引擎模块：$2.5
+    daily('2026-09-09', 1, 12, 100_000);      // 前端模块：$1
+    daily('2026-09-09', 1, 13, 50_000);       // 未归模块：$0.5
+    daily('2026-09-09', 1, 0, 20_000);        // 未归因：$0.2
+    daily('2026-09-09', 2, 20, 10_000);       // 别的项目：$0.1
+    daily('2026-09-21', 1, 10, 9_000_000);    // 下下周，不该进本周
+    const trans = (issueId: number, to: string, ts: number) =>
+      db.run(`INSERT INTO issue_events (issue_id, kind, data_json, ts) VALUES (?, 'transition', ?, ?)`,
+        [issueId, JSON.stringify({ event: 'x', from: 'implementing', to }), ts]);
+    trans(10, 'done', at(MON));                 // 引擎：完成 1
+    trans(11, 'blocked', at('2026-09-09'));     // 引擎：受阻 1，没救回来
+    trans(12, 'blocked', at('2026-09-08'));     // 前端：受阻后本周救回
+    trans(12, 'done', at('2026-09-10'));
+    trans(13, 'cancelled', at('2026-09-09'));   // 未归模块：取消
+    trans(20, 'done', at('2026-09-09'));        // 别的项目
+  }
+
+  interface WeeklyBody {
+    week: { start: string; end: string; days: string[]; fromMs: number; toMs: number };
+    pricing: { outputPerMTok: number };
+    days: Array<{ day: string; costUsd: number; usage: { outputTokens: number } }>;
+    modules: Array<{
+      projectId: number; projectName: string; moduleId: number; moduleSlug: string; moduleName: string;
+      costUsd: number; usage: { outputTokens: number };
+      outcomes: null | {
+        doneCount: number; blockedCount: number; cancelledCount: number; failedCount: number;
+        outcomeCount: number; failureRate: number; recoveredCount: number; recoveryRate: number;
+      };
+    }>;
+    totals: { costUsd: number; doneCount: number; failedCount: number; failureRate: number; recoveryRate: number };
+  }
+
+  const money = (n: number): number => Number(n.toFixed(2));
+
+  test('按模块并排给钱与四项可靠性指标；未归模块与未归因各自成桶', async () => {
+    const { db, dispatch, admin } = makeApp();
+    seedWeek(db);
+    const r = (await call(dispatch, 'GET', `/api/admin/usage/weekly?weekStart=${MON}`, admin.token))!;
+    expect(r.status).toBe(200);
+    const body = await r.json() as WeeklyBody;
+
+    expect(body.week).toMatchObject({ start: MON, end: '2026-09-13' });
+    expect(body.week.days).toHaveLength(7);
+
+    // 按天分桶：周一 $10、周三 2.5+1+0.5+0.2+0.1、其余为 0（缺的天补零，空着才看得出没干活）
+    expect(body.days.map((d) => money(d.costUsd))).toEqual([10, 0, 4.3, 0, 0, 0, 0]);
+
+    // 哨兵桶（0 未归模块 / -1 未归因）按项目分开，所以键要带上 projectId
+    const byModule = new Map(body.modules.map((m) => [`${m.projectId}:${m.moduleId}`, m]));
+    // 引擎模块：$12.5，完成 1 / 受阻 1 → 失败率 0.5、恢复率 0
+    expect(byModule.get('1:5')).toMatchObject({
+      projectName: '项目甲', moduleSlug: 'issue-engine', moduleName: 'issue 引擎与调度',
+    });
+    expect(money(byModule.get('1:5')!.costUsd)).toBe(12.5);
+    expect(byModule.get('1:5')!.outcomes).toMatchObject({
+      doneCount: 1, blockedCount: 1, failedCount: 1, outcomeCount: 2, failureRate: 0.5, recoveredCount: 0,
+    });
+    // 前端模块：本周受阻又救回 → 失败率 1（同一条只算一次）、恢复率 1
+    expect(byModule.get('1:6')!.outcomes).toMatchObject({
+      doneCount: 1, blockedCount: 1, outcomeCount: 1, failureRate: 1, recoveredCount: 1, recoveryRate: 1,
+    });
+    // 未归模块（0 桶）：取消算失败
+    expect(byModule.get('1:0')!.outcomes).toMatchObject({ cancelledCount: 1, failedCount: 1, failureRate: 1 });
+    // 未归因（-1 桶）：只有钱，没有结局指标——不许编一个 0/0 冒充健康
+    expect(byModule.get('1:-1')).toMatchObject({ outcomes: null });
+    expect(money(byModule.get('1:-1')!.costUsd)).toBe(0.2);
+    // 按成本降序
+    expect(body.modules.map((m) => m.moduleId)[0]).toBe(5);
+
+    expect(money(body.totals.costUsd)).toBe(14.3);
+    expect(body.totals).toMatchObject({ doneCount: 3, failedCount: 3 });
+    expect(body.totals.failureRate).toBeCloseTo(3 / 5, 10);
+  });
+
+  test('weekStart 收周内任意一天并归一到周一；不传 = 现在所在那一周', async () => {
+    const { db, dispatch, admin } = makeApp();
+    seedWeek(db);
+    const thu = await (await call(dispatch, 'GET', '/api/admin/usage/weekly?weekStart=2026-09-10', admin.token))!
+      .json() as WeeklyBody;
+    expect(thu.week.start).toBe(MON);
+    expect(money(thu.totals.costUsd)).toBe(14.3);
+
+    const now = await (await call(dispatch, 'GET', '/api/admin/usage/weekly', admin.token))!.json() as WeeklyBody;
+    expect(now.week.start).toBe(weekWindowOf(Date.now()).start);
+    expect(now.days).toHaveLength(7);
+  });
+
+  test('按项目筛选：别的项目的钱与结局都不串进来', async () => {
+    const { db, dispatch, admin } = makeApp();
+    seedWeek(db);
+    const body = await (await call(dispatch, 'GET', `/api/admin/usage/weekly?weekStart=${MON}&projectId=2`, admin.token))!
+      .json() as WeeklyBody;
+    expect(body.modules.map((m) => [m.projectId, m.moduleId])).toEqual([[2, 0]]);
+    expect(money(body.totals.costUsd)).toBe(0.1);
+    expect(body.totals).toMatchObject({ doneCount: 1, failedCount: 0 });
+  });
+
+  test('参数不合法直接 400（静默回退到本周会让人对着错的一周做决策）', async () => {
+    const { dispatch, admin } = makeApp();
+    expect((await call(dispatch, 'GET', '/api/admin/usage/weekly?weekStart=2026-9-7', admin.token))!.status).toBe(400);
+    expect((await call(dispatch, 'GET', '/api/admin/usage/weekly?weekStart=上周', admin.token))!.status).toBe(400);
+    expect((await call(dispatch, 'GET', '/api/admin/usage/weekly?projectId=abc', admin.token))!.status).toBe(400);
+  });
+
+  test('普通用户 403（周度视图同样仅管理员可见）', async () => {
+    const { db, dispatch, users } = makeApp();
+    seedWeek(db);
+    const alice = users.create('alice', 'user');
+    expect((await call(dispatch, 'GET', '/api/admin/usage/weekly', alice.token))!.status).toBe(403);
+  });
+
+  test('空库不报错：7 天全零、无模块行、单价给初值', async () => {
+    const { dispatch, admin } = makeApp();
+    const body = await (await call(dispatch, 'GET', `/api/admin/usage/weekly?weekStart=${MON}`, admin.token))!
+      .json() as WeeklyBody;
+    expect(body.days).toHaveLength(7);
+    expect(body.days.every((d) => d.costUsd === 0)).toBe(true);
+    expect(body.modules).toEqual([]);
+    expect(body.totals).toMatchObject({ costUsd: 0, doneCount: 0, failureRate: 0, recoveryRate: 0 });
+    expect(body.pricing.outputPerMTok).toBe(10);
+  });
+});
+
+describe('成本视图（#282 / I-08、I-09）', () => {
+  /** 造一份跨两个项目的用量现场：issue 用量 + chat 会话 + 未归因余量 */
+  function seed(db: ReturnType<typeof openDb>) {
+    db.run(`INSERT INTO executors (id, name, host, port, ssh_user, key_ref, workspace_root, claude_dir)
+      VALUES (1, 'local', '127.0.0.1', 22, 'root', 'k', '/ws', '/c')`);
+    db.run(`INSERT INTO projects (id, name, executor_id, cwd, owner_user_id, created_ts)
+      VALUES (1, '项目甲', 1, '/ws/a', 1, 1), (2, '项目乙', 1, '/ws/b', 1, 1)`);
+    db.run(`INSERT INTO conversations (id, project_id, label, created_ts, agent, kind)
+      VALUES ('c1', 1, 'x', 1, 'claude', 'issue'), ('chat1', 1, 'y', 1, 'claude', 'chat'),
+             ('c2', 2, 'z', 1, 'codex', 'issue')`);
+    db.run(`INSERT INTO issues (id, project_id, title, status, created_ts)
+      VALUES (10, 1, '贵的那条', 'done', 1000), (11, 2, '别的项目', 'done', 9000)`);
+    db.run(`INSERT INTO conversation_usage
+      (conv_id, project_id, kind, scanned_bytes, requests, input_tokens, cached_input_tokens,
+       output_tokens, reasoning_tokens, compactions, tool_calls, skill_reads, updated_ts)
+      VALUES ('c1', 1, 'issue', 10, 20, 500000, 400000, 20000, 5000, 2, 60, 4, 1),
+             ('chat1', 1, 'chat', 10, 5, 30000, 10000, 2000, 0, 0, 3, 0, 1),
+             ('c2', 2, 'issue', 10, 1, 100, 0, 10, 0, 0, 1, 0, 1)`);
+    db.run(`INSERT INTO issue_usage
+      (issue_id, project_id, requests, input_tokens, cached_input_tokens, output_tokens,
+       reasoning_tokens, compactions, tool_calls, skill_reads, updated_ts)
+      VALUES (10, 1, 12, 400000, 380000, 9000, 2500, 2, 47, 3, 1),
+             (11, 2, 1, 100, 0, 10, 0, 0, 1, 0, 1)`);
+    db.run(`INSERT INTO issue_events (issue_id, kind, data_json, ts)
+      VALUES (10, 'tests_failed', '{}', 1), (10, 'nudged', '{}', 2), (10, 'judged', '{}', 3),
+             (10, 'validation_passed', '{"durationMs":70000}', 4)`);
+  }
+
+  test('三档聚合 + 引擎指标；跨所有项目一起看', async () => {
+    const { db, dispatch, admin } = makeApp();
+    seed(db);
+    const r = (await call(dispatch, 'GET', '/api/admin/usage', admin.token))!;
+    expect(r.status).toBe(200);
+    const body = await r.json() as {
+      grand: { outputTokens: number; requests: number };
+      projects: Array<{ projectId: number; projectName: string; outputTokens: number }>;
+      chat: Array<{ projectId: number; outputTokens: number }>;
+      unattributed: Array<{ projectId: number; outputTokens: number }>;
+      issues: Array<{ issueId: number; title: string; usage: { outputTokens: number }; testRetries: number;
+        nudges: number; judged: number; validationMs: number; validationRuns: number }>;
+    };
+
+    // 项目档取会话总量（issue 会话 + chat 会话）
+    expect(body.projects.find((p) => p.projectId === 1)).toMatchObject({ projectName: '项目甲', outputTokens: 22000 });
+    expect(body.grand).toMatchObject({ outputTokens: 22010, requests: 26 }); // 含项目乙那条会话
+    // 非 Issue 会话单列
+    expect(body.chat).toEqual([expect.objectContaining({ projectId: 1, outputTokens: 2000 })]);
+    // 未归因余量 = 会话总量 − 已归因（项目甲 22000 − 9000；项目乙 10 − 10 = 0）
+    expect(body.unattributed.find((u) => u.projectId === 1)).toMatchObject({ outputTokens: 13000 });
+    expect(body.unattributed.find((u) => u.projectId === 2)).toMatchObject({ outputTokens: 0 });
+    // issue 档带上引擎侧的非 token 指标
+    const issue10 = body.issues.find((i) => i.issueId === 10)!;
+    expect(issue10).toMatchObject({
+      title: '贵的那条', testRetries: 1, nudges: 1, judged: 1, validationMs: 70000, validationRuns: 1,
+    });
+    expect(issue10.usage.outputTokens).toBe(9000);
+  });
+
+  test('按项目与时间窗筛选；时间窗只作用于 issue 档并在响应里说明', async () => {
+    const { db, dispatch, admin } = makeApp();
+    seed(db);
+
+    const byProject = await (await call(dispatch, 'GET', '/api/admin/usage?projectId=2', admin.token))!.json() as {
+      projects: Array<{ projectId: number }>; issues: Array<{ issueId: number }>;
+    };
+    expect(byProject.projects.map((p) => p.projectId)).toEqual([2]);
+    expect(byProject.issues.map((i) => i.issueId)).toEqual([11]);
+
+    const windowed = await (await call(dispatch, 'GET', '/api/admin/usage?from=5000', admin.token))!.json() as {
+      window: { from: number; windowAppliesTo: string }; issues: Array<{ issueId: number }>;
+      projects: Array<{ projectId: number }>;
+    };
+    expect(windowed.issues.map((i) => i.issueId)).toEqual([11]); // issue 10 建于 1000，被窗口挡掉
+    expect(windowed.window).toEqual({ from: 5000, windowAppliesTo: 'issues' });
+    expect(windowed.projects.length).toBeGreaterThan(0); // 项目档是累计值，不随窗口变
+  });
+
+  test('金额折算走后台单价表（#282 / Q2）：可读可改，改完成本跟着变', async () => {
+    const { db, dispatch, admin } = makeApp();
+    seed(db);
+
+    const got = await (await call(dispatch, 'GET', '/api/admin/usage/pricing', admin.token))!.json() as {
+      pricing: { inputPerMTok: number; cachedInputPerMTok: number; outputPerMTok: number };
+    };
+    expect(got.pricing).toMatchObject({ inputPerMTok: 1.25, cachedInputPerMTok: 0.125, outputPerMTok: 10 });
+
+    const before = await (await call(dispatch, 'GET', '/api/admin/usage', admin.token))!.json() as {
+      grandCostUsd: number; issues: Array<{ issueId: number; costUsd: number }>;
+    };
+    // 项目甲会话：input 50w + cached 40w + output 2w  →  0.625 + 0.05 + 0.2 ≈ 0.875（另加项目乙那条）
+    expect(before.grandCostUsd).toBeGreaterThan(0.8);
+    expect(before.issues.find((i) => i.issueId === 10)!.costUsd).toBeGreaterThan(0);
+
+    const put = await call(dispatch, 'PUT', '/api/admin/usage/pricing', admin.token, { outputPerMTok: 20 });
+    expect(put!.status).toBe(200);
+    const after = await (await call(dispatch, 'GET', '/api/admin/usage', admin.token))!.json() as {
+      grandCostUsd: number; pricing: { outputPerMTok: number };
+    };
+    expect(after.pricing.outputPerMTok).toBe(20);
+    expect(after.grandCostUsd).toBeGreaterThan(before.grandCostUsd);
+
+    // 负数拒绝，库内不动
+    expect((await call(dispatch, 'PUT', '/api/admin/usage/pricing', admin.token, { inputPerMTok: -1 }))!.status).toBe(400);
+  });
+
+  test('回扫入口（#282 / Q3）：游标与两张表一起清，下一轮从头重算', async () => {
+    const { db, dispatch, admin } = makeApp();
+    seed(db);
+    const r = (await call(dispatch, 'POST', '/api/admin/usage/rescan', admin.token, {}))!;
+    expect(r.status).toBe(200);
+    expect((await r.json() as { reset: number }).reset).toBe(3);
+
+    const after = await (await call(dispatch, 'GET', '/api/admin/usage', admin.token))!.json() as {
+      grand: { outputTokens: number }; issues: unknown[];
+    };
+    expect(after.grand.outputTokens).toBe(0);
+    expect(after.issues).toEqual([]); // issue_usage 一并清掉，重扫才不会翻倍
+  });
+
+  test('普通用户 403（成本视图仅管理员可见）', async () => {
+    const { db, dispatch, users } = makeApp();
+    seed(db);
+    const alice = users.create('alice', 'user');
+    expect((await call(dispatch, 'GET', '/api/admin/usage', alice.token))!.status).toBe(403);
+    expect((await call(dispatch, 'GET', '/api/admin/usage/pricing', alice.token))!.status).toBe(403);
+    expect((await call(dispatch, 'POST', '/api/admin/usage/rescan', alice.token, {}))!.status).toBe(403);
+  });
+
+  test('空库不报错：三档都空、总量全零', async () => {
+    const { dispatch, admin } = makeApp();
+    const body = await (await call(dispatch, 'GET', '/api/admin/usage', admin.token))!.json() as {
+      grand: { requests: number }; projects: unknown[]; chat: unknown[]; issues: unknown[];
+    };
+    expect(body).toMatchObject({ projects: [], chat: [], issues: [] });
+    expect(body.grand.requests).toBe(0);
   });
 });

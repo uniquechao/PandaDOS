@@ -30,6 +30,23 @@ export function sortBoardGroup(
   return [...items].sort(byCreatedAsc);
 }
 
+/**
+ * 宽屏打开项目时默认选中的 issue：等人工选择 > 待确认 > 进行中 > 待办 >
+ * 最近完成（与完成组同一倒序口径，#305）> 列表第一条。空列表 → null。
+ */
+export function pickDefaultIssueId(list: readonly Issue[]): number | null {
+  const pick = (sts: readonly Issue['status'][]): number | undefined => list.find((i) => sts.includes(i.status))?.id;
+  return (
+    list.find((i) => i.waitingInput)?.id ?? // 弹窗等人工选择的最优先
+    pick(['clarifying', 'plan_review', 'merge_review']) ??
+    pick(['planning', 'implementing', 'testing', 'merging']) ??
+    pick(['pending']) ??
+    list.filter((i) => i.status === 'done').sort(byFinishedDesc)[0]?.id ??
+    list[0]?.id ??
+    null
+  );
+}
+
 /** 收尾组每页条数（#105：完成/受阻/已取消都分页，>1 页才出分页脚） */
 export const CLOSED_PAGE_SIZE = 50;
 

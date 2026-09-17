@@ -8,7 +8,7 @@
  * 头部面包屑显示当前打开文件的完整路径。文本读写/预览/下载端点见 web/routes/files.ts。
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { api } from '../lib/api';
+import { api, uploadWithProgress } from '../lib/api';
 import { nav } from '../lib/router';
 import { timeAgo } from '../lib/fmt';
 import type { FsEntry, FsList, FsUploadResult, Project } from '../lib/types';
@@ -49,6 +49,7 @@ export function FilesView({ pid }: { pid: number }) {
   // 上传成功等外部变更信号：递增以驱动文件树重拉
   const [reload, setReload] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [prog, setProg] = useState(0); // 上传进度 0~100（整数）；lengthComputable=false 时停在 0
   const fileInput = useRef<HTMLInputElement>(null);
 
   // 窄屏目录浏览态（宽屏走文件树、忽略这些）
@@ -89,17 +90,17 @@ export function FilesView({ pid }: { pid: number }) {
   // 上传目标目录：宽屏=当前打开文件父目录（无则根）；窄屏=正在浏览的目录
   const uploadDir = wide ? parentDir(selected) : rel;
 
+  // 上传走 XHR 底座（fetch 拿不到上传进度）：进度实时进 prog，成败都复位 busy/prog
   const uploadFile = async (f: File): Promise<void> => {
     setBusy(true);
-    const fd = new FormData();
-    fd.append('file', f, f.name);
+    setProg(0);
     try {
-      const r = await fetch(
+      const j = await uploadWithProgress<FsUploadResult>(
         `/api/projects/${pid}/fs/upload?path=${encodeURIComponent(uploadDir)}`,
-        { method: 'POST', body: fd },
+        f,
+        f.name,
+        { onProgress: (p) => setProg(Math.round(p.ratio * 100)) },
       );
-      const j = (await r.json().catch(() => null)) as (FsUploadResult & { error?: string }) | null;
-      if (!r.ok || !j?.ok) throw new Error(j?.error ?? t('view.uploadFailed', { status: r.status }));
       toast.success(t('view.uploaded', { name: j.name }));
       if (wide) setReload((n) => n + 1); // 刷新文件树
       else loadList(rel); // 刷新当前目录列表
@@ -107,6 +108,7 @@ export function FilesView({ pid }: { pid: number }) {
       toast.error(String(e instanceof Error ? e.message : e));
     } finally {
       setBusy(false);
+      setProg(0);
     }
   };
 
@@ -161,8 +163,20 @@ export function FilesView({ pid }: { pid: number }) {
           <span class="btitle">{project?.name ?? t('view.projectFallback', { id: pid })} · {t('view.files')}</span>
           <div class="bacts">
             {showUpload && (
-              <button class="btn sm" disabled={busy} onClick={() => fileInput.current?.click()}>
-                {busy ? t('ui.uploading') : `⇧ ${t('ui.upload')}`}
+              <button class="btn sm fs-up" disabled={busy} onClick={() => fileInput.current?.click()}>
+                {busy ? (prog > 0 ? `${prog}%` : t('ui.uploading')) : `⇧ ${t('ui.upload')}`}
+                {busy && (
+                  <span
+                    class="up-prog"
+                    role="progressbar"
+                    aria-valuenow={prog}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-label={t('ui.uploadingPercent', { percent: prog })}
+                  >
+                    <i style={{ width: `${prog}%` }} />
+                  </span>
+                )}
               </button>
             )}
           </div>

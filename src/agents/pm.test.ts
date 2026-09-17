@@ -21,6 +21,9 @@ import {
   JUDGE_DONE_SYS,
   loadGlobalPersona,
   MERGE_SYS,
+  MERGE_CANDIDATE_BODY_CHARS,
+  formatMergeCandidate,
+  mergeCandidateFileHints,
   MODULE_SUGGEST_SYS,
   menuFromSelection,
   migratePmAgent,
@@ -73,8 +76,10 @@ const noopDriver = {
   removeTree: async () => {},
   mkdirp: async () => {},
   movePath: async () => {},
+  ensureGitAvailable: async () => {},
   git: async () => ({ code: 0, out: '', err: '' }),
   readGitBlob: async () => ({ code: 0, data: new Uint8Array(), err: '' }),
+  runCommand: async () => ({ code: 0, out: '', err: '', timedOut: false, durationMs: 0 }),
   openPty: async () => {
     throw new Error('nope');
   },
@@ -100,6 +105,7 @@ function project(over: Partial<Project> = {}): Project {
     summaryStatus: 'idle',
     summaryError: null,
     manualReview: false,
+    validationCommands: null,
     kind: 'issue',
     ...over,
   };
@@ -251,10 +257,16 @@ describe('judgeDone（v1 fallbackDoneCheck 保守判定平移）', () => {
     expect(await pm2.judgeDone(issue(), 'x')).toBe('clarify');
   });
 
+  // #275 / B-09：'blocked' 从来没被返回过，类型里留着只会诱人写永远走不到的分支
+  test('取值只有 done / not_done / clarify——模型硬塞 blocked 也落回 not_done', async () => {
+    const pm = new PmAgent(project(), makeDeps(new MockLlm(['{"done":false,"blocked":true,"reason":"卡住了"}'])));
+    expect(await pm.judgeDone(issue(), 'x')).toBe('not_done');
+  });
+
   test('JUDGE_DONE_SYS 快照逐字（含 v2 clarify 档）', () => {
     expect(JUDGE_DONE_SYS).toBe(
       `你在判断一个 Claude Code 任务/调试的当前状态。只看证据，宁可保守。只输出 JSON：{"done": bool, "clarify": bool, "reason": "≤30字中文"}。\n` +
-        `- done=true 仅当：最近输出显示工作已收尾、改动已落地且(若涉及)测试/自测已通过、没有在问用户或等用户输入、没有报错或卡住、没有明显未完的后续步骤。\n` +
+        `- done=true 仅当：已对照原始目标全部达成，改动已落地且(若涉及)测试/自测已通过，没有在问用户或等用户输入，没有报错或卡住，也不需要人工部署、配置或其他必要后续操作；仅测试通过不等于任务完成。\n` +
         `- clarify=true 当：最近输出显示它在**向用户提问 / 等用户回答或拍板后才能继续**（例如列出待确认的问题、征求你决策）；此时 done 必为 false。\n` +
         `- done 与 clarify 都为 false：还在进行中、报错、被卡住、或证据不足以确认完成。`,
     );
@@ -319,7 +331,56 @@ describe('mergeModuleTasks（同模块 pending 交 LLM 归并）', () => {
     expect(llm.calls[0]!.messages[0]!.content).toStartWith(MERGE_SYS);
     expect(llm.calls[0]!.opts?.jsonMode).toBe(true);
     expect(llm.calls[0]!.messages[1]!.content).toContain('模块「web」');
-    expect(llm.calls[0]!.messages[1]!.content).toContain('#1 A：aa');
+    // #289：候选改成结构化摘要（标题 / 需求 / 涉及），不再是「标题：正文」一行截断
+    expect(llm.calls[0]!.messages[1]!.content).toContain('#1 A');
+    expect(llm.calls[0]!.messages[1]!.content).toContain('需求：aa');
+  });
+
+  // #289 / B-14：500 字 midTruncate 会把中段的范围声明省掉，#277 就是这么被合并的
+  test('候选摘要保头优先：正文开头（含范围声明）一定进 prompt，超预算只截尾部', async () => {
+    const llm = new MockLlm(['{"groups":[]}']);
+    const pm = new PmAgent(project(), makeDeps(llm));
+    const body = ['【范围声明】本条独立，不得与任何其他 Issue 合并。', '正文'.repeat(3000), '尾部标记'].join('\n');
+    await pm.mergeModuleTasks('web', [cand(1, 'A', body), cand(2, 'B', 'bb')]);
+
+    const prompt = llm.calls[0]!.messages[1]!.content;
+    expect(prompt).toContain('【范围声明】本条独立，不得与任何其他 Issue 合并。');
+    expect(prompt).not.toContain('尾部标记'); // 超预算截的是尾巴
+    expect(prompt).toContain('（后略）');
+  });
+
+  test('候选摘要带上代码定位线索：差异往往就在这些细节里', async () => {
+    const llm = new MockLlm(['{"groups":[]}']);
+    const pm = new PmAgent(project(), makeDeps(llm));
+    await pm.mergeModuleTasks('web', [
+      cand(1, 'A', '改 src/issues/engine.ts:5245 与 src/agents/pm.ts 的合并逻辑'),
+      cand(2, 'B', '改 ui/src/views/IssueDetail.tsx'),
+    ]);
+    const prompt = llm.calls[0]!.messages[1]!.content;
+    expect(prompt).toContain('涉及：src/issues/engine.ts:5245、src/agents/pm.ts');
+    expect(prompt).toContain('涉及：ui/src/views/IssueDetail.tsx');
+  });
+
+  test('系统提示明确「含范围声明的一律不得合并」（引擎侧过滤之外的双保险）', async () => {
+    const llm = new MockLlm(['{"groups":[]}']);
+    const pm = new PmAgent(project(), makeDeps(llm));
+    await pm.mergeModuleTasks('web', [cand(1, 'A'), cand(2, 'B')]);
+    expect(llm.calls[0]!.messages[0]!.content).toContain('不得合并');
+    expect(llm.calls[0]!.messages[0]!.content).toContain('noMerge');
+  });
+
+  test('formatMergeCandidate / mergeCandidateFileHints：拼装与边界', () => {
+    expect(formatMergeCandidate({ id: 7, title: 'T', body: null }))
+      .toBe('#7 T\n需求：（无正文，仅标题）');
+    const short = formatMergeCandidate({ id: 8, title: 'T', body: '一句话' });
+    expect(short).toContain('需求：一句话');
+    expect(short).not.toContain('（后略）'); // 没超预算就不该出现省略提示
+    expect(short).not.toContain('涉及：');
+
+    expect(mergeCandidateFileHints('见 a/b.ts:12 与 a/b.ts:12 和 c.tsx')).toEqual(['a/b.ts:12', 'c.tsx']);
+    expect(mergeCandidateFileHints(null)).toEqual([]);
+    expect(mergeCandidateFileHints('x.ts '.repeat(20), 3)).toHaveLength(1); // 去重后不足 3 条
+    expect(MERGE_CANDIDATE_BODY_CHARS).toBeGreaterThan(500); // 旧口径 500 字明显不够
   });
 
   test('同一 id 被划进多组 → 只归第一组（不重复折叠）', async () => {

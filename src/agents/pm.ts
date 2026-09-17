@@ -120,13 +120,15 @@ export function loadGlobalPersona(path?: string): string {
 
 /** judgeDone 保守判定 system（v1 agent.ts:552-554 平移 + v2 增 clarify 档：识别在向用户提问/等输入） */
 export const JUDGE_DONE_SYS = `你在判断一个 Claude Code 任务/调试的当前状态。只看证据，宁可保守。只输出 JSON：{"done": bool, "clarify": bool, "reason": "≤30字中文"}。
-- done=true 仅当：最近输出显示工作已收尾、改动已落地且(若涉及)测试/自测已通过、没有在问用户或等用户输入、没有报错或卡住、没有明显未完的后续步骤。
+- done=true 仅当：已对照原始目标全部达成，改动已落地且(若涉及)测试/自测已通过，没有在问用户或等用户输入，没有报错或卡住，也不需要人工部署、配置或其他必要后续操作；仅测试通过不等于任务完成。
 - clarify=true 当：最近输出显示它在**向用户提问 / 等用户回答或拍板后才能继续**（例如列出待确认的问题、征求你决策）；此时 done 必为 false。
 - done 与 clarify 都为 false：还在进行中、报错、被卡住、或证据不足以确认完成。`;
 export const JUDGE_DONE_SYS_EN = `Judge the current state of a Claude Code task from evidence only and be conservative. Return JSON only: {"done": bool, "clarify": bool, "reason": "a concise reason"}.
-- done=true only when work is complete, changes landed, relevant checks passed, no user input is pending, and no error or obvious next step remains.
+- done=true only when every original objective is achieved, changes landed, relevant checks passed, no user input is pending, and no required manual deployment, configuration, or other follow-up remains. Passing tests alone is insufficient.
 - clarify=true when the latest output asks the user a question or cannot continue without their decision; done must then be false.
 - otherwise both values are false.`;
+
+export const JUDGE_AGENT_FAILURE_SYS = '判断 CLI 退回 shell 的原因。只输出 JSON：{"kind":"resume_conflict|ordinary_exit|unknown"}。resume_conflict 表示 resume 被另一 active writer、active turn 或进程占用；ordinary_exit 表示普通退出可重启；证据不足返回 unknown。';
 
 /**
  * 同模块任务智能合并 system（v2 新增）：把同一模块下若干待办 issue 交 LLM 判断哪些
@@ -146,10 +148,12 @@ export const MERGE_SYS = `# 任务：判断同一模块下的多条待办能否�
 - 每个 group 至少 2 个 members；members 用给定的 id。
 - title ≤ 60 字，概括合并后的整体目标。
 - body：把被合并各条的需求**完整保留**并条理化（分条列出，不要丢信息），供工程师一次实施。
+- **正文里写了范围声明（本条独立 / 不得合并 / noMerge 之类）的，一律不得出现在任何 group 里**——
+  这是发起人对该条的明确要求，比「看起来很像」重要得多。（引擎侧另有确定性过滤，这里是双保险。）
 - 没有任何可合并的组时，groups 给空数组。`;
 export const MERGE_SYS_EN = `# Task: decide whether pending issues in one module should be merged
 Return JSON only: {"groups":[{"members":[1,2],"title":"merged title","body":"complete merged requirements"}]}.
-Merge only highly related work with overlapping boundaries that can safely be implemented together. Keep independent or risky work separate. Every group needs at least two supplied IDs. Preserve every requirement in the merged body. Return an empty groups array when nothing should merge.`;
+Merge only highly related work with overlapping boundaries that can safely be implemented together. Keep independent or risky work separate. Every group needs at least two supplied IDs. Preserve every requirement in the merged body. **Never put an issue in a group when its body declares that it must not be merged (noMerge / "do not merge" / scope declaration)** — the engine filters those too, this is a second line of defence. Return an empty groups array when nothing should merge.`;
 
 /** clarifying 判定 system（v2 新增，风格沿用四段调优 prompt 的保守哲学） */
 export const CLARIFYING_SYS = `# 任务：判断需求是否需要先向发起人澄清
@@ -203,9 +207,53 @@ export function menuFromSelection(sel: { context: string; options: string[] }, r
 /** 审批结论（= approval.ts ApprovalOutcome，含 requestId 供防重放） */
 export type ApprovalDecision = ApprovalOutcome;
 
-export type DoneJudgement = 'done' | 'not_done' | 'blocked' | 'clarify';
+// #275 / B-09：删掉了 'blocked'。它从来没被 judgeDone 返回过（阻塞由哨兵 ISSUE_BLOCKED
+// 与菜单滞留检测负责），留着只会诱人写出永远走不到的分支。
+export type DoneJudgement = 'done' | 'not_done' | 'clarify';
+export type AgentFailureJudgement = 'resume_conflict' | 'ordinary_exit' | 'unknown';
 
 /** 送 LLM 判合并的候选（同模块同 agent/类型的 pending issue 投影） */
+/**
+ * 单条候选进 prompt 的正文预算（#289 / B-14）。
+ *
+ * 旧口径是 `midTruncate(整篇, 500)`——保头保尾、**省略中段**，于是 #277 写在正文中段的
+ * 「范围声明：本条独立，不得与 #276 合并」被省掉了，合并器根本没看见。500 字对「差异在细节里」
+ * 的 issue 也明显不够：几条 issue 在合并器眼里长得一样，方向甚至会反转。
+ *
+ * 现在改成 **保头优先**的结构化摘要：标题 + 正文开头（范围声明、需求首段一般都在这里）
+ * + 从正文里抠出来的模块/文件线索。宁可尾部丢一点，也不能把开头的声明丢了。
+ */
+export const MERGE_CANDIDATE_BODY_CHARS = 1500;
+
+/** 从正文里抠出代码定位线索（文件路径 / `模块.ts:行号`）——差异往往就在这些细节里 */
+export function mergeCandidateFileHints(body: string | null | undefined, limit = 8): string[] {
+  const text = String(body ?? '');
+  // 扩展名按长到短排：先试 tsx 再试 ts，否则 c.tsx 会被截成 c.ts
+  const hits = text.match(/[\w./-]+\.(?:tsx|ts|jsx|js|sql|json|md|css)(?::\d+)?/g) ?? [];
+  const out: string[] = [];
+  for (const hit of hits) {
+    if (!out.includes(hit)) out.push(hit);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/**
+ * 一条候选的结构化摘要。**保头**：正文只从开头截，绝不动中段——开头是声明与需求主干所在。
+ */
+export function formatMergeCandidate(candidate: MergeCandidate): string {
+  const body = (candidate.body ?? '').trim();
+  const head = body.length > MERGE_CANDIDATE_BODY_CHARS
+    ? `${body.slice(0, MERGE_CANDIDATE_BODY_CHARS)}…（后略）`
+    : body;
+  const files = mergeCandidateFileHints(body);
+  return [
+    `#${candidate.id} ${candidate.title}`,
+    head ? `需求：${head}` : '需求：（无正文，仅标题）',
+    files.length ? `涉及：${files.join('、')}` : '',
+  ].filter(Boolean).join('\n');
+}
+
 export interface MergeCandidate {
   id: number;
   title: string;
@@ -347,6 +395,7 @@ export class PmAgent {
         return buildPlanningPrompt({
           issue,
           goal: this.project.goal,
+          manualReview: this.project.manualReview,
           feedback: opts.feedback ?? null,
           imgHint,
           locale,
@@ -381,8 +430,8 @@ export class PmAgent {
    * 完成判定兜底（三级机制的第 3 级，v1 fallbackDoneCheck→judgeDone 平移）：
    * 裸 system（不带 persona/memory，v1 语义）+ jsonMode，只看证据宁可保守。
    * 返回 'done'（已收尾）/ 'clarify'（在向用户提问/等输入，第二层保险，忘输出 NEED_CLARIFY 也能兜住）
-   * / 'not_done'（还在跑或证据不足）。永远不返回 'blocked'（阻塞由哨兵 ISSUE_BLOCKED
-   * 与菜单滞留检测负责）；LLM 调用错误上抛（引擎捕获落事件）。
+   * / 'not_done'（还在跑或证据不足）。**没有 'blocked' 这个取值**——阻塞由哨兵 ISSUE_BLOCKED
+   * 与菜单滞留检测负责；LLM 调用错误上抛（引擎捕获落事件）。
    */
   async judgeDone(issue: Issue, recentOutput: string): Promise<DoneJudgement> {
     const locale = this.localeForIssue(issue);
@@ -411,6 +460,20 @@ export class PmAgent {
     } catch {
       return 'not_done'; // 解析失败按未完成（保守，v1 兜底语义）
     }
+  }
+
+  async judgeAgentFailure(agent: AgentKind, pane: string): Promise<AgentFailureJudgement> {
+    const out = await this.deps.llm.chat([
+      { role: 'system', content: JUDGE_AGENT_FAILURE_SYS },
+      { role: 'user', content: '代理：' + agent + '\n终端最近输出：\n' + pane.slice(-6000) },
+    ], { jsonMode: true });
+    let kind: AgentFailureJudgement = 'unknown';
+    try {
+      const parsed = JSON.parse(out.content || '{}') as { kind?: unknown };
+      if (parsed.kind === 'resume_conflict' || parsed.kind === 'ordinary_exit') kind = parsed.kind;
+    } catch {}
+    if (agent === 'codex' && /(?:active\s+(?:writer|turn)|resume[^\n]{0,120}(?:conflict|locked|in use))/i.test(pane)) return 'resume_conflict';
+    return kind;
   }
 
   /**
@@ -471,9 +534,7 @@ export class PmAgent {
   async mergeModuleTasks(module: string, candidates: MergeCandidate[]): Promise<MergeGroup[]> {
     if (candidates.length < 2) return [];
     const ids = new Set(candidates.map((c) => c.id));
-    const list = candidates
-      .map((c) => `#${c.id} ${midTruncate(c.body ? `${c.title}：${c.body}` : c.title, 500)}`)
-      .join('\n');
+    const list = candidates.map((c) => formatMergeCandidate(c)).join('\n\n');
     const locale = this.deps.users.getSettings(this.project.ownerUserId).locale ?? DEFAULT_LOCALE;
     const r = await this.deps.llm.chat(
       [
@@ -565,6 +626,32 @@ export class PmAgent {
    * 进度摘要（issue_events 批次 → 值不值得推）：值得推返回 headline，否则 null。
    * jsonl 噪音管道请用 createProgressReporter（批量 flush + 节流 + 回插）。
    */
+  /**
+   * 收尾摘要的降级出口（#275 / I-05）：引擎的确定性拼装一个字都拼不出来时才会走到这里。
+   * 与 summarizeProgress 分开写是刻意的——那个会改写项目的「运行中进度」摘要，
+   * 在 issue 收尾时调用会把无关的进度条覆盖掉。这里只做一次无副作用的短问答。
+   */
+  async summarizeOutcome(input: {
+    title: string;
+    kind: 'done' | 'blocked';
+    facts: string;
+    locale?: SupportedLocale;
+  }): Promise<string | null> {
+    const locale = input.locale ?? DEFAULT_LOCALE;
+    const zh = promptLanguage(locale) === 'zh';
+    const ask = zh
+      ? `任务「${input.title}」已${input.kind === 'done' ? '完成' : '受阻转人工'}。` +
+        `下面是它的事件流水，请用 3 句以内说清${input.kind === 'done' ? '做了什么、还剩什么' : '做到哪一步、卡在哪里'}，不要编造流水里没有的事实。`
+      : `Task "${input.title}" is ${input.kind === 'done' ? 'complete' : 'blocked and handed to a person'}. ` +
+        `From the event log below, state in at most three sentences ${input.kind === 'done' ? 'what was done and what remains' : 'how far it got and what blocked it'}. Do not invent anything absent from the log.`;
+    const msg = await this.deps.llm.chat([
+      { role: 'system', content: `${this.systemPrompt(locale)}\n\n${outputLanguageInstruction(locale)}` },
+      { role: 'user', content: `${ask}\n\n${input.facts}` },
+    ]);
+    const text = (msg.content ?? '').trim();
+    return text || null;
+  }
+
   async summarizeProgress(events: IssueEvent[]): Promise<string | null> {
     if (!events.length) return null;
     const activity = events

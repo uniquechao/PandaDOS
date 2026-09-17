@@ -30,7 +30,7 @@ export function RunStream({
         const k = ev.off ?? ev.seq;
         switch (ev.kind) {
           case 'thinking':
-            return <ThinkingEvent key={k} text={ev.text} />;
+            return <ThinkingEvent key={k} text={ev.text} off={ev.off} />;
           case 'message':
             return (
               <MessageEvent
@@ -38,7 +38,9 @@ export function RunStream({
                 role={ev.role}
                 text={ev.text}
                 images={ev.images}
+                files={ev.files}
                 ts={ev.ts}
+                off={ev.off}
                 pid={pid}
                 onOpenImage={onOpenImage}
               />
@@ -59,3 +61,4 @@ export { ToolEvent } from './ToolEvent';
 export { CommandEvent } from './CommandEvent';
 export { ResultView } from './ResultView';
 export { ExceptionView } from './ExceptionView';
+export { DetailCtx, type DetailApi, type DetailState } from './detail';

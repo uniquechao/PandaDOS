@@ -4,6 +4,8 @@
  * POST /api/projects/:projectId/upload：multipart（file 字段），≤5MB，仅白名单图片类型
  * （png/jpg/jpeg/gif/webp）。落盘经 Driver.writeFile 到项目 cwd/.panda/uploads/<随机子目录>/，
  * git exclude 经 Driver 读写（core/uploads.ts）。
+ * POST /api/projects/:projectId/upload/file：同一落点的**通用附件**（对话窗口「附文件」），
+ * ≤20MB、类型不限，文件名经 safeUploadFileName 净化（见 core/uploads 里为何不用 safeFsFileName）。
  *
  * 返回 { ok, path: rel, abs, name, size }（与 v1 响应形状一致）：
  * 前端拿 rel 随建 issue 的 images 一起提交 → 存 issues.images_json（相对 cwd 路径数组，
@@ -11,7 +13,14 @@
  * 只 export 路由定义，注册进 routes/index.ts 由集成步骤统一做。
  */
 import type { Database } from 'bun:sqlite';
-import { safeImageName, saveUploadImage, type UploadFs } from '../../core/uploads';
+import {
+  MAX_UPLOAD_FILE_BYTES,
+  safeImageName,
+  safeUploadFileName,
+  saveUploadFile,
+  saveUploadImage,
+  type UploadFs,
+} from '../../core/uploads';
 import { getProject } from '../../issues/engine';
 import { json, type RouteDef } from '../middleware';
 
@@ -60,6 +69,42 @@ export function uploadsRoutes(deps: UploadsRoutesDeps): RouteDef[] {
         const data = new Uint8Array(await file.arrayBuffer());
         try {
           const saved = await saveUploadImage(driver, project.cwd, name, data);
+          return json({ ok: true, path: saved.rel, abs: saved.abs, name: saved.name, size: data.length });
+        } catch (e) {
+          return json({ ok: false, error: String(e).slice(0, 200) }, 500);
+        }
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/projects/:projectId/upload/file',
+      auth: 'project-access',
+      handler: async ({ req, params }) => {
+        const project = getProject(db, Number(params.projectId));
+        if (!project) return json({ ok: false, error: '无此项目' }, 404);
+
+        // 与图片同款：声明长度先挡一刀，超大 body 不进 formData 全量缓冲
+        const declared = Number(req.headers.get('content-length') ?? Number.NaN);
+        if (Number.isFinite(declared) && declared > MAX_UPLOAD_FILE_BYTES + MULTIPART_OVERHEAD) {
+          return json({ ok: false, error: '文件过大(>20MB)' }, 413);
+        }
+
+        let fd: FormData;
+        try {
+          fd = await req.formData();
+        } catch {
+          return json({ ok: false, error: '需要 multipart/form-data（file 字段）' }, 400);
+        }
+        const file = fd.get('file');
+        if (!file || typeof file === 'string') return json({ ok: false, error: '无文件' }, 400);
+
+        const name = safeUploadFileName(file.name || '');
+        if (!name) return json({ ok: false, error: '非法文件名' }, 400);
+        if (file.size > MAX_UPLOAD_FILE_BYTES) return json({ ok: false, error: '文件过大(>20MB)' }, 413);
+
+        const data = new Uint8Array(await file.arrayBuffer());
+        try {
+          const saved = await saveUploadFile(driver, project.cwd, name, data);
           return json({ ok: true, path: saved.rel, abs: saved.abs, name: saved.name, size: data.length });
         } catch (e) {
           return json({ ok: false, error: String(e).slice(0, 200) }, 500);

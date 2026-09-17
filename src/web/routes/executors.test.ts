@@ -62,6 +62,7 @@ function setup(
     mkdirp: async (p) => {
       fsDirs.set(p, fsDirs.get(p) ?? []);
     },
+    ensureGitAvailable: async () => {},
     git: async () => ({ code: 0, out: '', err: '' }),
   };
   const dispatch = createDispatcher(

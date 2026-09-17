@@ -9,7 +9,7 @@ import { describe, expect, test } from 'bun:test';
 import type { ServerWebSocket } from 'bun';
 import type { JsonlReader } from '../../core/jsonl';
 import { KeyedMutex } from '../../issues/mutex';
-import { chatClose, chatMessage, type ChatDriver, type ChatWsData, type ChatWsDeps } from './chat';
+import { chatClose, chatMessage, chatOpen, type ChatDriver, type ChatWsData, type ChatWsDeps } from './chat';
 
 // ---------- 假件 ----------
 
@@ -236,6 +236,46 @@ describe('WS chat 代理存活门禁（issue #97）', () => {
     await waitFor(() => driver.sent.length === 1); // 就绪后自动补发
     expect(driver.sent[0]).toEqual({ session: 'cc-1', text: '继续修 a.ts' });
     expect(frames.length).toBe(1); // 补发成功就不再打扰
+  });
+
+  test('Codex resume 冲突经管家判定后拒绝注入且不重启', async () => {
+    const driver = downDriver('chat-conv-c');
+    driver.pane = 'Cannot resume: session already has an active turn\n[root@VM p]#';
+    let calls = 0;
+    const deps = fakeDeps({ judgeAgentFailure: async () => { calls++; return 'resume_conflict'; } });
+    const { ws, frames } = fakeWs(driver, { session: 'chat-conv-c', convId: 'conv-c', pinnedConv: 'conv-c', chatMode: true, agent: 'codex' });
+    chatMessage(ws, JSON.stringify({ type: 'text', text: '继续', id: 'conflict-1' }), deps);
+    await waitFor(() => frames.length >= 2);
+    expect(calls).toBe(1);
+    expect(deps.relaunched).toHaveLength(0);
+    expect(driver.sent).toHaveLength(0);
+    expect(frames.at(-1)).toMatchObject({ type: 'err', code: 'agent_not_ready', id: 'conflict-1' });
+    expect(String(frames.at(-1)!.msg)).toContain('active writer/active turn');
+  });
+
+  test('附件提示随补发一并带上（files → fileReadHint 拼执行机绝对路径）', async () => {
+    const driver = downDriver('cc-1');
+    const deps = fakeDeps({}, () => {
+      driver.commands.set('cc-1', 'claude');
+      driver.pane = '❯ ';
+    });
+    const { ws } = fakeWs(driver, { session: 'cc-1', convId: 'conv-a', agent: 'claude' });
+
+    chatMessage(
+      ws,
+      JSON.stringify({
+        type: 'text',
+        text: '看这个文件',
+        files: ['.panda/uploads/x/notes.txt', 'evil.txt'], // 后者非上传目录 → 丢
+      }),
+      deps,
+    );
+    await waitFor(() => driver.sent.length === 1);
+    const injected = driver.sent[0]!.text;
+    expect(injected).toContain('/repo/.panda/uploads/x/notes.txt'); // cwd 侧绝对路径
+    expect(injected).toContain('个文件'); // fileReadHint 前言
+    expect(injected).not.toContain('evil.txt');
+    expect(injected).toContain('看这个文件');
   });
 
   test('chat 独立会话（codex）同样受保护，附图提示一并补发', async () => {
@@ -628,5 +668,194 @@ describe('WS chat 发送回执（issue #116）', () => {
     expect(frames[1]).toMatchObject({ type: 'err', code: 'agent_not_ready', id: 'p10' });
     expect(String(frames[1]!.msg)).toContain('没发出去');
     expect(driver.sent.length).toBe(0);
+  });
+});
+
+describe('WS chat detail 帧（issue #288：按 off 回源取完整正文）', () => {
+  /** 只实现 statPath/readFileRange 的最小 reader：内容即一份内存 jsonl */
+  function memReader(text: string): JsonlReader {
+    const bytes = new TextEncoder().encode(text);
+    return {
+      async statPath() {
+        return { size: bytes.length };
+      },
+      async readFileRange(_p: string, offset: number, limit: number) {
+        return { data: bytes.subarray(offset, offset + limit), size: bytes.length };
+      },
+      async listDir() {
+        return [];
+      },
+    };
+  }
+
+  const long = '甲'.repeat(9000);
+  const line = `${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: long }] } })}\n`;
+
+  test('只读回看（live=false）也能取全文——detail 在注入门控之前', async () => {
+    const driver = fakeDriver();
+    const deps = fakeDeps({ reader: memReader(line) });
+    const { ws, frames } = fakeWs(driver, { session: 'cc-1', live: false, jsonl: '/x.jsonl' });
+
+    chatMessage(ws, JSON.stringify({ type: 'detail', off: 0 }), deps);
+    await waitFor(() => frames.length === 1);
+    expect(frames[0]!.type).toBe('detail');
+    expect(frames[0]!.off).toBe(0);
+    expect(frames[0]!.content).toBe(long); // 气泡流里这条是 brief 截断过的
+    expect(frames[0]!.truncated).toBe(false);
+    expect(frames[0]!.total).toBe(long.length);
+    expect(driver.sent.length).toBe(0); // 纯读，绝不注入
+  });
+
+  test('取不到（无 jsonl / off 非法 / 位置无消息）回 error:true', async () => {
+    const driver = fakeDriver();
+    const deps = fakeDeps({ reader: memReader(line) });
+
+    const noJsonl = fakeWs(driver, { session: 'cc-1', jsonl: null });
+    chatMessage(noJsonl.ws, JSON.stringify({ type: 'detail', off: 0 }), deps);
+    await waitFor(() => noJsonl.frames.length === 1);
+    expect(noJsonl.frames[0]).toEqual({ type: 'detail', off: 0, error: true });
+
+    const bad = fakeWs(driver, { session: 'cc-1', jsonl: '/x.jsonl' });
+    chatMessage(bad.ws, JSON.stringify({ type: 'detail', off: -3 }), deps);
+    await waitFor(() => bad.frames.length === 1);
+    expect(bad.frames[0]).toEqual({ type: 'detail', off: 0, error: true });
+
+    const oob = fakeWs(driver, { session: 'cc-1', jsonl: '/x.jsonl' });
+    chatMessage(oob.ws, JSON.stringify({ type: 'detail', off: 999_999 }), deps);
+    await waitFor(() => oob.frames.length === 1);
+    expect(oob.frames[0]).toEqual({ type: 'detail', off: 999_999, error: true });
+  });
+
+  test('role=user 时剥掉附图提示；tool 作为 tool_result 的工具名兜底', async () => {
+    const driver = fakeDriver();
+    const userLine = `${JSON.stringify({
+      type: 'user',
+      message: {
+        content: '看看这个\n\n（这条任务附了 1 张截图，请先用 Read 工具逐张查看，再据此判断和动手）\n· /repo/.panda/uploads/abc/image.png',
+      },
+    })}\n`;
+    const resultLine = `${JSON.stringify({
+      type: 'user',
+      message: {
+        content: [
+          { type: 'tool_result', content: 'Script completed successfully\nWall time 1s\nOutput:\n真正的输出' },
+        ],
+      },
+    })}\n`;
+    const deps = fakeDeps({ reader: memReader(userLine + resultLine) });
+
+    const u = fakeWs(driver, { session: 'cc-1', jsonl: '/x.jsonl' });
+    chatMessage(u.ws, JSON.stringify({ type: 'detail', off: 0, role: 'user' }), deps);
+    await waitFor(() => u.frames.length === 1);
+    expect(u.frames[0]!.content).toBe('看看这个');
+
+    const r = fakeWs(driver, { session: 'cc-1', jsonl: '/x.jsonl' });
+    const resultOff = new TextEncoder().encode(userLine).length; // off 是字节 offset，不是字符数
+    chatMessage(r.ws, JSON.stringify({ type: 'detail', off: resultOff, tool: 'exec_command' }), deps);
+    await waitFor(() => r.frames.length === 1);
+    expect(r.frames[0]!.content).toBe('真正的输出'); // codex exec 外壳按 toolHint 剥掉
+  });
+});
+
+// ---------- 绑定漂移自愈（#302） ----------
+
+/** 内存 jsonl：路径 → 文件内容（每行一条 claude/codex 风格记录） */
+function fakeReader(files: Record<string, string>): JsonlReader {
+  return {
+    async statPath(p: string) {
+      const t = files[p];
+      return t === undefined ? null : { size: Buffer.byteLength(t), mtimeMs: Date.now() };
+    },
+    async readFileRange(p: string, offset: number, limit: number) {
+      const buf = Buffer.from(files[p] ?? '');
+      return { data: new Uint8Array(buf.subarray(offset, offset + limit)), size: buf.length };
+    },
+    async listDir() {
+      return [];
+    },
+  };
+}
+
+/** 一条 claude 口径的用户消息行（core/jsonl 的解析入口，够 baseline 认出一条气泡） */
+function userLine(text: string): string {
+  return JSON.stringify({
+    type: 'user',
+    timestamp: new Date().toISOString(),
+    message: { role: 'user', content: [{ type: 'text', text }] },
+  }) + '\n';
+}
+
+describe('WS chat 绑定漂移自愈（#302）', () => {
+  test('注入成功但 transcript 不长 → 重认领并按新文件重发 baseline', async () => {
+    const driver = fakeDriver();
+    driver.sessions.add('chat-c1');
+    driver.commands.set('chat-c1', 'codex'); // 代理活着：注入会真打进去
+    const files: Record<string, string> = { '/old.jsonl': '', '/new.jsonl': userLine('人工重启后的新会话') };
+    let bound = '/old.jsonl';
+    const reclaimed: string[] = [];
+    const deps = fakeDeps({
+      reader: fakeReader(files),
+      locator: {
+        locate: async () => bound,
+        reclaim: async (id: string) => {
+          reclaimed.push(id);
+          bound = '/new.jsonl'; // 认领 = 重绑，之后 locate 走新文件
+          return bound;
+        },
+      },
+      chatPollMs: 20,
+      driftGraceMs: 0, // 注入后下一轮就判定
+      driftCooldownMs: 0,
+    });
+    const { ws, frames } = fakeWs(driver, {
+      session: 'chat-c1',
+      convId: 'c1',
+      pinnedConv: 'c1',
+      chatMode: true,
+    });
+
+    await chatOpen(ws, deps);
+    chatMessage(ws, JSON.stringify({ type: 'text', text: '继续' }), deps);
+    await waitFor(() => driver.sent.length === 1);
+    await waitFor(() => reclaimed.length === 1);
+    chatClose(ws);
+
+    expect(reclaimed[0]).toBe('c1');
+    expect(ws.data.jsonl).toBe('/new.jsonl');
+    const baselines = frames.filter((f) => f.type === 'baseline');
+    expect(baselines.length).toBe(2); // 建连一次 + 重绑后一次
+    expect(JSON.stringify(baselines[1]!.msgs)).toContain('人工重启后的新会话');
+  });
+
+  test('transcript 正常增长 → 不认领（长命令跑着时不能误判）', async () => {
+    const driver = fakeDriver();
+    driver.sessions.add('chat-c2');
+    driver.commands.set('chat-c2', 'codex');
+    const files: Record<string, string> = { '/live.jsonl': '' };
+    const reclaimed: string[] = [];
+    const deps = fakeDeps({
+      reader: fakeReader(files),
+      locator: {
+        locate: async () => '/live.jsonl',
+        reclaim: async (id: string) => {
+          reclaimed.push(id);
+          return null;
+        },
+      },
+      chatPollMs: 20,
+      driftGraceMs: 0,
+      driftCooldownMs: 0,
+    });
+    const { ws } = fakeWs(driver, { session: 'chat-c2', convId: 'c2', pinnedConv: 'c2', chatMode: true });
+
+    await chatOpen(ws, deps);
+    chatMessage(ws, JSON.stringify({ type: 'text', text: '继续' }), deps);
+    await waitFor(() => driver.sent.length === 1);
+    files['/live.jsonl'] = userLine('继续'); // 代理落盘了这条注入
+    await waitFor(() => ws.data.injectedAt === 0);
+    await new Promise((r) => setTimeout(r, 80)); // 再跑几轮，确认没有迟到的认领
+    chatClose(ws);
+
+    expect(reclaimed).toEqual([]);
   });
 });

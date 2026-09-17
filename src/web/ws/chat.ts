@@ -9,12 +9,22 @@
  *          {type:'mode',live}（仅 ?conv= 钉住模式：建连先于 baseline 发一次，live 翻转再发；
  *                              issue 现场：live=钉住对话即当前激活对话可注入，false=只读历史；
  *                              chat 独立对话：live 恒 true，注入打到该对话自身会话 chat-<convId>）
+ *          {type:'detail',off,content,truncated,total} / {type:'detail',off,error:true}
+ *                            （issue #288：按 off 回源 jsonl 取该条消息的完整正文，见下）
  *          {type:'stale'}（select 注入前重抓核对 sig 不符/菜单已消失）
  *          {type:'ack',id}（issue #116：带 id 的文本帧**真注入成功**了；前端据此把乐观气泡标「已送达」）
  *          {type:'err',code,id?}（bad_frame / bad_key / out_of_range / inject_failed / expired / forbidden /
  *                             agent_not_ready=会话不在（自愈重建中）或 codex 退回 shell，带 msg 文案）
  * - 客→服：{type:'text',text,id?} {type:'key',key} {type:'select',index,sig} {type:'explain',sig?}
  *          （select 可选带 requestId=审批升级卡的一次性 id，走消费即焚管道）
+ *          {type:'detail',off,role?,tool?}（issue #288「查看完整内容」）
+ *
+ * detail 帧（issue #288）：气泡流里的正文按 MAX_TEXT/MAX_INPUT/MAX_RESULT 做过 brief 头尾截断，
+ * 命令与工具入参还被 toolfmt 二次截断——用户要「看全 + 复制」就只能按需回源。off 是消息的稳定
+ * 标识（源行字节 offset + 行内序号），readMessageDetail 据此定位那一行、full 模式重解析、取出
+ * 行内第 (off − 行首) 条的完整正文。与 history 一样是**纯读**，故同样先于注入门控处理——只读
+ * 回看（钉住非激活对话）也得能看全。role/tool 是前端就手带上的渲染侧信息：role='user' 时按
+ * enrichUserImages 同口径剥掉附图提示，tool 给 tool_result 配回工具名（单行解析配不回）。
  *
  * 回执契约（issue #116，改动前必读）：text 帧带 id 时，这条消息的**结局恰好回一帧带 id 的
  * ack 或 err**——注入成功 ack，注入失败/空帧/只读拒绝/会话不在/补发超时回带 id 的 err。
@@ -28,6 +38,8 @@
  */
 import type { ServerWebSocket } from 'bun';
 import {
+  DETAIL_MAX_CHARS,
+  readMessageDetail,
   readOlder,
   readRecentConversationPage,
   tailConversation,
@@ -37,7 +49,15 @@ import {
 import { detectSelection, selectionSig } from '../../core/screen';
 import { judgeAgentLiveness, paneHasAgentUi, type AgentLiveness } from '../../core/agent-liveness';
 import type { AgentKind } from '../../core/types';
-import { absImages, extractUploadRels, imageReadHint, isUploadRel, stripImageHint } from '../../core/uploads';
+import {
+  absImages,
+  extractUploadFileRels,
+  extractUploadRels,
+  fileReadHint,
+  imageReadHint,
+  isUploadRel,
+  stripImageHint,
+} from '../../core/uploads';
 import { projectLockKey, tmuxLockKey, type KeyedMutex } from '../../issues/mutex';
 import type { MessageBumper } from '../../core/activity';
 import type { MenuDriver } from './inject';
@@ -70,7 +90,14 @@ export interface ChatApprovals {
 export interface ChatWsDeps {
   /** jsonl 读取（与引擎同源：主执行机 Driver） */
   reader: JsonlReader;
-  locator: { locate(convId: string): Promise<string | null> };
+  locator: {
+    locate(convId: string): Promise<string | null>;
+    /**
+     * 会话重认领（core/agent-locator）：绑定的 jsonl 已经不是 pane 里那个进程在写的文件时，
+     * 按 cwd 重新发现当前活跃会话并重绑。不接 = 该能力未装配，漂移检测整体关闭。
+     */
+    reclaim?(convId: string): Promise<string | null>;
+  };
   convs: {
     currentConv(projectId: number): string | undefined;
     /** 死会话（tmux 都没了）的自愈重建（issue #88，见 ConversationManager.activate） */
@@ -96,6 +123,10 @@ export interface ChatWsDeps {
   }): Promise<string | null>;
   /** 轮询周期，缺省 1200ms（v1 平移；测试调小） */
   chatPollMs?: number;
+  /** 注入后等 transcript 长出的宽限，缺省 DRIFT_GRACE_MS（测试调小） */
+  driftGraceMs?: number;
+  /** 漂移重认领冷却，缺省 DRIFT_RECLAIM_COOLDOWN_MS（测试调小） */
+  driftCooldownMs?: number;
   retryDelayMs?: number;
   /** 重启后等代理就绪的上限，缺省 30s（超时就把这条消息还给用户，让他重发） */
   resendWaitMs?: number;
@@ -107,6 +138,7 @@ export interface ChatWsDeps {
    * 缺省不接 = 不统计（最小装配/测试）。
    */
   messages?: MessageBumper;
+  judgeAgentFailure?(projectId: number, agent: AgentKind, pane: string): Promise<'resume_conflict' | 'ordinary_exit' | 'unknown'>;
 }
 
 export interface ChatWsData {
@@ -160,7 +192,24 @@ export interface ChatWsData {
   resendInFlight?: boolean;
   /** 连接已关（chatClose 置位）：在途的补发等待据此提前收手 */
   closed?: boolean;
+  /**
+   * 最近一次**注入成功**的时刻（绑定漂移检测，见 checkBindingDrift）。注入成功后
+   * transcript 必然立刻长出这条用户消息；到点还没长 = 我们 tail 的不是 pane 里那个会话。
+   * 0 = 没有在等（未注入过 / 已长出 / 已判定过）。
+   */
+  injectedAt?: number;
+  /** 上次漂移重认领的时刻，用于冷却（认领失败时不要每条消息都重扫会话目录） */
+  reclaimAt?: number;
 }
+
+/**
+ * 注入成功后等 transcript 长出这条消息的上限；超时即判「绑定漂移」，见 checkBindingDrift。
+ * 给得比一次抓屏轮询宽裕得多：codex/claude 落盘用户消息是注入后紧跟着的事，20s 没动静
+ * 不会是「代理在想」，只会是我们 tail 错了文件。
+ */
+export const DRIFT_GRACE_MS = 20_000;
+/** 漂移重认领的冷却：认领不到（多半确实没有别的活跃会话）时别每条消息都去重扫目录 */
+export const DRIFT_RECLAIM_COOLDOWN_MS = 120_000;
 
 /** baseline 自适应回溯的初始窗口；消息不足时会翻倍向前读取。 */
 export const BASELINE_BYTES = 256 * 1024;
@@ -228,6 +277,11 @@ const DEFAULT_RESEND_POLL_MS = 1_000;
 function whoOf(d: ChatWsData): string {
   return d.agent === 'codex' ? 'codex' : 'AI';
 }
+const RESUME_CONFLICT_HINT = 'Codex 恢复失败：该会话仍被另一个 active writer/active turn 占用。请先结束占用该会话的 Codex 进程，或新建会话后重试。';
+async function resumeConflictOf(d: ChatWsData, deps: ChatWsDeps, pane: string): Promise<boolean> {
+  if (d.agent !== 'codex' || !deps.judgeAgentFailure) return false;
+  return (await deps.judgeAgentFailure(d.projectId, d.agent, pane).catch(() => 'unknown')) === 'resume_conflict';
+}
 
 /** 强制重启这条对话的代理（chat 独立会话只需 tmux 锁；issue 现场遵引擎锁序 project → tmux） */
 async function relaunchAgent(ws: ServerWebSocket<ChatWsData>, deps: ChatWsDeps): Promise<void> {
@@ -276,6 +330,11 @@ async function restartAndResend(
   // 唯一不带 id 的 err：这条话还活着（重启后会自动补发），前端保持「发送中」等结局
   send(ws, { type: 'err', code: 'agent_not_ready', msg: `${who} 不在（可能已退出/登录过期），正在重启并自动补发…` });
   try {
+    const initialPane = await d.driver.capturePane(d.session).catch(() => '');
+    if (await resumeConflictOf(d, deps, initialPane)) {
+      send(ws, { type: 'err', code: 'agent_not_ready', msg: RESUME_CONFLICT_HINT, ...idPart });
+      return;
+    }
     await relaunchAgent(ws, deps);
     const deadline = Date.now() + (deps.resendWaitMs ?? DEFAULT_RESEND_WAIT_MS);
     const pollMs = deps.resendPollMs ?? DEFAULT_RESEND_POLL_MS;
@@ -284,6 +343,10 @@ async function restartAndResend(
       await new Promise((r) => setTimeout(r, pollMs));
       if (d.closed) return; // 页面关了：这条不补发（用户已经看不到结果，注入只会打扰下一个人）
       const pane = await d.driver.capturePane(d.session).catch(() => '');
+      if (await resumeConflictOf(d, deps, pane)) {
+        send(ws, { type: 'err', code: 'agent_not_ready', msg: RESUME_CONFLICT_HINT, ...idPart });
+        return;
+      }
       if (paneReadyFor(d, pane)) {
         ready = true;
         break;
@@ -299,6 +362,7 @@ async function restartAndResend(
       return;
     }
     await injectText(inj, d.session, text);
+    d.injectedAt = Date.now(); // 起漂移观察：这条该立刻出现在 transcript 里（checkBindingDrift）
     deps.messages?.bump(d.userId); // 补发成功才计；发帧时那条并未注入过，故不会重复
     if (msgId) send(ws, { type: 'ack', id: msgId }); // 真注入这一刻才算「已送达」
   } catch {
@@ -309,15 +373,22 @@ async function restartAndResend(
 }
 
 /**
- * 发帧前富化：user 消息若含对话附图（extractUploadRels 命中上传目录里的截图 rel），挂 images 供前端
- * 缩略图/灯箱预览，并用 stripImageHint 把 AI 向的「请先用 Read…」提示从正文里剥掉（对话附图不落库，
- * 全靠回读消息文本还原，见 core/uploads.ts）。非 user / 无附图消息原样透传，不复制、不改动。
+ * 发帧前富化：user 消息若含对话附件（extractUploadRels 命中截图 rel / extractUploadFileRels 命中
+ * 其余文件 rel），挂 images/files 供前端缩略图·灯箱与文件 chip，并用 stripImageHint 把 AI 向的
+ * 「请先用 Read…」提示从正文里剥掉（对话附件不落库，全靠回读消息文本还原，见 core/uploads.ts）。
+ * 非 user / 无附件消息原样透传，不复制、不改动。
  */
 function enrichUserImages(m: ChatMessage): ChatMessage {
   if (m.role !== 'user') return m;
   const images = extractUploadRels(m.text ?? '');
-  if (images.length === 0) return m;
-  return { ...m, images, text: stripImageHint(m.text ?? '') };
+  const files = extractUploadFileRels(m.text ?? '');
+  if (images.length === 0 && files.length === 0) return m;
+  return {
+    ...m,
+    ...(images.length ? { images } : {}),
+    ...(files.length ? { files } : {}),
+    text: stripImageHint(m.text ?? ''),
+  };
 }
 
 // ---------- baseline / tick ----------
@@ -395,10 +466,12 @@ async function chatTick(ws: ServerWebSocket<ChatWsData>, deps: ChatWsDeps): Prom
   }
   if (d.jsonl) {
     const t = await tailConversation(deps.reader, d.jsonl, d.offset, d.nextSeq);
+    if (t.offset !== d.offset) d.injectedAt = 0; // 长出来了 = 绑定没问题，撤销漂移观察
     d.offset = t.offset;
     d.nextSeq = t.nextSeq;
     for (const m of t.msgs) send(ws, { type: 'msg', m: enrichUserImages(m) });
   }
+  if (await checkBindingDrift(ws, deps)) return; // 重认领成功 → 已重发 baseline
   if (!d.live) return; // 只读：不看屏、不发 selection
   const pane = await d.driver.capturePane(d.session).catch(() => '');
   const sel = detectSelection(pane);
@@ -407,6 +480,37 @@ async function chatTick(ws: ServerWebSocket<ChatWsData>, deps: ChatWsDeps): Prom
     d.lastSelSig = sig;
     send(ws, { type: 'selection', sel: sel ? selectionFrameOf(sel) : null });
   }
+}
+
+/**
+ * 绑定漂移检测：网页 tail 的 jsonl 和 pane 里真正在跑的会话不是同一个（#302 现场）。
+ *
+ * 怎么发生的：panda 起的 codex 退了，人在 pane 里手敲 `codex` 重开——新进程 = 新 session id
+ * = 新 rollout 文件，而 `conversations.agent_jsonl_path` 还指着旧的那个。旧文件没被删，
+ * `AgentJsonlLocator.locate` 的路径缓存于是永远命中它，网页从此停在一段死掉的记录上，
+ * 终端里却在正常干活。issue 侧有引擎的会话失效检测兜底，chat 独立对话没有任何 watch，
+ * 所以只会一直歪下去。
+ *
+ * 判据只用「注入成功但 transcript 不长」这一条：代理收到注入会立刻把这条用户消息落盘，
+ * DRIFT_GRACE_MS 之后仍零增长，就只能是绑错了文件。不拿「屏在动但文件不长」当判据——
+ * 长命令跑起来时 codex 的计时器每秒重绘一次屏，那会把正常执行判成漂移。
+ *
+ * 认领由 locator.reclaim 完成（要求候选同 cwd、未被别的对话绑走、尾部仍在写）；认领不到
+ * 就什么都不动，只进冷却，等下一条消息再看。返回 true = 已重绑并重发 baseline。
+ */
+async function checkBindingDrift(ws: ServerWebSocket<ChatWsData>, deps: ChatWsDeps): Promise<boolean> {
+  const d = ws.data;
+  const reclaim = deps.locator.reclaim;
+  if (!reclaim || !d.convId || !d.jsonl || !d.injectedAt) return false;
+  const now = Date.now();
+  if (now - d.injectedAt < (deps.driftGraceMs ?? DRIFT_GRACE_MS)) return false;
+  d.injectedAt = 0; // 这一轮观察到此为止：认领成功与否都不再重复判定同一条注入
+  if (now - (d.reclaimAt ?? 0) < (deps.driftCooldownMs ?? DRIFT_RECLAIM_COOLDOWN_MS)) return false;
+  d.reclaimAt = now;
+  const found = await reclaim(d.convId).catch(() => null);
+  if (!found || found === d.jsonl) return false;
+  await sendBaseline(ws, deps); // 重新 locate + 从新文件尾部重建视图
+  return true;
 }
 
 // ---------- 菜单解读（issue #112） ----------
@@ -538,6 +642,34 @@ async function handleFrame(
     send(ws, { type: 'history', msgs: r.msgs.map(enrichUserImages), hasMore: r.hasMore });
     return;
   }
+  // detail 同属纯读（issue #288「查看完整内容」）：按 off 回源 jsonl 那一行取完整正文。
+  // 与 history 一并放在注入门控之前——只读回看的历史也要能展开看全、能复制。
+  if (f.type === 'detail') {
+    const off =
+      typeof f.off === 'number' && Number.isFinite(f.off) && f.off >= 0 ? Math.floor(f.off) : -1;
+    if (!d.jsonl || off < 0) {
+      send(ws, { type: 'detail', off: Math.max(off, 0), error: true });
+      return;
+    }
+    const toolHint = typeof f.tool === 'string' && f.tool ? f.tool : undefined;
+    const detail = await readMessageDetail(deps.reader, d.jsonl, off, DETAIL_MAX_CHARS, toolHint).catch(
+      () => null,
+    );
+    if (!detail) {
+      send(ws, { type: 'detail', off, error: true });
+      return;
+    }
+    // 用户消息里的附图提示是发送时拼进去的 AI 向文本，不是用户打的字——与气泡流同口径剥掉
+    const content = f.role === 'user' ? stripImageHint(detail.content) : detail.content;
+    send(ws, {
+      type: 'detail',
+      off,
+      content,
+      truncated: detail.truncated,
+      total: detail.truncated ? detail.total : content.length,
+    });
+    return;
+  }
   // 解读只读屏、不注入，走自己的分支（不必过注入自愈门禁：会话死了 capturePane 自然抓不到菜单）。
   // 但仍受 live 门控——只读模式下 pane 上的菜单属于别的对话，解释它就是张冠李戴。
   if (f.type === 'explain') {
@@ -604,15 +736,22 @@ async function handleFrame(
 
   if (f.type === 'text') {
     const rawText = typeof f.text === 'string' ? f.text : '';
-    // 附图：仅上传目录内的 rel 保留（isUploadRel 挡伪造路径引用任意文件）+ 最多 6 张，与建 issue 同款；
-    // 拼成执行机侧绝对路径，经 imageReadHint 生成「请先用 Read 逐张看图」提示（对话里的图不写 images_json）。
-    const rels = Array.isArray(f.images)
-      ? (f.images as unknown[])
-          .filter((p): p is string => typeof p === 'string' && p.length > 0 && isUploadRel(p))
-          .slice(0, 6)
-      : [];
-    const hint = rels.length ? imageReadHint(absImages(d.cwd, rels)) : '';
-    // 只发图（文本空但有图）也放行；纯空帧（无文本无图）→ bad_frame，不注入
+    // 附件：仅上传目录内的 rel 保留（isUploadRel 挡伪造路径引用任意文件）+ 各最多 6 个，与建 issue 同款；
+    // 拼成执行机侧绝对路径，经 imageReadHint/fileReadHint 生成「请先用 Read…」提示
+    // （对话里的附件不写 images_json）。
+    const pickRels = (v: unknown): string[] =>
+      Array.isArray(v)
+        ? (v as unknown[])
+            .filter((p): p is string => typeof p === 'string' && p.length > 0 && isUploadRel(p))
+            .slice(0, 6)
+        : [];
+    const rels = pickRels(f.images);
+    const fileRels = pickRels(f.files);
+    // 截图提示在前、文件提示在后（两段各自 imageReadHint/fileReadHint 同构，都是「先 Read 再动手」）
+    const hint =
+      (rels.length ? imageReadHint(absImages(d.cwd, rels)) : '') +
+      (fileRels.length ? fileReadHint(absImages(d.cwd, fileRels)) : '');
+    // 只发附件（文本空但有图/有文件）也放行；纯空帧（无文本无附件）→ bad_frame，不注入
     if (!rawText.trim() && !hint) {
       send(ws, { type: 'err', code: 'bad_frame', ...idPart });
       return;
@@ -632,6 +771,7 @@ async function handleFrame(
       send(ws, { type: 'err', code: 'inject_failed', ...idPart });
       return;
     }
+    d.injectedAt = Date.now(); // 起漂移观察（同上）
     deps.messages?.bump(d.userId); // 注入成功才计（抛错走上面的 catch → inject_failed，不计）
     if (msgId) send(ws, { type: 'ack', id: msgId });
     return;

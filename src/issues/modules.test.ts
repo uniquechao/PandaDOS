@@ -1,8 +1,17 @@
 import { describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { migrate } from '../core/migrate';
+import { parseReasoningEffort, REASONING_EFFORTS } from '../core/types';
 import { migrateIssueEngine } from './engine';
-import { ModuleManager, ModuleStore, normalizeModuleSlug, type ModuleSuggestion } from './modules';
+import {
+  ModuleManager,
+  ModuleStore,
+  normalizeModuleSkills,
+  normalizeModuleSlug,
+  OPT_IN_SKILLS,
+  resolveModuleSkills,
+  type ModuleSuggestion,
+} from './modules';
 
 function setup(): { db: Database; modules: ModuleStore } {
   const db = new Database(':memory:');
@@ -672,5 +681,71 @@ describe('035 legacy 回填迁移', () => {
       .get();
     expect(issue?.module_id).toBe(module!.id);
     db.close();
+  });
+});
+
+describe('模块级技能挂载（046 / #277 I-02）', () => {
+  test('未配置 = null；写入去重保序、空数组是「显式一个都不挂」、null 清回默认', () => {
+    const { modules } = setup();
+    const m = modules.create({
+      projectId: 1, slug: 'issue-engine', displayName: '引擎', agent: 'claude', source: 'manual', createdBy: 1,
+    });
+    expect(m.skills).toBeNull(); // 新模块未配置
+
+    expect(modules.setSkills(m.id, ['panda-issue', 'superpowers', 'panda-issue']).skills)
+      .toEqual(['panda-issue', 'superpowers']);
+    expect(modules.get(m.id)!.skills).toEqual(['panda-issue', 'superpowers']);
+    expect(modules.setSkills(m.id, []).skills).toEqual([]);
+    expect(modules.setSkills(m.id, null).skills).toBeNull();
+  });
+
+  test('非法技能名直接拒绝：配置里不许出现路径', () => {
+    expect(() => normalizeModuleSkills(['../etc/passwd'])).toThrow(/非法技能名/);
+    expect(() => normalizeModuleSkills('superpowers' as unknown)).toThrow(/数组/);
+    expect(normalizeModuleSkills([' panda-issue ', '', null])).toEqual(['panda-issue']);
+    expect(normalizeModuleSkills(null)).toBeNull();
+  });
+
+  test('resolveModuleSkills：未配置沿用项目默认并剔掉需显式开启的重技能，配过则完全以配置为准', () => {
+    const projectDefault = ['panda-issue', 'artifacts', 'superpowers'];
+    expect(OPT_IN_SKILLS).toContain('superpowers');
+    // 未配置：superpowers 不跟着项目默认自动挂
+    expect(resolveModuleSkills({ skills: null }, projectDefault)).toEqual(['panda-issue', 'artifacts']);
+    expect(resolveModuleSkills({}, projectDefault)).toEqual(['panda-issue', 'artifacts']);
+    // 显式勾了就挂；显式空数组就一个都不挂
+    expect(resolveModuleSkills({ skills: ['superpowers'] }, projectDefault)).toEqual(['superpowers']);
+    expect(resolveModuleSkills({ skills: [] }, projectDefault)).toEqual([]);
+  });
+});
+
+describe('推理档位（048 / #281）', () => {
+  test('模块默认档：未配置为 null；写入合法值；null 清回未配置', () => {
+    const { modules } = setup();
+    const m = modules.create({
+      projectId: 1, slug: 'issue-engine', displayName: '引擎', agent: 'codex', source: 'manual', createdBy: 1,
+    });
+    expect(m.reasoningEffort).toBeNull();
+
+    expect(modules.setReasoningEffort(m.id, 'low').reasoningEffort).toBe('low');
+    expect(modules.get(m.id)!.reasoningEffort).toBe('low');
+    expect(modules.setReasoningEffort(m.id, 'high').reasoningEffort).toBe('high');
+    expect(modules.setReasoningEffort(m.id, null).reasoningEffort).toBeNull();
+  });
+
+  test('非法档位直接拒绝：存进去只会变成启动命令里谁也不认识的参数', () => {
+    const { modules } = setup();
+    const m = modules.create({
+      projectId: 1, slug: 'issue-engine', displayName: '引擎', agent: 'codex', source: 'manual', createdBy: 1,
+    });
+    expect(() => modules.setReasoningEffort(m.id, 'ultra' as never)).toThrow(/非法推理档位/);
+    expect(modules.get(m.id)!.reasoningEffort).toBeNull();
+  });
+
+  test('parseReasoningEffort：认不出的值当未配置，不猜也不报错', () => {
+    expect(parseReasoningEffort('medium')).toBe('medium');
+    expect(parseReasoningEffort('HIGH')).toBeNull();
+    expect(parseReasoningEffort(null)).toBeNull();
+    expect(parseReasoningEffort(3)).toBeNull();
+    expect(REASONING_EFFORTS).toEqual(['low', 'medium', 'high']);
   });
 });

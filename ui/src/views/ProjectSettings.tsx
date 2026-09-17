@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
+import { AgentLogo } from '../components/AgentLogo';
 import { ModulesPanel } from '../components/ModulesPanel';
 import { SummaryButton } from '../components/SummaryButton';
 import { useI18n } from '../i18n/provider';
@@ -26,8 +27,10 @@ import type {
   Me,
   MemberCandidate,
   Project,
+  ProjectDataSyncStatus,
   ProjectMember,
   ProjectModule,
+  ValidationCommand,
 } from '../lib/types';
 
 const PROVIDER_LABEL: Record<ExternalIssueProvider, string> = { github: 'GitHub', gitlab: 'GitLab' };
@@ -44,24 +47,52 @@ export interface ExternalIssueSourceForm {
 export interface ProjectSettingsFields {
   name: string;
   goal: string;
+  /** 门禁命令（#279）：一行一条，参数空格分隔；空文本 = 未配置（按 package.json 探测） */
+  validationCommands: string;
+}
+
+/**
+ * 文本框 → 门禁命令（#279）。一行一条，按空白切成 argv；空行忽略。
+ * **空文本返回 null**（= 未配置，交给控制面按 package.json 探测），不是「不跑门禁」。
+ */
+export function parseValidationCommandLines(text: string): ValidationCommand[] | null {
+  const commands = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'))
+    .map((line) => line.split(/\s+/).filter((part) => part.length > 0))
+    .filter((argv) => argv.length > 0)
+    .map((argv) => ({ label: argv.slice(1).join(' ') || argv[0]!, argv }));
+  return commands.length > 0 ? commands : null;
+}
+
+/** 门禁命令 → 文本框（未配置/空配置都显示为空） */
+export function formatValidationCommandLines(commands: ValidationCommand[] | null | undefined): string {
+  return (commands ?? []).map((c) => c.argv.join(' ')).join('\n');
 }
 
 type SettingsSection = 'general' | 'repository' | 'issueSubscription' | 'members' | 'modules' | 'workflows';
 const SETTINGS_SECTION_INDEX: Record<SettingsSection, string> = {
   general: '01', repository: '02', issueSubscription: '03', members: '04', modules: '05', workflows: '06',
 };
+const SYNC_STATE_KEYS = {
+  never: 'projectSettings.syncState.never', syncing: 'projectSettings.syncState.syncing',
+  success: 'projectSettings.syncState.success', warning: 'projectSettings.syncState.warning',
+  error: 'projectSettings.syncState.error',
+} as const;
 
 function normalizedProjectSettings(fields: ProjectSettingsFields): ProjectSettingsFields {
   return {
     name: fields.name.trim(),
     goal: fields.goal.trim(),
+    validationCommands: formatValidationCommandLines(parseValidationCommandLines(fields.validationCommands)),
   };
 }
 
 export function projectSettingsDirty(saved: ProjectSettingsFields, current: ProjectSettingsFields): boolean {
   const a = normalizedProjectSettings(saved);
   const b = normalizedProjectSettings(current);
-  return a.name !== b.name || a.goal !== b.goal;
+  return a.name !== b.name || a.goal !== b.goal || a.validationCommands !== b.validationCommands;
 }
 
 /** 空 token 不进入请求，避免界面把脱敏摘要或空值误当成新凭据覆盖后端。 */
@@ -213,6 +244,7 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
   const [project, setProject] = useState<Project | null>(null);
   const [name, setName] = useState('');
   const [goal, setGoal] = useState('');
+  const [validationCommands, setValidationCommands] = useState('');
   const [remotes, setRemotes] = useState<ExternalIssueRemote[]>([]);
   const [source, setSource] = useState<ExternalIssueSourceSummary | null>(null);
   const [sourceForm, setSourceForm] = useState<ExternalIssueSourceForm>({
@@ -228,6 +260,8 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
   const [sourceSaving, setSourceSaving] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
   const [error, setError] = useState('');
+  const [syncStatus, setSyncStatus] = useState<ProjectDataSyncStatus | null>(null);
+  const [syncing, setSyncing] = useState(false);
 
   const canManage = Boolean(project && (me.role === 'admin' || me.id === project.ownerUserId));
 
@@ -235,10 +269,12 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
     const fields = {
       name: next.name,
       goal: next.goal ?? '',
+      validationCommands: formatValidationCommandLines(next.validationCommands),
     };
     setProject(next);
     setName(fields.name);
     setGoal(fields.goal);
+    setValidationCommands(fields.validationCommands);
     setSavedFields(fields);
   };
   const applySource = (next: ExternalIssueSourceSummary | null, candidates = remotes): void => {
@@ -263,7 +299,8 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
       api<Issue[]>(`/api/projects/${pid}/issues`),
       api<{ modules: ProjectModule[] }>(`/api/projects/${pid}/modules`),
       api<ExecutorLite[]>('/api/executors'),
-    ]).then(([nextProject, remoteResult, sourceResult, nextIssues, moduleResult, executors]) => {
+      api<{ status: ProjectDataSyncStatus }>(`/api/projects/${pid}/sync`),
+    ]).then(([nextProject, remoteResult, sourceResult, nextIssues, moduleResult, executors, syncResult]) => {
       const nextExecutor = executors.find((item) => item.id === nextProject.executorId) ?? null;
       applyProject(nextProject);
       setRemotes(remoteResult.remotes);
@@ -272,11 +309,12 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
       setModules(moduleResult.modules);
       setExecutor(nextExecutor);
       setSupportedAgents(nextExecutor?.supportedAgents ?? []);
+      setSyncStatus(syncResult.status);
     }).catch((e: Error) => setError(e.message));
   };
   useEffect(load, [pid]);
 
-  const currentFields = { name, goal };
+  const currentFields = { name, goal, validationCommands };
   const dirty = Boolean(savedFields && projectSettingsDirty(savedFields, currentFields));
 
   useEffect(() => {
@@ -300,7 +338,10 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
     setError('');
     try {
       const result = await api<{ project: Project }>(`/api/projects/${pid}`, 'PATCH', {
-        name: currentFields.name.trim(), goal: currentFields.goal.trim() || null,
+        name: currentFields.name.trim(),
+        goal: currentFields.goal.trim() || null,
+        // 留空 = null = 未配置（后端按 package.json 探测），与「显式不跑门禁」不是一回事
+        validationCommands: parseValidationCommandLines(currentFields.validationCommands),
       });
       applyProject(result.project);
       toast.success(t('projectSettings.saved'));
@@ -361,6 +402,21 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
     }
   };
 
+  const syncNow = async (): Promise<void> => {
+    if (syncing) return;
+    setSyncing(true);
+    try {
+      const result = await api<{ status: ProjectDataSyncStatus }>(`/api/projects/${pid}/sync`, 'POST');
+      setSyncStatus(result.status);
+      if (result.status.state === 'success') toast.success(t('projectSettings.syncCompleted'));
+      else toast.error(t('projectSettings.syncNeedsAttention'));
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   if (!project && !error) return <div class="boot">{t('ui.loading')}</div>;
   if (!project) return <div class="page"><div class="err" role="alert">{error}</div></div>;
 
@@ -387,6 +443,16 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
             <div class="ps-form-grid">
               <label class="field">{t('project.projectName')}<input value={name} disabled={!canManage} onInput={(e) => setName(e.currentTarget.value)} /></label>
               <label class="field">{t('project.goal')}<textarea rows={3} value={goal} disabled={!canManage} onInput={(e) => setGoal(e.currentTarget.value)} /><span class="small mut">{t('projectSettings.descriptionHelp')}</span></label>
+              <label class="field">{t('projectSettings.validationCommands')}
+                <textarea
+                  rows={3}
+                  class="mono"
+                  value={validationCommands}
+                  disabled={!canManage}
+                  onInput={(e) => setValidationCommands(e.currentTarget.value)}
+                />
+                <span class="small mut">{t('projectSettings.validationCommandsHelp')}</span>
+              </label>
             </div>
             <div class="ps-summary">
               <div class="ps-summary-head"><b>{t('projectSettings.readmeSummary')}</b><SummaryButton status={project.summaryStatus} busy={summarizing} onPick={(mode) => void updateSummary(mode)} renderLabel={(_, busy) => busy || project.summaryStatus === 'running' ? t('action.generating') : t('projectSettings.manualUpdate')} models={SUMMARY_MODELS.filter((item) => item.mode === 'llm' || supportedAgents.includes(item.mode as AgentKind))} /></div>
@@ -422,12 +488,26 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
                   <div class="ps-executor-agents">
                     <span>{t('admin.availableAgents')}</span>
                     <div>{executor.supportedAgents.length
-                      ? executor.supportedAgents.map((agent) => <span class="badge b-ai" key={agent}>{agent}</span>)
+                      ? executor.supportedAgents.map((agent) => <AgentLogo agent={agent} size="xs" key={agent} />)
                       : <span class="mut">{t('project.noAgent')}</span>}
                     </div>
                   </div>
                 </div>
               ) : <div class="empty">{t('ui.notConfigured')}</div>}
+            </div>
+            <div class={`ps-sync-card is-${syncStatus?.state ?? 'never'}`} aria-live="polite">
+              <div class="ps-sync-head">
+                <div><strong>{t('projectSettings.syncTitle')}</strong><span class={`ps-status ${syncStatus?.state === 'success' ? 'ok' : syncStatus?.state === 'warning' || syncStatus?.state === 'error' ? 'warn' : 'muted'}`}>{t(SYNC_STATE_KEYS[syncStatus?.state ?? 'never'])}</span></div>
+                <button class="btn sm" disabled={syncing || syncStatus?.state === 'syncing'} onClick={() => void syncNow()}>{syncing || syncStatus?.state === 'syncing' ? t('projectSettings.syncing') : t('projectSettings.syncNow')}</button>
+              </div>
+              <div class="ps-sync-meta">
+                <span>{syncStatus?.lastAttemptTs ? t('projectSettings.syncLast', { time: fmtTime(syncStatus.lastAttemptTs) }) : t('projectSettings.syncNever')}</span>
+                {syncStatus && <span>{t('projectSettings.syncSummary', { detected: syncStatus.detectedUpdates, imported: syncStatus.imported, archived: syncStatus.archived })}</span>}
+              </div>
+              {syncStatus && (syncStatus.conflicts > 0 || syncStatus.parseErrors > 0) && <div class="ps-sync-errors" role="alert">
+                <strong>{t('projectSettings.syncProblems', { conflicts: syncStatus.conflicts, errors: syncStatus.parseErrors })}</strong>
+                {syncStatus.details.length > 0 && <ul>{syncStatus.details.map((detail) => <li key={detail}><code>{detail}</code></li>)}</ul>}
+              </div>}
             </div>
           </section>
 
@@ -458,7 +538,7 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
                   <div class="ps-module-item" key={module.id}>
                     <div class="ps-module-main"><strong title={module.displayName}>{module.displayName}</strong><span class="mono" title={module.slug}>{module.slug}</span></div>
                     <div class="ps-module-meta">
-                      <span class="badge b-ai">{module.agent}</span>
+                      <AgentLogo agent={module.agent} size="xs" />
                       <span>{module.source === 'legacy' ? t('ui.migrated') : module.source === 'manual' ? t('ui.manual') : t('ui.automatic')}</span>
                       <span class="badge b-gray">{t('ui.moduleIssueCount', { count: issues.filter((issue) => issue.moduleId === module.id).length })}</span>
                       <span title={module.lastUsedTs ? fmtTime(module.lastUsedTs) : t('ui.never')}>{module.lastUsedTs ? timeAgo(module.lastUsedTs) : t('ui.never')}</span>

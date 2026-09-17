@@ -15,11 +15,18 @@ describe('工作台列表：等待澄清醒目化（#110）', () => {
     const idxReview = source.indexOf("' review'");
     expect(idxClarify).toBeGreaterThan(0);
     expect(idxReview).toBeGreaterThan(idxClarify);
+    // #275：色带改由 attentionKind 驱动，但老接口没有该字段时要能退回原来的状态判断
+    expect(source).toContain("issue.awaitingClarify // 兜底：老接口没有 attentionKind");
   });
 
-  test('「澄清待答」提到 amber 级，且不与「等待你澄清」重复挂两个角标', () => {
-    expect(source).toContain('issue.clarifyPending && !issue.awaitingClarify');
-    expect(source).toContain("badge b-amber\" title={tr('board.clarifyOptional')}");
+  // #275：原来「等你澄清 / 等你选择 / 澄清待答」是三块各自的判断，容易重复挂角标；
+  // 现在统一由 AttentionBadge 一个承载，重复问题从结构上消失
+  test('「在等什么」只挂一个角标，由后端派生的 attentionKind 驱动', () => {
+    expect(source).toContain('<AttentionBadge kind={issue.attentionKind} />');
+    expect(source).not.toContain('<WaitingBadge />');
+    expect(source).not.toContain('issue.clarifyPending && !issue.awaitingClarify');
+    // 同一行里只出现一次，不会既挂澄清又挂等待
+    expect(source.split('<AttentionBadge').length - 1).toBe(1);
   });
 
   test('样式落地：实心橙徽标 + 行左色带', () => {

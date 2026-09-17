@@ -32,7 +32,7 @@ import {
   type AutoApproveLevel,
   type Conversation,
   type Project,
-  type ProjectKind,
+  type ConversationKind,
 } from '../../core/types';
 import {
   discoverExecutorAgentHistory,
@@ -47,7 +47,7 @@ import { json, type RouteDef } from '../middleware';
 /** ConversationManager 最小面（core/conversations.ts 结构兼容） */
 export interface ConvManagerPort {
   listChats(projectId: number, includeArchived?: boolean): Conversation[];
-  create(projectId: number, label: string, agent?: AgentKind, kind?: ProjectKind): Conversation;
+  create(projectId: number, label: string, agent?: AgentKind, kind?: ConversationKind): Conversation;
   get(id: string): Conversation | undefined;
   activate(id: string): Promise<Conversation | null>;
   archive(id: string): Promise<void>;

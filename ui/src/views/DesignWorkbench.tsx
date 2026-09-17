@@ -34,6 +34,7 @@ import {
 } from '../lib/design';
 import { timeAgo } from '../lib/fmt';
 import { nav } from '../lib/router';
+import { AgentLogo } from '../components/AgentLogo';
 import { Loading } from '../components/Loaders';
 import { Modal } from '../components/Modal';
 import { toast } from '../lib/toast';
@@ -124,7 +125,7 @@ function DesignConversation({
   }, [run?.id, run?.status, pid, did]);
   return (
     <section class="design-conversation" aria-label={t('design.conversation')}>
-      <div class="design-conversation-head"><div><span class="design-eyebrow">{t('design.goalCoach')}</span><h2>{t('design.conversation')}</h2></div><span class="badge b-blue">{task.agent === 'claude' ? 'Claude Code' : 'Codex'}</span></div>
+      <div class="design-conversation-head"><div><span class="design-eyebrow">{t('design.goalCoach')}</span><h2>{t('design.conversation')}</h2></div><AgentLogo agent={task.agent} size="sm" /></div>
       <div class="design-messages" aria-live="polite">
         <article class="design-message user"><span class="design-message-author">{t('design.originalNeed')}</span><p>{task.originalRequest}</p></article>
         {events.map((event) => {

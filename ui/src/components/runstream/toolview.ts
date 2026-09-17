@@ -25,6 +25,6 @@ export function toolHeadView(ev: RunToolEvent, open: boolean): ToolHead {
     head: ev.title ?? `🔧 ${ev.tool}`,
     dur: fmtDuration(ev.durationMs),
     preview: !open && ev.result ? firstLine(ev.result, PREVIEW_CHARS) : '',
-    hasBody: Boolean(ev.input || ev.result),
+    hasBody: ev.input !== undefined || ev.result !== undefined,
   };
 }

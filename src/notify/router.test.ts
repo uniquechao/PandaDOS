@@ -85,10 +85,10 @@ function statusEvent(projectId: number, issueId: number, summary = 's'): NotifyE
 // ---------- 迁移 ----------
 
 describe('migrateNotify', () => {
-  test('应用 060 且幂等', () => {
+  test('应用 063 且幂等', () => {
     const db = makeDb();
     const s1 = migrateNotify(db);
-    expect(s1.applied).toContain(60);
+    expect(s1.applied).toContain(63);
     const s2 = migrateNotify(db); // 重复执行不炸
     expect(s2.applied).toEqual(s1.applied);
     db.run(`INSERT INTO users (username, token_hash, role, created_ts) VALUES ('u', 'h', 'user', 0)`);
@@ -182,6 +182,18 @@ describe('GateRequestStore', () => {
   });
 });
 
+/**
+ * 等某个条件成立（节流窗口到期这类定时器驱动的断言用）。
+ *
+ * **不要用固定 `Bun.sleep(窗口 + 余量)`**：全量跑时几十个测试文件并行，事件循环被压住，
+ * 定时器晚到几十毫秒是常事，固定睡眠就会变成偶发失败（本仓库实际发生过）。
+ * 轮询到条件成立立刻返回，正常路径几乎不多花时间；超时才让断言去报错。
+ */
+async function waitUntil(ok: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!ok() && Date.now() < deadline) await Bun.sleep(5);
+}
+
 // ---------- NotifyRouter.dispatch ----------
 
 describe('NotifyRouter.dispatch', () => {
@@ -192,6 +204,7 @@ describe('NotifyRouter.dispatch', () => {
     const bob = users.create('bob').user;
     users.setFeishuOpenid(alice.id, 'ou_alice');
     const pid = addProject(db, alice.id);
+    db.query('INSERT INTO project_members (project_id, user_id, created_ts) VALUES (?, ?, 0)').run(pid, bob.id);
     const iid = addIssue(db, pid);
     const router = new NotifyRouter(db, { throttleMs });
     const ch = new FakeChannel();
@@ -281,7 +294,7 @@ describe('NotifyRouter.dispatch', () => {
     expect(ch.texts).toHaveLength(1);
     expect(ch.texts[0]!.text).toContain('第1条');
 
-    await Bun.sleep(120); // 窗口到期定时器触发
+    await waitUntil(() => ch.texts.length >= 2); // 窗口到期定时器触发
     expect(ch.texts).toHaveLength(2);
     expect(ch.texts[1]!.text).toContain('第2条');
     expect(ch.texts[1]!.text).toContain('第3条');
@@ -325,6 +338,94 @@ describe('NotifyRouter.dispatch', () => {
     expect(ch.texts[1]!.text).toContain('計画の確認待ち：OAuth login');
     expect(ch.texts[1]!.text).not.toContain('Plan awaiting confirmation');
     router.stop();
+  });
+});
+
+describe('NotifyRouter authorization changes', () => {
+  function setup() {
+    const db = makeDb();
+    const users = new UserStore(db);
+    const owner = users.create('owner').user;
+    const member = users.create('member').user;
+    users.setFeishuOpenid(member.id, 'ou_member');
+    const projectId = addProject(db, owner.id, 'shared app');
+    const issueId = addIssue(db, projectId);
+    db.query('INSERT INTO project_members (project_id, user_id, created_ts) VALUES (?, ?, 0)').run(projectId, member.id);
+    const router = new NotifyRouter(db, { throttleMs: 60_000 });
+    const channel = new FakeChannel(); router.register(channel);
+    router.subscriptions.add(member.id, 'project', projectId);
+    return { db, users, owner, member, projectId, issueId, router, channel };
+  }
+
+  test('members resolve exact names with spaces; archived projects and duplicate accessible names are rejected', async () => {
+    const s = setup();
+    expect(await s.router.routeInbound('feishu', 'ou_member', '#shared app question')).toBe(s.projectId);
+    const other = addProject(s.db, s.member.id, 'shared app');
+    expect(await s.router.routeInbound('feishu', 'ou_member', '#shared app question')).toBeNull();
+    expect(await s.router.routeInbound('feishu', 'ou_member', `#${other} question`)).toBe(other);
+    s.db.query("UPDATE projects SET status = 'archived' WHERE id = ?").run(other);
+    expect(await s.router.routeInbound('feishu', 'ou_member', `#${other} question`)).toBeNull();
+    expect(await s.router.routeInbound('feishu', 'ou_member', '#shared app question')).toBe(s.projectId);
+    s.router.stop(); s.db.close();
+  });
+
+  for (const change of ['membership', 'archive', 'unbind', 'rebind', 'unregister', 'replace'] as const) {
+    test(`buffered notifications do not leak after ${change}`, async () => {
+      const s = setup();
+      await s.router.dispatch(statusEvent(s.projectId, s.issueId, 'first'));
+      await s.router.dispatch(statusEvent(s.projectId, s.issueId, 'confidential pending'));
+      expect(s.channel.texts).toHaveLength(1);
+      if (change === 'membership') s.db.query('DELETE FROM project_members WHERE user_id = ?').run(s.member.id);
+      if (change === 'archive') s.db.query("UPDATE projects SET status = 'archived' WHERE id = ?").run(s.projectId);
+      if (change === 'unbind') s.users.setFeishuOpenid(s.member.id, null);
+      if (change === 'rebind') s.users.setFeishuOpenid(s.member.id, 'ou_new');
+      if (change === 'unregister') s.router.unregister('feishu');
+      const replacement = new FakeChannel();
+      if (change === 'replace') s.router.register(replacement);
+      await s.router.flushAll();
+      expect(s.channel.texts).toHaveLength(1);
+      expect(replacement.texts).toEqual([]);
+      s.router.stop(); s.db.close();
+    });
+  }
+
+  test('stale subscriptions cannot authorize text or gate delivery', async () => {
+    const s = setup();
+    s.db.query('DELETE FROM project_members WHERE user_id = ?').run(s.member.id);
+    await s.router.dispatch(statusEvent(s.projectId, s.issueId, 'private'));
+    const gid = addGate(s.db, s.issueId);
+    await s.router.dispatch({ kind: 'gate_waiting', projectId: s.projectId, issueId: s.issueId,
+      gate: { id: gid, issueId: s.issueId, kind: 'plan', status: 'waiting', payloadJson: '{}', decidedBy: null, decidedTs: null } });
+    expect(s.channel.texts).toEqual([]); expect(s.channel.cards).toEqual([]);
+    s.router.stop(); s.db.close();
+  });
+
+  test('flush filters projects separately and retains still-authorized notifications', async () => {
+    const s = setup(); const own = addProject(s.db, s.member.id, 'own'); const ownIssue = addIssue(s.db, own);
+    s.router.subscriptions.add(s.member.id, 'project', own);
+    await s.router.dispatch(statusEvent(s.projectId, s.issueId, 'first'));
+    await s.router.dispatch(statusEvent(s.projectId, s.issueId, 'revoked-secret'));
+    await s.router.dispatch(statusEvent(own, ownIssue, 'allowed-progress'));
+    s.db.query('DELETE FROM project_members WHERE user_id = ?').run(s.member.id);
+    await s.router.flushAll();
+    expect(s.channel.texts).toHaveLength(2);
+    expect(s.channel.texts[1]!.text).toContain('allowed-progress');
+    expect(s.channel.texts[1]!.text).not.toContain('revoked-secret');
+    s.router.stop(); s.db.close();
+  });
+
+  test('rebind followed by new dispatch discards the previous recipient buffer', async () => {
+    const s = setup();
+    await s.router.dispatch(statusEvent(s.projectId, s.issueId, 'first'));
+    await s.router.dispatch(statusEvent(s.projectId, s.issueId, 'old-secret'));
+    s.users.setFeishuOpenid(s.member.id, 'ou_new');
+    await s.router.dispatch(statusEvent(s.projectId, s.issueId, 'new-progress'));
+    await s.router.flushAll();
+    expect(s.channel.texts).toHaveLength(2);
+    expect(s.channel.texts[1]!.target.address).toBe('ou_new');
+    expect(s.channel.texts[1]!.text).toContain('new-progress');
+    expect(s.channel.texts[1]!.text).not.toContain('old-secret');
+    s.router.stop(); s.db.close();
   });
 });
 
@@ -417,5 +518,114 @@ describe('formatEventText', () => {
 
     expect(progress).toContain('Raw AI headline（返信待ち）');
     expect(approval).toContain('選択が必要です：rm -rf build?');
+  });
+
+  // #275 / B-07：弹窗等人选不是「受阻」，两种通知的前缀与语气必须分开
+  test('choice_waiting 用「等你选择」的文案，与 issue_blocked 明确区分', () => {
+    const zh = createI18n({ locale: 'zh-Hans', timeZone: 'UTC', catalog: catalogs['zh-Hans'] });
+    const base = { projectId: 1, issueId: 7, summaryCode: 'menu_stuck' as const,
+      summaryParams: { minutes: 5, context: 'rm -rf build?' } };
+
+    const choice = formatEventText({ kind: 'choice_waiting', ...base }, zh);
+    const blocked = formatEventText({ kind: 'issue_blocked', ...base }, zh);
+
+    expect(choice).toContain('等你选择');
+    expect(choice).not.toContain('受阻');
+    expect(blocked).toContain('受阻');
+    // 两者都带上具体上下文，用户不用点进去也知道在等什么
+    expect(choice).toContain('rm -rf build?');
+    expect(choice).toContain('#7');
+  });
+
+  // #274 止损闸：花销触顶主动停下，不是执行失败——三种触发原因各渲染一次
+  test('止损暂停：三种触发原因分别渲染，并说清「没失败也没取消」', () => {
+    const zh = createI18n({ locale: 'zh-Hans', timeZone: 'UTC', catalog: catalogs['zh-Hans'] });
+    const render = (reason: string, params: Record<string, string | number>) => formatEventText({
+      kind: 'issue_blocked', projectId: 1, issueId: 2,
+      summaryCode: 'stop_loss_paused',
+      summaryParams: { title: '导出功能', reason, blocks: 0, reentries: 0, hours: 0, ...params },
+    }, zh);
+
+    expect(render('blocked', { blocks: 3 })).toContain('累计受阻 3 次');
+    expect(render('stage_reentry', { reentries: 3 })).toContain('同阶段重入 3 次');
+    expect(render('runtime', { hours: 4.2 })).toContain('累计运行 4.2 小时');
+    // 三种原因都必须带上这句：停下来 ≠ 失败，否则用户会去找一个不存在的报错
+    for (const reason of ['blocked', 'stage_reentry', 'runtime']) {
+      expect(render(reason, {})).toContain('没有失败，也没有取消');
+      expect(render(reason, {})).toContain('确认后可从停下的那个阶段继续');
+    }
+    // issue 标题是用户原文，原样透传
+    expect(render('blocked', { blocks: 3 })).toContain('导出功能');
+  });
+
+  // #280：创建时澄清一直失败——「一直烧钱、一直没产出」，文案要把这点说出来
+  test('澄清成功率告警：带上 ok/total，并说明每次白跑照付通读代码库的钱', () => {
+    const zh = createI18n({ locale: 'zh-Hans', timeZone: 'UTC', catalog: catalogs['zh-Hans'] });
+    const en = createI18n({ locale: 'en', timeZone: 'UTC', catalog: catalogs.en });
+    const event = {
+      kind: 'status_change' as const, projectId: 1, issueId: 9,
+      summaryCode: 'clarify_success_low' as const,
+      summaryParams: { project: 'panda', ok: 1, total: 10 },
+    };
+    const zhText = formatEventText(event, zh);
+    expect(zhText).toContain('panda');
+    expect(zhText).toContain('最近 10 次只成功 1 次');
+    expect(zhText).toContain('通读代码库');
+    expect(formatEventText(event, en)).toContain('1/10');
+  });
+
+  // #279：批次全量回归红了——不是某条 issue 的失败，也没建 issue，文案必须把这两点说清
+  test('回归失败通知：说清没建 issue、没人被阻塞，项目名与命令名原样透传', () => {
+    const zh = createI18n({ locale: 'zh-Hans', timeZone: 'UTC', catalog: catalogs['zh-Hans'] });
+    const en = createI18n({ locale: 'en', timeZone: 'UTC', catalog: catalogs.en });
+    const event = {
+      kind: 'issue_blocked' as const, projectId: 1, issueId: 42,
+      summaryCode: 'regression_failed' as const,
+      summaryParams: { project: 'panda', label: 'bun run test', code: 1 },
+    };
+
+    const zhText = formatEventText(event, zh);
+    expect(zhText).toContain('panda');
+    expect(zhText).toContain('bun run test'); // 命令名是原文，不翻译
+    expect(zhText).toContain('没有建 issue');
+    expect(zhText).toContain('没有任何任务被阻塞');
+
+    const enText = formatEventText(event, en);
+    expect(enText).toContain('No issue was created');
+    expect(enText).toContain('exit code: 1');
+  });
+
+  // #273：nudge / judge 自动重试到顶转人工。issue 未 block，文案必须说清「仍在运行」
+  test('自动重试到顶：reason 选词与 count 复数按语言渲染，issue 标题保持原文', () => {
+    const zh = createI18n({ locale: 'zh-Hans', timeZone: 'UTC', catalog: catalogs['zh-Hans'] });
+    const nudge = formatEventText({
+      kind: 'status_change', projectId: 1, issueId: 2,
+      summaryCode: 'auto_retry_exhausted',
+      summaryParams: { title: '导出功能', reason: 'nudge', count: 5 },
+    }, zh);
+    const judge = formatEventText({
+      kind: 'status_change', projectId: 1, issueId: 2,
+      summaryCode: 'auto_retry_exhausted',
+      summaryParams: { title: '导出功能', reason: 'judge', count: 10 },
+    }, zh);
+
+    expect(nudge).toContain('导出功能：自动催办连续 5 次没有进展，已停止。');
+    expect(nudge).toContain('未被阻塞'); // 不是 blocked，别让人以为任务死了
+    expect(judge).toContain('完成判定连续 10 次没有进展');
+
+    // 俄语复数走 ICU few/many，不是把英文数量拼进去
+    const ru = createI18n({ locale: 'ru', timeZone: 'UTC', catalog: catalogs.ru });
+    const one = formatEventText({
+      kind: 'status_change', projectId: 1, issueId: 2,
+      summaryCode: 'auto_retry_exhausted',
+      summaryParams: { title: 'Экспорт', reason: 'nudge', count: 1 },
+    }, ru);
+    const many = formatEventText({
+      kind: 'status_change', projectId: 1, issueId: 2,
+      summaryCode: 'auto_retry_exhausted',
+      summaryParams: { title: 'Экспорт', reason: 'nudge', count: 5 },
+    }, ru);
+    expect(one).toContain('после 1 попытки');
+    expect(many).toContain('после 5 попыток');
   });
 });

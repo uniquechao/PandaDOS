@@ -42,6 +42,8 @@ describe('PandaDOS 品牌命名契约', () => {
       // 运维迁移/回滚资产需要引用旧域名、旧服务名和兼容路径，不参与产品运行时命名。
       '.deploy/',
       '.panda/modules/',
+      // 对话 JSONL 是需原样保留的运行时历史，可能包含旧任务终端输出。
+      '.panda/conversations/',
       // 公开版发布说明是不可改写的版本历史，允许记录旧版品牌名。
       'docs/releases/',
       'docs/superpowers/',

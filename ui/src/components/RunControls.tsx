@@ -19,7 +19,7 @@ export function RunControls({
   /** 行首内联插槽（如「对话/原生」切换钮）：与运行操作钮合并为同一行 */
   leading?: ComponentChildren;
   onRetry: () => void;
-  /** 重试按钮文案（随状态变化，如「重试」/「解除阻塞重跑」） */
+  /** 运行控制文案（随状态变化，如「重试」/「解除阻塞并继续」） */
   retryLabel: string;
   /** 重试是否可点（无失败步骤时禁用） */
   retryEnabled: boolean;
@@ -32,7 +32,9 @@ export function RunControls({
   return (
     <div class="runctl">
       {leading}
-      <span class="rc-label">{t('ui.runRunning')}</span>
+      {/* 运行中：#300 起只留呼吸绿点，文字进 title / aria-label——同一行里「重试」「终止」
+          已经说明这是运行现场，再写一遍「运行中」是纯占位。读屏仍读得到（role=status）。 */}
+      <span class="rc-label" role="status" title={t('ui.runRunning')} aria-label={t('ui.runRunning')} />
       <button
         class="rc-btn"
         disabled={!retryEnabled}

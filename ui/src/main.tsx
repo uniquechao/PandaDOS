@@ -14,9 +14,11 @@ import { llmConfigGuidance } from './lib/llmConfig';
 import { aggregateSummary } from './lib/summary';
 import { useFavorites } from './lib/favorites';
 import { useRecent } from './lib/recent';
+import { useDocumentTitle } from './lib/docTitle';
 import { toast, Toaster } from './lib/toast';
 import { onLazyLoadError } from './lib/updatePrompt';
 import { Spinner } from './components/Loaders';
+import { Modal } from './components/Modal';
 import { LoginView } from './views/Login';
 import { ProjectsView } from './views/Projects';
 import { BoardView } from './views/Board';
@@ -31,9 +33,41 @@ import { DesignsView } from './views/Designs';
 import { WorkflowTemplatesView } from './views/WorkflowTemplates';
 import { AdminView } from './views/Admin';
 import { I18nProvider, useI18n } from './i18n/provider';
-import packageInfo from '../../package.json';
+import releaseInfo from '../../release.json';
 
-const APP_VERSION = `v${packageInfo.version}`;
+const RELEASE_NOTE_KEYS = {
+  workflow: 'release.note.workflow',
+  validation: 'release.note.validation',
+  usage: 'release.note.usage',
+  experience: 'release.note.experience',
+  'terminal-scrollback': 'release.note.terminalScrollback',
+  'feishu-colleague-login': 'release.note.feishuColleagueLogin',
+  'feishu-messaging': 'release.note.feishuMessaging',
+  'conversation-binding': 'release.note.conversationBinding',
+  'chat-navigation-sync': 'release.note.chatNavigationSync',
+  'project-data-sync': 'release.note.projectDataSync',
+  'issue-direct-execution': 'release.note.issueDirectExecution',
+  'issue-pause-resume': 'release.note.issuePauseResume',
+  'skill-policies': 'release.note.skillPolicies',
+  'project-sync-reliability': 'release.note.projectSyncReliability',
+} as const;
+
+function ReleaseNotes({ onClose }: { onClose: () => void }) {
+  const { t } = useI18n();
+  return (
+    <Modal title={t('release.title')} onClose={onClose}>
+      <div class="release-meta">{releaseInfo.version}</div>
+      <ul class="release-notes">
+        {(releaseInfo.notes as Array<keyof typeof RELEASE_NOTE_KEYS>).map((note) => (
+          <li key={note}>{t(RELEASE_NOTE_KEYS[note])}</li>
+        ))}
+      </ul>
+      <div class="mbtns">
+        <button type="button" class="btn" onClick={onClose}>{t('action.close')}</button>
+      </div>
+    </Modal>
+  );
+}
 
 /** 终端视图懒加载（xterm ~300KB，别拖累手机首屏；vite 自动 code-split） */
 function LazyTerm({ pid }: { pid: number }) {
@@ -122,7 +156,7 @@ function SideProjectsNav({
         key={p.id}
         class={'sproj-it' + (p.id === curPid ? ' on' : '')}
         title={p.name + (p.goal ? `｜${p.goal}` : '')}
-        onClick={() => nav(p.kind === 'chat' ? `/p/${p.id}/chat` : `/p/${p.id}`)}
+        onClick={() => nav(`/p/${p.id}`)}
       >
         <span
           class={'sproj-dot' + (doingN > 0 ? ' run' : '')}
@@ -136,8 +170,6 @@ function SideProjectsNav({
           <span class="sproj-b dg" title={t('shell.runningCount', { count: doingN })}>{doingN}</span>
         )}
         {waitN > 0 && <span class="sproj-b td" title={t('shell.waitingCount', { count: waitN })}>{waitN}</span>}
-        {/* issue 项目：项目级自由对话入口（chat 项目行本身即进对话，不再重复） */}
-        {p.kind !== 'chat' && (
           <span
             class="sproj-chat"
             role="button"
@@ -149,7 +181,6 @@ function SideProjectsNav({
           >
             💬
           </span>
-        )}
         <span
           class={'sproj-star' + (fav ? ' on' : '')}
           role="button"
@@ -435,6 +466,7 @@ function RunningTasks() {
 
 function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
   const { t } = useI18n();
+  const [releaseOpen, setReleaseOpen] = useState(false);
   const route = useRoute();
   const [llmStatus, setLlmStatus] = useState<LlmStatus | null>(null);
   useEffect(() => {
@@ -461,7 +493,8 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
       break;
     case 'chat':
       // 对话模式视图（chat 项目的落地页 / issue 项目的项目级自由对话入口）
-      view = <ChatView key={route.pid} pid={route.pid} />;
+      // cid 走 prop 而非 key：换对话只重选、不重挂整个视图（列表与项目信息不重拉）
+      view = <ChatView key={route.pid} pid={route.pid} cid={route.cid} />;
       break;
     case 'term':
       view = <LazyTerm pid={route.pid} />;
@@ -489,7 +522,7 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
       break;
     case 'admin':
       view = me.role === 'admin'
-        ? <AdminView initialTab={route.section === 'llm' ? 'llm' : 'users'} />
+        ? <AdminView initialTab={route.section ?? 'users'} />
         : <ProjectsView me={me} />;
       break;
     default:
@@ -498,6 +531,8 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
 
   const tab = route.name === 'settings' ? 'settings' : route.name === 'admin' ? 'admin' : 'projects';
   const curPid = 'pid' in route ? route.pid : null;
+  // 标签页标题跟随当前项目：项目内「项目名-PandaDOS」，项目外回落 PandaDOS
+  useDocumentTitle(curPid);
   const menu = [
     { key: 'settings', ic: '⚙️', tx: t('shell.settings'), to: '/settings' },
     ...(me.role === 'admin' ? [{ key: 'admin', ic: '🛡️', tx: t('shell.admin'), to: '/admin' }] : []),
@@ -519,15 +554,19 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
         <i class="dc1" /><i class="dc2" /><i class="dc3" /><i class="dc4" /><i class="dc5" />
       </div>
       <aside class={'sidebar' + (collapsed ? ' collapsed' : '')}>
-        <button type="button" class="brand" title="PandaDOS" onClick={() => nav('/')}>
-          <img class="brand-logo" src="/logo-mark.png" alt="PandaDOS" />
+        <div class="brand">
+          <button type="button" class="brand-home" title="PandaDOS" onClick={() => nav('/')}>
+            <img class="brand-logo" src="/logo-mark.png" alt="PandaDOS" />
+          </button>
           <span class="brand-copy">
             <span class="brand-tx">
               Panda<span class="brand-ai">DOS</span>
             </span>
-            <span class="brand-version">{APP_VERSION}</span>
+            <button type="button" class="brand-version" onClick={() => setReleaseOpen(true)} aria-label={t('release.open', { version: releaseInfo.version })}>
+              {releaseInfo.version}
+            </button>
           </span>
-        </button>
+        </div>
         <nav class="snav">
           <SideProjectsNav routeName={route.name} curPid={curPid} collapsed={collapsed} />
         </nav>
@@ -568,6 +607,7 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
         )}
         <div class="viewport">{view}</div>
       </main>
+      {releaseOpen && <ReleaseNotes onClose={() => setReleaseOpen(false)} />}
     </div>
   );
 }

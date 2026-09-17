@@ -236,6 +236,33 @@ async function api(
 }
 
 describe('server 集成冒烟（完整装配）', () => {
+  test('管理页保存飞书登录配置后立即启用扫码，关闭即时生效且无需通知通道', async () => {
+    const ctx = await boot();
+    const token = (await fsp.readFile(ctx.tokenFile, 'utf8')).trim();
+    expect((await api(ctx, 'GET', '/api/admin/feishu-login-config')).status).toBe(401);
+    const before = await api(ctx, 'GET', '/api/admin/feishu-login-config', token);
+    expect(before.status).toBe(200);
+    expect(before.body.configured).toBe(false);
+    expect((await api(ctx, 'GET', '/api/feishu/oauth/status')).body.enabled).toBe(false);
+    const config = { enabled: true, allowRegistration: true, appId: 'cli_test_admin',
+      appSecret: 'test-admin-secret', publicUrl: 'https://login.example' };
+    const saved = await api(ctx, 'PUT', '/api/admin/feishu-login-config', token, config);
+    expect(saved.status).toBe(200);
+    expect(saved.body.config.callbackUrl).toBe('https://login.example/api/feishu/oauth/callback');
+    expect(JSON.stringify(saved.body)).not.toContain('test-admin-secret');
+    expect((await api(ctx, 'GET', '/api/feishu/oauth/status')).body.enabled).toBe(true);
+    const start = await fetch(`${ctx.base}/api/feishu/oauth/start`, { redirect: 'manual' });
+    expect(start.status).toBe(302);
+    const authorize = new URL(start.headers.get('location')!);
+    expect(authorize.searchParams.get('client_id')).toBe('cli_test_admin');
+    expect(authorize.searchParams.get('redirect_uri')).toBe('https://login.example/api/feishu/oauth/callback');
+    await api(ctx, 'PUT', '/api/admin/feishu-login-config', token, { ...config, enabled: false, appSecret: '' });
+    expect((await api(ctx, 'GET', '/api/feishu/oauth/status')).body.enabled).toBe(false);
+    expect((await api(ctx, 'GET', '/healthz')).body.feishu).toBe(false);
+    expect((await api(ctx, 'GET', '/api/admin/feishu-messaging')).status).toBe(401);
+    expect((await api(ctx, 'GET', '/api/admin/feishu-messaging', token)).body).toMatchObject({ enabled: false, configured: true, state: 'disabled' });
+  });
+
   test('design run route executes the task agent and ingests a real steward revision', async () => {
     const dimensions = [
       'goal_clarity', 'scope_boundaries', 'solution_completeness',
@@ -470,27 +497,27 @@ describe('server 集成冒烟（完整装配）', () => {
   });
   test('backfills a legacy task-created crash window and keeps it out of ordinary surfaces', async () => {
     const conversationId = '00000000-0000-4000-8000-000000000066';
-    const sagaToken = 'saga-legacy-crash-window';
+    const sagaToken = 'saga-e98-crash-window';
     let taskId = 0;
     const ctx = await boot(undefined, (db) => {
       migrateIssueEngine(db);
       applyRecordedLegacyDesign050(db);
       db.run(`INSERT INTO users (id, username, token_hash, created_ts)
-              VALUES (66, 'legacy-owner', 'hash', 1)`);
+              VALUES (66, 'e98-owner', 'hash', 1)`);
       const workspaceRoot = db.query<{ root: string }, []>(
         'SELECT workspace_root AS root FROM executors WHERE id = 1',
       ).get()!.root;
       db.query(`INSERT INTO projects (id, name, executor_id, cwd, owner_user_id, created_ts)
-                VALUES (66, 'legacy-recovery', 1, ?, 66, 1)`).run(path.join(workspaceRoot, 'legacy'));
+                VALUES (66, 'e98-recovery', 1, ?, 66, 1)`).run(path.join(workspaceRoot, 'e98'));
       const store = new DesignStore(db);
       store.ensureCreationSaga({
         sagaToken,
         projectId: 66,
-        idempotencyKey: 'request-legacy-crash-window',
+        idempotencyKey: 'request-e98-crash-window',
         requestJson: JSON.stringify({
           input: {
             moduleId: null,
-            title: 'Legacy recovery',
+            title: 'E98 recovery',
             originalRequest: 'Recover the legacy ownership proof.',
             agent: 'claude',
             readinessThreshold: 80,
@@ -502,11 +529,11 @@ describe('server 集成冒烟（完整装配）', () => {
       });
       taskId = store.createCreationSagaTask(sagaToken, 'intent', {
         projectId: 66,
-        title: 'Legacy recovery',
+        title: 'E98 recovery',
         originalRequest: 'Recover the legacy ownership proof.',
         agent: 'claude',
-        documentJson: { title: 'Legacy recovery' },
-        documentMarkdown: '# Legacy recovery',
+        documentJson: { title: 'E98 recovery' },
+        documentMarkdown: '# E98 recovery',
         readiness: 0,
         actor: 'owner:user:66',
       })!.task.id;
@@ -659,7 +686,7 @@ describe('server 集成冒烟（完整装配）', () => {
     expect(await stopped).toBe(true);
     driver.release();
     await Bun.sleep(20);
-  });
+  }, 60_000);
 
   test('hung worktree Git recovery is deadline-bounded and leaves the active adapter fail-closed', async () => {
     const driver = new HungWorktreeRecoveryDriver();
@@ -683,20 +710,56 @@ describe('server 集成冒烟（完整装配）', () => {
         VALUES ('hung-active', 77, 77, 1, ?, 'hung-active', 'worktree', 'executing', 1,
                 'refs/heads/main', ?, 'codex/hung-active', '/srv/worktree', ?, 1, 1)`)
         .run('a'.repeat(64), '1'.repeat(40), '1'.repeat(40));
-    }, driver, { designWorktreeRecoveryLimit: 10, designWorktreeRecoveryTimeoutMs: 10 });
-    await driver.entered;
-    const outcome = await Promise.race([booted.then((ctx) => ({ kind: 'started' as const, ctx })), Bun.sleep(100).then(() => ({ kind: 'timeout' as const }))]);
-    expect(outcome.kind).toBe('started');
-    if (outcome.kind !== 'started') { driver.release(); await booted; return; }
-    expect(outcome.ctx.server.db.query<{ error: string | null }, []>(
-      "SELECT error_code AS error FROM design_execution_runs WHERE id = 'hung-active'",
-    ).get()?.error).toBe('RECOVERY_REQUIRED');
-    driver.release();
+      // recovery deadline 给 2s 而不是 10ms：recoverAll 的 deadline 一到就 break 出扫描循环，
+      // 10ms 等于让「deadline 起效」跟「循环是否已调用到卡死的 driver」赛跑——本文件单跑（空闲机）
+      // 稳赢，全量门禁（单进程 200+ 文件、机器上还压着代理与服务）则常常在进 driver 之前就到期：
+      // 恢复直接跳出、boot 顺利完成、driver.entered 永远不来，于是这条白等满整个超时预算变红。
+      // 2s 足够在忙机上进到 driver；进去后 driver 一直阻塞到 release()，deadline 照常掐断恢复，
+      // 用例要证的「boot 不挂死 + 留 RECOVERY_REQUIRED」语义一字未变。
+    }, driver, { designWorktreeRecoveryLimit: 10, designWorktreeRecoveryTimeoutMs: 2_000 });
+    // 本例要证的是「启动不会挂在卡死的 worktree 恢复上」：驱动在 `release()` 之前一直阻塞，
+    // 所以只要 boot 还 await 它，这里就**永远**等不到——判据是「等不等得到」，不是「多久等到」。
+    //
+    // 因此这里**不再跟墙钟赛跑**。历史上它用过 100ms / 3s / 30s 三个内部时限，全是按「本文件
+    // 单独跑」估的；门禁跑全量时机器上还压着代理与服务，一次完整 boot 轻松超过它们，于是这条
+    // 稳定地偶发红、把整条门禁拖成 code 1。真正的「卡死」由 bun 的每例超时（本例显式 180s）兜住，
+    // 慢机器只是慢，不会再被判错。
+    //
+    // 但「干等 entered」有个盲区：boot 若在走到 worktree 恢复**之前**就失败，entered 永远不来，
+    // 这条就白等满整个超时预算、报成一句「timed out」，真正的原因反而看不见。所以让它与 booted
+    // 竞速：boot 先结束（无论成败）就地抛出真实原因——把「超时、原因不明」变成「立刻失败、原因清晰」。
+    await Promise.race([
+      driver.entered,
+      booted.then(
+        () => {
+          throw new Error('boot 在进入 worktree 恢复前就完成了：恢复路径没跑到，用例前提已不成立');
+        },
+        (e: unknown) => {
+          throw new Error(`boot 在进入 worktree 恢复前就失败了：${String(e)}`);
+        },
+      ),
+    ]);
+    //
+    // `release()` 必须放 finally：早期写在断言之后，一旦断言先抛，卡住的驱动就再没人放开，
+    // 清理阶段跟着一起挂——一次 3s 的断言失败会被报成 60s 超时，原因反而看不出来。
+    let ctx: Ctx;
+    try {
+      ctx = await booted;
+      expect(ctx.server.db.query<{ error: string | null }, []>(
+        "SELECT error_code AS error FROM design_execution_runs WHERE id = 'hung-active'",
+      ).get()?.error).toBe('RECOVERY_REQUIRED');
+    } finally {
+      driver.release();
+    }
+    await booted.catch(() => undefined);
     await Bun.sleep(10);
-    expect(outcome.ctx.server.db.query<{ error: string | null }, []>(
+    expect(ctx.server.db.query<{ error: string | null }, []>(
       "SELECT error_code AS error FROM design_execution_runs WHERE id = 'hung-active'",
     ).get()?.error).toBe('RECOVERY_REQUIRED');
-  });
+    // 预算给到 180s：全量门禁单进程跑 200+ 文件、机器上还压着代理与服务时，一次完整 boot
+    // 远慢于本文件单跑（实测同一台机上全量比单跑慢一个数量级）。60s 在忙机上会把「慢」误判成
+    // 「卡死」，让整条门禁随机变红——真卡死有上面的竞速立刻兜住，这里只负责给慢机留余量。
+  }, 180_000);
 
   test('hung publication module write times out recovery and stop without a late DB touch', async () => {
     const driver = new HungModuleDriver();
@@ -776,6 +839,12 @@ describe('server 集成冒烟（完整装配）', () => {
     ctx.server.db.query(
       'UPDATE design_publication_outbox SET next_retry_ts = 0 WHERE publication_id = ?',
     ).run(published.body.publication.publicationId);
+    // 本例要考的是「发布投影卡死时，恢复会超时、stop 不会被它拖住」。把发布出来的 issue
+    // 先摁成 blocked：否则第二次启动时引擎会顺手把它接着跑起来，那条链自己也要写模块页，
+    // 于是「stop 等不等得住」变成了「引擎那次写有没有抢在 driver.release() 之前」的掷硬币
+    // ——与本例要证的性质无关，却会随启动路径上任何一点点耗时变化而翻面（#277 给模块起跑
+    // 加了技能挂载后就翻了）。
+    ctx.server.db.query("UPDATE issues SET status = 'blocked' WHERE project_id = 91").run();
     await ctx.server.stop();
 
     driver.moduleMode = 'hang';
@@ -818,7 +887,7 @@ describe('server 集成冒烟（完整装配）', () => {
       driver.release();
       ModuleStore.prototype.touch = originalTouch;
     }
-  });
+  }, 60_000);
 
   test('空数据库启动自动创建唯一系统本机执行机，重启保持幂等', async () => {
     const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-local-bootstrap-'));
@@ -873,12 +942,12 @@ describe('server 集成冒烟（完整装配）', () => {
   test('healthz → admin 登录 → 建用户/项目/issue → 属主隔离 → 优雅停机', async () => {
     const ctx = await boot();
 
-    // ---- healthz：迁移链全量（含 Issue 039/041/042、PM 040 与 Design 050-060）+ executor online + engine running ----
+    // ---- healthz：迁移链全量（含协作 outbox、Issue 044/062/064/065、PM 040、Design 050-059/061/073 与 Notify 063）+ executor online + engine running ----
     const h = await api(ctx, 'GET', '/healthz');
     expect(h.status).toBe(200);
     expect(h.body.ok).toBe(true);
-    expect(h.body.db.latest).toBe(60);
-    expect(h.body.db.applied).toBe(42);
+    expect(h.body.db.latest).toBe(73);
+    expect(h.body.db.applied).toBe(67);
     expect(h.body.executors).toEqual([{ id: 1, name: 'local', status: 'online' }]);
     expect(h.body.engine.running).toBe(true);
     expect(h.body.feishu).toBe(false);
@@ -966,10 +1035,18 @@ describe('server 集成冒烟（完整装配）', () => {
       category: 'debug',
     });
     expect(issue.status).toBe(200);
-    expect(issue.body.issue.status).toBe('planning');
+    expect(issue.body.issue.status).toBe('implementing');
+    expect(issue.body.issue.executionMode).toBe('direct');
+    const policyUrl=`/api/projects/${pid}/skill-policy`;
+    expect((await api(ctx,'PUT',policyUrl,alice.body.token,{superpowers:'manual'})).status).toBe(200);
+    expect((await api(ctx,'PUT',`${policyUrl}?issueId=${issue.body.issue.id}`,alice.body.token,{superpowers:'auto'})).body.effective.superpowers).toBe('auto');
+    expect((await api(ctx,'GET',policyUrl,alice.body.token)).body.policy.superpowers).toBe('manual');
+    expect((await api(ctx,'PUT',policyUrl,bob.body.token,{superpowers:'disabled'})).status).toBe(403);
+    expect((await api(ctx,'PUT',policyUrl,alice.body.token,{superpowers:'invalid'})).status).toBe(400);
+
     // 模块会话已（模拟）拉起：boot 已把 LLM 指到不可达地址 → 分类器必走确定性回退 general-work
     expect(ctx.driver.sessions.has(`cc-${pid}-m-general-work`)).toBe(true);
-    expect(ctx.driver.sent.some((s) => s.text.includes('claude --session-id'))).toBe(true);
+    expect(ctx.driver.sent.some((s) => s.text.includes('claude --session-id') || s.text.includes('.panda/tmp/skill-sessions/'))).toBe(true);
 
     // ---- 列表可见 + 属主隔离：他人 403 / 未登录 401 / admin 恒过 ----
     const list = await api(ctx, 'GET', `/api/projects/${pid}/issues`, alice.body.token);
@@ -1173,26 +1250,22 @@ describe('server 集成冒烟（完整装配）', () => {
     await expect(fetch(`${ctx.base}/healthz`)).rejects.toBeTruthy();
   });
 
-  test('对话模式：建 chat 项目 → 建/列/激活/重命名/归档对话 → 拒建 issue → fs/raw 内联', async () => {
+  test('Issue 项目：建/列/激活/重命名/归档独立对话 → fs/raw 内联', async () => {
     const ctx = await boot();
     const adminToken = (await fsp.readFile(ctx.tokenFile, 'utf8')).trim();
     const alice = await api(ctx, 'POST', '/api/admin/users', adminToken, { username: 'alice' });
     const at = alice.body.token as string;
 
-    // 建 chat 项目
+    // 所有项目固定进入 Issue 看板，同时仍可维护多条独立对话
     const proj = await api(ctx, 'POST', '/api/projects', at, {
       name: 'chatproj',
       executorId: 1,
-      kind: 'chat',
     });
     expect(proj.status).toBe(200);
-    expect(proj.body.project.kind).toBe('chat');
+    expect(proj.body.project.kind).toBe('issue');
     const pid = proj.body.project.id as number;
     const cwd = String(proj.body.project.cwd);
 
-    // chat 项目拒建 issue（引擎中央守卫 → 400）
-    const badIssue = await api(ctx, 'POST', `/api/projects/${pid}/issues`, at, { title: '不该建' });
-    expect(badIssue.status).toBe(400);
 
     // 建两条对话（claude + codex）→ 列表返回 2 条
     const c1 = await api(ctx, 'POST', `/api/projects/${pid}/conversations`, at, {

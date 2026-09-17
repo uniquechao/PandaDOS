@@ -5,7 +5,7 @@ const statusKeys = {
   pending: 'status.pending', clarifying: 'status.clarifying', planning: 'status.planning',
   plan_review: 'status.planReview', implementing: 'status.implementing', testing: 'status.testing',
   merge_review: 'status.mergeReview', merging: 'status.merging', done: 'status.done',
-  blocked: 'status.blocked', cancelled: 'status.cancelled',
+  paused: 'status.paused', blocked: 'status.blocked', cancelled: 'status.cancelled',
 } as const;
 
 const categoryKeys = {

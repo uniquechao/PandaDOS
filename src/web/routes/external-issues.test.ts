@@ -160,7 +160,7 @@ function createWorkflow(db: ReturnType<typeof openDb>) {
 describe('外部 issue 路由', () => {
   test('来源配置限属主，读取只返回脱敏 token；成员可列 remote', async () => {
     const s = await setup();
-    await s.driver.git(s.repo, ['remote', 'add', 'internal', 'ssh://git@gitlab.example.com:2222/team/repo.git']);
+    await s.driver.git(s.repo, ['remote', 'add', 'internal', 'ssh://git@gitlab.sunseed.tech:2222/team/repo.git']);
     expect((await call(s.dispatch, 'GET', '/api/projects/1/external-issues/remotes')).status).toBe(401);
     expect((await call(
       s.dispatch,
@@ -177,8 +177,8 @@ describe('外部 issue 路由', () => {
     );
     expect(remotes.body.remotes).toEqual([
       {
-        name: 'internal', url: 'ssh://git@gitlab.example.com:2222/team/repo.git', host: 'gitlab.example.com',
-        suggestedProvider: 'gitlab', suggestedInstanceUrl: 'https://gitlab.example.com',
+        name: 'internal', url: 'ssh://git@gitlab.sunseed.tech:2222/team/repo.git', host: 'gitlab.sunseed.tech',
+        suggestedProvider: 'gitlab', suggestedInstanceUrl: 'https://gitlab.sunseed.tech',
       },
       {
         name: 'origin', url: 'git@github.com:octo/repo.git', host: 'github.com',

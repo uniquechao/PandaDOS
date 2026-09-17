@@ -1,10 +1,18 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDb } from './db';
-import { migrate, migrationStatus, splitStatements } from './migrate';
+import {
+  ALL_MIGRATION_DIRS,
+  assertLedgerMatchesFiles,
+  assertNoMigrationCollisions,
+  assertUniqueMigrationIds,
+  migrate,
+  migrationStatus,
+  splitStatements,
+} from './migrate';
 
 const EXPECTED_TABLES = [
   'schema_migrations',
@@ -26,10 +34,17 @@ const EXPECTED_TABLES = [
   'user_message_counts',
   'project_external_issue_sources',
   'external_issue_records',
+  'project_attachments',
+  'project_data_sync_entries',
+  'conversation_shared_messages',
+  'project_data_outbox',
+  'project_data_sync_status',
+  'feishu_login_config',
+  'feishu_messaging_config',
 ].sort();
 
 /** core/migrations 当前最新编号（新增迁移文件时同步 +1） */
-const LATEST_MIGRATION = 18;
+const LATEST_MIGRATION = 68;
 
 function tableNames(db: Database): string[] {
   return db
@@ -80,6 +95,22 @@ describe('migrate', () => {
     expect(s.latest).toBe(LATEST_MIGRATION);
     expect(s.applied).toContain(1);
     expect(s.applied).toContain(LATEST_MIGRATION);
+    db.close();
+  });
+
+  test('024 迁移：项目统一转为 issue，独立对话类型保持不变', () => {
+    const db = openDb(':memory:');
+    migrate(db);
+    db.run("INSERT INTO users (username, token_hash, role, created_ts) VALUES ('migration-user', 'hash', 'user', 0)");
+    db.run("INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir) VALUES ('local', '127.0.0.1', 22, 'runner', 'key', '/tmp', '/tmp')");
+    db.run("INSERT INTO projects (name, executor_id, cwd, owner_user_id, created_ts, kind) VALUES ('legacy-chat', 1, '/tmp/legacy-chat', 1, 0, 'chat')");
+    db.run("INSERT INTO conversations (id, project_id, kind, created_ts) VALUES ('chat-history', 1, 'chat', 0)");
+    db.run('DELETE FROM schema_migrations WHERE id = 24');
+
+    migrate(db);
+
+    expect(db.query<{ kind: string }, []>('SELECT kind FROM projects LIMIT 1').get()?.kind).toBe('issue');
+    expect(db.query<{ kind: string }, []>("SELECT kind FROM conversations WHERE id = 'chat-history'").get()?.kind).toBe('chat');
     db.close();
   });
 
@@ -258,6 +289,27 @@ describe('migrate', () => {
     db.close();
   });
 
+  test('019 迁移：项目、对话与附件具有 UUIDv7 同步身份', () => {
+    const db = openDb(':memory:');
+    migrate(db);
+    db.run(`INSERT INTO users (id, username, token_hash, created_ts) VALUES (1, 'u', 'h', 1)`);
+    db.run(`INSERT INTO executors
+      (id, name, host, ssh_user, key_ref, workspace_root, claude_dir)
+      VALUES (1, 'e', 'local', '', '', '/ws', '')`);
+    db.run(`INSERT INTO projects
+      (id, name, executor_id, cwd, owner_user_id, created_ts)
+      VALUES (1, 'p', 1, '/ws/p', 1, 1700000000000)`);
+    db.run(`INSERT INTO conversations (id, project_id, created_ts) VALUES ('local-session', 1, 1700000000001)`);
+    db.run(`INSERT INTO project_attachments
+      (project_id, path, sha256, size, created_ts)
+      VALUES (1, '.panda/uploads/a/image.png', ?, 3, 1700000000002)`, ['a'.repeat(64)]);
+    for (const table of ['projects', 'conversations', 'project_attachments']) {
+      const uid = db.query<{ sync_uid: string }, []>(`SELECT sync_uid FROM ${table} LIMIT 1`).get()!.sync_uid;
+      expect(uid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    }
+    db.close();
+  });
+
   test('018 迁移：技能市场人格源 epoch 默认从 0 开始', () => {
     const db = openDb(':memory:');
     migrate(db);
@@ -280,7 +332,7 @@ describe('migrate', () => {
 
     const status = migrate(db);
 
-    expect(status.latest).toBe(18);
+    expect(status.latest).toBe(LATEST_MIGRATION);
     expect(db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM skill_markets').get()!.n).toBe(before);
     expect(db.query<{ persona_source_epoch: number }, []>(
       'SELECT persona_source_epoch FROM skill_markets ORDER BY id LIMIT 1',
@@ -305,4 +357,99 @@ describe('migrate', () => {
     const stmts = splitStatements('-- c\nCREATE TABLE a (x INTEGER); \n\nCREATE INDEX i ON a(x); -- t\n');
     expect(stmts).toEqual(['CREATE TABLE a (x INTEGER)', 'CREATE INDEX i ON a(x)']);
   });
+});
+
+// ---------- 跨目录编号守卫（#292） ----------
+
+describe('迁移编号守卫', () => {
+  const tmpDirs: string[] = [];
+
+  function dirWith(...files: string[]): string {
+    const dir = mkdtempSync(join(tmpdir(), 'panda-mig-'));
+    tmpDirs.push(dir);
+    mkdirSync(dir, { recursive: true });
+    for (const f of files) writeFileSync(join(dir, f), 'CREATE TABLE IF NOT EXISTS t (x INTEGER);');
+    return dir;
+  }
+
+  afterEach(() => {
+    for (const d of tmpDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  test('仓库现有迁移目录不存在跨目录撞号', () => {
+    expect(() => assertUniqueMigrationIds()).not.toThrow();
+    expect(ALL_MIGRATION_DIRS.length).toBe(5);
+  });
+
+  test('两个目录用同一编号 → 报错点名两个文件', () => {
+    const a = dirWith('060_alpha.sql');
+    const b = dirWith('060_beta.sql');
+    expect(() => assertUniqueMigrationIds([a, b])).toThrow(/060_alpha\.sql.*060_beta\.sql/s);
+  });
+
+  test('同一目录内同编号不同名也算撞号', () => {
+    const a = dirWith('060_alpha.sql', '060_beta.sql');
+    expect(() => assertUniqueMigrationIds([a])).toThrow(/migration id 60/);
+  });
+
+  test('账本里编号已被别的文件名占用 → 报错（该迁移会被静默跳过）', () => {
+    const db = openDb(':memory:');
+    migrate(db);
+    db.run('INSERT INTO schema_migrations (id, name, applied_ts) VALUES (?, ?, ?)', [
+      60,
+      '060_design_run_conversation_scope.sql',
+      0,
+    ]);
+    const notify = dirWith('060_notify_gate_requests.sql');
+    expect(() => assertLedgerMatchesFiles(db, [notify])).toThrow(
+      /060_design_run_conversation_scope\.sql.*060_notify_gate_requests\.sql/s,
+    );
+    // 换成未被占用的编号即放行
+    const fixed = dirWith('063_notify_gate_requests.sql');
+    expect(() => assertNoMigrationCollisions(db, [fixed])).not.toThrow();
+    db.close();
+  });
+
+  test('账本编号与文件名一致时不报错', () => {
+    const db = openDb(':memory:');
+    migrate(db);
+    expect(() => assertNoMigrationCollisions(db)).not.toThrow();
+    db.close();
+  });
+});
+
+test('paused migration preserves issue rows, child references and installed triggers', () => {
+  const db = new Database(':memory:');
+  const dir = mkdtempSync(join(tmpdir(), 'panda-paused-migration-'));
+  try {
+    migrate(db);
+    db.run("INSERT INTO users(id,username,token_hash,role,created_ts) VALUES(1,'test','hash','admin',0)");
+    db.run("INSERT INTO executors(id,name,host,ssh_user,key_ref,workspace_root,claude_dir) VALUES(1,'x','x','x','x','x','x')");
+    db.run("INSERT INTO projects(id,name,executor_id,cwd,owner_user_id,created_ts) VALUES(1,'x',1,'/x',1,0)");
+    db.run("INSERT INTO issues(id,project_id,title,created_ts) VALUES(99,1,'preserve',0)");
+    db.run("INSERT INTO issue_events(issue_id,kind,ts) VALUES(99,'keep',0)");
+    db.run('ALTER TABLE issues ADD COLUMN plugin_extra TEXT');
+    db.run("UPDATE issues SET plugin_extra='installed later' WHERE id=99");
+    db.run("INSERT INTO issues(id,project_id,title,created_ts) VALUES(200,1,'deleted',0)");
+    db.run('DELETE FROM issues WHERE id=200');
+    db.run('CREATE TABLE legacy_orphan (id INTEGER REFERENCES conversations(id))');
+    db.run('PRAGMA foreign_keys=OFF');
+    db.run('INSERT INTO legacy_orphan VALUES(777)');
+    db.run('CREATE TABLE audit (issue_id INTEGER)');
+    db.run('CREATE TRIGGER keep_trigger AFTER UPDATE ON issues BEGIN INSERT INTO audit VALUES(NEW.id); END');
+    db.run('CREATE INDEX keep_index ON issues(plugin_extra)');
+    db.run('PRAGMA foreign_keys=ON');
+    writeFileSync(join(dir,'071_paused_state.sql'), '-- panda:add-paused-issue-state\n');
+    migrate(db, dir);
+    db.run("UPDATE issues SET status='paused' WHERE id=99");
+    expect(db.query('SELECT plugin_extra FROM issues WHERE id=99').get()).toEqual({plugin_extra:'installed later'});
+    expect(db.query('SELECT kind FROM issue_events WHERE issue_id=99').get()).toEqual({kind:'keep'});
+    expect(db.query('SELECT * FROM audit').all()).toEqual([{issue_id:99}]);
+    expect(db.query('PRAGMA foreign_key_check').all()).toHaveLength(1);
+    expect(db.query('PRAGMA foreign_keys').get()).toEqual({foreign_keys:1});
+    db.run("INSERT INTO issues(project_id,title,created_ts) VALUES(1,'next',0)");
+    expect(db.query<{id:number},[]>("SELECT id FROM issues WHERE title='next'").get()!.id).toBeGreaterThan(200);
+    expect(db.query("SELECT name FROM sqlite_master WHERE name='keep_index'").get()).toBeTruthy();
+    migrate(db, dir);
+  } finally { db.close(); rmSync(dir, {recursive:true,force:true}); }
 });

@@ -12,15 +12,112 @@ import { promises as fsp } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  ENSURE_GIT_SCRIPT,
   DEFAULT_GIT_TIMEOUT_MS,
   DEFAULT_TMUX_TIMEOUT_MS,
+  INJECT_SUBMIT_MAX_POLLS,
+  codexComposerContainsInput,
   tmuxNewSessionArgs,
   tmuxResizeWindowArgs,
   tmuxScrollPaneArgs,
   TMUX_WIN_COLS,
   TMUX_WIN_ROWS,
+  sendTextWithStableSubmit,
+  gitAvailabilityError,
+  truncateCommandOutput,
+  MAX_COMMAND_OUTPUT_CHARS,
 } from './driver';
 import { LocalDriver, ptySpawnEnv, ptySpawnSpec, runCommand, sttyResizeArgs } from './local';
+
+describe('Local/SSH 共用稳定提交时序', () => {
+  test('长 prompt 等待输入画面稳定后只提交一次，响应出现即停止观察', async () => {
+    let phase: 'idle' | 'typing' | 'working' = 'idle';
+    let typingCaptures = 0;
+    let enters = 0;
+    await sendTextWithStableSubmit({
+      capturePane: async () => {
+        if (phase === 'idle') return '› 空输入框';
+        if (phase === 'working') return '• Working (1s)';
+        typingCaptures++;
+        return typingCaptures === 1 ? `› ${'长'.repeat(500)}` : `› ${'长'.repeat(2000)}`;
+      },
+      sendText: async () => { phase = 'typing'; },
+      sendEnter: async () => { enters++; phase = 'working'; },
+      sleep: async () => {},
+    });
+    expect(typingCaptures).toBeGreaterThan(2);
+    expect(enters).toBe(1);
+  });
+
+  test('Enter 被 paste-burst 吞成换行时只补交一次', async () => {
+    let typed = false;
+    let enters = 0;
+    let postCaptures = 0;
+    await sendTextWithStableSubmit({
+      capturePane: async () => {
+        if (!typed) return '› 空输入框';
+        if (enters >= 2) return '• Working';
+        if (enters === 1) {
+          postCaptures++;
+          return postCaptures % 2 === 0 ? '› 仍在 输入框' : '› 仍在\n输入框';
+        }
+        return '› 仍在 输入框';
+      },
+      sendText: async () => { typed = true; },
+      sendEnter: async () => { enters++; },
+      sleep: async () => {},
+    });
+    expect(postCaptures).toBe(INJECT_SUBMIT_MAX_POLLS);
+    expect(enters).toBe(2);
+  });
+
+  test('composer 扩高和状态变化时仍识别为待提交并补交一次', async () => {
+    const prompt = '请检查 issue 执行为什么没有自动提交';
+    let typed = false;
+    let enters = 0;
+    await sendTextWithStableSubmit({
+      inputText: prompt,
+      capturePane: async () => {
+        if (!typed) return '历史内容\n› 空输入框\n100% context left';
+        if (enters >= 2) return '› ' + prompt + '\n• Working';
+        if (enters === 1) {
+          return '旧内容已滚出\n╭────╮\n› ' + prompt + '\n\n╰────╯\n99% context left';
+        }
+        return '历史内容\n╭────╮\n› ' + prompt + '\n╰────╯\n100% context left';
+      },
+      sendText: async () => { typed = true; },
+      sendEnter: async () => { enters++; },
+      sleep: async () => {},
+    });
+    expect(enters).toBe(2);
+  });
+
+  test('输入进入历史区且底部出现新 composer 时不视为待提交', () => {
+    const prompt = '不要重复提交这条消息';
+    expect(codexComposerContainsInput(
+      '› ' + prompt + '\n• Working (1s)\n\n› \n100% context left',
+      prompt,
+    )).toBe(false);
+  });
+});
+
+describe('Git 自动就绪', () => {
+  test('安装脚本仅包含固定包管理器，并把权限与环境失败映射为明确错误', () => {
+    for (const manager of ['brew', 'apt-get', 'dnf', 'yum', 'apk', 'pacman']) {
+      expect(ENSURE_GIT_SCRIPT).toContain(manager);
+    }
+    expect(gitAvailabilityError({ code: 127, out: '', err: 'PANDA_GIT_NO_MANAGER' }).message)
+      .toContain('未找到受支持的包管理器');
+    expect(gitAvailabilityError({ code: 126, out: '', err: 'PANDA_GIT_NO_PRIVILEGE' }).message)
+      .toContain('没有免密 sudo');
+    expect(gitAvailabilityError({ code: 1, out: '', err: 'apt failed' }).message)
+      .toContain('apt failed');
+  });
+
+  test('本机已有 Git 时就绪检查直接成功', async () => {
+    await expect(new LocalDriver().ensureGitAvailable()).resolves.toBeUndefined();
+  });
+});
 
 describe('I5 本地命令超时', () => {
   test('findExecutable 只从 PATH 探测固定 Agent 命令', async () => {
@@ -30,10 +127,31 @@ describe('I5 本地命令超时', () => {
       const claude = path.join(dir, 'claude');
       await fsp.writeFile(claude, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       process.env.PATH = dir;
-      const driver = new LocalDriver();
+      const driver = new LocalDriver({ agentShell: '/bin/false' });
       expect(await driver.findExecutable('claude')).toBe(claude);
       expect(await driver.findExecutable('codex')).toBeNull();
       await expect(driver.findExecutable('bash' as never)).rejects.toThrow(/Agent/);
+    } finally {
+      process.env.PATH = previous;
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('findExecutable 在 systemd PATH 缺失时回退执行机用户登录 shell，并只接受真实绝对可执行文件', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-agent-login-'));
+    const previous = process.env.PATH;
+    try {
+      const codex = path.join(dir, 'user-bin', 'codex');
+      const shell = path.join(dir, 'login-shell');
+      await fsp.mkdir(path.dirname(codex), { recursive: true });
+      await fsp.writeFile(codex, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      await fsp.writeFile(shell, `#!/bin/sh\nprintf 'login banner\\n%s\\n' '${codex}'\n`, { mode: 0o755 });
+      process.env.PATH = '/usr/bin:/bin';
+      const driver = new LocalDriver({ agentShell: shell, agentHome: dir });
+      expect(await driver.findExecutable('codex')).toBe(codex);
+
+      await fsp.chmod(codex, 0o644);
+      expect(await driver.findExecutable('codex')).toBeNull();
     } finally {
       process.env.PATH = previous;
       await fsp.rm(dir, { recursive: true, force: true });
@@ -303,8 +421,22 @@ describe('I6 建会话尺寸单一来源', () => {
     expect(tmuxNewSessionArgs('s1', '/tmp/工作 目录')).toEqual([
       'new-session', '-d', '-s', 's1', '-c', '/tmp/工作 目录', '-x', '220', '-y', '50',
       ';', 'set-window-option', '-t', 's1', 'window-size', 'manual',
+      ';', 'set-window-option', '-t', 's1', 'alternate-screen', 'off',
       ';', 'resize-window', '-t', 's1', '-x', '220', '-y', '50',
     ]);
+  });
+
+  test('tmuxNewSessionArgs 关掉 alternate-screen（claude 终端回滚失效的根因）', () => {
+    // claude CLI 的 TUI 跑在备用屏（实测 alternate_on=1），tmux 对备用屏不留 scrollback
+    // （history_size 恒 0），于是 scrollPane 的 copy-mode + scroll-up 滚不动任何东西。
+    // codex 不用备用屏（alt=0，history_size 实测上千），本设置对它是 no-op。
+    const args = tmuxNewSessionArgs('s1', '/tmp/x');
+    const i = args.indexOf('alternate-screen');
+    expect(i).toBeGreaterThan(-1);
+    expect(args[i - 1]).toBe('s1');
+    expect(args[i + 1]).toBe('off');
+    // 必须在 resize-window 之前发出，与 window-size manual 同批设定
+    expect(i).toBeLessThan(args.indexOf('resize-window'));
   });
 
   test('tmuxResizeWindowArgs：给尺寸=resize-window（顺带 manual）；null=交还客户端定尺', () => {
@@ -395,4 +527,47 @@ describe.if(ptyBackendOk && sttyOk)('openPty winsize（真 pty）', () => {
       pty.close();
     }
   }, 15_000);
+});
+
+describe('LocalDriver.runCommand（#279 门禁执行入口）', () => {
+  test('argv 直送、不经 shell：元字符是字面量参数而不是第二条命令', async () => {
+    const driver = new LocalDriver();
+    const r = await driver.runCommand(os.tmpdir(), ['/bin/echo', 'a && rm -rf /', '$HOME'], 5000);
+    expect(r.code).toBe(0);
+    expect(r.out.trim()).toBe('a && rm -rf / $HOME'); // 既没执行 rm，也没展开 $HOME
+    expect(r.timedOut).toBe(false);
+    expect(r.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  test('在指定 cwd 下执行', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-runcmd-'));
+    try {
+      const r = await new LocalDriver().runCommand(dir, ['/bin/pwd'], 5000);
+      expect(await fsp.realpath(r.out.trim())).toBe(await fsp.realpath(dir));
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('非零退出照常返回、不抛错；超时按 timedOut 返回', async () => {
+    const driver = new LocalDriver();
+    const failed = await driver.runCommand(os.tmpdir(), ['/bin/sh', '-c', 'echo boom >&2; exit 3'], 5000);
+    expect(failed).toMatchObject({ code: 3, timedOut: false });
+    expect(failed.err).toContain('boom');
+
+    const slow = await driver.runCommand(os.tmpdir(), ['/bin/sleep', '5'], 80);
+    expect(slow).toMatchObject({ timedOut: true, code: -1 });
+  });
+
+  test('空 argv 直接拒绝', async () => {
+    await expect(new LocalDriver().runCommand(os.tmpdir(), [], 5000)).rejects.toThrow(/至少一个命令词/);
+  });
+
+  test('truncateCommandOutput 保尾不保头：门禁的有用信息全在末尾', () => {
+    const s = 'A'.repeat(100) + 'TAIL';
+    expect(truncateCommandOutput(s, 50).endsWith('TAIL')).toBe(true);
+    expect(truncateCommandOutput(s, 50)).toContain('省略');
+    expect(truncateCommandOutput('short', 50)).toBe('short');
+    expect(MAX_COMMAND_OUTPUT_CHARS).toBe(64 * 1024);
+  });
 });

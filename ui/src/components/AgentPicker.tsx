@@ -1,6 +1,5 @@
 import type { AgentKind } from '../lib/types';
-
-const LABELS: Record<AgentKind, string> = { claude: 'Claude', codex: 'Codex' };
+import { AgentLogo } from './AgentLogo';
 
 export function toggleAgent(
   value: AgentKind[],
@@ -43,9 +42,9 @@ export function AgentPicker({
               disabled={disabled || !allowed}
               onChange={(e) => onChange(toggleAgent(value, agent, e.currentTarget.checked))}
             />
-            <span>
-              <b>{LABELS[agent]}</b>
-              <span class="mut small"> {agent === 'claude' ? 'Claude Code' : 'OpenAI Codex'}</span>
+            <span class="agent-choice-name">
+              <AgentLogo agent={agent} decorative size="sm" />
+              <span class="mut small">{agent === 'claude' ? 'Claude Code' : 'OpenAI Codex'}</span>
             </span>
           </label>
         );

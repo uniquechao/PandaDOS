@@ -264,20 +264,20 @@ describe('isCodexUpdatePrompt', () => {
 
 describe('codexExitedToShell', () => {
   test('自更新退出：出现「Please restart Codex」→ true', () => {
-    const pane = `==> Updating Codex CLI from 0.144.6 to 0.145.0\n🎉 Update ran successfully! Please restart Codex.\n[root@VM demo_project]#\n`;
+    const pane = `==> Updating Codex CLI from 0.144.6 to 0.145.0\n🎉 Update ran successfully! Please restart Codex.\n[root@VM yuhang_project]#\n`;
     expect(codexExitedToShell(pane)).toBe(true);
   });
 
   test('末行是 shell 提示符（# / $ 收尾，含用户误发命令报错）→ true', () => {
-    expect(codexExitedToShell('[root@VM demo_project]# ')).toBe(true);
-    expect(codexExitedToShell('-bash: 阿萨德: command not found\n[root@VM demo_project]#')).toBe(true);
+    expect(codexExitedToShell('[root@VM yuhang_project]# ')).toBe(true);
+    expect(codexExitedToShell('-bash: 阿萨德: command not found\n[root@VM yuhang_project]#')).toBe(true);
     expect(codexExitedToShell('user@host:~/p$')).toBe(true);
     // 末尾有空白行也要回溯到末条非空行判定
     expect(codexExitedToShell('[root@VM p]#\n\n  \n')).toBe(true);
   });
 
   test('codex TUI 在跑（状态栏/输入行不以 $ 或 # 收尾）→ false', () => {
-    const tui = `╭─ OpenAI Codex (v0.145.0) ─╮\n› \n  gpt-5.6-sol medium · ~/user_space/users/u12/demo_project\n`;
+    const tui = `╭─ OpenAI Codex (v0.145.0) ─╮\n› \n  gpt-5.6-sol medium · ~/user_space/users/u12/yuhang_project\n`;
     expect(codexExitedToShell(tui)).toBe(false);
     expect(codexExitedToShell('› 连通性自测：请只回复 pong')).toBe(false);
     expect(codexExitedToShell('')).toBe(false); // 全空白 → 不误判为退回 shell

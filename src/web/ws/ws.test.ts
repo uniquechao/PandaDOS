@@ -15,7 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { openDb } from '../../core/db';
 import { migrate } from '../../core/migrate';
-import { imageReadHint } from '../../core/uploads';
+import { fileReadHint, imageReadHint } from '../../core/uploads';
 import { LocalDriver } from '../../executor/local';
 import { KEY_WHITELIST, type PtyChannel } from '../../executor/driver';
 import { startServer, type PandaServer } from '../server';
@@ -262,6 +262,9 @@ const user = (text: string) =>
 /** 复刻 web/ws/chat.ts 的注入拼法：cleanHint = imageReadHint(abs).replace(/^\n+/,'')；带正文再接 '\n'+正文 */
 const injected = (abs: string[], text = '') =>
   imageReadHint(abs).replace(/^\n+/, '') + (text ? '\n' + text : '');
+/** 同上，但混合截图与通用附件（截图提示在前、文件提示在后，与 chat.ts 拼法一致） */
+const injectedMixed = (imgAbs: string[], fileAbs: string[], text = '') =>
+  (imageReadHint(imgAbs) + fileReadHint(fileAbs)).replace(/^\n+/, '') + (text ? '\n' + text : '');
 
 const MENU = ' Do you want to proceed?\n ❯ 1. Yes\n   2. No';
 
@@ -758,6 +761,87 @@ describe('WS chat：baseline → msg 增量 → selection → stale → 注入',
     c.close();
     await c.closed;
   });
+
+  test('text 帧带 files：isUploadRel 过滤 + fileReadHint 拼注入；图文混合两段提示都在；只发文件也注入', async () => {
+    const t = await chatCtx();
+    const cwd = (t.server.db.query('SELECT cwd FROM projects WHERE id = ?').get(t.pid) as { cwd: string }).cwd;
+    const c = await connect(`${t.wsBase}/ws/chat/${t.pid}`, t.aliceToken);
+    await c.next(); // baseline
+
+    c.send({
+      type: 'text',
+      text: '看这个文件',
+      files: [
+        '.panda/uploads/x/notes.txt', // 合法
+        '.panda/uploads/y/Makefile', // 合法（无扩展名）
+        'evil.txt', // 非上传目录 → 丢
+        '.panda/uploads/../secret.txt', // 越界 → 丢
+      ],
+    });
+    await waitFor(() => t.driver.sent.length === 1);
+    const inj1 = t.driver.sent[0]!.text;
+    expect(inj1).toContain('个文件'); // fileReadHint 前言
+    expect(inj1).toContain(`${cwd}/.panda/uploads/x/notes.txt`);
+    expect(inj1).toContain(`${cwd}/.panda/uploads/y/Makefile`);
+    expect(inj1).not.toContain('evil.txt');
+    expect(inj1).not.toContain('secret.txt');
+    expect(inj1).toContain('看这个文件');
+    expect(inj1.indexOf('个文件')).toBeLessThan(inj1.indexOf('看这个文件')); // 提示在前、正文在后
+
+    // 图文混合：截图提示在前、文件提示在后，两段路径都注入
+    c.send({
+      type: 'text',
+      text: '一起看',
+      images: ['.panda/uploads/i/a.png'],
+      files: ['.panda/uploads/f/b.log'],
+    });
+    await waitFor(() => t.driver.sent.length === 2);
+    const inj2 = t.driver.sent[1]!.text;
+    expect(inj2).toContain(`${cwd}/.panda/uploads/i/a.png`);
+    expect(inj2).toContain(`${cwd}/.panda/uploads/f/b.log`);
+    expect(inj2.indexOf('张截图')).toBeLessThan(inj2.indexOf('个文件'));
+
+    // 只发文件（文本空但有附件）：仍注入
+    c.send({ type: 'text', text: '', files: ['.panda/uploads/z/c.csv'] });
+    await waitFor(() => t.driver.sent.length === 3);
+    expect(t.driver.sent[2]!.text).toContain(`${cwd}/.panda/uploads/z/c.csv`);
+
+    c.close();
+  });
+
+  test('user 消息附件富化：baseline/msg 帧按扩展名分流挂 images/files 且正文剥离两段提示', async () => {
+    const t = await chatCtx();
+    await fsp.writeFile(
+      t.jsonl,
+      user(injectedMixed(['/x/.panda/uploads/aa/a.png'], ['/x/.panda/uploads/bb/notes.txt'], '一起看看')),
+    );
+
+    const c = await connect(`${t.wsBase}/ws/chat/${t.pid}`, t.aliceToken);
+    const baseline = await c.next();
+    const m0 = baseline.msgs[0];
+    expect(m0.role).toBe('user');
+    expect(m0.images).toEqual(['.panda/uploads/aa/a.png']);
+    expect(m0.files).toEqual(['.panda/uploads/bb/notes.txt']);
+    expect(m0.text).toBe('一起看看');
+
+    // tail 增量：纯文件（无正文、无图）→ 只挂 files、不挂 images、正文空串
+    await fsp.appendFile(t.jsonl, user(injectedMixed([], ['/x/.panda/uploads/cc/Makefile'])));
+    const inc = await c.next();
+    expect(inc.type).toBe('msg');
+    expect(inc.m.files).toEqual(['.panda/uploads/cc/Makefile']);
+    expect(inc.m.images).toBeUndefined();
+    expect(inc.m.text).toBe('');
+
+    // 无附件 user → 原样透传（既不挂 images 也不挂 files）
+    await fsp.appendFile(t.jsonl, user('普通的一句话'));
+    const plain = await c.next();
+    expect(plain.m.files).toBeUndefined();
+    expect(plain.m.images).toBeUndefined();
+    expect(plain.m.text).toBe('普通的一句话');
+
+    c.close();
+    await c.closed;
+  });
 });
 
 // ---------- term（假 PTY 桥） ----------
@@ -1029,7 +1113,7 @@ describe('WS chat ?conv= chat 独立对话：自身会话 + 恒可注入（无�
     await fsp.writeFile(path.join(sub, `${convC}.jsonl`), asst('你好'));
 
     // codex 已自更新退回 bash（tmux 会话仍活着，pane 是 shell 提示符）
-    t.driver.pane = '🎉 Update ran successfully! Please restart Codex.\n[root@VM demo_project]#';
+    t.driver.pane = '🎉 Update ran successfully! Please restart Codex.\n[root@VM yuhang_project]#';
 
     const c = await connect(`${t.wsBase}/ws/chat/${t.pid}?conv=${convC}`, t.aliceToken);
     expect(await c.next()).toEqual({ type: 'mode', live: true });

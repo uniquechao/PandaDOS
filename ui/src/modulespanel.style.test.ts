@@ -107,3 +107,12 @@ describe('窄屏不挤爆', () => {
     expect(responsive).toMatch(/@media \(max-width: 479px\) \{[^@]*\.mrow-acts \{[^}]*width: 100%/);
   });
 });
+
+describe('模块推理档（#281 / I-04）', () => {
+  test('每行有模块默认档选择，且提示只对之后启动的会话生效', () => {
+    expect(panelSrc).toContain("void changeReasoning(m, e.currentTarget.value)");
+    expect(panelSrc).toContain("t('ui.reasoningInherit')");
+    expect(panelSrc).toContain("t('ui.reasoningCodexOnly')");
+    expect(panelSrc).toContain("{ reasoningEffort: next }");
+  });
+});

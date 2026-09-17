@@ -16,9 +16,11 @@ export type PendingState = 'sending' | 'sent' | 'failed';
 export interface PendingMsg {
   /** 本地生成的一次性 id，随 text 帧发出、随 ack/err 回来 */
   id: string;
-  /** 用户正文（不含附图提示；附图只记张数，不留 blob 预览——发送后本地 URL 已 revoke） */
+  /** 用户正文（不含附件提示；附件只记条数，不留 blob 预览——发送后本地 URL 已 revoke） */
   text: string;
   imgCount: number;
+  /** 附件（非图片）条数；老气泡/无附件时缺省按 0 */
+  fileCount?: number;
   /**
    * 创建时对话里最大的 off。只有比它更靠后的回流消息才可能是这一条——
    * 否则历史里一句一模一样的旧话就会把新气泡误撤掉。
@@ -45,11 +47,13 @@ export function markPending(list: PendingMsg[], id: string, state: PendingState)
   return list.map((p) => (p.id === id ? { ...p, state } : p));
 }
 
-/** 回流的这条消息是不是本地这条气泡（正文归一后相同；纯图消息比张数） */
+/** 回流的这条消息是不是本地这条气泡（正文归一后相同；纯附件消息比图片与文件条数） */
 function bodyMatches(m: ChatMessage, p: PendingMsg): boolean {
   const body = normText(m.text);
   if (p.text.trim()) return body === normText(p.text);
-  return body === '' && p.imgCount > 0 && (m.images?.length ?? 0) === p.imgCount;
+  const files = p.fileCount ?? 0;
+  if (body !== '' || p.imgCount + files === 0) return false;
+  return (m.images?.length ?? 0) === p.imgCount && (m.files?.length ?? 0) === files;
 }
 
 /**

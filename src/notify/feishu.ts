@@ -40,8 +40,8 @@ export interface FeishuConfig {
 // ---------- 回调 payload 薄类型（v1 全 any 的评审整改） ----------
 
 export interface FeishuInboundPayload {
-  sender?: { sender_id?: { open_id?: string } };
-  message?: { message_type?: string; content?: string };
+  sender?: { sender_type?: string; sender_id?: { open_id?: string } };
+  message?: { message_id?: string; chat_type?: string; message_type?: string; content?: string };
 }
 
 export interface FeishuCardPayload {
@@ -70,12 +70,21 @@ export interface FeishuEventHandlers {
   onCard(data: FeishuCardPayload): Promise<unknown>;
 }
 
+export type FeishuConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'failed';
+
+export interface FeishuChannelStatus {
+  state: FeishuConnectionState;
+  lastReceivedAt: number | null;
+  lastSentAt: number | null;
+  lastError: 'connection_failed' | 'send_failed' | null;
+}
+
 /** 连接层抽象：默认 larkSdk()（真 SDK），测试传假的 */
 export interface FeishuSdk {
   connect(
     cfg: FeishuConfig,
     handlers: FeishuEventHandlers,
-  ): Promise<{ client: FeishuSdkClient; stop(): void }>;
+  ): Promise<{ client: FeishuSdkClient; stop(): void; status?(): FeishuConnectionState }>;
 }
 
 /** 真 SDK 适配器（v1 feishu.ts:22-42 WSClient 接线平移；重连委托 SDK） */
@@ -85,23 +94,35 @@ export function larkSdk(): FeishuSdk {
       // SDK 类型质量差，适配层内收敛为最小 any 面
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const Lark = (await import('@larksuiteoapi/node-sdk')) as any;
-      const base = { appId: cfg.appId, appSecret: cfg.appSecret, domain: Lark.Domain.Feishu };
+      // SDK errors may include Axios request headers/body; never log their raw payloads.
+      const quiet = () => {};
+      const logger = { error: quiet, warn: quiet, info: quiet, debug: quiet, trace: quiet };
+      const base = { appId: cfg.appId, appSecret: cfg.appSecret, domain: Lark.Domain.Feishu, logger };
       const client = new Lark.Client(base) as FeishuSdkClient;
-      const wsClient = new Lark.WSClient({ ...base, loggerLevel: Lark.LoggerLevel.error });
-      wsClient.start({
-        eventDispatcher: new Lark.EventDispatcher({}).register({
-          'im.message.receive_v1': (data: FeishuInboundPayload) => handlers.onInbound(data),
-          'card.action.trigger': (data: FeishuCardPayload) => handlers.onCard(data),
+      let failed = false;
+      let started = false;
+      let stopped = false;
+      const wsClient = new Lark.WSClient({ ...base, loggerLevel: Lark.LoggerLevel.error,
+        onError: () => { failed = true; } });
+      const start = wsClient.start({
+        eventDispatcher: new Lark.EventDispatcher({ logger }).register({
+          'im.message.receive_v1': (data: FeishuInboundPayload) => stopped ? undefined : handlers.onInbound(data),
+          'card.action.trigger': (data: FeishuCardPayload) => stopped ? undefined : handlers.onCard(data),
         }),
       });
+      // start() arms the SDK loop; its resolution does not mean the WS is connected.
+      void Promise.resolve(start).then(() => { started = true; }, () => { failed = true; });
       return {
         client,
+        status(): FeishuConnectionState {
+          if (failed || stopped) return 'failed';
+          const state = wsClient.getConnectionStatus().state;
+          if (state === 'idle') return started ? 'failed' : 'connecting';
+          return state;
+        },
         stop() {
-          try {
-            wsClient.close?.();
-          } catch {
-            /* best-effort */
-          }
+          stopped = true;
+          try { wsClient.close({ force: true }); } catch { /* best-effort */ }
         },
       };
     },
@@ -129,23 +150,34 @@ export type GateDecideFn = (
 ) => Promise<{ ok: boolean; error?: string }>;
 
 export interface FeishuChannelDeps {
-  /** users.feishu_openid 校验 + notify_gate_requests（060 迁移需已应用） */
+  /** users.feishu_openid 校验 + notify_gate_requests（063 迁移需已应用） */
   db: Database;
   /** 卡点按钮回调转发引擎；未接线时点击回 error toast */
   decideGate?: GateDecideFn;
   /** 入站文本消息（路由到 PM 由集成层经 NotifyRouter.routeInbound 接） */
-  onInbound?: (openid: string, text: string) => void;
+  onInbound?: (openid: string, text: string) => void | Promise<void>;
   /** v1 选择卡回调兼容（弹窗菜单代点，集成时接 actOnMenu 原语） */
   onSelection?: (requestId: string, optionIndex: number, openid: string) => void;
   /** SDK 注入（缺省真 SDK；测试传 mock） */
   sdk?: FeishuSdk;
 }
 
+export const FEISHU_MESSAGE_DEDUP_TTL_MS = 10 * 60_000;
+export const FEISHU_MESSAGE_DEDUP_MAX = 2_000;
+
 export class FeishuChannel implements NotifyChannel {
   readonly name = 'feishu';
   readonly requests: GateRequestStore;
   private client: FeishuSdkClient | null = null;
   private stopFn: (() => void) | null = null;
+  private statusFn: (() => FeishuConnectionState) | null = null;
+  private generation = 0;
+  private active = false;
+  private state: FeishuConnectionState = 'connecting';
+  private lastReceivedAt: number | null = null;
+  private lastSentAt: number | null = null;
+  private lastError: FeishuChannelStatus['lastError'] = null;
+  private readonly received = new Map<string, number>();
 
   constructor(
     private readonly config: FeishuConfig,
@@ -154,53 +186,89 @@ export class FeishuChannel implements NotifyChannel {
     this.requests = new GateRequestStore(deps.db);
   }
 
-  /** 建立事件长连接（入站消息/卡片按钮回调）；回调异常不逃逸（v1 :33/:37 平移） */
-  async start(): Promise<void> {
-    const sdk = this.deps.sdk ?? larkSdk();
-    const { client, stop } = await sdk.connect(this.config, {
-      onInbound: async (data) => {
-        try {
-          this.handleInbound(data);
-        } catch (e) {
-          console.error('[feishu] inbound 异常:', e);
-        }
-      },
-      onCard: async (data) => {
-        try {
-          return await this.handleCard(data);
-        } catch (e) {
-          console.error('[feishu] card 异常:', e);
-          return undefined;
-        }
-      },
-    });
-    this.client = client;
-    this.stopFn = stop;
+  status(): FeishuChannelStatus {
+    const state = this.statusFn?.() ?? this.state;
+    if (state === 'failed' && this.active) this.lastError = 'connection_failed';
+    else if (state === 'connected' && this.lastError === 'connection_failed') this.lastError = null;
+    return { state, lastReceivedAt: this.lastReceivedAt, lastSentAt: this.lastSentAt, lastError: this.lastError };
   }
 
-  async stop(): Promise<void> {
+  /** Start the SDK without claiming its background WebSocket has connected. */
+  async start(): Promise<void> {
     this.stopFn?.();
     this.stopFn = null;
     this.client = null;
+    this.statusFn = null;
+    this.active = true;
+    this.state = 'connecting';
+    this.lastError = null;
+    const generation = ++this.generation;
+    const current = () => this.active && generation === this.generation;
+    try {
+      const connection = await (this.deps.sdk ?? larkSdk()).connect(this.config, {
+        onInbound: async (data) => {
+          if (!current()) return;
+          try { await this.handleInbound(data); }
+          catch { console.error('[feishu] inbound_failed'); }
+        },
+        onCard: async (data) => {
+          if (!current()) return undefined;
+          try { return await this.handleCard(data); }
+          catch { console.error('[feishu] card_failed'); return undefined; }
+        },
+      });
+      if (!current()) { connection.stop(); return; }
+      this.client = connection.client;
+      this.stopFn = () => connection.stop();
+      this.statusFn = connection.status ? () => connection.status!() : null;
+      this.state = connection.status?.() ?? 'connected';
+    } catch {
+      if (!current()) return;
+      this.state = 'failed';
+      this.lastError = 'connection_failed';
+      throw new Error('connection_failed');
+    }
   }
 
-  // ---- 入站（v1 handleInbound 平移：只解析 text，非文本降级占位） ----
+  async stop(): Promise<void> {
+    this.active = false;
+    this.generation++;
+    this.stopFn?.();
+    this.stopFn = null;
+    this.statusFn = null;
+    this.client = null;
+    this.state = 'failed';
+  }
 
-  private handleInbound(data: FeishuInboundPayload): void {
-    const message = data.message;
-    const openId = data.sender?.sender_id?.open_id ?? '';
-    if (!openId || !message) return;
-    let text = '';
-    if (message.message_type === 'text') {
-      try {
-        text = (JSON.parse(message.content ?? '') as { text?: string })?.text ?? '';
-      } catch {
-        /* ignore */
+  // Only non-empty private human text reaches PM. Unsupported messages are ignored.
+  private async handleInbound(data: FeishuInboundPayload): Promise<void> {
+    const message = data?.message;
+    const sender = data?.sender;
+    const openId = sender?.sender_id?.open_id;
+    if (typeof openId !== 'string' || !openId.trim() || !message ||
+        (sender?.sender_type !== undefined && sender.sender_type !== 'user') ||
+        (message.chat_type !== undefined && message.chat_type !== 'p2p') ||
+        message.message_type !== 'text' || typeof message.content !== 'string') return;
+    let text: unknown;
+    try { text = (JSON.parse(message.content) as { text?: unknown } | null)?.text; }
+    catch { return; }
+    if (typeof text !== 'string' || !text.trim()) return;
+    const now = Date.now();
+    const id = message.message_id;
+    if (typeof id === 'string' && id) {
+      for (const [key, ts] of this.received) {
+        if (now - ts < FEISHU_MESSAGE_DEDUP_TTL_MS) break;
+        this.received.delete(key);
       }
-    } else {
-      text = `[${message.message_type}]`;
+      if (this.received.has(id)) return;
+      while (this.received.size >= FEISHU_MESSAGE_DEDUP_MAX) {
+        this.received.delete(this.received.keys().next().value!);
+      }
+      // Reserve before awaiting downstream work so concurrent duplicate events cannot execute twice.
+      this.received.set(id, now);
     }
-    this.deps.onInbound?.(openId, text.trim());
+    this.lastReceivedAt = now;
+    await this.deps.onInbound?.(openId, text.trim());
   }
 
   // ---- 卡片回调：按 forge 分发（gate 新增 / selection v1 兼容） ----
@@ -276,8 +344,25 @@ export class FeishuChannel implements NotifyChannel {
     return this.client;
   }
 
+  private async send(args: FeishuMessageCreateArgs): Promise<void> {
+    const client = this.mustClient();
+    const generation = this.generation;
+    try {
+      const response = await client.im.v1.message.create(args);
+      // Legacy injected adapters return {}; the real SDK always supplies a numeric code.
+      if (!response || typeof response !== 'object' || Array.isArray(response) ||
+          ('code' in response && response.code !== 0)) throw new Error('send_failed');
+      if (!this.active || generation !== this.generation) throw new Error('send_failed');
+      this.lastSentAt = Date.now();
+      this.lastError = null;
+    } catch {
+      if (generation === this.generation) this.lastError = 'send_failed';
+      throw new Error('send_failed');
+    }
+  }
+
   async sendText(target: NotifyTarget, text: string): Promise<void> {
-    await this.mustClient().im.v1.message.create({
+    await this.send({
       params: { receive_id_type: 'open_id' },
       data: { receive_id: target.address, content: JSON.stringify({ text }), msg_type: 'text' },
     });
@@ -285,7 +370,7 @@ export class FeishuChannel implements NotifyChannel {
 
   /** 发交互卡片（进度/回复/选择/卡点卡通用） */
   async sendCard(toOpenId: string, card: unknown): Promise<void> {
-    await this.mustClient().im.v1.message.create({
+    await this.send({
       params: { receive_id_type: 'open_id' },
       data: { receive_id: toOpenId, content: JSON.stringify(card), msg_type: 'interactive' },
     });

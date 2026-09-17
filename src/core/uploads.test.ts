@@ -9,14 +9,19 @@ import os from 'node:os';
 import path from 'node:path';
 import { LocalDriver } from '../executor/local';
 import {
+  MAX_UPLOAD_FILE_BYTES,
   UPLOAD_DIR,
   absImages,
   addGitExclude,
+  extractUploadFileRels,
   extractUploadRels,
+  fileReadHint,
   imageReadHint,
   isUploadRel,
   resolveGitExcludePath,
   safeImageName,
+  safeUploadFileName,
+  saveUploadFile,
   saveUploadImage,
   stripImageHint,
   uploadId,
@@ -41,6 +46,35 @@ test('safeImageName rejects non-images and extensionless', () => {
   expect(safeImageName('noext')).toBeNull();
   expect(safeImageName('..png')).toBeNull(); // leading dots stripped → no extension left
   expect(safeImageName('')).toBeNull();
+});
+
+test('safeUploadFileName 不限扩展名但沿用严格白名单净化', () => {
+  expect(safeUploadFileName('notes.txt')).toBe('notes.txt');
+  expect(safeUploadFileName('data.tar.gz')).toBe('data.tar.gz');
+  expect(safeUploadFileName('Makefile')).toBe('Makefile'); // 无扩展名也收
+  expect(safeUploadFileName('我的 报告 v2.pdf')).toBe('_v2.pdf'); // 空格/中文→_，前导 _ 保留
+  expect(safeUploadFileName('../../etc/passwd')).toBe('passwd'); // 路径分量剥掉
+  expect(safeUploadFileName('C:\\x\\y.log')).toBe('y.log');
+  expect(safeUploadFileName('.hidden')).toBe('hidden'); // 前导点去掉
+});
+
+test('safeUploadFileName 拒空名与只剩点的名字', () => {
+  expect(safeUploadFileName('')).toBeNull();
+  expect(safeUploadFileName('...')).toBeNull();
+  expect(safeUploadFileName('/')).toBeNull();
+});
+
+test('MAX_UPLOAD_FILE_BYTES 是 20MB', () => {
+  expect(MAX_UPLOAD_FILE_BYTES).toBe(20 * 1024 * 1024);
+});
+
+test('fileReadHint 无文件为空串，否则含 Read 与各绝对路径', () => {
+  expect(fileReadHint([])).toBe('');
+  const h = fileReadHint(['/proj/.panda/uploads/x/a.txt', '/proj/.panda/uploads/y/Makefile']);
+  expect(h).toContain('Read');
+  expect(h).toContain('/proj/.panda/uploads/x/a.txt');
+  expect(h).toContain('/proj/.panda/uploads/y/Makefile');
+  expect(h).toContain('2 个文件');
 });
 
 test('isUploadRel only accepts paths inside the upload dir', () => {
@@ -115,6 +149,46 @@ test('stripImageHint 纯图消息（无正文）→ 空串', () => {
 test('stripImageHint 无附图提示 → 原样返回（不动用户文本/空白）', () => {
   expect(stripImageHint('普通消息\n第二行')).toBe('普通消息\n第二行');
   expect(stripImageHint('')).toBe('');
+});
+
+// ---------- fileReadHint 的逆运算：extractUploadFileRels + 扩展后的 stripImageHint ----------
+
+const FILE_ABS = ['/proj/.panda/uploads/ab12cd/notes.txt', '/proj/.panda/uploads/ef34gh/Makefile'];
+const FILE_REL = ['.panda/uploads/ab12cd/notes.txt', '.panda/uploads/ef34gh/Makefile'];
+const FILE_HINT = fileReadHint(FILE_ABS).replace(/^\n+/, '');
+const FILE_WITH_TEXT = FILE_HINT + '\n' + '看看这两个文件';
+const FILE_COMPRESSED = FILE_WITH_TEXT.replace(/\n/g, ' ');
+
+test('extractUploadFileRels 抠出非图片附件 rel（含无扩展名、换行被压成空格）', () => {
+  expect(extractUploadFileRels(FILE_WITH_TEXT)).toEqual(FILE_REL);
+  expect(extractUploadFileRels(FILE_HINT)).toEqual(FILE_REL);
+  expect(extractUploadFileRels(FILE_COMPRESSED)).toEqual(FILE_REL);
+});
+
+test('extractUploadFileRels 与 extractUploadRels 按扩展名分流、互不串台', () => {
+  const mixed = FILE_HINT + '\n' + CLEAN_HINT + '\n正文';
+  expect(extractUploadFileRels(mixed)).toEqual(FILE_REL); // 图片不进文件列表
+  expect(extractUploadRels(mixed)).toEqual(REL); // 文件不进图片列表
+  expect(extractUploadFileRels(IMAGE_ONLY)).toEqual([]);
+  expect(extractUploadRels(FILE_WITH_TEXT)).toEqual([]);
+});
+
+test('extractUploadFileRels 无附件返回 []、挡越界、顺序去重、上限 6', () => {
+  expect(extractUploadFileRels('')).toEqual([]);
+  expect(extractUploadFileRels('普通消息\n第二行')).toEqual([]);
+  expect(extractUploadFileRels('foo/bar/notes.txt')).toEqual([]); // 不在上传目录
+  expect(extractUploadFileRels('· /x/' + UPLOAD_DIR + '/../secret 正文')).toEqual([]);
+  expect(extractUploadFileRels(`· ${FILE_ABS[0]} · ${FILE_ABS[0]}`)).toEqual([FILE_REL[0]]);
+  const many = Array.from({ length: 8 }, (_, i) => `/proj/${UPLOAD_DIR}/s${i}/f${i}.txt`);
+  expect(extractUploadFileRels(many.map((p) => '· ' + p).join('\n')).length).toBe(6);
+});
+
+test('stripImageHint 同样剥掉文件提示（含图文混合），无提示仍原样返回', () => {
+  expect(stripImageHint(FILE_WITH_TEXT)).toBe('看看这两个文件');
+  expect(stripImageHint(FILE_COMPRESSED)).toBe('看看这两个文件');
+  expect(stripImageHint(FILE_HINT)).toBe(''); // 纯附件消息
+  expect(stripImageHint(FILE_HINT + '\n' + CLEAN_HINT + '\n混合正文')).toBe('混合正文');
+  expect(stripImageHint('文件 notes.txt 在哪')).toBe('文件 notes.txt 在哪'); // 非上传路径不动
 });
 
 test('absImages resolves relative against cwd, keeps absolute', () => {
@@ -241,4 +315,24 @@ test('saveUploadImage rejects non-whitelisted names', async () => {
   const proj = path.join(TMP, 'proj2');
   await fsp.mkdir(proj, { recursive: true });
   await expect(saveUploadImage(driver, proj, 'evil.exe', new Uint8Array([1]))).rejects.toThrow();
+});
+
+
+test('saveUploadFile 落到 .panda/uploads/<id>/<净化名> 并写 git exclude', async () => {
+  const repo = path.join(TMP, 'filesave');
+  await fsp.mkdir(path.join(repo, '.git', 'info'), { recursive: true });
+  const saved = await saveUploadFile(driver, repo, '我的 报告.txt', new TextEncoder().encode('hi'));
+  expect(saved.name).toBe('_.txt');
+  expect(saved.rel.startsWith(UPLOAD_DIR + '/')).toBe(true);
+  expect(saved.rel.endsWith('/_.txt')).toBe(true);
+  expect(saved.abs).toBe(path.join(repo, saved.rel));
+  expect(await fsp.readFile(saved.abs, 'utf-8')).toBe('hi');
+  const ex = await fsp.readFile(path.join(repo, '.git', 'info', 'exclude'), 'utf-8');
+  expect(excludeHits(ex)).toBe(1);
+});
+
+test('saveUploadFile 文件名非法时抛错', async () => {
+  const dir = path.join(TMP, 'filesave-bad');
+  await fsp.mkdir(dir, { recursive: true });
+  await expect(saveUploadFile(driver, dir, '...', new Uint8Array())).rejects.toThrow();
 });

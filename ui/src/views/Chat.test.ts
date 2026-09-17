@@ -98,3 +98,23 @@ describe('ChatView 导入当前项目本地历史（issue #7）', () => {
     expect(css).toContain('@media (pointer: coarse) {\n  .history-import-item { min-height: 68px; }');
   });
 });
+
+describe('ChatView 对话 id 与地址栏（#302）', () => {
+  test('选中的对话写进地址栏，深链优先于本地记忆', () => {
+    expect(source).toContain('function ChatView({ pid, cid }');
+    expect(source).toContain('const linked = r.conversations.find((c) => c.id === cidRef.current)?.id ?? null;');
+    expect(source).toContain('linked ?? restoreChatConversation(pid, r.conversations)');
+    expect(source).toContain("import { resolveChatSync } from '../lib/chatsync';");
+    // 同步只能有一个 effect：两个方向各一个会互相对打，生产上跑出过 1983 条 pending 请求
+    expect(source).toContain('prevCid: prevCidRef.current,');
+    expect(source.match(/resolveChatSync\(/g)?.length).toBe(1);
+  });
+
+  test('工具条里给出可复制的对话 id（网页/tmux/库三边对账）', () => {
+    expect(source).toContain('function ConvIdChip');
+    expect(source).toContain('<ConvIdChip id={selected} />');
+    expect(source).toContain("copyText(id)");
+    expect(source).toContain("t('view.copyConversationId', { id })");
+    expect(css).toContain('.conv-id {');
+  });
+});

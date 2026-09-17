@@ -1,15 +1,35 @@
 /**
  * ui/lib/newIssuePrefs —— 新建 issue 表单的「记住上次选择」（存浏览器本地，按设备）。
  *
- * 目前只记自动批准档位（#115）：跟账号走会让「我在自己电脑上敢开全自动、在别人机器上不敢」
+ * 自动批准档位（#115）：跟账号走会让「我在自己电脑上敢开全自动、在别人机器上不敢」
  * 这件事失控，所以明确按设备存（localStorage），一台机器一份，不同步。
- * 读侧对任何脏值/localStorage 不可用都退回 'medium' —— 新建表单必须能开出来，
+ * 档位读侧对任何脏值/localStorage 不可用都退回 'medium' —— 新建表单必须能开出来，
  * 且回退到的是既有默认档位，绝不会因为存储损坏悄悄放宽成全自动。
+ * 代理（#271）独立记住手动选择，与对话页偏好分开；没有有效记录时默认 claude。
  */
-import type { AutoApproveLevel } from './types';
+import type { AgentKind, AutoApproveLevel } from './types';
 
 /** localStorage 键（按设备存，一个用户多设备各自记） */
 export const NEW_ISSUE_AA_KEY = 'panda.newIssueAutoApprove';
+export const NEW_ISSUE_AGENT_KEY = 'panda.newIssueAgent';
+
+export function readNewIssueAgent(): AgentKind {
+  try {
+    return localStorage.getItem(NEW_ISSUE_AGENT_KEY) === 'codex' ? 'codex' : 'claude';
+  } catch {
+    return 'claude';
+  }
+}
+
+/** 只由用户手动选择触发；模块绑定和执行机回退不写入。 */
+export function writeNewIssueAgent(agent: AgentKind): void {
+  if (agent !== 'claude' && agent !== 'codex') return;
+  try {
+    localStorage.setItem(NEW_ISSUE_AGENT_KEY, agent);
+  } catch {
+    // 存储不可用时仍允许创建 issue。
+  }
+}
 
 /** 没记录时的默认档位 = 后端默认，也是现有审批管道行为 */
 export const NEW_ISSUE_AA_DEFAULT: AutoApproveLevel = 'medium';

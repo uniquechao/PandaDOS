@@ -56,7 +56,11 @@ export interface WsDeps {
     /** 就绪门禁自愈：codex 退回 shell 时重启会话（ConversationManager.activate） */
     activate?(convId: string): Promise<unknown>;
   };
-  locator: { locate(convId: string): Promise<string | null> };
+  locator: {
+    locate(convId: string): Promise<string | null>;
+    /** 会话重认领（core/agent-locator）：chat 面的绑定漂移自愈用，见 ws/chat 的 checkBindingDrift */
+    reclaim?(convId: string): Promise<string | null>;
+  };
   mutex: KeyedMutex;
   /** jsonl 读取面（与引擎/locator 同源 = 主执行机 Driver） */
   reader: JsonlReader;
@@ -65,6 +69,7 @@ export interface WsDeps {
   approvals?: ChatApprovals;
   /** 菜单解读（issue #112「解释一下」）；缺省不接 = 前端点了收 explain_failed */
   explain?: ChatWsDeps['explain'];
+  judgeAgentFailure?: ChatWsDeps['judgeAgentFailure'];
   chatPollMs?: number;
   retryDelayMs?: number;
   /** 用户消息计数（013）：chat 文本帧注入成功后记一笔；缺省不接 = 不统计 */
@@ -352,6 +357,7 @@ export function createWsHandlers(deps: WsDeps): WebSocketHandler<WsData> {
     mutex: deps.mutex,
     ...(deps.approvals ? { approvals: deps.approvals } : {}),
     ...(deps.explain ? { explain: deps.explain } : {}),
+    ...(deps.judgeAgentFailure ? { judgeAgentFailure: deps.judgeAgentFailure } : {}),
     ...(deps.chatPollMs !== undefined ? { chatPollMs: deps.chatPollMs } : {}),
     ...(deps.retryDelayMs !== undefined ? { retryDelayMs: deps.retryDelayMs } : {}),
     ...(deps.messages ? { messages: deps.messages } : {}),

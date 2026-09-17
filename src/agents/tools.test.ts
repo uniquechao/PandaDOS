@@ -74,11 +74,15 @@ function mockDriver(st: MockDriverState): ExecutorDriver {
     async removeTree() {},
     async mkdirp() {},
     async movePath() {},
+    async ensureGitAvailable() {},
     async git() {
       return { code: 0, out: '', err: '' };
     },
     async readGitBlob() {
       return { code: 0, data: new Uint8Array(), err: '' };
+    },
+    async runCommand() {
+      return { code: 0, out: '', err: '', timedOut: false, durationMs: 0 };
     },
     async openPty() {
       throw new Error('not implemented');

@@ -1,6 +1,8 @@
 import type { Database } from 'bun:sqlite';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { ensureSyncUids } from '../core/project-data';
+import { ensureProjectDataOutboxTriggers } from '../core/project-data-outbox';
 import { migrate, type MigrationStatus } from '../core/migrate';
 import { designGraphDigest, validateDesignGraph } from './graph';
 import {
@@ -688,7 +690,7 @@ function normalizeGraph(graph: DesignGraphDraft): DesignGraph {
 export const DESIGN_MIGRATIONS_DIR = join(import.meta.dir, 'migrations');
 
 /**
- * An intermediate legacy migration stored saga ownership on conversations. Migration 051 cannot
+ * The intermediate e98 migration stored saga ownership on conversations. Migration 051 cannot
  * conditionally reference that column in plain SQL because the restored/original 050 lacks it, so
  * bridge only schemas where PRAGMA proves the legacy column exists. Both IDs and project scope must
  * match the durable saga; arbitrary legacy token text is never promoted to ownership.
@@ -737,6 +739,10 @@ function ensureDesignGranularityNormalization(db: Database): void {
 /** Applies the design domain migration after the core and issue-domain migrations. */
 export function migrateDesigns(db: Database): MigrationStatus {
   const status = migrate(db, DESIGN_MIGRATIONS_DIR);
+  ensureSyncUids(db, [{ table: 'design_tasks', timestampColumn: 'created_ts' }]);
+  ensureProjectDataOutboxTriggers(db, [
+    { table: 'design_tasks', kind: 'design', archivedWhen: "NEW.status = 'archived'" },
+  ]);
   ensureDesignGranularityNormalization(db);
   backfillLegacyDesignConversationOwners(db);
   return status;

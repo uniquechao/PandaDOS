@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /**
  * core/skills —— 技能（agentskills 格式：目录 + SKILL.md）在执行机上的读写。
  *
@@ -32,6 +33,10 @@ export interface SkillInfo {
   scope: 'global' | 'project';
   /** 来源徽章：内置 / codex / 插件名 */
   source?: string;
+  pluginId?: string;
+  version?: string;
+  contentDigest?: string;
+  dependencyMetadata?: string;
 }
 
 /** 技能目录名白名单（安装/卸载的末段名；杜绝路径穿越） */
@@ -124,10 +129,13 @@ export async function scanSkillsDir(
       const st = await driver.statPath(md);
       if (!st || !st.isFile) continue;
       const text = (await readDriverText(driver, md)) ?? '';
+      const metadata = await readDriverText(driver,path.posix.join(base,e.name,'agents','openai.yaml'));
       out.push({
         name: e.name,
         path: md,
         summary: parseSkillMd(text).description,
+        contentDigest:createHash('sha256').update(text).update(metadata ?? '').digest('hex'),
+        ...(metadata ? {dependencyMetadata:metadata.slice(0,4000)} : {}),
         mtimeMs: st.mtimeMs,
         scope,
         ...(source ? { source } : {}),
@@ -158,8 +166,8 @@ async function disabledPlugins(driver: SkillsDriver, claudeHome: string): Promis
 async function installedPluginSkillDirs(
   driver: SkillsDriver,
   claudeHome: string,
-): Promise<{ plugin: string; dir: string }[]> {
-  const out: { plugin: string; dir: string }[] = [];
+): Promise<{ plugin: string; pluginId: string; dir: string }[]> {
+  const out: { plugin: string; pluginId: string; dir: string }[] = [];
   const text = await readDriverText(
     driver,
     path.posix.join(claudeHome, 'plugins', 'installed_plugins.json'),
@@ -179,7 +187,7 @@ async function installedPluginSkillDirs(
         const dir = path.posix.join(ip, 'skills');
         if (seen.has(dir)) continue;
         seen.add(dir);
-        out.push({ plugin, dir });
+        out.push({ plugin, pluginId: key, dir });
       }
     }
   } catch {
@@ -204,13 +212,28 @@ export async function listGlobalSkills(driver: SkillsDriver, homes: AgentHomes):
     }
   };
   push(await scanSkillsDir(driver, path.posix.join(homes.claudeHome, 'skills'), 'global', '内置'));
-  for (const { plugin, dir } of await installedPluginSkillDirs(driver, homes.claudeHome)) {
-    push(await scanSkillsDir(driver, dir, 'global', plugin));
+  for (const { plugin, pluginId, dir } of await installedPluginSkillDirs(driver, homes.claudeHome)) {
+    push((await scanSkillsDir(driver, dir, 'global', plugin)).map(s => ({...s,pluginId,version:path.posix.basename(path.posix.dirname(dir))})));
   }
   const codexSkills = path.posix.join(homes.codexHome, 'skills');
   if ((await driver.readlink(codexSkills)) === null) {
     push(await scanSkillsDir(driver, codexSkills, 'global', 'codex'));
   }
+  const cache = path.posix.join(homes.codexHome, 'plugins', 'cache');
+  async function walkPlugins(dir: string, depth: number): Promise<void> {
+    if (depth > 4) return;
+    const entries = await driver.listDir(dir).catch(() => []);
+    for (const entry of entries) {
+      if (entry.type !== 'dir') continue;
+      const child = path.posix.join(dir, entry.name);
+      if (entry.name === 'skills') {
+        const plugin = path.posix.basename(path.posix.dirname(dir));
+        push((await scanSkillsDir(driver, child, 'global', plugin)).map(s=>({...s,version:path.posix.basename(dir)})));
+      } else await walkPlugins(child, depth+1);
+    }
+  }
+  await walkPlugins(cache,0);
+  push(await scanSkillsDir(driver,path.posix.join(path.posix.dirname(homes.codexHome),'.agents','skills'),'global','agents'));
   merged.sort((a, b) => a.name.localeCompare(b.name) || (a.source ?? '').localeCompare(b.source ?? ''));
   return merged;
 }
@@ -224,6 +247,9 @@ export async function listProjectSkills(driver: SkillsDriver, cwd: string): Prom
       seen.add(s.path);
       merged.push(s);
     }
+  }
+  for (const s of await scanSkillsDir(driver, path.posix.join(cwd, '.agents', 'skills'), 'project', 'agents')) {
+    if (!seen.has(s.path)) { seen.add(s.path); merged.push(s); }
   }
   const codexSkills = path.posix.join(cwd, '.codex', 'skills');
   if ((await driver.readlink(codexSkills)) === null) {

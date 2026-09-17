@@ -34,6 +34,6 @@ export function cmdHeadView(ev: RunToolEvent, open: boolean): CmdHead {
     cmd: commandLine(ev),
     dur: fmtDuration(ev.durationMs),
     preview: !open && ev.result ? firstLine(ev.result, CMD_PREVIEW_CHARS) : '',
-    hasOut: Boolean(ev.result),
+    hasOut: ev.result !== undefined,
   };
 }

@@ -4,6 +4,8 @@ import { migrate } from '../../core/migrate';
 import { SessionStore } from '../../core/sessions';
 import { UserStore } from '../../core/users';
 import { COOKIE } from '../auth';
+import { migrateIssueEngine } from '../../issues/engine';
+import { projectsRoutes } from './projects';
 import { authDepsFromDb, createDispatcher } from '../middleware';
 import { OauthStateStore, type FeishuOauthPort, type FeishuOauthUser } from '../feishu-oauth';
 import { feishuOauthRoutes, OAUTH_CALLBACK_PATH } from './feishu-oauth';
@@ -12,6 +14,7 @@ import { feishuOauthRoutes, OAUTH_CALLBACK_PATH } from './feishu-oauth';
 function fakeOauth(users: Record<string, FeishuOauthUser>) {
   const calls: { code: string; redirectUri: string }[] = [];
   const port: FeishuOauthPort = {
+    canRegister: async (user) => user.tenantKey === 'tenant-company',
     authorizeUrl: (redirectUri, state) =>
       `https://feishu.example/authorize?redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`,
     async userByCode(code, redirectUri) {
@@ -126,6 +129,117 @@ describe('GET /api/feishu/oauth/bind（绑定流）', () => {
 });
 
 describe('GET /api/feishu/oauth/callback（登录流）', () => {
+  test('同企业首次扫码建普通账号，并发与重复登录复用账号', async () => {
+    const { users, sessions, dispatch, db } = makeApp(fakeOauth({
+      ok: { openId: 'ou_colleague', name: '同事', tenantKey: 'tenant-company' },
+    }).port);
+    const starts = await Promise.all([dispatch(get('/api/feishu/oauth/start'))!, dispatch(get('/api/feishu/oauth/start'))!]);
+    const callbacks = await Promise.all(starts.map(start =>
+      dispatch(get(`${OAUTH_CALLBACK_PATH}?code=ok&state=${stateOf(start)}`))!));
+    for (const cb of callbacks) {
+      expect(cb.headers.get('location')).toBe('/');
+      expect(cb.headers.get('set-cookie')).toContain(`${COOKIE}=`);
+    }
+    const all = users.list();
+    expect(all).toHaveLength(1);
+    expect(all[0]!.role).toBe('user');
+    expect(all[0]!.feishuOpenid).toBe('ou_colleague');
+    expect(all[0]!.lastLoginTs).toBeGreaterThan(0);
+    const rows = db.query<{ token_hash: string }, []>('SELECT token_hash FROM auth_sessions').all();
+    expect(rows).toHaveLength(2);
+    for (const row of rows) expect(sessions.userIdByTokenHash(row.token_hash)).toBe(all[0]!.id);
+    const start = await dispatch(get('/api/feishu/oauth/start'))!;
+    expect((await dispatch(get(`${OAUTH_CALLBACK_PATH}?code=ok&state=${stateOf(start)}`))!).headers.get('location')).toBe('/');
+    expect(users.list()).toHaveLength(1);
+  });
+
+  test('两位同名同事扫码后各自创建和管理项目，不能访问彼此项目', async () => {
+    const app = makeApp(fakeOauth({
+      alice: { openId: 'ou_alice', name: '同名', tenantKey: 'tenant-company' },
+      bob: { openId: 'ou_bob', name: '同名', tenantKey: 'tenant-company' },
+    }).port);
+    migrateIssueEngine(app.db);
+    app.db.run(`INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir)
+      VALUES ('local', '127.0.0.1', 22, 'panda', 'k', '/ws', '/claude')`);
+    const projectDispatch = createDispatcher(projectsRoutes({
+      db: app.db,
+      driverFor: () => ({
+        listSessions: async () => [],
+        readFileRange: async () => ({ data: new Uint8Array(), size: 0 }),
+        statPath: async () => null,
+        listDir: async () => [],
+        writeFile: async () => {},
+        mkdirp: async () => {},
+        ensureGitAvailable: async () => {},
+        git: async () => ({ code: 0, out: '', err: '' }),
+      }),
+    }), authDepsFromDb(app.db, app.users, app.sessions));
+    const colleagues: Array<{ cookie: string; projectId: number; userId: number }> = [];
+    for (const code of ['alice', 'bob']) {
+      const start = await app.dispatch(get('/api/feishu/oauth/start'))!;
+      const cb = await app.dispatch(get(`${OAUTH_CALLBACK_PATH}?code=${code}&state=${stateOf(start)}`))!;
+      const cookie = cb.headers.get('set-cookie')!.split(';')[0]!;
+      const created = await projectDispatch(new Request('http://panda.test/api/projects', {
+        method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'My Project', executorId: 1 }),
+      }))!;
+      expect(created.status).toBe(200);
+      const { project } = await created.json() as { project: { id: number; ownerUserId: number; cwd: string } };
+      const user = app.users.list().find(u => u.feishuOpenid === `ou_${code}`)!;
+      expect(project.ownerUserId).toBe(user.id);
+      expect(project.cwd).toBe(`/ws/u${user.id}/My-Project`);
+      colleagues.push({ cookie, projectId: project.id, userId: user.id });
+    }
+    expect(app.users.list()).toHaveLength(2);
+    expect(colleagues[0]!.userId).not.toBe(colleagues[1]!.userId);
+    for (const own of colleagues) {
+      const other = colleagues.find(c => c.userId !== own.userId)!;
+      const listed = await projectDispatch(get('/api/projects', { cookie: own.cookie }))!;
+      expect(listed.status).toBe(200);
+      const body = await listed.json() as Array<{ id: number }>;
+      expect(body.map(p => p.id)).toEqual([own.projectId]);
+      expect((await projectDispatch(get(`/api/projects/${own.projectId}`, { cookie: own.cookie }))!).status).toBe(200);
+      expect((await projectDispatch(get(`/api/projects/${other.projectId}`, { cookie: own.cookie }))!).status).toBe(403);
+      {
+        const mutate = (projectId: number) => new Request(`http://panda.test/api/projects/${projectId}`, {
+          method: 'PATCH', headers: { cookie: own.cookie, 'content-type': 'application/json' },
+          body: JSON.stringify({ goal: '自己的目标' }),
+        });
+        expect((await projectDispatch(mutate(other.projectId))!).status).toBe(403);
+        expect((await projectDispatch(mutate(own.projectId))!).status).toBe(200);
+      }
+    }
+  });
+
+  test('外企业与缺失企业身份不建号、不签发会话', async () => {
+    for (const tenantKey of ['tenant-other', '']) {
+      const { users, dispatch, db } = makeApp(fakeOauth({
+        ok: { openId: 'ou_outside', name: '外部', tenantKey },
+      }).port);
+      const start = await dispatch(get('/api/feishu/oauth/start'))!;
+      const cb = await dispatch(get(`${OAUTH_CALLBACK_PATH}?code=ok&state=${stateOf(start)}`))!;
+      expect(cb.headers.get('location')).toContain('feishu_err=');
+      expect(cb.headers.get('set-cookie')).toBeNull();
+      expect(users.list()).toHaveLength(0);
+      expect(db.query('SELECT * FROM auth_sessions').all()).toHaveLength(0);
+    }
+  });
+
+  test('企业核验服务失败时回跳提示，恢复后重试可登录', async () => {
+    const oauth = fakeOauth({ ok: { openId: 'ou_retry', name: '同事', tenantKey: 'tenant-company' } }).port;
+    const verify = oauth.canRegister;
+    oauth.canRegister = async () => { throw new Error('企业身份校验暂时不可用'); };
+    const { users, dispatch } = makeApp(oauth);
+    const start = await dispatch(get('/api/feishu/oauth/start'))!;
+    const cb = await dispatch(get(`${OAUTH_CALLBACK_PATH}?code=ok&state=${stateOf(start)}`))!;
+    expect(cb.headers.get('location')).toContain('feishu_err=');
+    expect(cb.headers.get('set-cookie')).toBeNull();
+    expect(users.list()).toHaveLength(0);
+    oauth.canRegister = verify;
+    const retry = await dispatch(get('/api/feishu/oauth/start'))!;
+    expect((await dispatch(get(`${OAUTH_CALLBACK_PATH}?code=ok&state=${stateOf(retry)}`))!).headers.get('location')).toBe('/');
+  });
+
   test('已绑定用户扫码 → 种会话 cookie，可过 auth:user 接口', async () => {
     const { users, sessions, dispatch, db } = makeApp(
       fakeOauth({ ok: { openId: 'ou_a', name: 'A' } }).port,

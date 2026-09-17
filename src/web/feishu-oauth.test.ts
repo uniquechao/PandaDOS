@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   FEISHU_AUTHORIZE_URL,
   FEISHU_TOKEN_URL,
+  FEISHU_TENANT_TOKEN_URL,
+  FEISHU_TENANT_URL,
   FEISHU_USERINFO_URL,
   FeishuOauthClient,
   OauthStateStore,
@@ -33,13 +35,13 @@ describe('FeishuOauthClient.userByCode', () => {
       calls.push({ url, ...(init ? { init } : {}) });
       if (url === FEISHU_TOKEN_URL) return jsonRes({ code: 0, access_token: 'uat-1' });
       if (url === FEISHU_USERINFO_URL) {
-        return jsonRes({ code: 0, data: { open_id: 'ou_abc', name: '张三' } });
+        return jsonRes({ code: 0, data: { open_id: 'ou_abc', name: '张三', tenant_key: 'tenant-company' } });
       }
       throw new Error(`unexpected url ${url}`);
     };
     const c = new FeishuOauthClient(CFG, fetchFn);
     const u = await c.userByCode('code-1', CB);
-    expect(u).toEqual({ openId: 'ou_abc', name: '张三' });
+    expect(u).toEqual({ openId: 'ou_abc', name: '张三', tenantKey: 'tenant-company' });
 
     // 换 token 请求体带齐授权码模式全参数（redirect_uri 必须与授权时一致）
     const tokenBody = JSON.parse(String(calls[0]!.init!.body)) as Record<string, string>;
@@ -96,5 +98,42 @@ describe('OauthStateStore', () => {
     expect(s.consume(a)).toBeNull(); // 最旧的 a 被淘汰
     expect(s.consume(b)).not.toBeNull();
     expect(s.consume(c)).not.toBeNull();
+  });
+});
+
+
+describe('FeishuOauthClient.canRegister', () => {
+  const colleague = { openId: 'ou_new', name: '同事', tenantKey: 'tenant-company' };
+
+  test('使用服务端应用凭据核验所属企业，拒绝其他企业及无企业身份用户', async () => {
+    const client = new FeishuOauthClient(CFG, async (url, init) => {
+      if (url === FEISHU_TENANT_TOKEN_URL) {
+        expect(JSON.parse(String(init?.body))).toEqual({ app_id: 'cli_test', app_secret: 'sec_test' });
+        return jsonRes({ code: 0, tenant_access_token: 'tenant-token' });
+      }
+      expect(url).toBe(FEISHU_TENANT_URL);
+      expect(new Headers(init?.headers).get('authorization')).toBe('Bearer tenant-token');
+      return jsonRes({ code: 0, data: { tenant: { tenant_key: 'tenant-company' } } });
+    });
+    expect(await client.canRegister(colleague)).toBe(true);
+    expect(await client.canRegister({ ...colleague, tenantKey: 'tenant-other' })).toBe(false);
+    expect(await client.canRegister({ openId: 'ou_unknown', name: '' })).toBe(false);
+  });
+
+  test('企业凭据或企业查询失败时拒绝注册，故障恢复可重试', async () => {
+    for (const failedUrl of [FEISHU_TENANT_TOKEN_URL, FEISHU_TENANT_URL]) {
+      for (const failure of [() => jsonRes({ code: 999, msg: 'denied' }), () => new Response('gateway error', { status: 502 }), () => jsonRes({ code: 0 })]) {
+        let failing = true;
+        const client = new FeishuOauthClient(CFG, async url => {
+          if (failing && url === failedUrl) return failure();
+          return url === FEISHU_TENANT_TOKEN_URL
+            ? jsonRes({ code: 0, tenant_access_token: 'tenant-token' })
+            : jsonRes({ code: 0, data: { tenant: { tenant_key: 'tenant-company' } } });
+        });
+        await expect(client.canRegister(colleague)).rejects.toThrow('企业身份校验失败');
+        failing = false;
+        expect(await client.canRegister(colleague)).toBe(true);
+      }
+    }
   });
 });

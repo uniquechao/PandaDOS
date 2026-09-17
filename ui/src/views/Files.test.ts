@@ -44,6 +44,17 @@ describe('FilesView 分栏组合', () => {
     expect(source).toContain('/fs/upload?path=');
   });
 
+  test('上传走 XHR 进度底座，按钮内显示百分比进度条并在上传中禁点', () => {
+    expect(source).toContain('uploadWithProgress');
+    expect(source).not.toContain("method: 'POST', body: fd"); // 不再用 fetch 传（拿不到进度）
+    expect(source).toContain('onProgress:');
+    expect(source).toContain('setProg(');
+    expect(source).toContain('class="up-prog"');
+    expect(source).toContain('role="progressbar"');
+    expect(source).toContain('disabled={busy}');
+    expect(source).toContain('setProg(0);'); // 成败都复位
+  });
+
   test('上传后刷新：宽屏 bump reloadToken、窄屏重载列表', () => {
     expect(source).toContain('setReload');
     expect(source).toContain('reloadToken={reload}');

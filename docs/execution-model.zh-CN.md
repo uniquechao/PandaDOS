@@ -113,7 +113,7 @@ issue → (模块) → 对话(session-id，持久)
 
 ### 写入（注入）
 
-3. **sendKeys / sendKey** —— 受控注入。净化 + 截断 + 回车三件套（`driver.ts`）：控制字符含 `\n` 一律→空格（tmux 里 `\n` 等于回车，保留会把多行文本逐行提前提交）、截断 `MAX_INJECT_CHARS`（2000）、发完停 `INJECT_ENTER_DELAY_MS`（300ms）再回车（codex 的 paste-burst 会把紧跟的 Enter 并进粘贴，消息滞留输入框永不提交）。`sendKey` 只收 22 键白名单。
+3. **sendKeys / sendKey** —— 受控注入。净化 + 截断 + 稳定提交四件套（`driver.ts`）：控制字符含 `\n` 一律→空格（tmux 里 `\n` 等于回车，保留会把多行文本逐行提前提交）、截断 `MAX_INJECT_CHARS`（2000）、至少等待 `INJECT_ENTER_DELAY_MS`（300ms）并轮询 pane 至输入稳定后再回车。若提交后的 pane 在完整观察窗内始终等价（包括 Enter 被 paste-burst 吞成换行），最多补交一次；出现响应、菜单或状态变化则绝不重发。`sendKey` 只收 22 键白名单。
 4. **PTY 直写** —— 网页终端里用户自己敲的键，绕过净化直接进 tmux。
 
 ### 互斥纪律
@@ -170,7 +170,9 @@ issue → (模块) → 对话(session-id，持久)
 | `SESSION_RECOVER_COOLDOWN_MS` | 60s | `engine.ts` |
 | `TICK_STUCK_WARN_MS` | 5min | `engine.ts` |
 | `MAX_INJECT_CHARS` | 2000 | `driver.ts` |
-| `INJECT_ENTER_DELAY_MS` | 300 | `driver.ts` |
+| `INJECT_ENTER_DELAY_MS` | 300（稳定观察前的下限） | `driver.ts` |
+| `INJECT_STABLE_MAX_POLLS` | 20 × 100ms | `driver.ts` |
+| `INJECT_SUBMIT_MAX_POLLS` | 10 × 100ms | `driver.ts` |
 | tmux 会话尺寸 | 220×50 | `tmuxNewSessionArgs` |
 | Driver 超时 | tmux 10s / git 60s | `driver.ts` |
 

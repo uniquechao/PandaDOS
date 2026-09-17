@@ -92,11 +92,16 @@ async function setup(opts: {
   const convs = new ConversationManager(db, driver, locator);
   const pm = {
     questions: null as string[] | null,
+    /** #289 的拆回用例要真的走一次智能合并 */
+    merges: [] as Array<{ members: number[]; title: string; body: string }>,
     async judgeDone() {
       return 'not_done' as const;
     },
     async generateClarifyingQuestions() {
       return pm.questions;
+    },
+    async mergeModuleTasks() {
+      return pm.merges;
     },
   };
   const moduleStore = new ModuleStore(db);
@@ -183,6 +188,23 @@ function createWorkflow(db: ReturnType<typeof openDb>, projectId: number, name: 
 }
 
 describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
+  test('创建与编辑均按 8000 字符契约完整保存正文', async () => {
+    const s = await setup();
+    const body = '长'.repeat(8_000);
+    const created = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, {
+      title: '长正文', body,
+    })));
+    expect(created.status).toBe(200);
+    expect(created.body.issue.body).toBe(body);
+
+    s.db.query("UPDATE issues SET status = 'cancelled' WHERE id = ?").run(created.body.issue.id);
+    const edited = await j(s.dispatch(req(
+      'PATCH', `/api/projects/1/issues/${created.body.issue.id}`, s.alice.token, { body },
+    )));
+    expect(edited.status).toBe(200);
+    expect(edited.body.issue.body).toBe(body);
+  });
+
   test('高级工作流选择保存不可变快照和节点共享上下文', async () => {
     const s = await setup({ modules: true });
     s.db.run(
@@ -477,22 +499,24 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     expect(patched.body.issue.implMode).toBe('team');
     expect(patched.body.issue.agent).toBe('codex'); // pending 未绑对话，可换代理
 
-    // block → 解除方法必填；提交后重新入队（unblock 后接力自动再开跑）
+    // block → 解除方法必填；提交后从受阻前阶段继续（无恢复上下文才经队列回到 planning）
     expect((await s.engine.blockIssue(iid, '手动卡住')).ok).toBe(true);
+    // block 会把队列中的 B 接力开跑；先取消它，才能验证 A 在无会话竞争时恢复原 planning 阶段。
+    expect((await s.engine.cancelIssue(iid2)).ok).toBe(true);
     expect(
       (await j(s.dispatch(req('POST', `/api/projects/1/issues/${iid}/unblock`, s.alice.token, {})))).status,
     ).toBe(400);
     const ub = await j(
       s.dispatch(
         req('POST', `/api/projects/1/issues/${iid}/unblock`, s.alice.token, {
-          guidance: '先修正执行参数，再重新规划',
+          guidance: '先修正执行参数，再继续运行',
         }),
       ),
     );
     expect(ub.status).toBe(200);
-    expect(['pending', 'planning']).toContain(ub.body.issue.status);
+    expect(ub.body.issue.status).toBe('planning');
     const unblockEvent = s.engine.store.listEvents(iid).find((event) => event.kind === 'unblock_guidance');
-    expect(unblockEvent?.dataJson).toContain('先修正执行参数，再重新规划');
+    expect(unblockEvent?.dataJson).toContain('先修正执行参数，再继续运行');
   });
 
   test('PATCH 子任务只修改未派发项，并返回稳定错误码', async () => {
@@ -782,7 +806,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     // 非 cancelled（驱动中）→ 409 且文案说清为什么
     const notCancelled = await j(s.dispatch(req('POST', `/api/projects/1/issues/${iid1}/reopen`, s.alice.token)));
     expect(notCancelled.status).toBe(409);
-    expect(String(notCancelled.body.error.details)).toContain('仅已取消的 issue 可重新运行');
+    expect(String(notCancelled.body.error.details)).toContain('仅已取消或已完成的 issue 可重新运行');
     expect(String(notCancelled.body.error.details)).toContain('planning'); // 带上当前状态，便于排查
 
     // 取消 → 改需求 → 复活：完整走一遍本 issue 的目标流程
@@ -818,6 +842,19 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     expect((await j(s.dispatch(req('POST', `/api/projects/1/issues/${iid1}/reopen`)))).status).toBe(401);
   });
 
+  test('POST /reopen 退回历史 done 时必须提供 guidance', async () => {
+    const s = await setup();
+    const created = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: '误标完成' })));
+    const iid = created.body.issue.id as number;
+    s.db.query("UPDATE issues SET status = 'done' WHERE id = ?").run(iid);
+    expect((await j(s.dispatch(req('POST', `/api/projects/1/issues/${iid}/reopen`, s.alice.token)))).status).toBe(409);
+    const reopened = await j(s.dispatch(req('POST', `/api/projects/1/issues/${iid}/reopen`, s.alice.token, {
+      guidance: '仍需完成生产部署',
+    })));
+    expect(reopened.status).toBe(200);
+    expect(['pending', 'planning']).toContain(reopened.body.issue.status);
+  });
+
   test('waiting_input 派生标记：列表/详情随数据源变化，默认 false', async () => {
     const s = await setup();
     const created = await j(
@@ -840,6 +877,44 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     s.waitingSet.delete(iid);
     const list2 = await j(s.dispatch(req('GET', '/api/projects/1/issues', s.alice.token)));
     expect(list2.body.find((i: { id: number }) => i.id === iid).waitingInput).toBe(false);
+  });
+
+  // #275 / I-07：把 blocked 这个统一出口按原因拆开，列表与详情都要出这个字段
+  test('attentionKind：列表/详情同源派生，弹窗等待优先于受阻', async () => {
+    const s = await setup();
+    const created = await j(
+      s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: '分层任务' })),
+    );
+    const iid = created.body.issue.id as number;
+    const inList = async () => {
+      const r = await j(s.dispatch(req('GET', '/api/projects/1/issues', s.alice.token)));
+      return r.body.find((i: { id: number }) => i.id === iid).attentionKind;
+    };
+    const inDetail = async () => {
+      const r = await j(s.dispatch(req('GET', `/api/projects/1/issues/${iid}`, s.alice.token)));
+      return r.body.issue.attentionKind;
+    };
+
+    expect(await inList()).toBe('none');
+    expect(await inDetail()).toBe('none');
+
+    // 受阻 + 本地门禁其实过了、只差人工重启 → verify，而不是笼统的 blocked
+    s.engine.store.logEvent(iid, 'auto_commit', { message: 'x' });
+    s.engine.store.logEvent(iid, 'auto_push', { branch: 'main' });
+    await s.engine.applyEvent(iid, 'block', { note: '需人工在低峰执行 systemctl restart panda 才生效' });
+    expect(await inList()).toBe('verify');
+    expect(await inDetail()).toBe('verify');
+
+    // 弹窗在等人工选择时优先报 choice（你此刻一步就能解开它）
+    s.waitingSet.add(iid);
+    expect(await inList()).toBe('choice');
+    s.waitingSet.delete(iid);
+
+    // 止损打的那次受阻 → stalled，与 #273 自动重试到顶同一个取值
+    await s.engine.unblockIssue(iid, '继续');
+    await s.engine.applyEvent(iid, 'block', { note: '止损暂停：累计受阻 3 次', stopLoss: true });
+    expect(await inList()).toBe('stalled');
+    expect(await inDetail()).toBe('stalled');
   });
 
   test('派生标记：awaitingClarify（execClarifyWait 非空）+ clarifyPending 跨状态（第 5 点）', async () => {
@@ -1356,5 +1431,227 @@ describe('模块管理路由：智能整理 / 执行合并 / 改名归档', () =
     const ar2 = await j(s.dispatch(req('PATCH', `/api/projects/1/modules/${m1.id}`, s.alice.token, { status: 'archived' })));
     expect(ar2.status).toBe(200);
     expect(ar2.body.module.status).toBe('archived');
+  });
+
+  test('编辑来源标记（#283 / B-11）：只有用户编辑才重新澄清，同步回写不触发', async () => {
+    const clarified: number[] = [];
+    const s = await setup({ modules: true });
+    const original = s.engine.scheduleClarify.bind(s.engine);
+    s.engine.scheduleClarify = (id: number) => { clarified.push(id); original(id); };
+
+    const issue = await s.engine.createIssue(1, { title: '原标题', body: '原正文' }, false);
+    const url = `/api/projects/1/issues/${issue.id}`;
+
+    // 用户编辑：内容变了 → 重新澄清
+    clarified.length = 0;
+    expect((await j(s.dispatch(req('PATCH', url, s.alice.token, { body: '用户改的正文' })))).status).toBe(200);
+    expect(clarified).toContain(issue.id);
+
+    // 同步回写：同样的内容变化，但显式标了来源 → 不再白跑一次澄清
+    clarified.length = 0;
+    expect((await j(s.dispatch(req('PATCH', url, s.alice.token, {
+      body: '同步回写的正文', source: 'sync',
+    })))).status).toBe(200);
+    expect(clarified).toEqual([]);
+    expect(s.engine.store.get(issue.id)!.body).toBe('同步回写的正文'); // 内容照常落库
+  });
+
+  test('一键拆回（#289 / B-14）：详情出可拆回标记，拆回后各条恢复原文；已开跑拒绝', async () => {
+    const s = await setup({ modules: true });
+    const b = await s.engine.createIssue(1, { title: 'B', body: 'B 的原文', module: 'web' }, false);
+    const c = await s.engine.createIssue(1, { title: 'C', body: 'C 的原文', module: 'web' }, false);
+    s.pm.merges = [{ members: [b.id, c.id], title: '合并 B+C', body: '摘要' }];
+    // 合并照跑，但别顺势开跑（拆回只允许宿主仍 pending）
+    const original = s.engine.startIssue.bind(s.engine);
+    s.engine.startIssue = async () => ({ ok: false, error: '暂不开跑', deferral: 'project-busy' as const });
+    try {
+      await s.engine.scheduleNext(1, 'web');
+    } finally {
+      s.engine.startIssue = original;
+    }
+
+    const detail = await j(s.dispatch(req('GET', `/api/projects/1/issues/${b.id}`, s.alice.token)));
+    expect(detail.body.mergedFrom).toMatchObject({ canUnmerge: true });
+    expect(detail.body.mergedFrom.members.map((m: { id: number }) => m.id).sort()).toEqual([b.id, c.id].sort());
+
+    const r = await j(s.dispatch(req('POST', `/api/projects/1/issues/${b.id}/unmerge`, s.alice.token, {})));
+    expect(r.status).toBe(200);
+    expect(r.body.restored).toEqual([c.id]);
+    expect(s.engine.store.get(b.id)!.body).toBe('B 的原文');
+    expect(s.engine.store.get(c.id)!).toMatchObject({ status: 'pending', body: 'C 的原文' });
+    // 拆过就不给再拆
+    expect((await j(s.dispatch(req('POST', `/api/projects/1/issues/${b.id}/unmerge`, s.alice.token, {})))).status)
+      .toBe(409);
+  });
+
+  test('宿主已开跑：详情标记 canUnmerge=false，接口也拒绝', async () => {
+    const s = await setup({ modules: true });
+    const b = await s.engine.createIssue(1, { title: 'B', body: 'bb', module: 'web' }, false);
+    const c = await s.engine.createIssue(1, { title: 'C', body: 'cc', module: 'web' }, false);
+    s.pm.merges = [{ members: [b.id, c.id], title: '合并 B+C', body: '摘要' }];
+    await s.engine.scheduleNext(1, 'web'); // 合并后顺势开跑
+
+    const detail = await j(s.dispatch(req('GET', `/api/projects/1/issues/${b.id}`, s.alice.token)));
+    expect(detail.body.mergedFrom).toMatchObject({ canUnmerge: false });
+    expect((await j(s.dispatch(req('POST', `/api/projects/1/issues/${b.id}/unmerge`, s.alice.token, {})))).status)
+      .toBe(409);
+  });
+
+  test('受阻解除自动排队（#283 / B-10）：忙时返回 queued 而不是 409，可撤销', async () => {
+    const s = await setup({ modules: true });
+    const blocked = await s.engine.createIssue(1, { title: '受阻的' }, false);
+    await s.engine.startIssue(blocked.id);
+    await s.engine.applyEvent(blocked.id, 'block', { note: '缺依赖' });
+    const running = await s.engine.createIssue(1, { title: '在跑的' }, false);
+    await s.engine.startIssue(running.id);
+
+    const url = `/api/projects/1/issues/${blocked.id}/unblock`;
+    const queued = await j(s.dispatch(req('POST', url, s.alice.token, { guidance: '装上依赖再跑' })));
+    expect(queued.status).toBe(200); // 不再是 409
+    expect(queued.body).toMatchObject({ ok: true, queued: true });
+    expect(queued.body.unblockRequest).toMatchObject({ issueId: blocked.id, guidance: '装上依赖再跑' });
+
+    // 详情接口把意图带出来，前端据此显示「已排队」
+    const detail = await j(s.dispatch(req('GET', `/api/projects/1/issues/${blocked.id}`, s.alice.token)));
+    expect(detail.body.unblockRequest).toMatchObject({ guidance: '装上依赖再跑' });
+    // 已排队 = 不用人再做什么：attentionKind 不再喊「受阻」
+    expect(detail.body.issue.attentionKind).toBe('none');
+
+    // 撤销
+    const cancelled = await j(s.dispatch(req('POST', `${url}/cancel`, s.alice.token, {})));
+    expect(cancelled.status).toBe(200);
+    expect(cancelled.body.unblockRequest).toBeNull();
+    expect((await j(s.dispatch(req('GET', `/api/projects/1/issues/${blocked.id}`, s.alice.token)))).body.unblockRequest)
+      .toBeNull();
+    // 没有意图时再撤销 → 409，不静默成功
+    expect((await j(s.dispatch(req('POST', `${url}/cancel`, s.alice.token, {})))).status).toBe(409);
+  });
+
+  test('项目空闲时解除仍是直接恢复（不返回 queued），入参校验不变', async () => {
+    const s = await setup({ modules: true });
+    const issue = await s.engine.createIssue(1, { title: '独苗' }, false);
+    await s.engine.startIssue(issue.id);
+    await s.engine.applyEvent(issue.id, 'block', { note: 'x' });
+    const url = `/api/projects/1/issues/${issue.id}/unblock`;
+
+    expect((await j(s.dispatch(req('POST', url, s.alice.token, { guidance: '  ' })))).status).toBe(400);
+    const ok = await j(s.dispatch(req('POST', url, s.alice.token, { guidance: '接着干' })));
+    expect(ok.status).toBe(200);
+    expect(ok.body.queued).toBeUndefined();
+    expect(ok.body.issue.status).not.toBe('blocked');
+  });
+
+  test('推理档（#281 / I-04）：模块默认档 + issue 覆盖，出参带生效档与来源', async () => {
+    const s = await setup({ modules: true });
+    const m = s.moduleStore.create({
+      projectId: 1, slug: 'issue-engine', displayName: '引擎', agent: 'codex', source: 'manual',
+    });
+    const issue = await s.engine.createIssue(1, { title: '高风险迁移', moduleId: m.id }, false);
+    const issueUrl = `/api/projects/1/issues/${issue.id}`;
+    const moduleUrl = `/api/projects/1/modules/${m.id}`;
+
+    // 都没配 → 默认档，来源 default
+    let detail = await j(s.dispatch(req('GET', issueUrl, s.alice.token)));
+    expect(detail.body.reasoning).toEqual({ effort: 'medium', source: 'default', override: null });
+
+    // 模块默认档
+    const mod = await j(s.dispatch(req('PATCH', moduleUrl, s.alice.token, { reasoningEffort: 'low' })));
+    expect(mod.body.module.reasoningEffort).toBe('low');
+    detail = await j(s.dispatch(req('GET', issueUrl, s.alice.token)));
+    expect(detail.body.reasoning).toMatchObject({ effort: 'low', source: 'module' });
+
+    // issue 覆盖压过模块（迁移/状态机这类临时提到 high）
+    const up = await j(s.dispatch(req('PATCH', issueUrl, s.alice.token, { reasoningEffort: 'high' })));
+    expect(up.body.reasoning).toEqual({ effort: 'high', source: 'issue', override: 'high' });
+
+    // null = 继承模块
+    const cleared = await j(s.dispatch(req('PATCH', issueUrl, s.alice.token, { reasoningEffort: null })));
+    expect(cleared.body.reasoning).toEqual({ effort: 'low', source: 'module', override: null });
+
+    // 非法值 400，库内不动
+    expect((await j(s.dispatch(req('PATCH', issueUrl, s.alice.token, { reasoningEffort: 'ultra' })))).status).toBe(400);
+    expect((await j(s.dispatch(req('PATCH', moduleUrl, s.alice.token, { reasoningEffort: 'ultra' })))).status).toBe(400);
+    expect(s.moduleStore.get(m.id)!.reasoningEffort).toBe('low');
+  });
+
+  test('推理档改动不受「可编辑状态」限制：跑到一半也能提档（下次启动生效）', async () => {
+    const s = await setup({ modules: true });
+    const issue = await s.engine.createIssue(1, { title: '跑着的' }, false);
+    await s.engine.startIssue(issue.id);
+    const url = `/api/projects/1/issues/${issue.id}`;
+    // 改内容照旧被挡
+    expect((await j(s.dispatch(req('PATCH', url, s.alice.token, { title: '新标题' })))).status).toBe(400);
+    // 只改推理档则放行
+    const ok = await j(s.dispatch(req('PATCH', url, s.alice.token, { reasoningEffort: 'high' })));
+    expect(ok.status).toBe(200);
+    expect(ok.body.reasoning).toMatchObject({ effort: 'high', source: 'issue' });
+  });
+
+  test('详情接口出 validation：本轮范围 + 最近一次结果（#279 / I-03）', async () => {
+    const s = await setup({ modules: true });
+    const issue = await s.engine.createIssue(1, { title: '要过门禁' }, false);
+    const url = `/api/projects/1/issues/${issue.id}`;
+
+    // 还没跑过：两项都是 null，但字段必须在（前端据此判断「有没有门禁信息」）
+    let detail = await j(s.dispatch(req('GET', url, s.alice.token)));
+    expect(detail.body.validation).toEqual({ scope: null, last: null });
+
+    s.engine.store.setValidationScope(issue.id, {
+      kind: 'targeted', files: ['src/a.test.ts'], reason: '按改动文件推导',
+    });
+    s.engine.store.logEvent(issue.id, 'validation_failed', {
+      scope: 'targeted', label: 'test', code: 1, timedOut: false, durationMs: 4200, tail: '3 fail',
+    });
+
+    detail = await j(s.dispatch(req('GET', url, s.alice.token)));
+    expect(detail.body.validation.scope).toEqual({
+      kind: 'targeted', files: ['src/a.test.ts'], reason: '按改动文件推导',
+    });
+    expect(detail.body.validation.last).toMatchObject({
+      outcome: 'failed', scope: 'targeted', label: 'test', code: 1, timedOut: false, durationMs: 4200,
+    });
+
+    // 只认最后一次：后来的通过要覆盖前面的失败
+    s.engine.store.logEvent(issue.id, 'validation_passed', { scope: 'full', durationMs: 9000 });
+    detail = await j(s.dispatch(req('GET', url, s.alice.token)));
+    expect(detail.body.validation.last).toMatchObject({ outcome: 'passed', scope: 'full', durationMs: 9000 });
+  });
+
+  test('PATCH skills：未配置 = 沿用项目默认，显式数组落库，null 清回默认（#277 / I-02）', async () => {
+    const s = await setup({ modules: true });
+    const m = s.moduleStore.create({
+      projectId: 1, slug: 'issue-engine', displayName: '引擎', agent: 'claude', source: 'manual',
+    });
+    const url = `/api/projects/1/modules/${m.id}`;
+
+    // 出：未配置的模块 skills 为 null（前端据此显示「沿用项目默认」）
+    const listed = await j(s.dispatch(req('GET', '/api/projects/1/modules', s.alice.token)));
+    expect(listed.body.modules[0].skills).toBeNull();
+
+    // 收：显式指定（去重保序），superpowers 这类要显式勾才挂
+    const set = await j(s.dispatch(req('PATCH', url, s.alice.token, {
+      skills: ['panda-issue', 'superpowers', 'panda-issue'],
+    })));
+    expect(set.status).toBe(200);
+    expect(set.body.module.skills).toEqual(['panda-issue', 'superpowers']);
+    expect(s.moduleStore.get(m.id)!.skills).toEqual(['panda-issue', 'superpowers']);
+
+    // 空数组 = 显式一个都不挂，与「未配置」不是一回事
+    const none = await j(s.dispatch(req('PATCH', url, s.alice.token, { skills: [] })));
+    expect(none.body.module.skills).toEqual([]);
+
+    // null = 清回沿用项目默认
+    const cleared = await j(s.dispatch(req('PATCH', url, s.alice.token, { skills: null })));
+    expect(cleared.body.module.skills).toBeNull();
+
+    // 非法输入 → 400，库内不动
+    await s.dispatch(req('PATCH', url, s.alice.token, { skills: ['ok-skill'] }));
+    expect((await j(s.dispatch(req('PATCH', url, s.alice.token, { skills: ['../etc/passwd'] })))).status).toBe(400);
+    expect((await j(s.dispatch(req('PATCH', url, s.alice.token, { skills: 'superpowers' })))).status).toBe(400);
+    expect(s.moduleStore.get(m.id)!.skills).toEqual(['ok-skill']);
+
+    // 权限与空请求体照旧
+    expect((await j(s.dispatch(req('PATCH', url, s.bob.token, { skills: [] })))).status).toBe(403);
+    expect((await j(s.dispatch(req('PATCH', url, s.alice.token, {})))).status).toBe(400);
   });
 });

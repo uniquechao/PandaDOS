@@ -4,6 +4,7 @@
  * #/p/:pid          项目详情（issue 看板）
  * #/p/:pid/issue/:iid  issue 详情
  * #/p/:pid/chat        对话视图
+ * #/p/:pid/chat/:cid    对话视图（钉住某条对话；cid = conversations.id，也是 tmux chat-<cid>）
  * #/p/:pid/term        终端
  * #/p/:pid/files       文件浏览
  * #/p/:pid/git         git 提交图
@@ -20,12 +21,12 @@ import { pushRecent } from './recent';
 export type Route =
   | { name: 'projects' }
   | { name: 'settings' }
-  | { name: 'admin'; section?: 'llm' }
+  | { name: 'admin'; section?: 'llm' | 'feishu' }
   | { name: 'board'; pid: number }
   | { name: 'issue'; pid: number; iid: number }
   | { name: 'designs'; pid: number }
   | { name: 'design'; pid: number; did: number }
-  | { name: 'chat'; pid: number }
+  | { name: 'chat'; pid: number; cid?: string }
   | { name: 'term'; pid: number }
   | { name: 'files'; pid: number }
   | { name: 'git'; pid: number }
@@ -34,11 +35,26 @@ export type Route =
   | { name: 'workflows'; pid: number }
   | { name: 'project-settings'; pid: number };
 
+/** 对话 id 的形状（uuid / 导入历史 id）；只用于挡住畸形深链，不代表该对话存在 */
+const CONV_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+
+/** 半截转义（如手改地址栏留下的裸 `%`）会让 decodeURIComponent 抛错，按「没带 cid」处理 */
+function decodeSegment(raw: string | undefined): string {
+  if (!raw) return '';
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return '';
+  }
+}
+
 export function parseHash(hash: string): Route {
   const parts = hash.replace(/^#/, '').split('/').filter((s) => s.length > 0);
   if (parts[0] === 'settings') return { name: 'settings' };
   if (parts[0] === 'admin') {
-    return parts[1] === 'llm' ? { name: 'admin', section: 'llm' } : { name: 'admin' };
+    return parts[1] === 'llm' || parts[1] === 'feishu'
+      ? { name: 'admin', section: parts[1] }
+      : { name: 'admin' };
   }
   if (parts[0] === 'p' && parts[1]) {
     const pid = Number(parts[1]);
@@ -54,7 +70,11 @@ export function parseHash(hash: string): Route {
         }
         return { name: 'designs', pid };
       }
-      if (parts[2] === 'chat') return { name: 'chat', pid };
+      if (parts[2] === 'chat') {
+        // cid 只做形状校验：真正的存在性由 ChatView 按对话列表核对，认不出就回退到默认选中项
+        const cid = decodeSegment(parts[3]);
+        return CONV_ID_RE.test(cid) ? { name: 'chat', pid, cid } : { name: 'chat', pid };
+      }
       if (parts[2] === 'term') return { name: 'term', pid };
       if (parts[2] === 'files') return { name: 'files', pid };
       if (parts[2] === 'git') return { name: 'git', pid };

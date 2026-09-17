@@ -1,3 +1,5 @@
+import { feishuChatMessages } from '../domains/feishu-chat';
+import { feishuLoginMessages } from '../domains/feishu-login';
 import type { MessageCatalog } from '../messages';
 import { shellMessages } from '../domains/shell';
 import { actionMessages } from '../domains/actions';
@@ -17,11 +19,15 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const deCatalog = {
+  ...feishuChatMessages["de"],
+  ...feishuLoginMessages["de"],
   ...shellMessages.de,
   ...actionMessages.de,
   ...commonUiMessages.de,
+  'issue.validation': 'Prüfungen', 'issue.validationTargeted': 'gezielt ({files} Dateien)', 'issue.validationFull': 'vollständig', 'issue.validationPassed': 'bestanden', 'issue.validationFailed': 'fehlgeschlagen ({label}, Exit-Code {code})', 'issue.validationSkipped': 'übersprungen', 'issue.validationPending': 'noch nicht gelaufen', 'issue.pushFailedTitle':'Abgeschlossen, aber die Änderungen wurden nicht ins Remote gepusht','issue.pushFailedHint':'Die Änderungen sind lokal committet. Pushen Sie sie manuell und prüfen Sie es dann erneut.','issue.pushFailedBranch':'Branch {branch}',
+  'issue.completionReport':'Abschlussbericht','issue.reportOutcomeComplete':'Ziele erreicht','issue.reportOutcomePartial':'Teilweise abgeschlossen','issue.reportOutcomeBlocked':'Blockiert','issue.reportOutcomeUnverified':'Ungeprüfte historische Zusammenfassung','issue.reportObjective':'Umsetzungsziel','issue.reportImplementation':'Umsetzung','issue.reportAdvantages':'Vorteile','issue.reportDisadvantages':'Nachteile und Abwägungen','issue.reportVerification':'Prüfnachweise','issue.reportCompletion':'Fertigstellungsstand','issue.reportUnmetGoals':'Nicht erreichte Ziele','issue.reportRemainingWork':'Erforderliche Folgearbeiten','issue.reportAttentionTitle':'Dieses Issue ist noch nicht vollständig abgeschlossen','issue.reportLegacyWarningTitle':'Dieser Abschluss wurde nicht strukturiert geprüft','issue.reportLegacyWarning':'Der historische Eintrag enthält nur eine freie Zusammenfassung. PandaDOS kann daher weder alle erreichten Ziele noch ausstehende notwendige Arbeiten bestätigen.','issue.continueProcessing':'Weiterbearbeiten','issue.continueProcessingTitle':'Abschluss korrigieren und fortfahren','issue.continueProcessingWarningTitle':'Das Issue wird erneut geöffnet','issue.continueProcessingWarning':'Beschreiben Sie die offenen Punkte. Das Issue kehrt zur Planung zurück und kann sofort starten.','issue.continueGuidance':'Nicht erreichtes Ziel oder Folgeanweisung','issue.continueGuidancePlaceholder':'Beschreiben Sie das offene Ziel und die nächsten erforderlichen Schritte…','issue.continueGuidanceRequired':'Geben Sie vor dem Fortfahren das offene Ziel oder die notwendige Folgearbeit an.','issue.confirmContinueProcessing':'Erneut öffnen und fortfahren',
   'issue.recoveryLength':'{current} / {max} Zeichen',
-  'issue.recoveryTitle':'Blockierung lösen','issue.recoveryReason':'Grund für den Ausführungsstopp','issue.recoveryHelp':'Fügen Sie konkrete Hinweise hinzu oder korrigieren Sie das Issue und die blockierte Teilaufgabe. Das Speichern startet das Issue nicht neu.','issue.recoveryGuidance':'Zusätzliche Hinweise oder Lösungsweg','issue.recoveryGuidancePlaceholder':'Beschreiben Sie die Änderung, den Ansatz oder wie die Blockierung gelöst wird…','issue.recoveryGuidanceRequired':'Geben Sie vor dem Fortfahren zusätzliche Hinweise oder einen Lösungsweg ein.','issue.editBlockedIssue':'Issue bearbeiten','issue.editBlockedIssueHint':'Titel, Details, Einstellungen oder Bilder ändern','issue.editBlockedSubtask':'Blockierte Teilaufgabe bearbeiten','issue.editBlockedSubtaskHint':'Den blockierten Schritt vor dem erneuten Versuch korrigieren','issue.noEditableBlockedSubtask':'Es gibt keine bearbeitbare unerledigte Teilaufgabe','issue.recoveryQueueHint':'Nach der Bestätigung kehrt das Issue zur Planung zurück und kann sofort starten.','issue.confirmRecovery':'Hinweise senden und erneut ausführen','issue.openRecovery':'Blockierung lösen',
+  'issue.recoveryTitle':'Blockierung lösen','issue.recoveryReason':'Grund für den Ausführungsstopp','issue.recoveryHelp':'Fügen Sie konkrete Hinweise hinzu oder korrigieren Sie das Issue und den blockierten Teilschritt, bevor Sie fortfahren. Das Speichern setzt die Ausführung nicht fort.','issue.recoveryGuidance':'Zusätzliche Hinweise oder Lösungsweg','issue.recoveryGuidancePlaceholder':'Beschreiben Sie die Änderung, den Ansatz oder wie die Blockierung gelöst wird…','issue.recoveryGuidanceRequired':'Geben Sie vor dem Fortfahren zusätzliche Hinweise oder einen Lösungsweg ein.','issue.editBlockedIssue':'Issue bearbeiten','issue.editBlockedIssueHint':'Titel, Details, Einstellungen oder Bilder ändern','issue.editBlockedSubtask':'Blockierte Teilaufgabe bearbeiten','issue.editBlockedSubtaskHint':'Den blockierten Schritt vor dem Fortfahren korrigieren','issue.noEditableBlockedSubtask':'Es gibt keine bearbeitbare unerledigte Teilaufgabe','issue.recoveryQueueHint':'Nach der Bestätigung wird das Issue ab der unterbrochenen Phase fortgesetzt. Fehlt der Wiederherstellungskontext, kehrt es sicher zur Planung zurück.','issue.confirmRecovery':'Hinweise senden und fortfahren','issue.mergedFrom': 'Aus mehreren Issues zusammengeführt', 'issue.unmerge': 'Zusammenführung rückgängig', 'issue.unmergeLocked': 'Läuft bereits – die Zusammenführung lässt sich nicht mehr rückgängig machen.', 'issue.unblockQueued': 'In der Warteschlange: Läuft automatisch weiter, sobald die aktuelle Aufgabe fertig ist.', 'issue.unblockQueuedCancel': 'Wartende Fortsetzung abbrechen', 'issue.openRecovery':'Blockierung lösen',
   ...statusMessages.de,
   ...errorMessages.de,
   ...notifyMessages.de,
@@ -92,7 +98,7 @@ export const deCatalog = {
   'ui.dragList': 'Ziehen, um die Listenbreite zu ändern', 'ui.dragListReset': 'Ziehen, um die Listenbreite zu ändern · Doppelklick zum Zurücksetzen',
   'ui.terminalDisconnected': 'Terminal getrennt', 'ui.terminalEnded': 'Terminalsitzung beendet', 'ui.subtaskProgress': 'Fortschritt der Teilaufgaben',
   'ui.completedProgress': '{done}/{total} abgeschlossen', 'ui.endpoint': 'Endpunkt', 'ui.collapse': 'Einklappen', 'ui.expandCount': 'Ausklappen · {count}',
-  'ui.issueNoMessages': 'Dieses Issue hat noch keine Chatnachrichten', 'ui.directoryPicker': 'Verzeichnis des Executors auswählen',
+  'ui.reasoningEffort': 'Denkaufwand', 'ui.reasoningInherit': 'Erben', 'ui.reasoningCodexOnly': 'Nur für Codex; gilt ab dem nächsten Sitzungsstart.', 'issue.reasoningEffective': 'Aktiv: {effort} (von {source, select, issue {diesem Issue} module {dem Modul} other {der Vorgabe}})', 'ui.moduleSkills': 'Skills', 'ui.moduleSkillsDefault': 'Nicht konfiguriert – es gilt die Projektvorgabe (Skills wie superpowers bleiben aus, bis du sie hier ankreuzt).', 'ui.moduleSkillsExplicit': 'Für dieses Modul ausdrücklich konfiguriert.', 'ui.useProjectDefault': 'Projektvorgabe verwenden', 'ui.noSkills': 'Keine Skills installiert', 'ui.moduleHistory': 'Frühere Arbeit in diesem Modul', 'ui.segmentInEarlierConv': 'Dieser Verlauf liegt in einer früheren Unterhaltung; öffne das zugehörige Issue, um ihn zu lesen.', 'ui.issueNoMessages': 'Dieses Issue hat noch keine Chatnachrichten', 'ui.directoryPicker': 'Verzeichnis des Executors auswählen',
   'ui.parentDirectory': 'Übergeordnetes Verzeichnis', 'ui.directoryMissing': 'Dieses Verzeichnis ist noch nicht vorhanden. Sie können es hier erstellen.',
   'ui.reading': 'Wird gelesen…', 'ui.noSubdirectories': 'Keine Unterverzeichnisse', 'ui.tooManyDirectories': 'Zu viele Verzeichnisse; die ersten 1.000 werden angezeigt.',
   'ui.newDirectoryName': 'Name des neuen Verzeichnisses', 'ui.useDirectory': 'Dieses Verzeichnis verwenden', 'ui.loadFailed': 'Laden fehlgeschlagen',
@@ -136,7 +142,7 @@ export const deCatalog = {
   'view.noConversations': 'Noch keine Unterhaltungen. Wählen Sie einen Agenten und dann „Neu“ aus.',
   'view.updateProjectMemory': 'Projektgedächtnis aus Chatverlauf und Repository aktualisieren und CLAUDE.md/AGENTS.md erneuern.',
   'view.filesPreview': 'Dateien und Vorschau', 'view.memoryUpdateFailed': 'Aktualisierung des Gedächtnisses fehlgeschlagen: {error}',
-  'view.conversationListWidth': 'Breite der Unterhaltungsliste', 'view.chooseConversation': 'Wählen oder erstellen Sie eine Unterhaltung.',
+  'view.conversationListWidth': 'Breite der Unterhaltungsliste', 'view.chooseConversation': 'Wählen oder erstellen Sie eine Unterhaltung.', 'view.copyConversationId': 'Unterhaltungs-ID {id} kopieren',
   'view.startingNative': 'Native Sitzung wird gestartet…', 'view.uploadCurrentDirectory': 'In das aktuelle Verzeichnis hochladen',
   'view.collapsePreview': 'Vorschau einklappen', 'view.openFullFiles': 'In der vollständigen Dateiansicht öffnen', 'view.downloadToOpen': 'Zum Anzeigen herunterladen',
   'view.personaHelp': 'Persona (wie der Assistent Sie ansprechen und mit Ihnen arbeiten soll)',
@@ -159,7 +165,7 @@ export const deCatalog = {
   'project.searchSuffix': ' (Suche: „{query}“)', 'project.archivedCount': 'Archiviert ({count})',
   'project.gitRequired': 'URL eines Git-Repositorys eingeben', 'project.clonedCreated': 'Repository geklont und Projekt erstellt',
   'project.createdWarnings': 'Mit Warnungen erstellt:\n{warnings}', 'project.newProject': 'Neues Projekt',
-  'project.issueModeHelp':'Issue-Modus: Organisieren Sie die Arbeit im Issue-Board und lassen Sie Agents sie im Projektablauf ausführen.','project.chatModeHelp': 'Chatmodus: Fragen stellen und Dateien im Projektverzeichnis ohne Issues erstellen; jedes Projekt kann mehrere Unterhaltungen haben.',
+
   'project.projectName': 'Projektname', 'project.repoNameDefault': ' (leer lassen, um den Repository-Namen zu verwenden)',
   'project.cloneTo': 'Klonen nach', 'project.selectedUserHome': 'Home-Verzeichnis des ausgewählten Benutzers',
   'project.yourWorkspace': 'Ihr Arbeitsbereich', 'project.pickDirectory': 'Verzeichnis auswählen',
@@ -172,8 +178,8 @@ export const deCatalog = {
   'project.sameDirectory': 'Ein Projekt verwendet dieses Verzeichnis bereits (#{id}); der Import wird damit zusammengeführt.',
   'project.importing': 'Wird importiert…', 'project.import': 'Importieren', 'project.linuxUser': 'Linux-Benutzer (Eigentümer des Projektverzeichnisses)',
   'project.startedSummary': 'Erstellung mit {mode} gestartet. Dies kann einen Moment dauern…',
-  'project.archiveConfirm': 'Projekt „{name}“ {verb}? {hint}', 'project.archiveSuccess': '„{name}“: {verb}', 'project.projectType': 'Projekttyp',
-  'project.issueBoard': 'Issue-Board', 'project.blankProject': 'Leeres Projekt', 'project.cloneFromGit': 'Aus Git klonen',
+  'project.archiveConfirm': 'Projekt „{name}“ {verb}? {hint}', 'project.archiveSuccess': '„{name}“: {verb}',
+   'project.blankProject': 'Leeres Projekt', 'project.cloneFromGit': 'Aus Git klonen',
   'project.gitUrl': 'URL des Git-Repositorys', 'project.gitUrlPlaceholder': 'https://github.com/owner/repo.git oder git@host:owner/repo.git',
   'project.executor': 'Executor', 'project.goalOptional': 'Ziel (optional, für den Projektassistenten)',
   'project.locationOptional': '{target} (optional; Standard: {home})', 'project.browse': 'Durchsuchen',
@@ -237,7 +243,7 @@ export const deCatalog = {
   'issue.commitHistory': 'Commit-Verlauf · {count}',
   'issue.noChangesRunning': 'In Bearbeitung, noch keine Änderungen. Änderungen des Agenten werden hier vor dem automatischen Commit angezeigt.',
   'issue.noChanges': 'Dieses Issue hat noch keine Änderungen erzeugt.', 'issue.changeTreeWidth': 'Breite des Änderungsbaums',
-  'issue.collapseDiff': 'Diff einklappen', 'issue.chooseChange': 'Wählen Sie eine Datei für ihren Diff oder einen Commit für Details aus.',
+  'issue.collapseDiff': 'Diff einklappen', 'issue.chooseChange': 'Wählen Sie eine Datei aus, um den Diff anzuzeigen.',
   'issue.planReview': 'Plan genehmigen', 'issue.mergeReview': 'Vor dem Merge prüfen',
   'issue.feedbackPlaceholder': 'Beim Ablehnen ist eine Rückmeldung erforderlich; sie wird an Claude gesendet.',
   'issue.approvePlan': 'Plan genehmigen', 'issue.approveMerge': 'Merge genehmigen',
@@ -262,7 +268,7 @@ export const deCatalog = {
   'issue.agentFeedback': 'Agentenrückmeldung (letzte Analyse)', 'issue.agentReanalyzingInline': 'Der Agent analysiert erneut…',
   'issue.planProgress': 'Plan ({done}/{total})', 'issue.rejectWithFeedback': 'Mit Rückmeldung ablehnen', 'issue.cancelTask': 'Issue abbrechen',
   'issue.regenerateReview': 'Prüfung neu erstellen', 'issue.blocked': 'Blockiert', 'issue.cancelIssue': 'Issue abbrechen',
-  'issue.unblockRerun': 'Blockierung lösen und erneut ausführen', 'issue.start': 'Starten',
+  'issue.unblockContinue': 'Blockierung lösen und fortfahren', 'issue.start': 'Starten',
   'issue.submitClarification': 'Klärungsantwort übermitteln', 'issue.runAgainConfirm': 'Dieses Issue erneut ausführen?\n\n{hint}.',
   'issue.deleteConfirm': 'Issue #{id} löschen?', 'issue.cancelledCanRerun': 'Abgebrochen – Anfrage bearbeiten und anschließend erneut ausführen',
   'issue.editAction': 'Bearbeiten', 'issue.runAgain': 'Erneut ausführen',
@@ -329,7 +335,8 @@ export const deCatalog = {
   'skills.noProjectSkills': 'Keine Projekt-Skills installiert. Wählen Sie einen im Markt aus.', 'skills.globalSkills': 'Globale Skills',
   'skills.globalSkillsPath': 'Executor ~/.claude/skills und gebündelte Plugin-Skills', 'skills.noGlobalSkills': 'Keine globalen Skills',
   'admin.users': 'Benutzer', 'admin.executors': 'Executors', 'admin.llm': 'Steuermodell', 'admin.ownership': 'Projekteigentum',
-  'admin.overview': 'Aktivitätsübersicht', 'admin.configApplied': 'Die Konfiguration des Steuermodells ist aktiv',
+  'admin.scope': 'Bereich', 'admin.costAmount': 'Kosten (USD)', 'admin.costRescan': 'Neu scannen', 'admin.cost': 'Kosten', 'admin.costTokens': 'Tokens (Eingabe / Cache / Ausgabe / Reasoning)', 'admin.costRequests': 'Anfragen', 'admin.costTools': 'Tool-Aufrufe', 'admin.costCompactions': 'Verdichtungen', 'admin.costChat': 'Nicht-Issue-Sitzungen', 'admin.costUnattributed': 'Nicht zugeordnet', 'admin.costGateTime': 'Prüfzeit', 'admin.costRetries': 'Wiederholungen', 'admin.costWindowNote': 'Die Summen umfassen alle Sitzungen; der Zeitraum filtert nur die Issue-Liste.',
+  'admin.costWeekly': 'Wochenansicht', 'admin.costWeekPrev': 'Vorige Woche', 'admin.costWeekThis': 'Diese Woche', 'admin.costWeekNext': 'Nächste Woche', 'admin.costWeekRange': '{start} bis {end}', 'admin.costDay': 'Tag', 'admin.costModule': 'Modul', 'admin.costDone': 'Abgeschlossen', 'admin.costFailureRate': 'Fehlerquote', 'admin.costRecoveryRate': 'Erholungsquote', 'admin.costUnmoduled': 'Ohne Modul', 'admin.costWeeklyNote': 'Tage beginnen um Mitternacht Pekinger Zeit, Wochen am Montag. Fehlerquote = Issues mit Blockade oder Abbruch, gemessen an den Issues mit Ausgang in dieser Woche; Erholungsquote = blockierte Issues, die später fertig wurden.', 'admin.overview': 'Aktivitätsübersicht', 'admin.configApplied': 'Die Konfiguration des Steuermodells ist aktiv',
   'admin.configIncomplete': 'Konfiguration gespeichert, aber unvollständig',
   'admin.clearKeyConfirm': 'Aktuellen API-Schlüssel löschen? Funktionen, die vom Steuermodell abhängen, werden pausiert.',
   'admin.keyCleared': 'API-Schlüssel gelöscht',

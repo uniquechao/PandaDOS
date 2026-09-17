@@ -1,7 +1,8 @@
 /**
  * 对话模式主视图（chat 界面）。
  *
- * 路由：#/p/:pid/chat。左栏多对话列表（新建/切换/归档/重命名 + 每对话 claude/codex），
+ * 路由：#/p/:pid/chat 与 #/p/:pid/chat/:cid（选中即把对话 id 写进地址栏，可直链/可对账：
+ * 该 id 就是 conversations.id，也是执行机上的 tmux 会话名 chat-<id>）。左栏多对话列表（新建/切换/归档/重命名 + 每对话 claude/codex），
  * 右栏复用 ChatPane（按 conv 独立流：传 conv=<对话 id> 钉住该对话自身会话）。
  * 每条 chat 对话有独立 tmux 会话（后端 chat-<convId>），切换只是重连 WS、不 kill 其它对话，
  * 故来回切换互不打断。选中/新建即 activate（幂等：会话活着不重启）。
@@ -11,6 +12,7 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { AutoApproveSwitch } from '../components/AutoApproveSwitch';
+import { AgentLogo } from '../components/AgentLogo';
 import { ModelBadge } from '../components/badges';
 import { ChatPane } from '../components/ChatPane';
 import { ListSplitter } from '../components/ListSplitter';
@@ -19,8 +21,11 @@ import { NativeModeSwitch, type NativeMode } from '../components/NativeModeSwitc
 import { Modal } from '../components/Modal';
 import { SummaryButton } from '../components/SummaryButton';
 import { TermPane } from '../components/TermPane';
-import { api, ApiError, getProjectExecutorAgents, setConvAutoApprove } from '../lib/api';
+import { api, ApiError, getProjectExecutorAgents, setConvAutoApprove, uploadWithProgress } from '../lib/api';
+import { copyText } from '../lib/clipboard';
+import { resolveChatSync } from '../lib/chatsync';
 import { timeAgo } from '../lib/fmt';
+import { readChatAgent, writeChatAgent, readChatConversation, writeChatConversation, restoreChatConversation } from '../lib/chatPrefs';
 import { useListWidth } from '../lib/listwidth';
 import { pollProjectSummary } from '../lib/pollSummary';
 import { extOf, isImageExt, isImagePath, previewKind } from '../lib/preview';
@@ -45,13 +50,39 @@ import { reconcileAgent } from '../components/AgentPicker';
 import { useI18n } from '../i18n/provider';
 import { tr } from '../i18n/runtime';
 
-export function ChatView({ pid }: { pid: number }) {
+/** 代理正式名：图标按钮不显示文字，名称改由 title/aria-label 承载。 */
+const AGENT_NAMES: Record<AgentKind, string> = { claude: 'Claude', codex: 'Codex' };
+
+/** 导入本地历史：收成图标钮后用「下载进托盘」的形状表达导入。 */
+function ImportIcon() {
+  return (
+    <svg
+      class="conv-hd-icon"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M12 3.5v10m0 0 3.6-3.6M12 13.5 8.4 9.9" />
+      <path d="M4.5 15.5v2.6a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-2.6" />
+    </svg>
+  );
+}
+
+export function ChatView({ pid, cid }: { pid: number; cid?: string }) {
   const { t } = useI18n();
   const [project, setProject] = useState<Project | null>(null);
   const [convs, setConvs] = useState<Conversation[] | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  // 深链里的对话 id：装载时的初始选中要用它，但列表拉取的 effect 只依赖 pid，故用 ref 读最新值
+  const cidRef = useRef<string | undefined>(cid);
+  cidRef.current = cid;
   const [mode, setMode] = useState<NativeMode>('chat');
-  const [newAgent, setNewAgent] = useState<AgentKind>('claude');
+  const [newAgent, setNewAgent] = useState<AgentKind>(readChatAgent);
   const [supportedAgents, setSupportedAgents] = useState<AgentKind[]>([]);
   const [busy, setBusy] = useState(false);
   const [importingHistory, setImportingHistory] = useState(false);
@@ -66,28 +97,38 @@ export function ChatView({ pid }: { pid: number }) {
   const splitRef = useRef<HTMLDivElement>(null); // .wb-split 容器 ref，供分隔条换算左栏像素宽
 
   useEffect(() => {
+    let disposed = false;
     setProject(null);
     setConvs(null);
     setSelected(null);
+    setSupportedAgents([]);
+    setNewAgent(readChatAgent());
     setErr('');
-    api<Project>(`/api/projects/${pid}`).then(setProject).catch((e: Error) => setErr(e.message));
+    api<Project>(`/api/projects/${pid}`)
+      .then((value) => { if (!disposed) setProject(value); })
+      .catch((e: Error) => { if (!disposed) setErr(e.message); });
     void getProjectExecutorAgents(pid)
       .then((agents) => {
+        if (disposed) return;
         setSupportedAgents(agents);
-        const next = reconcileAgent(newAgent, agents);
+        const next = reconcileAgent(readChatAgent(), agents);
         if (next) setNewAgent(next);
       })
-      .catch(() => setSupportedAgents([]));
+      .catch(() => { if (!disposed) setSupportedAgents([]); });
     api<{ conversations: Conversation[] }>(`/api/projects/${pid}/conversations`)
       .then((r) => {
+        if (disposed) return;
         setConvs(r.conversations);
-        // 默认选中最近活跃的一条（后端已按最近使用倒序）
-        const initial = r.conversations[0]?.id ?? null;
+        // 地址栏带的对话优先（直链/刷新/分享），其次本项目上次打开的，最后回退最近活跃项。
+        const linked = r.conversations.find((c) => c.id === cidRef.current)?.id ?? null;
+        const initial = linked ?? restoreChatConversation(pid, r.conversations);
         setSelected(initial);
+        writeChatConversation(pid, initial);
         // 服务重启后 tmux 可能已不在；与手动点选一致，幂等确保原生视图有真实代理会话可连。
         if (initial) activate(initial);
       })
-      .catch((e: Error) => setErr(e.message));
+      .catch((e: Error) => { if (!disposed) setErr(e.message); });
+    return () => { disposed = true; };
   }, [pid]);
 
   // 确保对话自身会话已启动（幂等：会话活着不重启，故不打断其它在跑对话）
@@ -97,11 +138,35 @@ export function ChatView({ pid }: { pid: number }) {
 
   const select = (id: string): void => {
     setSelected(id);
+    writeChatConversation(pid, id);
     activate(id);
   };
 
+  /**
+   * 地址栏与选中项的同步——决策在 lib/chatsync（纯函数 + 收敛性单测），这里只执行。
+   * **必须是同一个 effect**：拆成两个方向会互相对打，永远收敛不了（详见 chatsync.ts 的事故记录）。
+   */
+  const prevCidRef = useRef<string | undefined>(cid);
+  useEffect(() => {
+    const action = resolveChatSync({
+      cid,
+      prevCid: prevCidRef.current,
+      selected,
+      conversationIds: convs?.map((c) => c.id) ?? null,
+    });
+    prevCidRef.current = cid;
+    if (action.kind === 'select') {
+      setSelected(action.convId);
+      writeChatConversation(pid, action.convId);
+      activate(action.convId);
+    } else if (action.kind === 'nav') {
+      // 一律 replace：切对话不往历史里堆条目（返回键仍是「离开对话页」）
+      nav(action.convId ? `/p/${pid}/chat/${action.convId}` : `/p/${pid}/chat`, { replace: true });
+    }
+  }, [pid, cid, convs, selected]);
+
   const createConv = async (): Promise<void> => {
-    if (busy) return;
+    if (busy || !supportedAgents.includes(newAgent)) return;
     setBusy(true);
     try {
       const r = await api<{ conversation: Conversation }>(
@@ -111,6 +176,7 @@ export function ChatView({ pid }: { pid: number }) {
       );
       setConvs((cur) => (cur ? [r.conversation, ...cur] : [r.conversation]));
       setSelected(r.conversation.id);
+      writeChatConversation(pid, r.conversation.id);
       activate(r.conversation.id);
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : String(e));
@@ -123,6 +189,7 @@ export function ChatView({ pid }: { pid: number }) {
     setImportingHistory(false);
     setConvs((current) => [conversation, ...(current ?? []).filter((item) => item.id !== conversation.id)]);
     setSelected(conversation.id);
+    writeChatConversation(pid, conversation.id);
     setMode('chat');
     activate(conversation.id);
     try {
@@ -132,6 +199,7 @@ export function ChatView({ pid }: { pid: number }) {
         ? conversation.id
         : (r.conversations[0]?.id ?? null);
       setSelected(target);
+      writeChatConversation(pid, target);
       if (target && target !== conversation.id) activate(target);
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : String(e));
@@ -144,9 +212,12 @@ export function ChatView({ pid }: { pid: number }) {
       await api(`/api/projects/${pid}/conversations/${id}/archive`, 'POST');
       const rest = (convs ?? []).filter((c) => c.id !== id);
       setConvs(rest);
+      // 手机上返回列表只收起对话；归档被记住的项时仍需更新记录。
+      if (readChatConversation(pid) === id) writeChatConversation(pid, rest[0]?.id ?? null);
       if (selected === id) {
         const next = rest[0]?.id ?? null;
         setSelected(next);
+        writeChatConversation(pid, next);
         if (next) activate(next);
       }
     } catch (e) {
@@ -216,9 +287,8 @@ export function ChatView({ pid }: { pid: number }) {
     [convs, selected],
   );
 
-  // 返回目标：chat 类型项目回项目列表；issue 项目（从工作台「对话」进来）回其看板。
-  // project 未载入时按 issue 处理——常见入口即 issue 工作台，且 chat 项目回看板会被 BoardView 重定向回本页，无害。
-  const backTo = project?.kind === 'chat' ? '/' : `/p/${pid}`;
+  // 所有项目的对话页都返回对应 Issue 看板。
+  const backTo = `/p/${pid}`;
 
   const convRow = (c: Conversation) => {
     const renaming = renamingId === c.id;
@@ -228,9 +298,7 @@ export function ChatView({ pid }: { pid: number }) {
         class={'conv-it' + (c.id === selected ? ' on' : '')}
         onClick={() => !renaming && select(c.id)}
       >
-        <span class={'conv-agent ' + (c.agent === 'codex' ? 'cx' : 'cl')} title={c.agent}>
-          {c.agent === 'codex' ? 'CX' : 'CL'}
-        </span>
+        <AgentLogo agent={c.agent} />
         {renaming ? (
           <input
             class="conv-rename grow"
@@ -281,26 +349,39 @@ export function ChatView({ pid }: { pid: number }) {
       <div class="conv-list-hd">
         <span class="conv-list-t">{t('view.conversation')}{convs ? ` · ${convs.length}` : ''}</span>
         <div class="conv-new">
-          <button class="btn sm" onClick={() => setImportingHistory(true)}>
-            {t('view.importLocalHistory')}
+          <button
+            class="btn sm icon"
+            title={t('view.importLocalHistory')}
+            aria-label={t('view.importLocalHistory')}
+            onClick={() => setImportingHistory(true)}
+          >
+            <ImportIcon />
           </button>
           <div class="seg sm" role="tablist">
             {supportedAgents.map((agent) => (
               <button
                 key={agent}
+                role="tab"
+                aria-selected={newAgent === agent}
+                title={AGENT_NAMES[agent]}
+                aria-label={AGENT_NAMES[agent]}
                 class={`seg-btn ${newAgent === agent ? 'on' : ''}`}
-                onClick={() => setNewAgent(agent)}
+                onClick={() => {
+                  setNewAgent(agent);
+                  writeChatAgent(agent);
+                }}
               >
-                {agent}
+                <AgentLogo agent={agent} decorative size="sm" />
               </button>
             ))}
           </div>
           <button
-            class="btn sm primary"
+            class="btn sm primary conv-create"
+            title={t('ui.create')}
             disabled={busy || supportedAgents.length === 0}
             onClick={() => void createConv()}
           >
-            ＋ {t('ui.create')}
+            ＋<span class="conv-create-t">{t('ui.create')}</span>
           </button>
         </div>
       </div>
@@ -331,7 +412,7 @@ export function ChatView({ pid }: { pid: number }) {
               ‹
             </button>
             <span class="btitle">{selectedConv?.label || t('view.conversation')}</span>
-            <span class="badge b-gray">{selectedConv?.agent ?? ''}</span>
+            {selectedConv && <AgentLogo agent={selectedConv.agent} size="sm" />}
           </div>
         </div>
         <div class="wb-main">
@@ -540,10 +621,12 @@ function ImportLocalHistoryModal({
                 key={agent}
                 class={'seg-btn' + (filter === agent ? ' on' : '')}
                 aria-pressed={filter === agent}
+                title={agent === 'all' ? t('shell.all') : AGENT_NAMES[agent]}
+                aria-label={agent === 'all' ? t('shell.all') : AGENT_NAMES[agent]}
                 disabled={busy}
                 onClick={() => setFilter(agent)}
               >
-                {agent === 'all' ? t('shell.all') : agent}
+                {agent === 'all' ? t('shell.all') : <AgentLogo agent={agent} decorative size="sm" />}
               </button>
             ))}
           </div>
@@ -591,13 +674,11 @@ function ImportLocalHistoryModal({
                     disabled={imported || busy}
                     onChange={() => toggle(session)}
                   />
-                  <span class={'conv-agent ' + (session.agent === 'codex' ? 'cx' : 'cl')} aria-hidden="true">
-                    {session.agent === 'codex' ? 'CX' : 'CL'}
-                  </span>
+                  <AgentLogo agent={session.agent} decorative />
                   <span class="history-import-copy">
                     <span class="history-import-title">{session.title || t('view.untitledHistory')}</span>
                     <span class="history-import-meta">
-                      {session.agent} · {timeAgo(session.updatedTs || session.createdTs)}
+                      {timeAgo(session.updatedTs || session.createdTs)}
                     </span>
                   </span>
                   {imported && <span class="badge b-green">{t('view.historyAlreadyImported')}</span>}
@@ -615,6 +696,36 @@ function ImportLocalHistoryModal({
         </button>
       </div>
     </Modal>
+  );
+}
+
+/**
+ * 对话 id 徽标：显示前 8 位、点一下复制全 id。
+ *
+ * 这个 id 就是 `conversations.id`，也是执行机上这条对话的 tmux 会话名 `chat-<id>` 和
+ * codex/claude 会话的绑定主键——排「网页看到的记录和终端里跑的不是同一条」这类问题时，
+ * 拿它就能把地址栏、tmux 会话、库里的 agent_session_id 三边对上号。
+ */
+function ConvIdChip({ id }: { id: string }) {
+  const { t } = useI18n();
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      class={'badge mono conv-id' + (copied ? ' ok' : '')}
+      title={t('view.copyConversationId', { id })}
+      aria-label={t('view.copyConversationId', { id })}
+      onClick={() => {
+        void copyText(id).then((ok) => {
+          if (!ok) return;
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1200);
+        });
+      }}
+    >
+      <span class="conv-id-v">{id.slice(0, 8)}</span>
+      <span class="conv-id-ic" aria-hidden="true">{copied ? '\u2713' : '\u29c9'}</span>
+    </button>
   );
 }
 
@@ -644,6 +755,7 @@ function ConversationPane({
       <NativeModeSwitch mode={mode} onChange={onModeChange} />
       <AutoApproveSwitch level={autoApprove} onChange={onAutoApprove} />
       <ModelBadge model={model} />
+      <ConvIdChip id={selected} />
     </>
   );
   if (mode === 'chat') {
@@ -735,6 +847,7 @@ function FilePanel({
   const [preview, setPreview] = useState<string | null>(null);
   const [err, setErr] = useState('');
   const [uploading, setUploading] = useState(false);
+  const [prog, setProg] = useState(0); // 上传进度 0~100（整数）；进度未知时停在 0
   const fileInput = useRef<HTMLInputElement>(null);
   // 已见过的图片全路径：用于「新出现的图片=本轮产物」判定（Bash 生成的图也能被抓到）
   const seenImgs = useRef<Set<string>>(new Set());
@@ -781,24 +894,24 @@ function FilePanel({
   };
   const openFile = (name: string): void => setPreview(rel ? `${rel}/${name}` : name);
 
-  // 上传到当前目录（复用 Files 页逻辑：multipart，成功后刷新当前目录）
+  // 上传到当前目录（复用 Files 页逻辑：走 XHR 底座拿上传进度，成功后刷新当前目录）
   const uploadFile = async (f: File): Promise<void> => {
     setUploading(true);
-    const fd = new FormData();
-    fd.append('file', f, f.name);
+    setProg(0);
     try {
-      const r = await fetch(`/api/projects/${pid}/fs/upload?path=${encodeURIComponent(rel)}`, {
-        method: 'POST',
-        body: fd,
-      });
-      const j = (await r.json().catch(() => null)) as (FsUploadResult & { error?: string }) | null;
-      if (!r.ok || !j?.ok) throw new Error(j?.error ?? t('view.uploadFailed', { status: r.status }));
+      const j = await uploadWithProgress<FsUploadResult>(
+        `/api/projects/${pid}/fs/upload?path=${encodeURIComponent(rel)}`,
+        f,
+        f.name,
+        { onProgress: (p) => setProg(Math.round(p.ratio * 100)) },
+      );
       toast.success(t('view.uploaded', { name: j.name }));
       load(rel);
     } catch (e) {
       toast.error(String(e instanceof Error ? e.message : e));
     } finally {
       setUploading(false);
+      setProg(0);
     }
   };
 
@@ -809,12 +922,24 @@ function FilePanel({
       <div class="fpanel-hd">
         <span class="fpanel-t">{t('view.files')}</span>
         <button
-          class="linkbtn"
+          class="linkbtn fs-up"
           title={t('view.uploadCurrentDirectory')}
           disabled={uploading}
           onClick={() => fileInput.current?.click()}
         >
-          {uploading ? '…' : '⇧'}
+          {uploading ? (prog > 0 ? `${prog}%` : '…') : '⇧'}
+          {uploading && (
+            <span
+              class="up-prog"
+              role="progressbar"
+              aria-valuenow={prog}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-label={t('ui.uploadingPercent', { percent: prog })}
+            >
+              <i style={{ width: `${prog}%` }} />
+            </span>
+          )}
         </button>
         <button class="linkbtn" title={t('ui.refresh')} onClick={() => load(rel, false)}>
           🔄

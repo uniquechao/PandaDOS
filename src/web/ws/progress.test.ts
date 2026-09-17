@@ -63,6 +63,7 @@ const project = (id: number): Project => ({
   summaryStatus: 'idle',
   summaryError: null,
   manualReview: false,
+  validationCommands: null,
   kind: 'issue',
 });
 
@@ -92,6 +93,7 @@ const issue = (id: number, projectId: number): EngineIssue => ({
   pinnedTs: null,
   clarifyFeedback: null,
   resultSummary: null,
+  completionReport: null,
   autoApprove: 'medium',
 });
 
@@ -278,7 +280,7 @@ describe('引擎 Wave3 钩子', () => {
 
   test('onConvMessages：tail 新消息回调（事件源=引擎 tail）；onMenu：弹窗检测回调；抛错不打断 tick', async () => {
     const t = await engineSetup();
-    const issue = await t.engine.createIssue(1, { title: '任务', category: 'task' });
+    const issue = await t.engine.createIssue(1, { title: '任务', category: 'task', executionMode: 'planned' });
     expect(t.engine.store.get(issue.id)!.status).toBe('planning');
     const convId = t.engine.store.get(issue.id)!.convId!;
     const p = path.join(t.dir, `${convId}.jsonl`);

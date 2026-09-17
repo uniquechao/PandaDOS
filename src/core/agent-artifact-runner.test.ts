@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  CODEX_READY_DELAY_MS,
   runAgentArtifacts,
   type AgentArtifactDriver,
 } from './agent-artifact-runner';
@@ -49,6 +50,20 @@ class FakeDriver implements AgentArtifactDriver {
     const data = new TextEncoder().encode(this.files.get(path) ?? '');
     return { data: data.subarray(offset, offset + limit), size: data.length };
   }
+  /** 诊断用：列 scratch 目录（#280）——按 files 里的路径前缀推出直接子项 */
+  async listDir(path: string) {
+    const prefix = `${path}/`;
+    const names = new Set<string>();
+    for (const key of this.files.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      const rest = key.slice(prefix.length);
+      const [head] = rest.split('/');
+      if (head) names.add(rest.includes('/') ? `${head}/` : head);
+    }
+    return [...names].map((name) => name.endsWith('/')
+      ? { name: name.slice(0, -1), type: 'dir' as const }
+      : { name, type: 'file' as const });
+  }
   async removeTree(path: string) {
     this.removed.push(path);
     for (const key of [...this.files.keys()]) {
@@ -97,7 +112,8 @@ describe('runAgentArtifacts', () => {
   test('resolves the selected executable and quotes its path before launching Claude Code or Codex', async () => {
     for (const [agent, executable, expected] of [
       ['claude', '/Applications/Claude Code/bin/claude', "'/Applications/Claude Code/bin/claude' --permission-mode acceptEdits"],
-      ['codex', '/srv/tools/codex', '/srv/tools/codex --dangerously-bypass-approvals-and-sandbox'],
+      // #281：一次性会话统一 low（codex 的 effort 是启动参数，只能在这里定）
+      ['codex', '/srv/tools/codex', '/srv/tools/codex --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort="low"'],
     ] as const) {
       const driver = new FakeDriver();
       driver.executable = executable;
@@ -183,7 +199,7 @@ describe('runAgentArtifacts', () => {
       input,
       { ...FAST, autoApproveMenus: false },
     );
-    expect(result).toEqual({ ok: false, reason: 'timeout' });
+    expect(result).toMatchObject({ ok: false, reason: 'timeout' });
     expect(driver.keys).toEqual([]);
   });
 
@@ -191,7 +207,9 @@ describe('runAgentArtifacts', () => {
     const driver = new FakeDriver();
     driver.paneAt = () => 'DONE successfully';
     const result = await runAgentArtifacts({ driver, ...clock() }, input, FAST);
-    expect(result).toEqual({ ok: false, reason: 'timeout' });
+    expect(result).toMatchObject({ ok: false, reason: 'timeout' });
+    // 屏上说完事了不算数，产物也确实没写出来 → 不是 partial
+    expect(result.ok === false && result.partial).toBeUndefined();
   });
 
   test('cancels promptly through AbortSignal', async () => {
@@ -202,7 +220,7 @@ describe('runAgentArtifacts', () => {
       input,
       { ...FAST, signal: controller.signal },
     );
-    expect(result).toEqual({ ok: false, reason: 'cancelled' });
+    expect(result).toMatchObject({ ok: false, reason: 'cancelled' });
   });
 
   test('guarantees session and scratch cleanup after success, parse failure, and launch failure', async () => {
@@ -227,5 +245,164 @@ describe('runAgentArtifacts', () => {
     const result = await runAgentArtifacts({ driver, ...clock() }, input, FAST);
     expect(result).toEqual({ ok: false, reason: 'executable-not-found' });
     expect(driver.created).toEqual([]);
+  });
+
+  // #280 / B-06：超时即 kill + removeTree 让生产上 92% 的失败退化成一句无信息的 reason=timeout
+  test('超时带回现场证据：pane 尾部 + scratch 文件清单 + 耗时', async () => {
+    const driver = new FakeDriver();
+    driver.paneAt = () => ['正在读取代码库…', '❯ 还在跑'].join('\n');
+    driver.onCapture = (n, files) => {
+      if (n >= 2) files.set(`${paths.scratch}/notes.md`, '半成品');
+    };
+    const result = await runAgentArtifacts({ driver, ...clock() }, input, FAST);
+
+    expect(result.ok).toBe(false);
+    const diag = result.ok === false ? result.diagnostics : undefined;
+    expect(diag?.paneTail).toContain('正在读取代码库');
+    expect(diag?.files.map((f) => f.name).sort()).toEqual(['notes.md', 'task.md']);
+    expect(diag?.files.find((f) => f.name === 'task.md')?.size).toBeGreaterThan(0);
+    expect(diag?.elapsedMs).toBeGreaterThan(0);
+    expect(diag?.hadArtifacts).toBe(0);
+  });
+
+  test('产物抢救：done 没出现但产物写出来了 → partial + 产物照常带回', async () => {
+    const driver = new FakeDriver();
+    driver.onCapture = (n, files) => {
+      if (n >= 2) files.set(paths.output, '{"answer":42}'); // 就是不写 done
+    };
+    const result = await runAgentArtifacts({ driver, ...clock() }, input, FAST);
+
+    expect(result).toMatchObject({ ok: false, reason: 'timeout', partial: true });
+    expect(result.ok === false && result.artifacts).toEqual({ output: { answer: 42 } });
+    expect(result.ok === false && result.diagnostics?.hadArtifacts).toBe(1);
+  });
+
+  test('失败时可按选项保留 scratch 留现场；成功路径照常清理', async () => {
+    const kept = new FakeDriver();
+    await runAgentArtifacts({ driver: kept, ...clock() }, input, { ...FAST, preserveScratchOnFailure: true });
+    // 起会话前那次自清残留仍在（步骤 0），失败后的那次被跳过 → 总共只删一次
+    expect(kept.removed.filter((p2) => p2 === paths.scratch)).toHaveLength(1);
+    expect(kept.sessions.has(input.session)).toBe(false); // 会话仍然要收
+
+    const wiped = new FakeDriver();
+    await runAgentArtifacts({ driver: wiped, ...clock() }, input, FAST); // 不开保留 → 删两次
+    expect(wiped.removed.filter((p2) => p2 === paths.scratch)).toHaveLength(2);
+
+    const cleaned = new FakeDriver();
+    cleaned.onCapture = (n, files) => {
+      if (n >= 2) {
+        files.set(paths.output, '{"answer":42}');
+        files.set(paths.done, 'ok');
+      }
+    };
+    const ok = await runAgentArtifacts({ driver: cleaned, ...clock() }, input, { ...FAST, preserveScratchOnFailure: true });
+    expect(ok).toEqual({ ok: true, artifacts: { output: { answer: 42 } } });
+    expect(cleaned.removed).toContain(paths.scratch);
+  });
+
+  test('成功路径不受影响：不采样、不带诊断字段', async () => {
+    const driver = new FakeDriver();
+    driver.onCapture = (n, files) => {
+      if (n >= 2) {
+        files.set(paths.output, '{"answer":7}');
+        files.set(paths.done, 'ok');
+      }
+    };
+    const result = await runAgentArtifacts({ driver, ...clock() }, input, FAST);
+    expect(result).toEqual({ ok: true, artifacts: { output: { answer: 7 } } });
+  });
+
+  test('required 产物缺失也带诊断；其它产物已写出时同样标 partial', async () => {
+    const driver = new FakeDriver();
+    driver.onCapture = (n, files) => {
+      if (n >= 2) files.set(paths.done, 'ok'); // 只写 done，不写 output
+    };
+    const result = await runAgentArtifacts(
+      { driver, ...clock() },
+      { ...input, artifacts: [{ key: 'output', path: paths.output, maxBytes: 1024, required: true }] },
+      FAST,
+    );
+    expect(result).toMatchObject({ ok: false, reason: 'malformed-artifact', artifact: 'output' });
+    expect(result.ok === false && result.diagnostics?.files.map((f) => f.name)).toContain('done');
+    expect(result.ok === false && result.partial).toBeUndefined(); // 一个都没写出来，不算部分成功
+  });
+
+  // #280 / B-06：生产上失败几乎全落在 codex（codex 4 成功 / 47 失败，claude 55 / 3），
+  // 失败形态是「跑满超时也没写出 done」——最可疑的一档是提示词打进了还没接管终端的 shell。
+  test('codex：pane 在注入后毫无变化 → 补交一次提示词（最多一次）', async () => {
+    const driver = new FakeDriver();
+    driver.paneAt = () => 'codex 启动中…'; // 屏幕从头到尾不变
+    const result = await runAgentArtifacts(
+      { driver, ...clock() },
+      { ...input, agent: 'codex' },
+      FAST,
+    );
+
+    expect(result.ok).toBe(false); // 本例照常超时，这里只验补交行为
+    const prompts = driver.sent.filter((x) => x.text === input.prompt);
+    expect(prompts).toHaveLength(2); // 原发 + 补交，且只补一次
+  });
+
+  test('codex：pane 变了说明收到了 → 不补交', async () => {
+    const driver = new FakeDriver();
+    // 收到提示词之后屏幕就变了（按「提示词发出去没有」切，不按抓屏次数切）
+    driver.paneAt = () => (driver.sent.some((x) => x.text === input.prompt)
+      ? '> 收到任务，正在读取 task.md'
+      : 'codex 启动中…');
+    await runAgentArtifacts({ driver, ...clock() }, { ...input, agent: 'codex' }, FAST);
+    expect(driver.sent.filter((x) => x.text === input.prompt)).toHaveLength(1);
+  });
+
+  test('claude 路径行为不变：既不补交，也不用 codex 的加长就绪窗口', async () => {
+    const driver = new FakeDriver();
+    driver.paneAt = () => '同一屏，从不变化';
+    await runAgentArtifacts({ driver, ...clock() }, input, FAST);
+    expect(driver.sent.filter((x) => x.text === input.prompt)).toHaveLength(1);
+  });
+
+  test('抓屏不可用时不补交：宁可这轮白跑，也不重复灌进一个其实在干活的会话', async () => {
+    const driver = new FakeDriver();
+    driver.capturePane = async () => { throw new Error('capture failed'); };
+    await runAgentArtifacts({ driver, ...clock() }, { ...input, agent: 'codex' }, FAST);
+    expect(driver.sent.filter((x) => x.text === input.prompt)).toHaveLength(1);
+  });
+
+  test('codex 默认就绪窗口更长；显式传 readyDelayMs 仍以调用方为准', async () => {
+    expect(CODEX_READY_DELAY_MS).toBeGreaterThan(12_000);
+
+    const slow = new FakeDriver();
+    const timeline: number[] = [];
+    await runAgentArtifacts(
+      { driver: slow, ...clock((now) => timeline.push(now)) },
+      { ...input, agent: 'codex' },
+      { pollIntervalMs: 1000, timeoutMs: 1000 }, // 不传 readyDelayMs → 用 codex 档
+    );
+    // 就绪窗口按 codex 档走：注入提示词之前至少睡够 CODEX_READY_DELAY_MS
+    const promptAt = slow.sent.findIndex((x) => x.text === input.prompt);
+    expect(promptAt).toBeGreaterThan(0);
+    expect(timeline.some((t) => t >= CODEX_READY_DELAY_MS)).toBe(true);
+  });
+
+  // #281 / I-04：这些会话每条 issue 都会跑，是最值得先砍的一块
+  test('一次性会话默认 low；调用方显式传 codexArgs 仍以调用方为准；claude 不受影响', async () => {
+    const low = new FakeDriver();
+    low.executable = '/bin/codex';
+    await runAgentArtifacts({ driver: low, ...clock() }, { ...input, agent: 'codex' }, FAST);
+    expect(low.sent[0]!.text).toContain('-c model_reasoning_effort="low"');
+
+    const override = new FakeDriver();
+    override.executable = '/bin/codex';
+    await runAgentArtifacts(
+      { driver: override, ...clock() },
+      { ...input, agent: 'codex' },
+      { ...FAST, codexArgs: '--dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort="high"' },
+    );
+    expect(override.sent[0]!.text).toContain('model_reasoning_effort="high"');
+    expect(override.sent[0]!.text).not.toContain('model_reasoning_effort="low"');
+
+    const claude = new FakeDriver();
+    await runAgentArtifacts({ driver: claude, ...clock() }, input, FAST);
+    expect(claude.sent[0]!.text).toBe('/opt/bin/claude --permission-mode acceptEdits');
+    expect(claude.sent[0]!.text).not.toContain('model_reasoning_effort');
   });
 });

@@ -1,3 +1,5 @@
+import { feishuChatMessages } from '../domains/feishu-chat';
+import { feishuLoginMessages } from '../domains/feishu-login';
 import { shellMessages } from '../domains/shell';
 import { actionMessages } from '../domains/actions';
 import { commonUiMessages } from '../domains/common-ui';
@@ -16,6 +18,8 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const enCatalog = {
+  ...feishuChatMessages["en"],
+  ...feishuLoginMessages["en"],
   ...shellMessages.en,
   ...actionMessages.en,
   ...commonUiMessages.en,

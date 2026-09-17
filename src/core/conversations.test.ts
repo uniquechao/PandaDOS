@@ -401,6 +401,34 @@ describe('ConversationManager', () => {
     await convs.activate(b.id);
     expect(driver.sent.at(-1)?.text).toBe(`claude --resume ${b.id}`);
   });
+
+  test('轮换下来的旧模块会话仍按 slug 归属同一 tmux（#277 / I-01）', async () => {
+    // 每条 issue 一段独立 transcript：模块指针会挪到新 conv。旧 conv 若退化成项目级
+    // `cc-1`，sleepIssue(旧 conv) 就会去 kill 项目会话，把别的活儿一起打死。
+    const { convs, db, driver } = setup();
+    const oldConv = convs.create(1, 'module:export-tools');
+    const newConv = convs.create(1, 'module:export-tools');
+    db.query(
+      `INSERT INTO project_modules (id, project_id, slug, display_name, agent, source, conversation_id, created_ts)
+       VALUES (7, 1, 'export-tools', 'Export', 'claude', 'manual', ?, 1)`,
+    ).run(newConv.id);
+    // 旧 conv 只剩下「某条 issue 曾绑在它上面」这一条线索
+    db.run(
+      `INSERT INTO issues (id, project_id, title, category, module, module_id, impl_mode, agent, status, conv_id, created_by, created_ts)
+       VALUES (501, 1, '上一条', 'task', 'export-tools', 7, 'seq', 'claude', 'done', ?, 1, 1)`,
+      [oldConv.id],
+    );
+
+    expect(convs.sessionName(newConv)).toBe('cc-1-m-export-tools');
+    expect(convs.sessionName(oldConv)).toBe('cc-1-m-export-tools'); // 不是 cc-1
+    expect(convs.tmuxName(1, oldConv.id)).not.toBe(dedTmux(1));
+
+    driver.sessions.add('cc-1');
+    driver.sessions.add('cc-1-m-export-tools');
+    await convs.sleepIssue(oldConv.id);
+    expect(driver.killed).toContain('cc-1-m-export-tools');
+    expect(driver.sessions.has('cc-1')).toBe(true); // 项目会话毫发无损
+  });
 });
 
 describe('ConversationManager chat 独立对话（009）', () => {
@@ -502,7 +530,7 @@ describe('ConversationManager codex 代理', () => {
     const before = Date.now();
     await convs.activate(c.id);
     expect(driver.sent[0]!.text).toBe(
-      'codex -c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox',
+      `codex -c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort="medium"`,
     );
     const row = db
       .query<{ agent_launch_ts: number | null }, [string]>(
@@ -518,12 +546,65 @@ describe('ConversationManager codex 代理', () => {
     db.query('UPDATE conversations SET agent_session_id = ? WHERE id = ?').run('sid-123', c.id);
     await convs.activate(c.id);
     expect(driver.sent[0]!.text).toBe(
-      'codex -c check_for_update_on_startup=false resume sid-123 --dangerously-bypass-approvals-and-sandbox',
+      `codex -c check_for_update_on_startup=false resume sid-123 --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort="medium"`,
     );
 
     const cc = convs.create(1, 'cl'); // 默认 claude
     await convs.activate(cc.id);
     expect(driver.sent[1]!.text).toBe(`claude --session-id ${cc.id}`);
+  });
+
+  // #281 / I-04：codex 的 model_reasoning_effort 是进程启动参数，跑起来改不了 → 只在启动时定档
+  test('推理档按 issue > 模块 > 默认定档，fresh 与 resume 两条路径都带上', async () => {
+    const { db, driver, convs } = setup();
+    const c = convs.create(1, 'cx', 'codex');
+    db.run(
+      `INSERT INTO project_modules (id, project_id, slug, display_name, agent, source, reasoning_effort, created_ts)
+       VALUES (5, 1, 'issue-engine', '引擎', 'codex', 'manual', 'low', 1)`,
+    );
+    db.run(
+      `INSERT INTO issues (id, project_id, title, category, module, module_id, impl_mode, agent, status, conv_id, created_by, created_ts)
+       VALUES (900, 1, '普通改动', 'task', 'issue-engine', 5, 'seq', 'codex', 'implementing', ?, 1, 1)`,
+      [c.id],
+    );
+
+    // 模块档命中
+    await convs.activate(c.id);
+    expect(driver.sent.at(-1)!.text).toContain('-c model_reasoning_effort="low"');
+
+    // issue 覆盖压过模块（迁移/状态机这类临时提到 high）
+    db.run(`UPDATE issues SET reasoning_effort = 'high' WHERE id = 900`);
+    await convs.relaunch(c.id);
+    expect(driver.sent.at(-1)!.text).toContain('-c model_reasoning_effort="high"');
+
+    // resume 路径同样带档
+    db.query('UPDATE conversations SET agent_session_id = ? WHERE id = ?').run('sid-42', c.id);
+    await convs.relaunch(c.id);
+    expect(driver.sent.at(-1)!.text).toContain('resume sid-42');
+    expect(driver.sent.at(-1)!.text).toContain('-c model_reasoning_effort="high"');
+
+    // 两处都清空 → 回到默认档
+    db.run(`UPDATE issues SET reasoning_effort = NULL WHERE id = 900`);
+    db.run(`UPDATE project_modules SET reasoning_effort = NULL WHERE id = 5`);
+    await convs.relaunch(c.id);
+    expect(driver.sent.at(-1)!.text).toContain('-c model_reasoning_effort="medium"');
+  });
+
+  test('已收尾的 issue 不再定档；claude 会话根本不带这个参数', async () => {
+    const { db, driver, convs } = setup();
+    const c = convs.create(1, 'cx', 'codex');
+    db.run(
+      `INSERT INTO issues (id, project_id, title, category, module, impl_mode, agent, status, conv_id, created_by, created_ts)
+       VALUES (901, 1, '已完成', 'task', 'x', 'seq', 'codex', 'done', ?, 1, 1)`,
+      [c.id],
+    );
+    db.run(`UPDATE issues SET reasoning_effort = 'high' WHERE id = 901`);
+    await convs.activate(c.id);
+    expect(driver.sent.at(-1)!.text).toContain('-c model_reasoning_effort="medium"'); // done 的不算数
+
+    const cl = convs.create(1, 'cl'); // claude 没有对应开关
+    await convs.activate(cl.id);
+    expect(driver.sent.at(-1)!.text).not.toContain('model_reasoning_effort');
   });
 
   test('resume 也重盖 launch_ts 并清 path 缓存（防旧绑定粘连，issue #48）', async () => {
@@ -535,7 +616,7 @@ describe('ConversationManager codex 代理', () => {
     const before = Date.now();
     await convs.activate(c.id);
     expect(driver.sent[0]!.text).toBe(
-      'codex -c check_for_update_on_startup=false resume sid-9 --dangerously-bypass-approvals-and-sandbox',
+      `codex -c check_for_update_on_startup=false resume sid-9 --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort="medium"`,
     );
     const row = db
       .query<{ agent_jsonl_path: string | null; agent_launch_ts: number }, [string]>(
@@ -554,7 +635,7 @@ describe('ConversationManager codex 代理', () => {
     expect(driver.sessions.has(session)).toBe(true);
     expect(driver.sent.length).toBe(1);
     // 模拟 codex 自更新后退回 bash（tmux 会话仍活着）
-    driver.paneText = '🎉 Update ran successfully! Please restart Codex.\n[root@VM demo_project]#';
+    driver.paneText = '🎉 Update ran successfully! Please restart Codex.\n[root@VM yuhang_project]#';
     await convs.activate(c.id);
     expect(driver.killed).toContain(session); // 重启 = kill 旧
     expect(driver.sent.length).toBe(2);
@@ -565,7 +646,7 @@ describe('ConversationManager codex 代理', () => {
     const { driver, convs } = setup();
     const c = convs.create(1, 'cx', 'codex', 'chat');
     await convs.activate(c.id);
-    driver.paneText = '› \n  gpt-5.6-sol medium · ~/user_space/users/u12/demo_project';
+    driver.paneText = '› \n  gpt-5.6-sol medium · ~/user_space/users/u12/yuhang_project';
     await convs.activate(c.id);
     expect(driver.sent.length).toBe(1); // 未重启
     expect(driver.killed).toEqual([]);

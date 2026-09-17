@@ -43,7 +43,7 @@ import { ModelProbe } from '../core/model-probe';
 import { AgentSummaryRunner } from '../core/agent-summary';
 import { buildHistoryDigest } from '../core/history-digest';
 import { SummaryOrchestrator } from '../core/summary-orchestrator';
-import { migrate, type MigrationStatus } from '../core/migrate';
+import { assertNoMigrationCollisions, migrate, type MigrationStatus } from '../core/migrate';
 import { SessionStore } from '../core/sessions';
 import type { Executor, ExecutorStatus } from '../core/types';
 import { ensureAdminUser, UserStore } from '../core/users';
@@ -63,6 +63,7 @@ import { DesignStore, migrateDesigns } from '../designs/store';
 import { DesignWorktreeService, DesignWorktreeStore } from '../designs/worktree';
 import type { ExecutorDriver } from '../executor/driver';
 import { LocalDriver } from '../executor/local';
+import { ProjectDataWatcher } from './project-data-watcher';
 import { withPaneCache } from '../executor/pane-cache';
 import { SshDriver } from '../executor/ssh';
 import { runClarify } from '../issues/clarify-runner';
@@ -73,11 +74,18 @@ import { ModuleManager, ModuleStore } from '../issues/modules';
 import { KeyedMutex, tmuxLockKey } from '../issues/mutex';
 import { FeishuChannel, type FeishuConfig } from '../notify/feishu';
 import { migrateNotify, NotifyRouter, userByFeishuOpenid } from '../notify/router';
+import { RegressionGuard, DEFAULT_REGRESSION_GUARD_CONFIG } from '../issues/validation-guard';
+import { UsageCollector, DEFAULT_USAGE_COLLECTOR_CONFIG } from '../core/usage-collector';
+import { isBusy } from '../issues/queue';
 import type { Project } from '../core/types';
-import { FeishuOauthClient, type FeishuOauthPort } from './feishu-oauth';
+import { FeishuLoginConfigStore } from './feishu-login-config';
+import { FeishuMessaging } from './feishu-messaging';
+import { PrivateChat } from '../notify/private-chat';
 import { authDepsFromDb, createDispatcher } from './middleware';
 import { createApiDispatcher } from './routes';
 import { actRoutes } from './routes/act';
+import { createProjectDataPersistence } from './project-data-persistence';
+import { decidePoll, ProjectDataSyncCoordinator } from './project-data-sync';
 import { ApprovalPipeline } from './ws/approvals';
 import { ChatApprovalWatcher } from './ws/chat-approvals';
 import { ProgressBridge } from './ws/progress';
@@ -118,6 +126,12 @@ export interface ServerOptions {
   statusIntervalMs?: number;
   /** WS 聊天轮询周期；缺省 1200ms（v1 平移；测试调小） */
   wsChatPollMs?: number;
+  /** `.panda` 协作文件的快轮询周期（只轮没被 inotify 覆盖的项目），缺省 5s */
+  projectDataPollMs?: number;
+  /** `.panda` 协作文件的安全网轮询周期（全量轮一遍，防 inotify 漏事件），缺省 60s */
+  projectDataSafetyPollMs?: number;
+  /** `.panda` 文件事件的抖动合并窗口，缺省 300ms */
+  projectDataDebounceMs?: number;
   /** 对话侧自动批准巡检周期（issue #108）；缺省 3s */
   chatApprovalTickMs?: number;
   /** 进度管道批处理窗口秒数（透传 ProgressReporter；缺省 30s） */
@@ -141,6 +155,10 @@ export interface ServerOptions {
   designAssetShutdownTimeoutMs?: number;
   /** Retry interval for pending execution-sync external effects. */
   executionSyncEffectIntervalMs?: number;
+  /** 批次全量回归守护的间隔（#279）；<= 0 关闭。缺省 24h。 */
+  regressionGuardIntervalMs?: number;
+  /** 成本埋点采集间隔（#282）；<= 0 关闭。缺省 5min。 */
+  usageCollectIntervalMs?: number;
   /** Per-drain deadline and shutdown join budget for execution-sync external effects. */
   executionSyncEffectDrainTimeoutMs?: number;
   /** Maximum worktree recovery rows inspected before the server starts accepting work. */
@@ -271,6 +289,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   // Validate controlled storage before opening SQLite or creating bootstrap credentials.
   const assetStorageRoot = resolveDesignAssetStorageRoot(dbPath, opts.designAssetStorageRoot);
   const db = openDb(dbPath);
+  // 撞号会让某条迁移被静默跳过（#292），启动即校验，别等到运行时读写缺失的表才发现
+  assertNoMigrationCollisions(db);
   migrate(db);
   migrateIssueEngine(db);
   migratePmAgent(db);
@@ -293,10 +313,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     mkdirSync(dirname(f), { recursive: true });
     writeFileSync(f, `${boot.token}\n`, { mode: 0o600 });
     chmodSync(f, 0o600); // 文件已存在时 writeFileSync 的 mode 不生效，补一刀
-    // 明文 token 仅此一次输出 stdout + 0600 文件；严禁进任何日志（v1 前科）
-    process.stdout.write(
-      `[${PRODUCT_NAME}] 首启已创建 admin 用户（username=admin）。token 仅显示这一次（已写入 ${f}，0600）：\n${boot.token}\n`,
-    );
+    // 明文 token 仅此一次输出 stdout + 0600 文件；严禁进任何日志（v1 前科）。
+    // 测试环境不打：单测里每起一个服务器就打一行，全量跑下来 stdout 全是这些 token 行，
+    // 把门禁失败回灌的尾部挤得一条 `(fail)` 都不剩（#279 的 failureTail 因此改成先保 stderr）。
+    if (process.env.NODE_ENV !== 'test') {
+      process.stdout.write(
+        `[${PRODUCT_NAME}] 首启已创建 admin 用户（username=admin）。token 仅显示这一次（已写入 ${f}，0600）：\n${boot.token}\n`,
+      );
+    }
   }
 
   // ---- 3. executors 表 → Driver 池 ----
@@ -408,8 +432,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     removeTree: (path) => resolvePrimary().removeTree(path),
     mkdirp: (path) => resolvePrimary().mkdirp(path),
     movePath: (src, dst) => resolvePrimary().movePath(src, dst),
+    ensureGitAvailable: () => resolvePrimary().ensureGitAvailable(),
     git: (cwd, args) => resolvePrimary().git(cwd, args),
     readGitBlob: (cwd, rev, path) => resolvePrimary().readGitBlob(cwd, rev, path),
+    runCommand: (cwd, argv, timeoutMs) => resolvePrimary().runCommand(cwd, argv, timeoutMs),
     openPty: (cmd, cols, rows) => resolvePrimary().openPty(cmd, cols, rows),
   };
   const claudeProjectsDir = primary?.claudeDir ?? join(homedir(), '.claude', 'projects');
@@ -420,9 +446,105 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     const ex = listExecutors(db).find((e) => e.id === p.executorId);
     return ex ? driverForExecutor(ex) : primaryDriver;
   };
+  // project-data 原子替换与所有 Git 写共用同一 mutex；必须在两套服务装配前创建。
+  const mutex = new KeyedMutex();
+  let engine!: IssueEngine; // project-data 同步和飞书回调均在下方引擎初始化后实际使用
+  const projectDataPersistence = createProjectDataPersistence(db, driverForProject, mutex);
+  const projectDataSync = new ProjectDataSyncCoordinator(db, driverForProject, mutex, async (projectId) => {
+    if (engine) await engine.scheduleNext(projectId, { source: 'manual' }); // 协作文件同步带来的新 issue
+  });
+  let projectDataDrain: Promise<void> | null = null;
+  const drainProjectData = (): Promise<void> => {
+    if (projectDataDrain) return projectDataDrain;
+    let task!: Promise<void>;
+    task = projectDataPersistence.drain().then(() => {}).catch((error) => {
+      console.error(`[${PRODUCT_NAME}] .panda 协作文件持久化失败:`, error);
+    }).finally(() => {
+      if (projectDataDrain === task) projectDataDrain = null;
+    });
+    projectDataDrain = task;
+    return task;
+  };
+  const flushProjectData = async (projectId: number): Promise<void> => {
+    // 若加入本轮的状态投影恰好晚于一个在途 drain 的取数快照，再补 drain 一轮。
+    await drainProjectData();
+    if (projectDataPersistence.pending(projectId).length > 0) await drainProjectData();
+    const remaining = projectDataPersistence.pending(projectId);
+    if (remaining.length > 0) {
+      throw new Error(remaining[0]!.lastError ?? '协作过程页仍有待写变更');
+    }
+  };
+  void drainProjectData();
+  const projectDataTimer = setInterval(() => void drainProjectData(), 1_000);
+  let projectDataPoll: Promise<void> | null = null;
+  /** 安全网轮询欠着一拍：被单飞守卫挡下时置位，下一拍（最多 5s 后）补上 */
+  let fullPollDue = false;
+  /**
+   * `.panda` 协作文件的同步调度，两条腿：
+   * - **事件**（`ProjectDataWatcher`，本机执行机）：谁改了就同步谁，300ms 合并抖动；
+   * - **轮询**：被事件覆盖的项目只走 60s 的安全网（inotify 队列会溢出、递归监听在批量改名时
+   *   也有缺口，不能只信事件）；没被覆盖的（远程执行机、目录还没建、名额耗尽）保持原来的 5s。
+   */
+  const pollProjectData = (opts?: { onlyUnwatched?: boolean }): void => {
+    // 单飞守卫只能让安全网**推迟**到下一拍，不能把它整个吞掉（判据见 decidePoll）
+    const decided = decidePoll(
+      { inFlight: projectDataPoll !== null, fullDue: fullPollDue },
+      opts?.onlyUnwatched ? 'fast' : 'full',
+    );
+    fullPollDue = decided.fullDue;
+    if (!decided.run) return;
+    // 启动及周期轮询都必须等当前 outbox 落盘，避免读取旧 Markdown 并反向覆盖
+    // 刚提交到数据库、尚未持久化的 Issue 状态。
+    const include = decided.full
+      ? undefined
+      : (projectId: number): boolean => !projectDataWatcher.healthy(projectId);
+    let task!: Promise<void>;
+    task = drainProjectData().then(() => projectDataSync.pollActive(include)).then(() => {}).catch((error) => {
+      console.error(`[${PRODUCT_NAME}] .panda 协作文件轮询失败:`, error);
+    }).finally(() => {
+      if (projectDataPoll === task) projectDataPoll = null;
+    });
+    projectDataPoll = task;
+  };
+  const syncProjectDataNow = (projectId: number): void => {
+    void drainProjectData()
+      .then(() => projectDataSync.syncById(projectId))
+      .catch((error) => {
+        console.error(`[${PRODUCT_NAME}] .panda 协作文件同步失败（项目 ${projectId}）:`, error);
+      });
+  };
+  const projectDataWatcher = new ProjectDataWatcher({
+    // 只监听本机执行机的项目：远程执行机没有 inotify，那些项目原样吃轮询。
+    // 判本机的口径与 buildDriver 一致（host 是回环且没配私钥）——不能拿 `instanceof LocalDriver`
+    // 判，主 Driver 是个每次现解析的门面，拿到的未必是 LocalDriver 实例。
+    targets: () => db.query<{ id: number; cwd: string }, []>(
+      `SELECT projects.id AS id, projects.cwd AS cwd FROM projects
+         JOIN executors ON executors.id = projects.executor_id
+        WHERE projects.status = 'active'
+          AND executors.host IN ('127.0.0.1', 'localhost')
+          AND COALESCE(executors.key_ref, '') = ''
+        ORDER BY projects.id`,
+    ).all().map(({ id, cwd }) => ({ projectId: id, cwd })),
+    onChange: syncProjectDataNow,
+    onError: (projectId, error) => {
+      // 不健康不是故障，只是这个项目降级回密集轮询；watcher 已按原因去重，不会每拍刷屏
+      console.warn(`[${PRODUCT_NAME}] .panda 文件监听未装上（项目 ${projectId}，改用轮询）:`, String(error).slice(0, 200));
+    },
+    ...(opts.projectDataDebounceMs !== undefined ? { debounceMs: opts.projectDataDebounceMs } : {}),
+  });
+  projectDataWatcher.refresh();
+  pollProjectData();
+  // refresh 跟着快轮询走：新项目、后建的 .panda 目录、名额恢复都能在下一拍自己装上监听
+  const projectDataPollTimer = setInterval(() => {
+    projectDataWatcher.refresh();
+    pollProjectData({ onlyUnwatched: true });
+  }, opts.projectDataPollMs ?? 5_000);
+  const projectDataSafetyTimer = setInterval(
+    () => pollProjectData(),
+    opts.projectDataSafetyPollMs ?? 60_000,
+  );
 
   // ---- 4. 单例互斥/定位/对话（PM 与引擎必须共用同一 mutex 实例，锁才有互斥意义） ----
-  const mutex = new KeyedMutex();
   const derivedHomes = agentHomesOf(claudeProjectsDir);
   const homes = derivedHomes ?? {
     claudeHome: join(homedir(), '.claude'),
@@ -570,53 +692,42 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
 
   // ---- 6. 通知路由 + 飞书通道（配置齐全才 start；缺配置 = 不注册，dispatch 静默跳过） ----
   const notify = new NotifyRouter(db);
-  let engine: IssueEngine; // 先声明：feishu 卡点回调闭包引用（下面 7 再赋值）
   let approvals: ApprovalPipeline; // 先声明：feishu 选择卡回调 + 引擎 onMenu 钩子闭包引用
   let chatApprovals: ChatApprovalWatcher; // 对话侧自动批准巡检（issue #108）
   let progress: ProgressBridge; // 先声明：引擎 onConvMessages 钩子闭包引用
-  let feishu: FeishuChannel | null = null;
-
-  const handleFeishuInbound = async (openid: string, text: string): Promise<void> => {
-    try {
-      // `#<项目id|项目名> 问题…` → 定位项目 → 项目 PM 应答
-      const pid = await notify.routeInbound('feishu', openid, text);
-      if (!pid || !feishu) return;
-      const user = userByFeishuOpenid(db, openid);
-      const project = getProject(db, pid);
-      if (!user || !project) return;
-      const q = text.trim().replace(/^#\S+\s*/, '');
-      if (!q) return;
-      messages.bump(user.id); // 飞书上问 PM 也是「用户发了一条消息」
-      const answer = await pmFor(project).answerQuestion(user.id, q);
-      await feishu.sendText({ userId: user.id, address: openid }, answer);
-    } catch (e) {
-      console.error(`[${PRODUCT_NAME}] 飞书入站处理失败:`, e);
-    }
-  };
-
+  const publicUrl = opts.publicUrl ?? process.env.PANDA_PUBLIC_URL;
   const feishuCfg = opts.feishu !== undefined ? opts.feishu : feishuConfigFromEnv();
-  // 扫码登录/绑定只依赖 app 凭据（纯 HTTP），与 WS 长连通道解耦
-  const feishuOauth: FeishuOauthPort | null = feishuCfg ? new FeishuOauthClient(feishuCfg) : null;
+  const feishuLoginConfig = new FeishuLoginConfigStore(db, feishuCfg, publicUrl);
   const channelOn = opts.feishuChannel ?? process.env.PANDA_FEISHU_CHANNEL !== 'off';
-  if (feishuCfg && channelOn) {
-    const ch = new FeishuChannel(feishuCfg, {
-      db,
-      decideGate: (g, u, a, n) => engine.decideGate(g, u, a, n),
-      onInbound: (openid, text) => void handleFeishuInbound(openid, text),
-      // 审批升级卡（v1 选择卡协议）回调 → 消费即焚 + 重抓菜单核对 menuSig 再注入
-      onSelection: (requestId, idx, openid) =>
-        void approvals
-          .consumeFromCard(requestId, idx, openid)
-          .catch((e) => console.error(`[${PRODUCT_NAME}] 选择卡回调处理失败:`, e)),
-    });
-    try {
-      await ch.start();
-      notify.register(ch);
-      feishu = ch;
-    } catch (e) {
-      console.error(`[${PRODUCT_NAME}] 飞书通道启动失败（本次不注册，通知静默跳过）:`, e);
-    }
-  }
+  const feishuMessaging: FeishuMessaging = new FeishuMessaging({
+    db, config: feishuLoginConfig, notify,
+    // Preserve deployment defaults; saving login credentials alone never enables messaging.
+    defaultEnabled: !!feishuCfg && channelOn,
+    create: (config) => {
+      const chat: PrivateChat = new PrivateChat({
+        db,
+        isActive: () => feishuMessaging.current === channel,
+        answer: async (userId, projectId, question) => {
+          const project = getProject(db, projectId);
+          if (!project) throw new Error('Project unavailable');
+          messages.bump(userId);
+          return pmFor(project).answerQuestion(userId, question);
+        },
+        send: (target, text) => channel.sendText(target, text),
+      });
+      const channel: FeishuChannel = new FeishuChannel(config, {
+        db,
+        decideGate: (g, u, a, n) => engine.decideGate(g, u, a, n),
+        onInbound: (openid, text) => chat.handle(openid, text),
+        onSelection: (requestId, idx, openid) => {
+          if (feishuMessaging.current !== channel) return;
+          void approvals.consumeFromCard(requestId, idx, openid)
+            .catch(() => console.error(`[${PRODUCT_NAME}] Feishu selection failed`));
+        },
+      });
+      return channel;
+    },
+  });
 
   // ---- 7. issue 引擎 + watch 循环（Wave3：菜单审批 onMenu / 进度 onConvMessages 钩子接线） ----
   engine = new IssueEngine({
@@ -627,14 +738,22 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     pmFor,
     notify,
     mutex,
+    flushProjectData,
     executionWorkspaces,
     modulesFor,
     // 创建时澄清：clr-<issueId> 一次性独立会话（按项目所在执行机取 Driver）
-    clarify: (project, input) => runClarify({ driver: driverForProject(project) }, input),
+    // #280：分析超时由引擎按 clarifyRunTimeoutMs 下发，这里必须真的传下去——
+    // 不传的话 runner 用它自己的 8 分钟默认值，生产上 49 次白跑就是这么来的。
+    clarify: (project, input) => runClarify(
+      { driver: driverForProject(project) },
+      input,
+      input.timeoutMs ? { timeoutMs: input.timeoutMs } : {},
+    ),
     // 模块智能整理：org-<projectId> 一次性独立会话（手动触发，扫全部 issue + 代码库出方案）
     organize: (project, input) => runOrganize({ driver: driverForProject(project) }, input),
     onMenu: (ctx) => approvals.onMenu(ctx),
     onMenuGone: (session) => approvals.menuGone(session),
+    onTextPrompt: (ctx) => approvals.onTextPrompt(ctx),
     onConvMessages: (issue, project, msgs) => progress.onConvMessages(issue, project, msgs),
     ...(opts.engineConfig ? { config: opts.engineConfig } : {}),
   });
@@ -791,9 +910,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     driverFor: driverForProject,
     subs: notify.subscriptions,
     notify,
-    feishu, // 无飞书通道时升级卡退化为 NotifyRouter 文本
+    get feishu() { return feishuMessaging.current; }, // 保存配置后动态获取通道
     log: (issueId, kind, data) => engine.store.logEvent(issueId, kind, data),
   });
+  await feishuMessaging.refresh();
   // 对话侧自动批准巡检（issue #108）：引擎只看驱动中的 issue 会话，独立聊天对话
   // （chat-<convId>）不在它视野里，档位靠这条服务端巡检才能在没人开网页时生效。
   chatApprovals = new ChatApprovalWatcher({
@@ -801,6 +921,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     llm,
     mutex, // 与引擎/PM/WS 同一把锁
     driverFor: driverForProject,
+    onTextDecision: (decision) => {
+      console.info(`[${PRODUCT_NAME}] chat text approval`, JSON.stringify({
+        convId: decision.convId,
+        action: decision.outcome.action,
+        reason: decision.outcome.reason,
+        result: decision.result ?? null,
+      }));
+    },
     ...(opts.chatApprovalTickMs !== undefined ? { tickMs: opts.chatApprovalTickMs } : {}),
   });
   progress = new ProgressBridge({
@@ -874,6 +1002,53 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
       console.error(`[${PRODUCT_NAME}] design Issue sync retry failed:`, error);
     }
   }, 5_000);
+  /**
+   * 批次全量回归守护（#279 / I-03）：per-issue 门禁是定向的，定向没覆盖到的用例可能已经被
+   * 前几条 issue 改红了。这里按固定间隔在项目 cwd 跑一次全量、红了发通知——**不建 issue、
+   * 不动队列**（要不要修是人的决定）。项目忙就跳过：抢同一个工作树只会两败俱伤。
+   */
+  const regressionGuard = new RegressionGuard(
+    {
+      driver: primaryDriver,
+      listProjects: () =>
+        db.query<{ id: number }, []>("SELECT id FROM projects WHERE status = 'active' ORDER BY id")
+          .all()
+          .flatMap((r) => {
+            const p = getProject(db, r.id);
+            return p ? [p] : [];
+          }),
+      isBusy: (projectId) => isBusy(engine.store.listByProject(projectId)),
+      anchorIssueId: (projectId) => engine.store.listByProject(projectId).at(-1)?.id ?? null,
+      logEvent: (issueId, kind, data) => engine.store.logEvent(issueId, kind, data),
+      lastRunTs: (projectId) =>
+        engine.store.lastProjectEventTs(projectId, 'regression_passed')
+        ?? engine.store.lastProjectEventTs(projectId, 'regression_failed'),
+      notify: (event) => void notify.dispatch(event).catch((e) => {
+        console.error(`[${PRODUCT_NAME}] 回归守护通知失败:`, e);
+      }),
+    },
+    {
+      intervalMs: opts.regressionGuardIntervalMs ?? DEFAULT_REGRESSION_GUARD_CONFIG.intervalMs,
+      timeoutMs: DEFAULT_REGRESSION_GUARD_CONFIG.timeoutMs,
+    },
+  );
+  regressionGuard.start();
+
+  /**
+   * 成本埋点采集（#282 / I-08、I-09）：按 conversation 增量扫 jsonl，落 conversation_usage，
+   * 再按 segment 边界归因到 issue。定时、单飞、失败只留痕——统计再重要也不能影响执行路径。
+   */
+  const usageCollector = new UsageCollector(
+    {
+      db,
+      driver: primaryDriver,
+      locate: (convId) => locator.locate(convId),
+      onError: (convId, error) => console.error(`[${PRODUCT_NAME}] 用量采集失败（${convId}）:`, error),
+    },
+    { intervalMs: opts.usageCollectIntervalMs ?? DEFAULT_USAGE_COLLECTOR_CONFIG.intervalMs },
+  );
+  usageCollector.start();
+
   startExecutionEffectDrain();
   const executionEffectTimer = setInterval(
     startExecutionEffectDrain,
@@ -881,7 +1056,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   );
 
   // ---- 8. 路由聚合 + 静态 + healthz ----
-  const publicUrl = opts.publicUrl ?? process.env.PANDA_PUBLIC_URL;
   const dispatch = createApiDispatcher({
     db,
     users,
@@ -901,15 +1075,18 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     driverFor: (ex) => driverForExecutor(ex),
     previewDriverFor: (ex) => buildDriver(ex),
     driverForProject, // files/git 浏览、技能安装按项目所在执行机取 Driver
+    projectDataSync,
     llm, // 技能市场 驱动大模型 富化（与 PM 池共享并发闸）
     onExecutorChanged: invalidateDriver, // M5：admin 改/删执行机后热失效 Driver 池
     convs,
     mutex, // 对话模式 conversations 路由 activate/archive 用（与引擎/PM/act/WS 同一把锁）
     models: modelProbe, // 对话/issue 详情页显示「正在用哪个模型」
     subs: notify.subscriptions,
-    feishu,
+    get feishu() { return feishuMessaging.current; },
     sessions,
-    feishuOauth,
+    feishuOauth: null,
+    feishuLoginConfig,
+    feishuMessaging,
     publicUrl,
     notify,
     summaryOrchestrator,
@@ -943,6 +1120,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     driverForProject,
     approvals,
     messages, // chat 文本帧计入用户消息数
+    judgeAgentFailure: async (projectId, agent, pane) => {
+      const project = getProject(db, projectId);
+      return project ? pmFor(project).judgeAgentFailure(agent, pane) : 'unknown';
+    },
     // 菜单解读（issue #112「解释一下」）：点了才调，issue 执行页与独立对话共用这一条 WS
     explain: async ({ projectId, userId, context, options, multiSelect }) => {
       const project = getProject(db, projectId);
@@ -1020,7 +1201,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
       db: { applied: migrations.applied.length, latest: migrations.latest },
       executors,
       engine: { running: engineRunning, driving: engine.store.listDriving().length },
-      feishu: feishu !== null,
+      feishu: feishuMessaging.current?.status().state === 'connected',
     });
   };
 
@@ -1072,6 +1253,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     clearInterval(statusTimer);
     clearInterval(revisionSyncTimer);
     clearInterval(executionEffectTimer);
+    clearInterval(projectDataTimer);
+    clearInterval(projectDataPollTimer);
+    clearInterval(projectDataSafetyTimer);
+    projectDataWatcher.close();
+    regressionGuard.stop();
+    usageCollector.stop();
+    await projectDataDrain;
+    await projectDataPoll;
     designCreationRecoveryAbort.abort('shutdown');
     for (const controller of executionEffectControllers) {
       controller.abort(new DOMException('shutdown', 'AbortError'));
@@ -1099,7 +1288,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     progress.stopAll(); // 进度 reporter 挂引擎生命周期（引擎停了再清定时器）
     await notify.flushAll(); // 引擎已停，冲掉聚合缓冲里最后一批通知
     notify.stop();
-    if (feishu) await feishu.stop();
+    await feishuMessaging.stop();
     for (const d of drivers.values()) {
       await (d as { close?: () => Promise<void> | void }).close?.(); // SshDriver 终态；LocalDriver 无需
     }
@@ -1118,7 +1307,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     approvals,
     chatApprovals,
     progress,
-    feishuEnabled: feishu !== null,
+    get feishuEnabled() { return feishuMessaging.current?.status().state === 'connected'; },
     stop,
   };
 }

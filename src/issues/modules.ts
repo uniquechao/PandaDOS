@@ -5,7 +5,8 @@
  * 可由 SQLite 强约束的事实，避免模块身份在引擎、路由和 UI 各自解释。
  */
 import type { Database } from 'bun:sqlite';
-import type { AgentKind, ProjectModule } from '../core/types';
+import type { AgentKind, ProjectModule, ReasoningEffort } from '../core/types';
+import { parseReasoningEffort, REASONING_EFFORTS } from '../core/types';
 import { moduleIssueRelPath } from './module-docs';
 
 export type ModuleSource = ProjectModule['source'];
@@ -58,6 +59,11 @@ export interface ModuleDocsPort {
     issue: { id: number; title: string; body: string | null; status: string; agent: AgentKind; createdTs: number },
     summary: string,
   ): Promise<void>;
+  /** 模块知识增量（#277 / I-01）：写进 MODULE.md 的 module-knowledge 区块 */
+  recordModuleKnowledge?(
+    module: ProjectModule,
+    entry: { issueId: number; status: string; title: string; note?: string },
+  ): Promise<void>;
 }
 
 export interface ModuleMergeInput {
@@ -83,6 +89,7 @@ export interface ModuleManagerDeps {
 
 interface ModuleRow {
   id: number;
+  sync_uid?: string | null;
   project_id: number;
   slug: string;
   display_name: string;
@@ -90,6 +97,10 @@ interface ModuleRow {
   source: string;
   status: string;
   conversation_id: string | null;
+  /** 046；旧库/未配置为 null */
+  skills_json?: string | null;
+  /** 048；旧库/未配置为 null（= 用控制面默认档） */
+  reasoning_effort?: string | null;
   sync_status: string;
   sync_error: string | null;
   created_by: number | null;
@@ -97,9 +108,61 @@ interface ModuleRow {
   last_used_ts: number | null;
 }
 
+/**
+ * 需要**显式开启**才挂的重技能（#277 / I-02）。
+ *
+ * superpowers 这类会把「任何任务都先走头脑风暴→计划文档→TDD 全流程」塞进每一次注入，
+ * 对绝大多数小改动是纯浪费；默认不挂，谁真需要谁在模块面板上勾。
+ */
+export const OPT_IN_SKILLS: readonly string[] = ['superpowers'];
+
+/** 单个技能名的合法形状（与 core/skills 的 SKILL_NAME_RE 同口径，避免把路径写进配置） */
+const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/** 规范化一份技能配置：去空白、去重、丢非法名、保序；null 原样返回（= 未配置） */
+export function normalizeModuleSkills(input: unknown): string[] | null {
+  if (input === null || input === undefined) return null;
+  if (!Array.isArray(input)) throw new Error('技能配置必须是数组或 null');
+  const out: string[] = [];
+  for (const raw of input) {
+    const name = typeof raw === 'string' ? raw.trim() : '';
+    if (!name) continue;
+    if (!SKILL_NAME_RE.test(name)) throw new Error(`非法技能名: ${String(raw).slice(0, 40)}`);
+    if (!out.includes(name)) out.push(name);
+  }
+  if (out.length > 32) throw new Error('技能数量过多');
+  return out;
+}
+
+/** 读列：坏 JSON 当未配置处理（配置读不出来时沿用默认，比整块报错安全） */
+export function parseModuleSkills(json: string | null): string[] | null {
+  if (!json) return null;
+  try {
+    return normalizeModuleSkills(JSON.parse(json) as unknown);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 这个模块最终要挂哪些技能（#277 / I-02）。
+ *
+ * - 未配置（`null`/缺省）= 沿用项目默认，但把「需显式开启」的重技能剔掉；
+ * - 配过 = 完全以模块配置为准（勾了 superpowers 就挂，空数组就一个都不挂）。
+ */
+export function resolveModuleSkills(
+  module: Pick<ProjectModule, 'skills'>,
+  projectDefault: readonly string[],
+): string[] {
+  const configured = module.skills ?? null;
+  if (configured) return [...configured];
+  return projectDefault.filter((name) => !OPT_IN_SKILLS.includes(name));
+}
+
 function mapModule(r: ModuleRow): ProjectModule {
   return {
     id: r.id,
+    ...(r.sync_uid ? { syncUid: r.sync_uid } : {}),
     projectId: r.project_id,
     slug: r.slug,
     displayName: r.display_name,
@@ -107,6 +170,8 @@ function mapModule(r: ModuleRow): ProjectModule {
     source: r.source === 'manual' ? 'manual' : r.source === 'legacy' ? 'legacy' : 'auto',
     status: r.status === 'archived' ? 'archived' : 'active',
     conversationId: r.conversation_id,
+    skills: parseModuleSkills(r.skills_json ?? null),
+    reasoningEffort: parseReasoningEffort(r.reasoning_effort ?? null),
     syncStatus: r.sync_status === 'error' ? 'error' : 'ready',
     syncError: r.sync_error,
     createdBy: r.created_by,
@@ -173,7 +238,7 @@ export class ModuleStore {
         input.createdTs ?? Date.now(),
       );
     if (!row) throw new Error('创建模块失败');
-    return mapModule(row);
+    return this.get(row.id)!;
   }
 
   countActiveAuto(projectId: number): number {
@@ -224,6 +289,32 @@ export class ModuleStore {
     if (activeIssues > 0) throw new Error('模块仍有未结束 issue，不能切换 Agent');
     this.db.query('UPDATE project_modules SET agent = ? WHERE id = ?').run(agent, id);
     return this.get(id)!;
+  }
+
+  /** 写模块技能配置（046）：null = 清空回「沿用项目默认」，数组 = 显式指定 */
+  setSkills(id: number, skills: string[] | null): ProjectModule {
+    const normalized = normalizeModuleSkills(skills);
+    this.db
+      .query('UPDATE project_modules SET skills_json = ? WHERE id = ?')
+      .run(normalized === null ? null : JSON.stringify(normalized), id);
+    const module = this.get(id);
+    if (!module) throw new Error('无此模块');
+    return module;
+  }
+
+  /**
+   * 模块默认推理档（048 / #281）：null = 清回未配置（用控制面默认档）。
+   * codex 的 effort 是**进程启动参数**，所以这里改了只对**之后启动的会话**生效——
+   * 不要为了让它立刻生效去重启在跑的会话，那比省下来的推理 token 贵得多。
+   */
+  setReasoningEffort(id: number, effort: ReasoningEffort | null): ProjectModule {
+    if (effort !== null && !REASONING_EFFORTS.includes(effort)) {
+      throw new Error(`非法推理档位: ${String(effort)}`);
+    }
+    this.db.query('UPDATE project_modules SET reasoning_effort = ? WHERE id = ?').run(effort, id);
+    const module = this.get(id);
+    if (!module) throw new Error('无此模块');
+    return module;
   }
 
   setConversation(id: number, conversationId: string): void {
@@ -378,6 +469,19 @@ export class ModuleManager {
   ): Promise<void> {
     if (!this.deps.docs.recordResultSummary) return;
     await this.deps.docs.recordResultSummary(module, issue, summary);
+    this.store.touch(module.id);
+  }
+
+  /**
+   * 模块知识增量（#277 / I-01）：由引擎在 segment 结束时确定性写入。
+   * docs 层没实现（老装配）就静默跳过——它是给下一条 issue 看的便条，缺了不该影响收尾。
+   */
+  async recordModuleKnowledge(
+    module: ProjectModule,
+    entry: { issueId: number; status: string; title: string; note?: string },
+  ): Promise<void> {
+    if (!this.deps.docs.recordModuleKnowledge) return;
+    await this.deps.docs.recordModuleKnowledge(module, entry);
     this.store.touch(module.id);
   }
 

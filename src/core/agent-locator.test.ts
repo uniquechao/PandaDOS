@@ -78,6 +78,41 @@ function insConv(
   ).run(id, createdTs ?? Date.now(), agent, launchTs ?? null, sid ?? null);
 }
 
+/**
+ * 造子代理 rollout（codex multi-agent）：文件名后缀是自己的 id，而 `payload.session_id`
+ * 记的是**父线程**——发现/重认领都必须跳过它，否则会绑出「sid 是主线程、path 是子代理」。
+ */
+async function writeSubagentRollout(
+  root: string,
+  ts: number,
+  sid: string,
+  parentSid: string,
+  cwd: string,
+): Promise<string> {
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, '0');
+  const day = path.join(root, String(d.getFullYear()), p(d.getMonth() + 1), p(d.getDate()));
+  await fsp.mkdir(day, { recursive: true });
+  const f = path.join(day, fmtRollout(ts, sid));
+  const iso = new Date(ts).toISOString();
+  await fsp.writeFile(
+    f,
+    JSON.stringify({
+      timestamp: iso,
+      type: 'session_meta',
+      payload: {
+        id: sid,
+        session_id: parentSid,
+        parent_thread_id: parentSid,
+        thread_source: 'subagent',
+        timestamp: iso,
+        cwd,
+      },
+    }) + '\n',
+  );
+  return f;
+}
+
 /** 给会话文件追加一条带时间戳的行（reclaim 活跃度判据吃文件尾时间戳） */
 async function appendTsLine(f: string, ts: number): Promise<void> {
   await fsp.appendFile(f, JSON.stringify({ timestamp: new Date(ts).toISOString(), type: 'event_msg' }) + '\n');
@@ -293,6 +328,34 @@ describe('AgentJsonlLocator', () => {
     expect(row!.agent_jsonl_path).toBe(live);
     expect(row!.agent_launch_ts).toBe(t0 - 1800_000);
     expect(await loc.locate('conv-rc')).toBe(live);
+  });
+
+  test('codex reclaim：跳过子代理线程，认领主线程（#302：否则会绑出子代理的流水）', async () => {
+    const cwd = path.join(dir, 'p7b');
+    const db = setup(cwd);
+    const root = path.join(dir, 'codex-sessions-6b');
+    const t0 = Date.now();
+    insConv(db, 'conv-sub', 'codex', t0 - 7200_000, 'dead-sid', t0 - 7200_000);
+    const dead = await writeRollout(root, t0 - 7200_000, 'dead-sid', cwd);
+    db.query('UPDATE conversations SET agent_jsonl_path = ? WHERE id = ?').run(dead, 'conv-sub');
+    // 人工重启后的主线程（30 分钟前），以及它随后派生的两个子代理（更新、也在写）
+    const main = await writeRollout(root, t0 - 1800_000, 'main-sid', cwd);
+    await appendTsLine(main, t0 - 5000);
+    const sub1 = await writeSubagentRollout(root, t0 - 900_000, 'sub1-sid', 'main-sid', cwd);
+    await appendTsLine(sub1, t0 - 3000);
+    const sub2 = await writeSubagentRollout(root, t0 - 600_000, 'sub2-sid', 'main-sid', cwd);
+    await appendTsLine(sub2, t0 - 1000);
+
+    const loc = new AgentJsonlLocator(db, driver, new JsonlLocator(driver, path.join(dir, 'nope')), root);
+    // 「取 meta 最新」本会挑到 sub2，子代理过滤把它挡回主线程
+    expect(await loc.reclaim('conv-sub')).toBe(main);
+    const row = db
+      .query<{ agent_session_id: string; agent_jsonl_path: string }, [string]>(
+        'SELECT agent_session_id, agent_jsonl_path FROM conversations WHERE id = ?',
+      )
+      .get('conv-sub');
+    expect(row!.agent_session_id).toBe('main-sid');
+    expect(row!.agent_jsonl_path).toBe(main);
   });
 
   test('codex reclaim：无活跃候选返回 null 且不动原绑定', async () => {

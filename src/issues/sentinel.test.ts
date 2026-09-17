@@ -9,8 +9,10 @@ import {
   findStageDone,
   findTestsFailed,
   looksRateLimited,
+  MAX_BLOCKED_NOTE_CHARS,
   MAX_CLARIFY_TEXT_CHARS,
   parseClarifyQuestions,
+  parseCompletionReportBlock,
   parseSubtasksBlock,
 } from './sentinel';
 
@@ -57,6 +59,13 @@ describe('哨兵矩阵：ISSUE_BLOCKED / TESTS_FAILED', () => {
   test('BLOCKED 带原因', () => {
     expect(findBlocked('ISSUE_BLOCKED:42 缺少数据库密码', ID)).toEqual({ note: '缺少数据库密码' });
     expect(findBlocked('ISSUE_BLOCKED:42：中文冒号也行', ID)).toEqual({ note: '中文冒号也行' });
+  });
+  // #301：原因改成「在做什么｜卡在哪｜要我做什么」三段式，200 字会把最要紧的第三段截掉
+  test('BLOCKED 三段式原因留到 400 字，不再 200 字截断', () => {
+    const long = `${'甲'.repeat(150)}｜${'乙'.repeat(150)}｜${'丙'.repeat(150)}`;
+    const note = findBlocked(`ISSUE_BLOCKED:42 ${long}`, ID)!.note;
+    expect(note.length).toBe(MAX_BLOCKED_NOTE_CHARS);
+    expect(note).toContain('丙'); // 第三段（要用户做什么）还在
   });
   test('BLOCKED 错 id / 子串 = 拒', () => {
     expect(findBlocked('ISSUE_BLOCKED:41 原因', ID)).toBeNull();
@@ -195,5 +204,44 @@ describe('limit 识别（收紧版）', () => {
     expect(looksRateLimited('the counter resets at midnight')).toBe(false);
     expect(looksRateLimited('we should limit retries to 3')).toBe(false);
     expect(looksRateLimited('该函数对输入做了 limit 截断')).toBe(false);
+  });
+});
+
+describe('完成报告块 REPORT_BEGIN / REPORT_END（#275 / I-05）', () => {
+  const report = {
+    version: 1,
+    outcome: 'complete',
+    objective: '目标',
+    implementation: ['做了 A'],
+    advantages: ['快'],
+    disadvantages: [],
+    verification: ['跑了测试'],
+    completion: '已完成',
+    unmetGoals: [],
+    remainingWork: [],
+  };
+  const wrap = (body: string) => `STAGE_DONE:42:testing\nREPORT_BEGIN\n${body}\nREPORT_END\n收工`;
+
+  test('随 STAGE_DONE 一并带出时能解析，字段照原样落下来', () => {
+    const r = parseCompletionReportBlock(wrap(JSON.stringify(report, null, 2)));
+    expect(r).toMatchObject({ outcome: 'complete', objective: '目标', implementation: ['做了 A'] });
+  });
+
+  test('两个标记必须各自独占一行：写在句中不算', () => {
+    expect(parseCompletionReportBlock(`前面 REPORT_BEGIN ${JSON.stringify(report)} REPORT_END`)).toBeNull();
+    expect(parseCompletionReportBlock(`REPORT_BEGIN\n${JSON.stringify(report)}`)).toBeNull(); // 缺 END
+    expect(parseCompletionReportBlock('毫无关系的一段话')).toBeNull();
+  });
+
+  test('非法内容一律返回 null 由调用方忽略，不抛错', () => {
+    expect(parseCompletionReportBlock(wrap('{坏 JSON'))).toBeNull();
+    expect(parseCompletionReportBlock(wrap('{"version":2}'))).toBeNull();      // 版本不符
+    expect(parseCompletionReportBlock(wrap(JSON.stringify({ ...report, outcome: 'x' })))).toBeNull();
+    expect(parseCompletionReportBlock(wrap(''))).toBeNull();                    // 空块
+  });
+
+  test('超长块直接拒收，避免把整屏日志当 JSON 解', () => {
+    const fat = JSON.stringify({ ...report, objective: 'x'.repeat(40_000) });
+    expect(parseCompletionReportBlock(wrap(fat))).toBeNull();
   });
 });

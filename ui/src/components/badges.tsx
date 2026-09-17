@@ -1,5 +1,5 @@
 /** 状态/类别/执行机 徽标 */
-import type { ExecutorStatus, IssueCategory, IssueStatus } from '../lib/types';
+import type { AttentionKind, ExecutorStatus, IssueCategory, IssueStatus } from '../lib/types';
 import { issueCategoryLabel, issueStatusLabel } from '../lib/labels';
 import { useI18n } from '../i18n/provider';
 
@@ -13,6 +13,7 @@ const STATUS_COLOR: Record<IssueStatus, string> = {
   merge_review: 'b-amber',
   merging: 'b-ai', // AI 执行中
   done: 'b-green',
+  paused: 'b-yellow',
   blocked: 'b-red',
   cancelled: 'b-gray',
 };
@@ -29,6 +30,45 @@ export function StatusBadge({ status, awaitingClarify }: { status: IssueStatus; 
     );
   }
   return <span class={`badge ${STATUS_COLOR[status] ?? 'b-gray'}`}>{issueStatusLabel(status)}</span>;
+}
+
+/**
+ * 「在等什么」徽标（#275 / I-07）——把原来散在各处的 waitingInput / clarifyPending /
+ * 状态判断收成一个。取值与优先级由后端 issues/attention.ts 决定，前端只负责呈现。
+ *
+ * 配色按视觉规范：琥珀 = 「等你处理」（clarify/choice/review/stalled），
+ * 蓝 = 信息性的「等你验收」（本地门禁其实过了，不是出事），红 = 真故障。
+ * 把 verify 从红档摘出来正是这条 issue 的意义：本周 41 次 blocked 里 27 次不该是红的。
+ */
+const ATTENTION_STYLE: Record<Exclude<AttentionKind, 'none'>, { cls: string; icon: string }> = {
+  clarify: { cls: 'b-clarify', icon: '⏳' },
+  choice: { cls: 'b-amber', icon: '🔢' },
+  review: { cls: 'b-amber', icon: '🚦' },
+  stalled: { cls: 'b-amber', icon: '⏸' },
+  verify: { cls: 'b-blue', icon: '🔍' },
+  blocked: { cls: 'b-red', icon: '⛔' },
+};
+
+export function AttentionBadge({ kind }: { kind?: AttentionKind }) {
+  const { t } = useI18n();
+  if (!kind || kind === 'none') return null;
+  const style = ATTENTION_STYLE[kind];
+  const label = kind === 'clarify' ? t('status.awaitingClarify')
+    : kind === 'choice' ? t('status.waitingChoice')
+      : kind === 'review' ? t('status.attentionReview')
+        : kind === 'verify' ? t('status.attentionVerify')
+          : kind === 'stalled' ? t('status.attentionStalled')
+            : t('status.blocked');
+  const hint = kind === 'clarify' ? t('status.awaitingClarifyHint')
+    : kind === 'choice' ? t('status.waitingChoiceHint')
+      : kind === 'verify' ? t('status.attentionVerifyHint')
+        : kind === 'stalled' ? t('status.attentionStalledHint')
+          : undefined;
+  return (
+    <span class={`badge ${style.cls}`} {...(hint ? { title: hint } : {})}>
+      {style.icon} {label}
+    </span>
+  );
 }
 
 /** waiting_input 派生标记：CC 弹窗在等人工选择（升级卡未处理/菜单滞留），选完自动消失 */

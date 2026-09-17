@@ -14,6 +14,7 @@
  *   光标可能被动过，但菜单本体没变仍应可注入（审批卡不存 cursorIndex）。
  */
 import { detectSelection, selectionSig, type SelectionPayload } from '../../core/screen';
+import { textApprovalCandidate } from '../../agents/approval';
 import { KeyedMutex, tmuxLockKey } from '../../issues/mutex';
 
 // ---------- Driver 最小接口（ExecutorDriver 结构子集，测试可用轻量假实现） ----------
@@ -35,6 +36,15 @@ export interface InjectDeps {
 /** 审批卡用的菜单签名：只看选项本体，不含 cursorIndex（发卡→点击期间光标可被动过） */
 export function optionsSigOf(options: string[]): string {
   return options.join('|');
+}
+
+/** 纯文本确认签名：忽略空白重排与 Codex 动态 context 百分比。 */
+export function textApprovalSigOf(pane: string): string {
+  return (textApprovalCandidate(pane) ?? '')
+    .replace(/\b\d+%\s+context left\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(-3000);
 }
 
 /** WS/act 推给前端的菜单帧（sig = screen.ts selectionSig 全签名，客户端 select 时回带） */
@@ -76,6 +86,27 @@ export function injectKey(deps: InjectDeps, session: string, key: string): Promi
 export type MenuActResult =
   | { ok: true; option: string }
   | { ok: false; reason: 'no_menu' | 'stale' | 'out_of_range' };
+
+export type TextApprovalActResult =
+  | { ok: true; reply: string }
+  | { ok: false; reason: 'no_prompt' | 'stale' };
+
+/** 锁内重抓并核对纯文本确认仍是原提示，再通过 Driver 的稳定提交发送短回复。 */
+export function actOnTextApproval(
+  deps: InjectDeps,
+  session: string,
+  reply: string,
+  expectedSig: string,
+): Promise<TextApprovalActResult> {
+  return deps.mutex.runExclusive(tmuxLockKey(session), async () => {
+    const current = await deps.driver.capturePane(session).catch(() => '');
+    const sig = textApprovalSigOf(current);
+    if (!sig) return { ok: false, reason: 'no_prompt' } as const;
+    if (sig !== expectedSig) return { ok: false, reason: 'stale' } as const;
+    await deps.driver.sendKeys(session, reply);
+    return { ok: true, reply } as const;
+  });
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

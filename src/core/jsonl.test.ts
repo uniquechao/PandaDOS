@@ -4,8 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { LocalDriver } from '../executor/local';
 import {
+  DETAIL_MAX_CHARS,
   JsonlLocator,
   parseLines,
+  readMessageDetail,
   readOlder,
   readRecentConversationPage,
   readRecentMessages,
@@ -406,5 +408,105 @@ describe('parseLines codex rollout（response_item 自动识别）', () => {
     expect(msgs[0]!.input).toBe('$ echo hi');
     expect(msgs[2]!.tool).toBe('apply_patch');
     expect(msgs[2]!.result).toBe('Done!');
+  });
+
+  test('functions.exec 包装规范化为真实命令与原始输出', () => {
+    const script = 'const r = await tools.exec_command({cmd:"git status --short",workdir:"/repo"}); text(r.output);';
+    const lines = [
+      ri({ type: 'custom_tool_call', name: 'exec', call_id: 'c4', input: script }),
+      ri({ type: 'custom_tool_call_output', call_id: 'c4', output: 'Script completed\nWall time 0.1 seconds\nOutput: M src/a.ts' }),
+    ];
+    const { msgs } = parseLines(lines, 0);
+    expect(msgs[0]).toMatchObject({ role: 'tool_use', tool: 'exec', input: '$ git status --short' });
+    expect(msgs[1]).toMatchObject({ role: 'tool_result', tool: 'exec', result: 'M src/a.ts' });
+  });
+
+  test('functions.exec 调用与结果分批解析仍保留稳定 call_id 并清理结果信封', () => {
+    const script = 'const r = await tools.exec_command({cmd:"git status --short",workdir:"/repo"}); text(r.output);';
+    const use = ri({ type: 'custom_tool_call', name: 'exec', call_id: 'split-call', input: script });
+    const output = ri({
+      type: 'custom_tool_call_output',
+      call_id: 'split-call',
+      output: [
+        { type: 'input_text', text: 'Script completed\nWall time 0.1 seconds\nOutput:\n' },
+        { type: 'input_text', text: 'M src/a.ts' },
+      ],
+    });
+
+    const call = parseLines([use], 0).msgs[0]!;
+    const result = parseLines([output], 1).msgs[0]!;
+
+    expect(call).toMatchObject({ role: 'tool_use', toolCallId: 'split-call', tool: 'exec' });
+    expect(result).toMatchObject({ role: 'tool_result', toolCallId: 'split-call', result: 'M src/a.ts' });
+  });
+});
+
+describe('readMessageDetail（issue #288：按 off 回源取完整正文）', () => {
+  /** 写一个 jsonl 并把每条消息的 off 一并算出来（tailConversation 挂 off，与线上同一条路径） */
+  async function writeAndOff(name: string, lines: string[]): Promise<{ file: string; offs: number[] }> {
+    const file = path.join(dir, name);
+    await fsp.writeFile(file, lines.map((l) => `${l}\n`).join(''));
+    const { msgs } = await tailConversation(driver, file, 0, 0);
+    return { file, offs: msgs.map((m) => m.off!) };
+  }
+
+  test('超长 AI 正文：气泡流被 brief 截断，回源拿到全文', async () => {
+    const long = '甲'.repeat(9000);
+    const { file, offs } = await writeAndOff('detail-text.jsonl', [asst('前一句'), asst(long)]);
+    const { msgs } = await tailConversation(driver, file, 0, 0);
+    expect(msgs[1]!.text).toContain('…[省略'); // 流里是截断的
+    const d = await readMessageDetail(driver, file, offs[1]!);
+    expect(d).not.toBeNull();
+    expect(d!.content).toBe(long);
+    expect(d!.truncated).toBe(false);
+    expect(d!.total).toBe(long.length);
+  });
+
+  test('同一行多条消息：off 行内序号定位到正确的那一条', async () => {
+    const cmd = `echo ${'x'.repeat(4000)}`;
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'text', text: '先说一句' },
+          { type: 'thinking', thinking: '想' + 'y'.repeat(6000) },
+          { type: 'tool_use', id: 'toolu_a', name: 'Bash', input: { command: cmd } },
+        ],
+      },
+    });
+    const { file, offs } = await writeAndOff('detail-multi.jsonl', [line]);
+    expect(offs.length).toBe(3);
+    expect((await readMessageDetail(driver, file, offs[0]!))!.content).toBe('先说一句');
+    expect((await readMessageDetail(driver, file, offs[1]!))!.content).toBe('想' + 'y'.repeat(6000));
+    expect((await readMessageDetail(driver, file, offs[2]!))!.content).toBe(`$ ${cmd}`);
+  });
+
+  test('超长工具结果：回源不截断；maxChars 只截尾并标注', async () => {
+    const out = 'z'.repeat(5000);
+    const { file, offs } = await writeAndOff('detail-result.jsonl', [asst('引子'), toolResult(out)]);
+    const full = await readMessageDetail(driver, file, offs[1]!);
+    expect(full!.content).toBe(out);
+    expect(full!.truncated).toBe(false);
+
+    const capped = await readMessageDetail(driver, file, offs[1]!, 100);
+    expect(capped!.content).toBe('z'.repeat(100)); // 只截尾，不再从中间挖空
+    expect(capped!.truncated).toBe(true);
+    expect(capped!.total).toBe(5000);
+  });
+
+  test('toolHint：单行解析配不回工具名时由调用方兜底，codex exec 包装照剥', async () => {
+    const wrapped = 'Script completed successfully\nWall time 1s\nOutput:\n真正的输出';
+    const { file, offs } = await writeAndOff('detail-hint.jsonl', [toolResult(wrapped)]);
+    expect((await readMessageDetail(driver, file, offs[0]!))!.content).toBe(wrapped);
+    const hinted = await readMessageDetail(driver, file, offs[0]!, DETAIL_MAX_CHARS, 'exec_command');
+    expect(hinted!.content).toBe('真正的输出');
+  });
+
+  test('越界 / 无消息的位置返回 null', async () => {
+    const { file, offs } = await writeAndOff('detail-edge.jsonl', [asst('只有一条')]);
+    expect(await readMessageDetail(driver, file, 10_000_000)).toBeNull();
+    expect(await readMessageDetail(driver, file, -1)).toBeNull();
+    expect(await readMessageDetail(driver, file, offs[0]! + 5)).toBeNull(); // 行内序号没有第 5 条
+    expect(await readMessageDetail(driver, `${file}.missing`, 0)).toBeNull();
   });
 });

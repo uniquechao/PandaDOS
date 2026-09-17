@@ -15,7 +15,7 @@
  * （与 ExecutorDriver 的 statPath/readFileRange/listDir 结构兼容，调用方直接传 Driver）。
  */
 
-import { describeToolUse } from './toolfmt';
+import { describeToolUse, normalizeToolResult } from './toolfmt';
 
 // ---------- 消息类型（v1 types.ts ChatMessage 平移；core/types.ts 不许动，故定义在此） ----------
 
@@ -24,6 +24,8 @@ export interface ChatMessage {
   role: 'assistant' | 'thinking' | 'tool_use' | 'tool_result' | 'user';
   text?: string;
   tool?: string; // 工具名（tool_result 也带：按 tool_use_id 批内回配）
+  /** Agent 原始工具调用 id；跨增量 tail 仍可稳定关联 tool_use / tool_result。 */
+  toolCallId?: string;
   title?: string; // tool_use 人话标题（如「✏️ 改 Login.tsx」，toolfmt 生成）
   input?: string; // 工具入参（人话正文：路径/±diff/$命令）
   result?: string;
@@ -40,6 +42,11 @@ export interface ChatMessage {
    * 从消息文本里 extractUploadRels 富化（并同步 stripImageHint 清正文），供前端缩略图/灯箱预览。
    */
   images?: string[];
+  /**
+   * 用户消息附件（非图片）的 cwd 相对路径。与 images 同款：jsonl 不带此字段，由 web/ws/chat.ts
+   * 发帧前从消息文本里 extractUploadFileRels 富化，供前端渲染文件 chip。
+   */
+  files?: string[];
 }
 
 // v1 chat.ts:4-6 气泡截断（评审 5.7：平移别瞎改；入参改走 toolfmt 人话正文后上限随 v1 提到 1600 兜底）
@@ -77,12 +84,34 @@ function parseTs(v: unknown): number | undefined {
 }
 
 /**
+ * 解析选项（issue #288）。缺省即气泡流的老行为，两项都只服务「查看完整内容」的单行回源。
+ * - full：跳过 brief() 与 toolfmt 的字段截断，正文一个字不少（回源只解析一行，撑不爆带宽）；
+ * - toolHint：单行解析拿不到同批次的 tool_use，tool_result 配不回工具名——调用方（前端已知）
+ *   把工具名带进来当兜底，否则 normalizeToolResult 认不出 codex exec 包装、剥不掉那层壳。
+ */
+export interface ParseOpts {
+  full?: boolean;
+  toolHint?: string;
+}
+
+/** 正文字段落地：非 full 走 brief 头尾截断，full 只 trim（与 brief 的 trim 语义保持一致） */
+function cut(s: unknown, n: number, opts?: ParseOpts): string {
+  const t = String(s ?? '');
+  return opts?.full ? t.trim() : brief(t, n);
+}
+
+/**
  * 解析一行 jsonl → 0..n 条 ChatMessage（v1 chat.ts parseLine 平移，含 thinking/redacted_thinking）。
  * 行级 timestamp（claude/codex 都在行顶层）解析成毫秒后挂到本行产出的所有消息（tool_use 取调用行、
  * tool_result 取结果行，前端据此算耗时）；无/非法则不挂。
  * toolNames：本批次 tool_use id→名字，给 tool_result 配回工具名（跨批次配不上就没有，退化为「结果」）。
  */
-function parseLine(ln: string, seqStart: number, toolNames?: Map<string, string>): ChatMessage[] {
+function parseLine(
+  ln: string,
+  seqStart: number,
+  toolNames?: Map<string, string>,
+  opts?: ParseOpts,
+): ChatMessage[] {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let e: any;
   try {
@@ -90,7 +119,7 @@ function parseLine(ln: string, seqStart: number, toolNames?: Map<string, string>
   } catch {
     return [];
   }
-  const out = parseEntry(e, seqStart, toolNames);
+  const out = parseEntry(e, seqStart, toolNames, opts);
   const ts = parseTs(e?.timestamp);
   if (ts !== undefined) for (const m of out) m.ts = ts;
   return out;
@@ -101,26 +130,27 @@ function parseLine(ln: string, seqStart: number, toolNames?: Map<string, string>
  * 含 claude（assistant/user）与 codex rollout（response_item）双格式，行 type 空间不相交。
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function parseEntry(e: any, seqStart: number, toolNames?: Map<string, string>): ChatMessage[] {
+function parseEntry(e: any, seqStart: number, toolNames?: Map<string, string>, opts?: ParseOpts): ChatMessage[] {
   const out: ChatMessage[] = [];
   let seq = seqStart;
 
   if (e.type === 'assistant' && Array.isArray(e.message?.content)) {
     for (const c of e.message.content) {
       if (c.type === 'text' && c.text?.trim()) {
-        out.push({ seq: seq++, role: 'assistant', text: brief(c.text, MAX_TEXT) });
+        out.push({ seq: seq++, role: 'assistant', text: cut(c.text, MAX_TEXT, opts) });
       } else if (c.type === 'thinking' || c.type === 'redacted_thinking') {
         const t = c.thinking ?? c.text ?? '（已隐去的思考）';
-        if (String(t).trim()) out.push({ seq: seq++, role: 'thinking', text: brief(t, MAX_TEXT) });
+        if (String(t).trim()) out.push({ seq: seq++, role: 'thinking', text: cut(t, MAX_TEXT, opts) });
       } else if (c.type === 'tool_use') {
         if (c.id && toolNames) toolNames.set(String(c.id), String(c.name ?? ''));
-        const d = describeToolUse(String(c.name ?? ''), c.input);
+        const d = describeToolUse(String(c.name ?? ''), c.input, opts?.full);
         out.push({
           seq: seq++,
           role: 'tool_use',
           tool: c.name,
+          ...(c.id ? { toolCallId: String(c.id) } : {}),
           title: d.title,
-          input: d.body ? brief(d.body, MAX_INPUT) : undefined,
+          input: d.body ? cut(d.body, MAX_INPUT, opts) : undefined,
         });
       }
     }
@@ -129,21 +159,23 @@ function parseEntry(e: any, seqStart: number, toolNames?: Map<string, string>): 
   if (e.type === 'user' && Array.isArray(e.message?.content)) {
     for (const c of e.message.content) {
       if (c.type === 'tool_result') {
+        const tool = (c.tool_use_id ? toolNames?.get(String(c.tool_use_id)) : undefined) ?? opts?.toolHint;
         out.push({
           seq: seq++,
           role: 'tool_result',
-          tool: c.tool_use_id ? toolNames?.get(String(c.tool_use_id)) : undefined,
-          result: brief(resultText(c.content), MAX_RESULT),
+          tool,
+          ...(c.tool_use_id ? { toolCallId: String(c.tool_use_id) } : {}),
+          result: cut(normalizeToolResult(tool, resultText(c.content)), MAX_RESULT, opts),
           isError: Boolean(c.is_error),
         });
       } else if (c.type === 'text' && c.text?.trim()) {
-        out.push({ seq: seq++, role: 'user', text: brief(c.text, MAX_TEXT) });
+        out.push({ seq: seq++, role: 'user', text: cut(c.text, MAX_TEXT, opts) });
       }
     }
     return out;
   }
   if (e.type === 'user' && typeof e.message?.content === 'string' && e.message.content.trim()) {
-    out.push({ seq: seq++, role: 'user', text: brief(e.message.content, MAX_TEXT) });
+    out.push({ seq: seq++, role: 'user', text: cut(e.message.content, MAX_TEXT, opts) });
   }
 
   // ---------- claude 排队消息（issue #116：代理正忙时发进去的话）----------
@@ -160,7 +192,7 @@ function parseEntry(e: any, seqStart: number, toolNames?: Map<string, string>): 
     e.attachment?.origin?.kind === 'human'
   ) {
     const prompt = typeof e.attachment.prompt === 'string' ? e.attachment.prompt : '';
-    if (prompt.trim()) out.push({ seq: seq++, role: 'user', text: brief(prompt, MAX_TEXT) });
+    if (prompt.trim()) out.push({ seq: seq++, role: 'user', text: cut(prompt, MAX_TEXT, opts) });
     return out;
   }
 
@@ -174,10 +206,10 @@ function parseEntry(e: any, seqStart: number, toolNames?: Map<string, string>): 
       case 'message': {
         const text = codexContentText(p.content);
         if (p.role === 'assistant' && text.trim()) {
-          out.push({ seq: seq++, role: 'assistant', text: brief(text, MAX_TEXT) });
+          out.push({ seq: seq++, role: 'assistant', text: cut(text, MAX_TEXT, opts) });
         } else if (p.role === 'user' && text.trim() && !CODEX_SYNTH_RE.test(text.trim())) {
           // codex 把 <environment_context>/<permissions …> 等合成消息记成 user——不进气泡
-          out.push({ seq: seq++, role: 'user', text: brief(text, MAX_TEXT) });
+          out.push({ seq: seq++, role: 'user', text: cut(text, MAX_TEXT, opts) });
         }
         return out; // developer 等其余 role 不进气泡
       }
@@ -187,7 +219,7 @@ function parseEntry(e: any, seqStart: number, toolNames?: Map<string, string>): 
               .map((s: unknown) => (typeof s === 'string' ? s : ((s as { text?: string })?.text ?? '')))
               .join('\n')
           : '';
-        if (sum.trim()) out.push({ seq: seq++, role: 'thinking', text: brief(sum, MAX_TEXT) });
+        if (sum.trim()) out.push({ seq: seq++, role: 'thinking', text: cut(sum, MAX_TEXT, opts) });
         return out;
       }
       case 'function_call':
@@ -202,13 +234,14 @@ function parseEntry(e: any, seqStart: number, toolNames?: Map<string, string>): 
             input = { input };
           }
         }
-        const d = describeToolUse(name, input);
+        const d = describeToolUse(name, input, opts?.full);
         out.push({
           seq: seq++,
           role: 'tool_use',
           tool: name,
+          ...(p.call_id ? { toolCallId: String(p.call_id) } : {}),
           title: d.title,
-          input: d.body ? brief(d.body, MAX_INPUT) : undefined,
+          input: d.body ? cut(d.body, MAX_INPUT, opts) : undefined,
         });
         return out;
       }
@@ -221,18 +254,21 @@ function parseEntry(e: any, seqStart: number, toolNames?: Map<string, string>): 
           seq: seq++,
           role: 'tool_use',
           tool: 'shell',
+          ...(p.call_id ? { toolCallId: String(p.call_id) } : {}),
           title: `💻 ${cmd.slice(0, 60)}`,
-          input: brief(`$ ${cmd}`, MAX_INPUT),
+          input: cut(`$ ${cmd}`, MAX_INPUT, opts),
         });
         return out;
       }
       case 'function_call_output':
       case 'custom_tool_call_output': {
+        const tool = (p.call_id ? toolNames?.get(String(p.call_id)) : undefined) ?? opts?.toolHint;
         out.push({
           seq: seq++,
           role: 'tool_result',
-          tool: p.call_id ? toolNames?.get(String(p.call_id)) : undefined,
-          result: brief(resultText(p.output), MAX_RESULT),
+          tool,
+          ...(p.call_id ? { toolCallId: String(p.call_id) } : {}),
+          result: cut(normalizeToolResult(tool, resultText(p.output), p.type === 'custom_tool_call_output'), MAX_RESULT, opts),
         });
         return out;
       }
@@ -510,6 +546,132 @@ export async function readRecentMessages(
   }
   const str = new TextDecoder('utf-8').decode(chunk);
   return parseLines(str.split('\n'), 0).msgs;
+}
+
+// ---------- 单条消息回源取全文（issue #288「查看完整内容」） ----------
+
+/**
+ * 一次回源最多回多少字。气泡流那份是 brief 头尾截断（MAX_TEXT/MAX_INPUT/MAX_RESULT），
+ * 这里是「看全」路径，只在真的巨大时**截尾**并由调用方标注截断，绝不再从中间挖空。
+ */
+export const DETAIL_MAX_CHARS = 100_000;
+
+/** 反扫行首的窗口（够覆盖绝大多数 jsonl 行，不够就再往前一窗） */
+const DETAIL_BACK_WINDOW = 64 * 1024;
+
+/**
+ * 单行源 jsonl 的字节上限。整行必须完整才能 JSON.parse，比这还长的行不回源（返回 null）——
+ * 与其为一条病态大行把内存打爆，不如让前端老实显示「完整内容加载失败」。
+ */
+const DETAIL_MAX_LINE_BYTES = 8 * 1024 * 1024;
+
+export interface MessageDetail {
+  /** 完整正文（超过 maxChars 时只截尾） */
+  content: string;
+  /** 是否因 maxChars 截了尾 */
+  truncated: boolean;
+  /** 截尾前的总字数（前端据此提示「共 N 字」） */
+  total: number;
+}
+
+/**
+ * off → 该消息的完整正文。
+ *
+ * off 的构造见 parseChunkWithOffsets：`off = 源行首字节 + 行内序号 k`，而行内序号恒远小于
+ * 行长（每条消息至少对应几十字节 JSON），故 [0, off) 里最后一个 '\n' 的下一字节就是行首，
+ * `off - 行首` 就是这条消息在本行产出序列里的下标。据此：反扫行首 → 向后读到行尾 →
+ * full 模式解析这一行 → 取第 (off - 行首) 条。
+ *
+ * 返回 null = 取不到（off 越界 / 行超上限 / 该位置解析不出消息），调用方按加载失败处理。
+ * toolHint：单行解析没有同批次的 tool_use，tool_result 的工具名由调用方补（见 ParseOpts）。
+ */
+export async function readMessageDetail(
+  r: JsonlReader,
+  jsonl: string,
+  off: number,
+  maxChars: number = DETAIL_MAX_CHARS,
+  toolHint?: string,
+): Promise<MessageDetail | null> {
+  if (!Number.isFinite(off) || off < 0) return null;
+  const st = await r.statPath(jsonl).catch(() => null);
+  if (!st || off >= st.size) return null;
+  const lineStart = await findLineStart(r, jsonl, Math.floor(off));
+  if (lineStart < 0) return null;
+  const line = await readWholeLine(r, jsonl, lineStart, st.size);
+  if (line === null) return null;
+  const msgs = parseLine(line, 0, undefined, {
+    full: true,
+    ...(toolHint ? { toolHint } : {}),
+  });
+  const m = msgs[Math.floor(off) - lineStart];
+  if (!m) return null;
+  const content = m.text ?? m.input ?? m.result ?? '';
+  const cap = Math.max(1, Math.floor(maxChars));
+  const truncated = content.length > cap;
+  return { content: truncated ? content.slice(0, cap) : content, truncated, total: content.length };
+}
+
+/** [0, off) 里最后一个 '\n' 的下一字节；到文件头没换行则 0；读失败/行超上限返回 -1。 */
+async function findLineStart(r: JsonlReader, jsonl: string, off: number): Promise<number> {
+  let end = off;
+  while (end > 0) {
+    if (off - end > DETAIL_MAX_LINE_BYTES) return -1;
+    const start = Math.max(0, end - DETAIL_BACK_WINDOW);
+    let chunk: Uint8Array;
+    try {
+      chunk = await readRange(r, jsonl, start, end - start);
+    } catch {
+      return -1;
+    }
+    if (chunk.length === 0) return -1;
+    for (let i = chunk.length - 1; i >= 0; i--) {
+      if (chunk[i] === 0x0a) return start + i + 1;
+    }
+    end = start;
+  }
+  return 0;
+}
+
+/** 从 lineStart 读到行尾（不含 '\n'）并解码；超 DETAIL_MAX_LINE_BYTES 或读失败返回 null。 */
+async function readWholeLine(
+  r: JsonlReader,
+  jsonl: string,
+  lineStart: number,
+  size: number,
+): Promise<string | null> {
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  let pos = lineStart;
+  while (pos < size) {
+    let chunk: Uint8Array;
+    try {
+      chunk = await readRange(r, jsonl, pos, Math.min(READ_CHUNK, size - pos));
+    } catch {
+      return null;
+    }
+    if (chunk.length === 0) break;
+    let nl = -1;
+    for (let i = 0; i < chunk.length; i++) {
+      if (chunk[i] === 0x0a) {
+        nl = i;
+        break;
+      }
+    }
+    const take = nl < 0 ? chunk : chunk.subarray(0, nl);
+    parts.push(take);
+    total += take.length;
+    if (total > DETAIL_MAX_LINE_BYTES) return null;
+    if (nl >= 0) break;
+    pos += chunk.length;
+  }
+  if (total === 0) return null;
+  const buf = new Uint8Array(total);
+  let at = 0;
+  for (const part of parts) {
+    buf.set(part, at);
+    at += part.length;
+  }
+  return new TextDecoder('utf-8').decode(buf);
 }
 
 // ---------- jsonl 定位（列目录按 id 匹配，弃 cwd 硬算） ----------

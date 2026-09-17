@@ -10,6 +10,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import type { ProjectModule } from '../lib/types';
 import { useI18n } from '../i18n/provider';
+import { AgentLogo } from './AgentLogo';
 
 /** 过滤（导出供测试）：空查询给全量；否则按显示名/slug 包含匹配（不分大小写） */
 export function filterModules(modules: ProjectModule[], query: string): ProjectModule[] {
@@ -97,7 +98,7 @@ export function ModuleSelect({
             >
               <span class="msel-name">{m.displayName}</span>
               <span class="msel-slug">{m.slug}</span>
-              <span class={`badge ${m.agent === 'codex' ? 'b-ai' : 'b-gray'}`}>{m.agent}</span>
+              <AgentLogo agent={m.agent} size="xs" />
             </button>
           ))}
           {filtered.length === 0 && (

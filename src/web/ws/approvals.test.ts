@@ -14,7 +14,7 @@ import { migrate } from '../../core/migrate';
 import { detectSelection, selectionSig } from '../../core/screen';
 import type { AutoApproveLevel, Project } from '../../core/types';
 import { UserStore } from '../../core/users';
-import type { EngineIssue, EngineMenuCtx } from '../../issues/engine';
+import type { EngineIssue, EngineMenuCtx, EngineTextPromptCtx } from '../../issues/engine';
 import { migrateIssueEngine } from '../../issues/engine';
 import { KeyedMutex } from '../../issues/mutex';
 import { SubscriptionStore } from '../../notify/router';
@@ -90,7 +90,12 @@ function fakeLlm(reply = '（解读）这是一个确认弹窗') {
 }
 
 function setup(
-  opts: { feishu?: boolean; decide?: ApprovalPm['decideApproval']; autoApprove?: AutoApproveLevel } = {},
+  opts: {
+    feishu?: boolean;
+    decide?: ApprovalPm['decideApproval'];
+    autoApprove?: AutoApproveLevel;
+    llmReply?: string;
+  } = {},
 ) {
   const db = openDb(':memory:');
   migrate(db);
@@ -128,6 +133,7 @@ function setup(
     summaryStatus: 'idle',
     summaryError: null,
     manualReview: false,
+  validationCommands: null,
     kind: 'issue',
   };
   const issue: EngineIssue = {
@@ -156,6 +162,7 @@ function setup(
     pinnedTs: null,
     clarifyFeedback: null,
     resultSummary: null,
+    completionReport: null,
     autoApprove: opts.autoApprove ?? 'medium',
   };
 
@@ -179,7 +186,7 @@ function setup(
     },
     systemPrompt: () => 'SYS',
   };
-  const llm = fakeLlm();
+  const llm = fakeLlm(opts.llmReply);
   const cards: Array<{ openid: string; card: unknown }> = [];
   const feishu =
     opts.feishu === false
@@ -578,5 +585,47 @@ describe('多行说明菜单的相对导航（actOnMenu，issue #94/#95）', () 
     const r = await actOnMenu({ driver, mutex: new KeyedMutex() }, 'cc-1', 0, { optionsSig: '朝向基本固定' });
     expect(r).toEqual({ ok: false, reason: 'stale' });
     expect(driver.keys).toEqual([]);
+  });
+});
+
+describe('Issue 审批管道：纯文本执行确认', () => {
+  const pane = [
+    '请选择执行方式：',
+    '1. 子代理分任务实施',
+    '2. 当前会话直接实施',
+    '回复 `2` 我就立即开始。',
+  ].join('\n');
+
+  const textCtx = (t: ReturnType<typeof setup>): EngineTextPromptCtx => ({
+    issue: t.issue,
+    project: t.project,
+    session: 'cc-1',
+    pane,
+  });
+
+  test('全自动档由管家判定后锁内复核、发送回复并记录审计', async () => {
+    const t = setup({
+      autoApprove: 'auto',
+      llmReply: '{"action":"reply","reply":"2","reason":"继续既定计划"}',
+    });
+    t.driver.pane = pane;
+    await t.pipeline.processTextPrompt(textCtx(t));
+    await t.pipeline.processTextPrompt(textCtx(t));
+    expect(t.driver.sent).toEqual(['2']);
+    expect(t.logs.filter((l) => l.kind === 'text_approval_auto')).toHaveLength(1);
+    expect(t.logs.find((l) => l.kind === 'text_approval_auto')?.data).toMatchObject({
+      reply: '2', result: 'injected',
+    });
+  });
+
+  test('管家要求人工时不注入并记录 hold', async () => {
+    const t = setup({
+      autoApprove: 'auto',
+      llmReply: '{"action":"hold","reason":"业务取舍"}',
+    });
+    t.driver.pane = pane;
+    await t.pipeline.processTextPrompt(textCtx(t));
+    expect(t.driver.sent).toEqual([]);
+    expect(t.logs.find((l) => l.kind === 'text_approval_hold')?.data?.reason).toBe('业务取舍');
   });
 });

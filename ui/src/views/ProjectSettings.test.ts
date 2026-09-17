@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { externalIssueSourceDefaults, externalIssueSourcePayload, projectSettingsDirty } from './ProjectSettings';
+import {
+  externalIssueSourceDefaults,
+  externalIssueSourcePayload,
+  formatValidationCommandLines,
+  parseValidationCommandLines,
+  projectSettingsDirty,
+} from './ProjectSettings';
 
 const source = readFileSync(new URL('./ProjectSettings.tsx', import.meta.url), 'utf8');
 const styles = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
@@ -14,8 +20,8 @@ describe('项目配置页外部 issue 来源请求', () => {
 
   test('GitLab 自建实例、token 与清除意图显式传递', () => {
     expect(externalIssueSourcePayload({
-      provider: 'gitlab', remoteName: 'upstream', instanceUrl: ' https://gitlab.example.com/team ', apiToken: ' secret ', clearApiToken: false,
-    })).toEqual({ provider: 'gitlab', remoteName: 'upstream', instanceUrl: 'https://gitlab.example.com/team', apiToken: 'secret' });
+      provider: 'gitlab', remoteName: 'upstream', instanceUrl: ' https://gitlab.example/team ', apiToken: ' secret ', clearApiToken: false,
+    })).toEqual({ provider: 'gitlab', remoteName: 'upstream', instanceUrl: 'https://gitlab.example/team', apiToken: 'secret' });
     expect(externalIssueSourcePayload({
       provider: 'gitlab', remoteName: 'origin', instanceUrl: '', apiToken: '', clearApiToken: true,
     })).toEqual({ provider: 'gitlab', remoteName: 'origin', clearApiToken: true });
@@ -26,14 +32,14 @@ describe('项目配置页外部 issue 来源请求', () => {
       host: 'github.com', suggestedProvider: 'github', suggestedInstanceUrl: 'https://github.com',
     })).toEqual({ provider: 'github', instanceUrl: '' });
     expect(externalIssueSourceDefaults({
-      host: 'gitlab.example.com',
-    })).toEqual({ provider: 'gitlab', instanceUrl: 'https://gitlab.example.com' });
+      host: 'gitlab.sunseed.tech',
+    })).toEqual({ provider: 'gitlab', instanceUrl: 'https://gitlab.sunseed.tech' });
   });
 });
 
 describe('项目设置控制台', () => {
   test('项目字段通过规范化快照派生未保存状态', () => {
-    const saved = { name: 'PandaDOS', goal: 'Ship' };
+    const saved = { name: 'PandaDOS', goal: 'Ship', validationCommands: '' };
     expect(projectSettingsDirty(saved, saved)).toBeFalse();
     expect(projectSettingsDirty(saved, { ...saved, name: ' PandaDOS ' })).toBeFalse();
     expect(projectSettingsDirty(saved, { ...saved, goal: 'New goal' })).toBeTrue();
@@ -99,5 +105,41 @@ describe('项目设置控制台', () => {
     expect(source).toContain('class="ps-module-list"');
     expect(source).toContain('module.displayName');
     expect(source).toContain("t('ui.moduleIssueCount'");
+  });
+
+  test('仓库分区展示同步摘要、原始错误和手动立即同步入口', () => {
+    expect(source).toContain('class={`ps-sync-card');
+    expect(source).toContain('`/api/projects/${pid}/sync`');
+    expect(source).toContain("t('projectSettings.syncNow')");
+    expect(source).toContain('syncStatus.detectedUpdates');
+    expect(source).toContain('syncStatus.details.map');
+    expect(styles).toContain('.ps-sync-errors');
+  });
+});
+
+describe('门禁命令编辑（#279 / I-03）', () => {
+  test('一行一条、参数空格分隔；空行与注释忽略', () => {
+    expect(parseValidationCommandLines('bun run typecheck\n\n  bun run test  \n# 注释')).toEqual([
+      { label: 'run typecheck', argv: ['bun', 'run', 'typecheck'] },
+      { label: 'run test', argv: ['bun', 'run', 'test'] },
+    ]);
+  });
+
+  test('留空 = null（未配置，交后端按 package.json 探测），不是「不跑门禁」', () => {
+    expect(parseValidationCommandLines('')).toBeNull();
+    expect(parseValidationCommandLines('   \n\n')).toBeNull();
+  });
+
+  test('回填与解析是一对：未配置显示为空', () => {
+    expect(formatValidationCommandLines([{ label: 'x', argv: ['make', 'ci'] }])).toBe('make ci');
+    expect(formatValidationCommandLines(null)).toBe('');
+    expect(formatValidationCommandLines(undefined)).toBe('');
+  });
+
+  test('门禁命令进入未保存判定，且只按规范化结果比较', () => {
+    const saved = { name: 'p', goal: 'g', validationCommands: 'bun run test' };
+    expect(projectSettingsDirty(saved, { ...saved, validationCommands: '  bun   run test  ' })).toBeFalse();
+    expect(projectSettingsDirty(saved, { ...saved, validationCommands: 'make ci' })).toBeTrue();
+    expect(projectSettingsDirty(saved, { ...saved, validationCommands: '' })).toBeTrue();
   });
 });

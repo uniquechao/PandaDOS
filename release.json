@@ -1,0 +1,9 @@
+{
+  "version": "2.3.2-2026.0917",
+  "notes": [
+    "issue-direct-execution",
+    "issue-pause-resume",
+    "skill-policies",
+    "project-sync-reliability"
+  ]
+}

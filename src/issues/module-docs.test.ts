@@ -4,7 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 import type { ProjectModule } from '../core/types';
 import { LocalDriver } from '../executor/local';
-import { ModuleDocs, moduleIssueRelPath } from './module-docs';
+import {
+  appendModuleKnowledge,
+  formatModuleKnowledgeEntry,
+  MAX_KNOWLEDGE_ENTRY_CHARS,
+  ModuleDocs,
+  moduleIssueRelPath,
+  parseModuleKnowledge,
+} from './module-docs';
 
 const cleanups: string[] = [];
 afterEach(async () => {
@@ -19,6 +26,7 @@ async function setup(): Promise<{ cwd: string; docs: ModuleDocs; module: Project
     docs: new ModuleDocs(new LocalDriver(), cwd),
     module: {
       id: 5,
+      syncUid: '018bcfe5-6800-7102-8304-05060708090b',
       projectId: 12,
       slug: 'terminal-runtime',
       displayName: '终端运行时',
@@ -81,17 +89,22 @@ describe('ModuleDocs', () => {
     expect(page).toContain('module: terminal-runtime');
     expect(page).toContain('## 设计与实施');
     await fsp.appendFile(path.join(cwd, rel), '\n人工过程记录：保留我。\n');
-    await docs.createIssuePage(module, {
+    const updatedRel = await docs.createIssuePage(module, {
       id: 72,
-      title: 'Terminal Process Isolation',
-      body: '对话和 issue 互不影响',
+      title: 'Terminal Process Isolation Updated',
+      body: '更新后的当前需求',
       status: 'implementing',
       agent: 'codex',
       createdTs: 100,
     });
-    const updated = await fsp.readFile(path.join(cwd, rel), 'utf8');
+    const updated = await fsp.readFile(path.join(cwd, updatedRel), 'utf8');
     expect(updated).toContain('status: implementing');
+    expect(updated).toContain('# #72 Terminal Process Isolation Updated');
+    expect(updated).toContain('## 原始需求\n\n更新后的当前需求');
+    expect(updated).not.toContain('对话和 issue 互不影响');
+    expect(updated).toContain('## 设计与实施');
     expect(updated).toContain('人工过程记录：保留我。');
+    await expect(fsp.stat(path.join(cwd, rel))).rejects.toThrow();
     const index = await fsp.readFile(
       path.join(cwd, '.panda/modules/terminal-runtime/ISSUES.md'),
       'utf8',
@@ -183,12 +196,112 @@ describe('ModuleDocs', () => {
   test('MODULE 身份与数据库冲突时拒绝覆盖', async () => {
     const { cwd, docs, module } = await setup();
     await docs.ensureModule(module);
-    await expect(docs.ensureModule({ ...module, id: 6 })).rejects.toThrow('身份冲突');
+    await expect(docs.ensureModule({
+      ...module,
+      id: 6,
+      syncUid: '018bcfe5-6800-7102-8304-05060708090a',
+    })).rejects.toThrow('身份冲突');
     const text = await fsp.readFile(
       path.join(cwd, '.panda/modules/terminal-runtime/MODULE.md'),
       'utf8',
     );
     expect(text).toContain('module_id: 5');
     expect(text).not.toContain('module_id: 6');
+  });
+});
+
+/** #277 / I-01：跨 issue 的连续性改由这一小段结构化知识承担，替代继承整条 transcript */
+describe('模块知识区 module-knowledge（纯函数）', () => {
+  const doc = [
+    '# issue 引擎',
+    '',
+    '## 职责边界',
+    '',
+    '这段是人写的，永远不能被动。',
+    '',
+    '<!-- panda:module-index:start -->',
+    '- [A](a/MODULE.md)',
+    '<!-- panda:module-index:end -->',
+    '',
+  ].join('\n');
+  const add = (text: string, id: number, extra: Partial<{ status: string; title: string; note: string }> = {}) =>
+    appendModuleKnowledge(text, {
+      issueId: id, status: extra.status ?? 'done', title: extra.title ?? `任务 ${id}`,
+      ...(extra.note !== undefined ? { note: extra.note } : {}),
+    });
+
+  test('追加一条：只动自己的区块，人工正文与其它区块原样保留', () => {
+    const out = add(doc, 7, { note: '已上线' });
+    expect(out).toContain('- #7 done · 任务 7 —— 已上线');
+    expect(out).toContain('这段是人写的，永远不能被动。');
+    expect(out).toContain('<!-- panda:module-index:start -->');
+    expect(out).toContain('<!-- panda:module-index:end -->');
+    // 区块自带说明，避免有人手工去改
+    expect(out).toContain('由 PandaDOS 引擎在每条 issue 结束时自动维护');
+  });
+
+  test('整段重写而不是逐行追加：重复写同样内容不会越写越乱', () => {
+    const once = add(doc, 7, { note: 'n' });
+    const twice = add(once, 7, { note: 'n' });
+    expect(twice).toBe(once);
+    expect(twice.match(/panda:module-knowledge:start/g)).toHaveLength(1);
+  });
+
+  test('同一 issue 只留最新一条，并移到末尾（末尾 = 最近）', () => {
+    let out = add(doc, 1, { note: '第一次' });
+    out = add(out, 2);
+    out = add(out, 1, { note: '第二次' });
+    const lines = parseModuleKnowledge(out);
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('#2');
+    expect(lines[1]).toContain('第二次');
+    expect(out).not.toContain('第一次');
+  });
+
+  test('只留最近 N 条：更早的按顺序丢掉', () => {
+    let out = doc;
+    for (let i = 1; i <= 6; i++) out = add(out, i);
+    out = appendModuleKnowledge(out, { issueId: 7, status: 'done', title: '任务 7' }, { maxEntries: 3 });
+    const lines = parseModuleKnowledge(out);
+    expect(lines).toHaveLength(3);
+    expect(lines.map((l) => l.split(' ')[1])).toEqual(['#5', '#6', '#7']);
+  });
+
+  test('单条超长按字符截断，但不把这条丢掉', () => {
+    const line = formatModuleKnowledgeEntry({
+      issueId: 9, status: 'done', title: 'T'.repeat(1000), note: 'N'.repeat(1000),
+    });
+    expect(line.length).toBe(MAX_KNOWLEDGE_ENTRY_CHARS);
+    expect(line).toStartWith('- #9 done · ');
+    expect(line).toEndWith('…');
+  });
+
+  test('总量超限从最旧的开始丢，至少留住刚写进去的那条', () => {
+    let out = doc;
+    for (let i = 1; i <= 5; i++) out = add(out, i, { note: 'x'.repeat(200) });
+    out = appendModuleKnowledge(out, { issueId: 99, status: 'done', title: '最新' }, { maxChars: 400 });
+    const lines = parseModuleKnowledge(out);
+    expect(lines.at(-1)).toContain('#99');
+    expect(lines.join('\n').length).toBeLessThanOrEqual(400);
+  });
+
+  test('换行与多余空白压平：一条就是一行，否则解析会散架', () => {
+    const out = add(doc, 3, { title: '多\n行\n标题', note: '带  空白\n的备注' });
+    const lines = parseModuleKnowledge(out);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toBe('- #3 done · 多 行 标题 —— 带 空白 的备注');
+  });
+
+  test('文档里没有该区块时凭空建；空文档也能写', () => {
+    expect(parseModuleKnowledge('# 空\n')).toEqual([]);
+    expect(add('', 1)).toContain('- #1 done · 任务 1');
+  });
+
+  test('区块被人手改坏（缺 end 标记）时不吞掉其它内容', () => {
+    const broken = `${doc}\n<!-- panda:module-knowledge:start -->\n- #1 done · 旧的\n`;
+    const out = add(broken, 2);
+    expect(out).toContain('这段是人写的，永远不能被动。');
+    expect(out).toContain('<!-- panda:module-index:start -->');
+    expect(out).toContain('- #2 done · 任务 2');
   });
 });

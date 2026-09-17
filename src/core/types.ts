@@ -86,13 +86,8 @@ export function parseAutoApproveLevel(v: unknown): AutoApproveLevel | null {
 
 export type ProjectStatus = 'active' | 'archived';
 
-/**
- * 项目类型（009 迁移）：
- * 'issue' = issue 看板驱动开发（默认，向后兼容存量项目）；
- * 'chat'  = 纯对话模式——不建 issue，维护多条独立对话，AI 代理产物直接落项目 cwd。
- * 对话（conversations.kind）复用同一取值：'issue'=引擎绑定执行会话；'chat'=独立聊天会话。
- */
-export type ProjectKind = 'issue' | 'chat';
+/** 对话类型：issue 引擎执行会话或项目级独立聊天会话。 */
+export type ConversationKind = 'issue' | 'chat';
 
 /**
  * 「Agent 认知总结」后台任务态（007 迁移 summary_status）：
@@ -102,6 +97,7 @@ export type SummaryStatus = 'idle' | 'running' | 'done' | 'error';
 
 export interface Project {
   id: number;
+  syncUid?: string;
   name: string;
   executorId: number;
   cwd: string;
@@ -134,8 +130,13 @@ export interface Project {
    * 卡点等人批准；关闭时计划自动确认直接开工、测试通过自动 commit/push 后直接 done。
    */
   manualReview: boolean;
-  /** 项目类型（009 迁移；默认 'issue'）：'issue'=issue 看板；'chat'=纯对话模式 */
-  kind: ProjectKind;
+  /**
+   * 项目级门禁命令（047）：null = 未配置，由控制面按 package.json scripts 探测默认命令；
+   * 空数组 = 显式「不跑门禁」。两者不是一回事，别在读取侧混成一个。
+   */
+  validationCommands: ValidationCommand[] | null;
+  /** 项目统一使用 Issue 看板；字段保留用于兼容既有持久化与接口。 */
+  kind: 'issue';
 }
 
 // ---------- 外部 issue 来源 / 导入记录 ----------
@@ -201,13 +202,15 @@ export interface Conversation {
    * 对话类型（009 迁移；默认 'issue'）：'issue'=issue 引擎绑定的执行会话（共用 cc-<pid>）；
    * 'chat'=独立聊天会话（每对话独立 tmux 会话 `chat-<convId>`，各自常驻可并存）。
    */
-  kind: ProjectKind;
+  kind: ConversationKind;
   /** 对话最近活跃（激活/收发）时刻（009 迁移；毫秒；null=从未激活），供对话列表按最近使用排序 */
   lastActiveTs: number | null;
   /** 本对话的弹窗自动批准档位（014 迁移；默认 'cautious' = 现状全部等人点） */
   autoApprove: AutoApproveLevel;
   /** Server-owned execution workspace; null keeps the project's canonical cwd. */
   workspaceCwd: string | null;
+  /** 从项目协作文件重建的只读历史；不得启动或恢复本机 Agent 会话。 */
+  sharedReadOnly?: boolean;
 }
 
 // ---------- Project Module ----------
@@ -219,6 +222,7 @@ export type ModuleSyncStatus = 'ready' | 'error';
 /** 项目内共享模块：固定一种代理、绑定一条可恢复的逻辑会话。 */
 export interface ProjectModule {
   id: number;
+  syncUid?: string;
   projectId: number;
   slug: string;
   displayName: string;
@@ -228,6 +232,13 @@ export interface ProjectModule {
   conversationId: string | null;
   syncStatus: ModuleSyncStatus;
   syncError: string | null;
+  /**
+   * 模块级技能挂载（046）：缺省/`null` = 未配置，沿用项目默认；数组 = 显式指定，
+   * 空数组 = 显式一个都不挂。superpowers 一类重技能默认不在项目默认里，要在这里显式开。
+   */
+  skills?: string[] | null;
+  /** 模块默认推理档（048）：null = 未配置，用控制面默认档 */
+  reasoningEffort?: ReasoningEffort | null;
   createdBy: number | null;
   createdTs: number;
   lastUsedTs: number | null;
@@ -249,10 +260,52 @@ export type IssueState =
   | 'merging'
   | 'done'
   | 'blocked'
+  | 'paused'
   | 'cancelled';
+
+/**
+ * 推理档位（048 / #281）：codex 的 `model_reasoning_effort`。
+ *
+ * **它是进程启动参数，会话跑起来之后改不了**——所以只在启动时定档，绝不为了切档去重启会话。
+ * claude 没有对应开关，这个字段对它无效（存了也不生效，UI 会说明）。
+ */
+export type ReasoningEffort = 'low' | 'medium' | 'high';
+
+export const REASONING_EFFORTS: readonly ReasoningEffort[] = ['low', 'medium', 'high'];
+
+/** 认不出的值一律当「未配置」（继承上一层），不猜、也不报错 */
+export function parseReasoningEffort(value: unknown): ReasoningEffort | null {
+  return typeof value === 'string' && (REASONING_EFFORTS as readonly string[]).includes(value)
+    ? (value as ReasoningEffort)
+    : null;
+}
+
+/**
+ * 一条门禁命令（047 / #279）。argv 不经 shell，`label` 只用于展示与事件留痕。
+ * 命令由项目配置或控制面探测得出，**绝不接受 Agent 输出直接构成**（见 ExecutorDriver.runCommand）。
+ */
+export interface ValidationCommand {
+  label: string;
+  argv: string[];
+}
+
+/**
+ * 一轮门禁的执行范围（047 / #279）。
+ *
+ * `targeted` = 只跑与本 issue 改动相关的测试文件；`full` = 全量。定向是省钱的主路径，
+ * 但只有在推导可信时才用——推不出来、或改动碰了公共文件，一律退回 `full`（`reason` 写清为什么）。
+ */
+export interface ValidationScope {
+  kind: 'targeted' | 'full' | 'docs';
+  /** 定向时要跑的测试文件（相对仓库根）；full 时为空数组 */
+  files: string[];
+  /** 这个范围是怎么定的，给人看的一句话 */
+  reason: string;
+}
 
 export interface Issue {
   id: number;
+  syncUid?: string;
   projectId: number;
   title: string;
   body: string | null;
@@ -270,6 +323,12 @@ export interface Issue {
   createdBy: number | null;
   createdTs: number;
   doneTs: number | null;
+  /** 047：本轮门禁的执行范围；null = 尚未计算（旧数据同此） */
+  validationScope?: ValidationScope | null;
+  /** 048：本条 issue 的推理档覆盖；null = 继承模块（高风险 issue 才临时提到 high） */
+  reasoningEffort?: ReasoningEffort | null;
+  /** 045：协作过程页路径；有过程页却几乎没有正文 = 正文疑似被截断（#289 的判据之一） */
+  docPath?: string | null;
 }
 
 // ---------- Project Workflow / Issue Workflow ----------
@@ -279,6 +338,7 @@ export type ProjectWorkflowTemplateStatus = 'active' | 'archived';
 
 export interface ProjectWorkflowTemplate {
   id: number;
+  syncUid?: string;
   projectId: number;
   name: string;
   description: string | null;

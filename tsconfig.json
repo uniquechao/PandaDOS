@@ -14,5 +14,5 @@
     "forceConsistentCasingInFileNames": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src", "ui", "shared"]
+  "include": ["src", "ui", "shared", "scripts"]
 }

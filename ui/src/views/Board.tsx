@@ -1,3 +1,4 @@
+import { SkillPolicyEditor } from '../components/SkillPolicyEditor';
 /**
  * 项目工作台（2026-07-15 重构：看板 → 主从工作台）。
  * 左栏（宽屏约 1/4）：issue 列表按状态分组（待确认→进行中→待办→完成），一眼триаж；
@@ -35,12 +36,12 @@ import type {
 } from '../lib/types';
 import { pollProjectSummary } from '../lib/pollSummary';
 import { resolveSelIid } from '../lib/seliid';
-import { filterIssueList, pageSlice, sortBoardGroup, type BoardGroupKey } from '../lib/issueOrdering';
-import { StatusBadge, WaitingBadge } from '../components/badges';
+import { filterIssueList, pageSlice, pickDefaultIssueId, sortBoardGroup, type BoardGroupKey } from '../lib/issueOrdering';
+import { AttentionBadge, StatusBadge } from '../components/badges';
 import { Modal } from '../components/Modal';
 import { ModuleSelect } from '../components/ModuleSelect';
 import { AutoApproveSwitch } from '../components/AutoApproveSwitch';
-import { readNewIssueAutoApprove, writeNewIssueAutoApprove } from '../lib/newIssuePrefs';
+import { readNewIssueAgent, writeNewIssueAgent, readNewIssueAutoApprove, writeNewIssueAutoApprove } from '../lib/newIssuePrefs';
 import { ImageAttach, type AttachedImage } from '../components/ImageAttach';
 import { IssueGitBranchFields } from '../components/IssueGitBranchFields';
 import { Loading } from '../components/Loaders';
@@ -52,7 +53,6 @@ import {
   issueGitBranchPayload,
   type IssueGitBranchValue,
 } from '../lib/issuegitbranch';
-import { ChatView } from './Chat';
 import { IssueWorkbench } from './IssueDetail';
 import { reconcileAgent } from '../components/AgentPicker';
 import { WorkflowGraph } from '../components/WorkflowGraph';
@@ -129,19 +129,8 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
     return m;
   }, [issues]);
 
-  // 宽屏默认落在最需要处理的一条：待确认 > 进行中 > 待办 > 任意
-  const defaultIid = useMemo(() => {
-    const list = issues ?? [];
-    const pick = (sts: IssueStatus[]): number | undefined => list.find((i) => sts.includes(i.status))?.id;
-    return (
-      list.find((i) => i.waitingInput)?.id ?? // 弹窗等人工选择的最优先
-      pick(['clarifying', 'plan_review', 'merge_review']) ??
-      pick(['planning', 'implementing', 'testing', 'merging']) ??
-      pick(['pending']) ??
-      list[0]?.id ??
-      null
-    );
-  }, [issues]);
+  // 宽屏默认落在最需要处理的一条：待确认 > 进行中 > 待办 > 最近完成 > 任意
+  const defaultIid = useMemo(() => pickDefaultIssueId(issues ?? []), [issues]);
 
   // 深链校验：URL 指定优先，但仅当它属于本项目（issues 加载完后校验）。失效/跨项目的旧深链
   // → 回退自动选优先项 + 清掉 URL 里的坏 iid（否则每 5s 轮询刷 404）。issues=null 视为未加载。
@@ -152,6 +141,15 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
   useEffect(() => {
     if (sel.stale) nav(`/p/${pid}`, { replace: true });
   }, [sel.stale, pid]);
+  // 默认选中落在已完成 issue 时，把初始折叠的完成组展开一次，让选中项在列表里可见；
+  // 只做一次，用户之后手动折叠不再被强制展开（#305）
+  const finishedAutoOpened = useRef(false);
+  const defaultIsDone = wide && sel.effectiveIid == null && issues?.find((i) => i.id === defaultIid)?.status === 'done';
+  useEffect(() => {
+    if (!defaultIsDone || finishedAutoOpened.current) return;
+    finishedAutoOpened.current = true;
+    setCollapsed((c) => ({ ...c, finished: false }));
+  }, [defaultIsDone]);
 
   const toggleSub = async (): Promise<void> => {
     if (subscribed === null) return;
@@ -199,9 +197,6 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
       toast.error(e instanceof ApiError ? e.message : String(e));
     }
   };
-
-  // chat 类型项目：没有 issue 看板，整页渲染对话视图（直链 /p/:pid 落到这里时也隐藏看板）
-  if (project?.kind === 'chat') return <ChatView pid={pid} />;
 
   // 窄屏且已选中 → 整页工作台（顶部返回键回列表）
   if (!wide && selectedId != null) {
@@ -323,7 +318,7 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
             <button class="btn sm" onClick={() => nav(`/p/${pid}/designs`)}>
               {tr('design.title')}
             </button>
-            {/* 项目对话模式入口：切到 chat 视图（chat 类型项目已在上方整页渲染，不会走到这里） */}
+            {/* 项目级独立对话入口。 */}
             <button class="btn sm" onClick={() => nav(`/p/${pid}/chat`)}>
               {tr('view.conversation')}
             </button>
@@ -409,17 +404,23 @@ function IssueRow({
   onOpen: () => void;
   onPin?: (pinned: boolean) => void;
 }) {
+  // 色带改由 attentionKind 驱动（#275）：以前是「澄清 > 卡点 > blocked > 在跑」的一串状态判断，
+  // 现在「在等什么」只有一处真相，前端不再各自拼。attentionKind 缺省（老接口/派生失败）时
+  // 退回原来的状态判断，不至于整条列表失色。
+  const attention = issue.attentionKind;
   const review = issue.status === 'plan_review' || issue.status === 'merge_review';
-  // 等待你澄清压过其它色带（#110）：这条不是在跑，是停下来等你——列表上必须一眼分得出来
-  const tone = issue.awaitingClarify
+  const doing = ['planning', 'implementing', 'testing', 'merging'].includes(issue.status);
+  const tone = attention === 'clarify'
     ? ' clarify'
-    : review
+    : attention === 'choice' || attention === 'review' || attention === 'stalled' || attention === 'verify'
       ? ' review'
-      : issue.status === 'blocked'
+      : attention === 'blocked'
         ? ' blocked'
-        : ['planning', 'implementing', 'testing', 'merging'].includes(issue.status)
-          ? ' doing'
-          : '';
+        : attention === 'none'
+          ? (doing ? ' doing' : '')
+          : issue.awaitingClarify // 兜底：老接口没有 attentionKind
+            ? ' clarify'
+            : review ? ' review' : issue.status === 'blocked' ? ' blocked' : doing ? ' doing' : '';
   const pinned = issue.pinnedTs != null;
   const canPin = issue.status === 'pending'; // 置顶只影响待办排队
   return (
@@ -430,13 +431,9 @@ function IssueRow({
       </div>
       <div class="wb-row-m">
         <StatusBadge status={issue.status} awaitingClarify={issue.awaitingClarify} />
-        {issue.waitingInput && <WaitingBadge />}
-        {/* awaitingClarify 已由状态徽标覆盖显示，这里不再重复挂一个「澄清待答」 */}
-        {issue.clarifyPending && !issue.awaitingClarify && (
-          <span class="badge b-amber" title={tr('board.clarifyOptional')}>
-            ❓ {tr('board.clarificationPending')}
-          </span>
-        )}
+        {/* #275：等你澄清/选择/审核/验收/处理/受阻 统一由这一个徽标承载，
+            替掉原来的 WaitingBadge + clarifyPending 两块分散判断 */}
+        <AttentionBadge kind={issue.attentionKind} />
         {issue.module && <span class="badge b-gray">{issue.module}</span>}
         {issue.agent === 'codex' && <span class="badge b-ai">codex</span>}
         <span class="badge b-gray" title={tr('board.creator', { name: issue.createdByName || '—' })}>
@@ -631,10 +628,12 @@ function NewIssueModal({
   const [category, setCategory] = useState<IssueCategory>('task');
   const [module, setModule] = useState('');
   const [modules, setModules] = useState<ProjectModule[]>([]);
-  const [agent, setAgent] = useState<AgentKind>('claude');
+  const [agent, setAgent] = useState<AgentKind>(readNewIssueAgent);
   // 批准档位（#115）：初值 = 本机上次新建用的那档（没记录 → medium）
   const [autoApprove, setAutoApprove] = useState<AutoApproveLevel>(readNewIssueAutoApprove);
   const [team, setTeam] = useState(false);
+  const [executionMode,setExecutionMode]=useState<'direct'|'planned'>('direct');
+  const [skillPolicy,setSkillPolicy]=useState<Record<string,'auto'|'manual'|'disabled'>>({});
   const [images, setImages] = useState<AttachedImage[]>([]);
   const [gitBranch, setGitBranch] = useState<IssueGitBranchValue>({
     targetBranch: '',
@@ -652,13 +651,9 @@ function NewIssueModal({
 
   const uploading = images.some((im) => im.rel === null && !im.error);
   const selectedModule = modules.find((m) => m.slug === module.trim() || m.displayName === module.trim());
-  const effectiveAgent = selectedModule?.agent ?? agent;
+  // agent 保留手动偏好；模块绑定和能力回退只决定本次实际代理。
+  const effectiveAgent = selectedModule?.agent ?? reconcileAgent(agent, supportedAgents) ?? agent;
   const agentUnavailable = !supportedAgents.includes(effectiveAgent);
-
-  useEffect(() => {
-    const next = reconcileAgent(agent, supportedAgents);
-    if (next) setAgent(next);
-  }, [supportedAgents]);
 
   useEffect(() => {
     void api<{ modules: ProjectModule[] }>(`/api/projects/${pid}/modules`)
@@ -693,7 +688,8 @@ function NewIssueModal({
             ? { moduleName: module.trim() }
             : {}),
         implMode: team ? 'team' : 'seq',
-        agent,
+        executionMode, skillPolicy,
+        agent: effectiveAgent,
         autoApprove,
         ...(workflowTemplateId !== null ? { workflowTemplateId } : {}),
         ...issueGitBranchPayload(gitBranch),
@@ -752,7 +748,7 @@ function NewIssueModal({
               </section>
             </div>
           )}
-          {err && <div class="err">{err}</div>}
+        {err && <div class="err">{err}</div>}
         </div>
         <div class="mbtns">
           <button class="btn" onClick={() => { setWorkflowTemplateId(null); setWorkflowPickerOpen(false); }}>{tr('workflow.noWorkflow')}</button>
@@ -787,11 +783,7 @@ function NewIssueModal({
             <ModuleSelect
               modules={modules}
               value={module}
-              onChange={(value) => {
-                setModule(value);
-                const picked = modules.find((m) => m.slug === value.trim() || m.displayName === value.trim());
-                if (picked) setAgent(picked.agent);
-              }}
+              onChange={setModule}
               placeholder={tr('board.autoModule')}
             />
           </label>
@@ -799,10 +791,17 @@ function NewIssueModal({
         <label class="field">
           {tr('board.agent')}
           <select
-            value={selectedModule?.agent ?? agent}
+            value={effectiveAgent}
             disabled={Boolean(selectedModule)}
-            onChange={(e) => setAgent(e.currentTarget.value as AgentKind)}
+            onChange={(e) => {
+              const picked = e.currentTarget.value as AgentKind;
+              setAgent(picked);
+              writeNewIssueAgent(picked);
+            }}
           >
+            {selectedModule && agentUnavailable && (
+              <option value={selectedModule.agent}>{selectedModule.agent === 'claude' ? 'Claude Code' : 'Codex'}</option>
+            )}
             {supportedAgents.map((a) => (
               <option key={a} value={a}>{a === 'claude' ? 'Claude Code' : 'Codex'}</option>
             ))}
@@ -848,6 +847,10 @@ function NewIssueModal({
             </div>
           )}
         </section>
+          <label class="row"><span>{tr('status.executionDetails')}</span><select value={executionMode} onChange={e=>setExecutionMode(e.currentTarget.value as 'direct'|'planned')}>
+          <option value="direct">{tr('status.direct')}</option><option value="planned">{tr('status.planned')}</option>
+        </select></label>
+        <SkillPolicyEditor pid={pid} moduleId={selectedModule?.id} value={skillPolicy} onChange={setSkillPolicy} />
         {err && <div class="err">{err}</div>}
       </div>
       <div class="mbtns">

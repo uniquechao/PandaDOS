@@ -30,6 +30,10 @@ import {
   USERNAME_RE,
   type UserStore,
 } from '../../core/users';
+import { UsageStore, type UsageBucket } from '../../core/usage-store';
+import { costOf } from '../../core/usage';
+import { weeklyReport } from '../../core/usage-weekly';
+import { IssueStore } from '../../issues/engine';
 import { json, type RouteDef } from '../middleware';
 import { parseSettingsBody } from './me';
 
@@ -133,6 +137,195 @@ export function adminRoutes(deps: AdminRoutesDeps): RouteDef[] {
   const { db, users } = deps;
 
   return [
+    // ===== 成本视图（#282 / I-08、I-09；仅管理员，跨所有项目） =====
+    {
+      /**
+       * 三档聚合：项目 / issue / 「非 Issue 会话」。
+       *
+       * 时间窗（from/to）**只作用于 issue 档**（按 issue 创建时间筛）：项目与会话档的用量是
+       * 按会话累计的，表里没有按时间分桶的数据，硬按 `updated_ts`（最后一次扫描时刻）过滤
+       * 只会给出一个看起来精确的错数。响应里用 `windowAppliesTo` 明说这件事，别让人误读。
+       */
+      method: 'GET',
+      path: '/api/admin/usage',
+      auth: 'admin',
+      handler: ({ url }) => {
+        const usage = new UsageStore(db);
+        const issues = new IssueStore(db);
+        const num = (key: string): number | undefined => {
+          const raw = url.searchParams.get(key);
+          const n = raw === null ? Number.NaN : Number(raw);
+          return Number.isFinite(n) ? n : undefined;
+        };
+        const projectId = num('projectId');
+        const from = num('from');
+        const to = num('to');
+        const limit = Math.min(Math.max(num('limit') ?? 100, 1), 500);
+
+        const names = new Map<number, string>();
+        for (const p of db.query<{ id: number; name: string }, []>('SELECT id, name FROM projects').all()) {
+          names.set(p.id, p.name);
+        }
+        const pricing = usage.pricing();
+        const named = <T extends UsageBucket>(rows: T[]): Array<T & { projectName: string; costUsd: number }> =>
+          rows
+            .filter((r) => projectId === undefined || r.projectId === projectId)
+            .map((r) => ({ ...r, projectName: names.get(r.projectId) ?? '', costUsd: costOf(r, pricing) }));
+
+        const meta = new Map<number, { projectId: number; title: string; status: string; createdTs: number }>();
+        for (const row of db
+          .query<{ id: number; project_id: number; title: string; status: string; created_ts: number }, []>(
+            'SELECT id, project_id, title, status, created_ts FROM issues',
+          )
+          .all()) {
+          meta.set(row.id, {
+            projectId: row.project_id, title: row.title, status: row.status, createdTs: row.created_ts,
+          });
+        }
+
+        const issueRows = usage
+          .listIssueUsage(projectId)
+          .flatMap((bucket) => {
+            const info = bucket.issueId === undefined ? undefined : meta.get(bucket.issueId);
+            if (!info) return [];
+            if (from !== undefined && info.createdTs < from) return [];
+            if (to !== undefined && info.createdTs > to) return [];
+            const stats = issues.issueCostStats(bucket.issueId!);
+            return [{
+              issueId: bucket.issueId!,
+              projectId: info.projectId,
+              projectName: names.get(info.projectId) ?? '',
+              title: info.title,
+              status: info.status,
+              createdTs: info.createdTs,
+              usage: stats.usage,
+              testRetries: stats.testRetries,
+              nudges: stats.nudges,
+              judged: stats.judged,
+              clarifies: stats.clarifies,
+              validationMs: stats.validationMs,
+              validationRuns: stats.validationRuns,
+              costUsd: costOf(stats.usage, pricing),
+            }];
+          })
+          .slice(0, limit);
+
+        return json({
+          ok: true,
+          window: {
+            ...(from === undefined ? {} : { from }),
+            ...(to === undefined ? {} : { to }),
+            // 时间窗只筛 issue 档；项目/会话档是累计值
+            windowAppliesTo: 'issues',
+          },
+          pricing,
+          grand: usage.grandTotal(),
+          grandCostUsd: costOf(usage.grandTotal(), pricing),
+          projects: named(usage.listProjectUsage()),
+          chat: named(usage.listChatUsage()),
+          unattributed: named(usage.unattributedByProject()),
+          issues: issueRows,
+        });
+      },
+    },
+
+    {
+      /**
+       * 周度视图（#295）：按模块把「钱」和「完成 / 失败 / 恢复」并排放，
+       * 回答 #282 设埋点的初衷问题——**只优化 token，有没有把可靠性一起优化没了**。
+       *
+       * 与上面那个累计口径的 `/api/admin/usage` 不同，本条**真的按时间分桶**（065 的
+       * `usage_daily`），所以周区间是实打实的筛选，不需要再声明 `windowAppliesTo`。
+       * 口径（北京时间日切、周一起算、失败率/恢复率的分母）统一在 core/usage-weekly 的
+       * 文件头，这里只做参数解析与项目名拼接，别在这一层再算一遍。
+       *
+       * `weekStart` 收周内任意一天的日键（`YYYY-MM-DD`），内部归一到那一周的周一；
+       * 缺省 = 现在所在那一周。格式不对直接 400——静默回退到本周会让人对着错的一周做决策。
+       */
+      method: 'GET',
+      path: '/api/admin/usage/weekly',
+      auth: 'admin',
+      handler: ({ url }) => {
+        const rawWeek = url.searchParams.get('weekStart');
+        if (rawWeek !== null && !/^\d{4}-\d{2}-\d{2}$/.test(rawWeek)) {
+          return json({ ok: false, error: 'weekStart 必须是 YYYY-MM-DD' }, 400);
+        }
+        const rawProject = url.searchParams.get('projectId');
+        const projectId = rawProject === null ? undefined : Number(rawProject);
+        if (projectId !== undefined && !Number.isFinite(projectId)) {
+          return json({ ok: false, error: 'projectId 必须是数字' }, 400);
+        }
+
+        const report = weeklyReport(db, {
+          ...(rawWeek === null ? {} : { week: rawWeek }),
+          ...(projectId === undefined ? {} : { projectId }),
+        });
+
+        const names = new Map<number, string>();
+        for (const p of db.query<{ id: number; name: string }, []>('SELECT id, name FROM projects').all()) {
+          names.set(p.id, p.name);
+        }
+        return json({
+          ok: true,
+          ...(projectId === undefined ? {} : { projectId }),
+          week: report.week,
+          pricing: report.pricing,
+          days: report.days,
+          modules: report.modules.map((m) => ({ ...m, projectName: names.get(m.projectId) ?? '' })),
+          totals: report.totals,
+        });
+      },
+    },
+
+    {
+      /** 单价表（#282 / Q2）：后台可配，绝不写死在代码里 */
+      method: 'GET',
+      path: '/api/admin/usage/pricing',
+      auth: 'admin',
+      handler: () => json({ ok: true, pricing: new UsageStore(db).pricing() }),
+    },
+    {
+      method: 'PUT',
+      path: '/api/admin/usage/pricing',
+      auth: 'admin',
+      handler: async ({ req }) => {
+        const b = await req.json().catch(() => ({})) as Record<string, unknown>;
+        const store = new UsageStore(db);
+        const cur = store.pricing();
+        const num = (key: string, fallback: number): number =>
+          typeof b[key] === 'number' && Number.isFinite(b[key] as number) ? (b[key] as number) : fallback;
+        try {
+          return json({
+            ok: true,
+            pricing: store.setPricing({
+              currency: typeof b.currency === 'string' && b.currency.trim() ? b.currency.trim() : cur.currency,
+              inputPerMTok: num('inputPerMTok', cur.inputPerMTok),
+              cachedInputPerMTok: num('cachedInputPerMTok', cur.cachedInputPerMTok),
+              outputPerMTok: num('outputPerMTok', cur.outputPerMTok),
+              reasoningPerMTok: num('reasoningPerMTok', cur.reasoningPerMTok),
+            }),
+          });
+        } catch (e) {
+          return json({ ok: false, error: String(e).slice(0, 200) }, 400);
+        }
+      },
+    },
+    {
+      /**
+       * 回扫（#282 / Q3）：把游标与累计清零，下一轮采集从头重算——历史回填与基线对齐都靠它。
+       * 同时清 issue_usage（那张表是累加的，不清就会重复计数）。
+       */
+      method: 'POST',
+      path: '/api/admin/usage/rescan',
+      auth: 'admin',
+      handler: async ({ req }) => {
+        const b = await req.json().catch(() => ({})) as Record<string, unknown>;
+        const projectId = typeof b.projectId === 'number' && Number.isFinite(b.projectId) ? b.projectId : undefined;
+        const reset = new UsageStore(db).resetScan(projectId);
+        return json({ ok: true, reset });
+      },
+    },
+
     // ===== 驱动大模型配置 =====
     {
       method: 'GET',

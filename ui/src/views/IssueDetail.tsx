@@ -1,15 +1,15 @@
+import { SkillPolicyEditor } from '../components/SkillPolicyEditor';
 /**
  * Issue 工作台（2026-07-15 重构：看板→主从工作台的右栏）。
  * 一个 issue 的三视图（tab，2026-07-24 issue #80 提交併入改动）：
  *  - 详情：body / 截图 / 计划(子任务)；
  *  - 执行：执行现场——「对话」(ChatPane 钉住 issue conv，含菜单/输入) 与「原生」(真实代理 tmux) 二选一；
- *  - 改动：本 issue 的完整 git 现场——状态头（分支/提交数/推送态/快照标注）+
- *         ⏳未提交树 + ✅已提交树（ChangeTree 目录树）+ 提交记录区；
- *         点文件 → 范围内/工作区单文件 diff，点提交 → 提交详情（复用 Git 页组件）。
+ *  - 改动：合并本 issue 已提交与执行中未提交的文件，按路径去重后显示一棵 ChangeTree；
+ *         点文件 → 对应范围内/工作区单文件 diff。
  *         范围：固定/共享分支取 impl_base 起点 start..tip，否则 base..branch。
  * 卡点操作（GateBar：plan/merge review、blocked、clarifying、pending 启动）：
  *  - 执行 tab 落在 ChatPane 底部拇指区（承接 CC 菜单同一操作区）；
- *  - 其余 tab 作为工作台底部常驻条 —— 让开发者「看着 diff/提交就地拍板」。
+ *  - 其余 tab 作为工作台底部常驻条 —— 让开发者看着详情或 diff 就地拍板。
  * embedded=true：作为看板右栏嵌入（无返回键，左栏列表即导航）；
  * embedded=false：窄屏整页（顶部返回键回项目看板）。
  */
@@ -17,10 +17,12 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { api, ApiError, getProjectExecutorAgents, setIssueAutoApprove } from '../lib/api';
 import { nav } from '../lib/router';
-import { timeAgo, tryJson } from '../lib/fmt';
+import { timeAgo, truncate, tryJson } from '../lib/fmt';
+import { fmtDuration } from '../lib/runstream';
 import { onLazyLoadError } from '../lib/updatePrompt';
 import { ChatPane } from '../components/ChatPane';
 import type { TermStatus } from '../components/TermPane';
+import { AgentLogo } from '../components/AgentLogo';
 import { AutoApproveSwitch } from '../components/AutoApproveSwitch';
 import { reconcileAgent } from '../components/AgentPicker';
 import { NativeModeSwitch, type NativeMode } from '../components/NativeModeSwitch';
@@ -28,6 +30,7 @@ import { canEditSubtask, ExecProgress, execProgressState, stepGlyph } from '../c
 import type {
   AgentKind,
   AutoApproveLevel,
+  CompletionReport,
   ConversationSegment,
   Gate,
   Issue,
@@ -36,15 +39,19 @@ import type {
   IssueEvent,
   IssueGitInfo,
   IssueWorkflowRuntime,
-  IssuePushState,
   MergeGatePayload,
   PlanGatePayload,
   ProjectModule,
+  ReasoningEffort,
+  ReasoningInfo,
+  MergedFromInfo,
   Subtask,
+  UnblockRequest,
+  ValidationInfo,
 } from '../lib/types';
-import { CatBadge, ModelBadge, StatusBadge, WaitingBadge } from '../components/badges';
+import { AttentionBadge, CatBadge, ModelBadge, StatusBadge } from '../components/badges';
 import { useConvModel } from '../lib/useConvModel';
-import { clarifyPanelState, retryPlan } from '../lib/issueStatus';
+import { clarifyPanelState, pushFailureState, retryPlan } from '../lib/issueStatus';
 import { toApprovalLog, type ApprovalLogRow } from '../lib/approvalLog';
 import { Loading } from '../components/Loaders';
 import { Modal } from '../components/Modal';
@@ -58,13 +65,9 @@ import { ImageLightbox } from '../components/ImageLightbox';
 import { ImgThumb } from '../components/ImgThumb';
 import { gitImageUrls } from '../components/GitImagePreview';
 import {
-  CommitPanel,
   DiffContent,
   PathText,
-  PlusMinus,
-  RefBadges,
   StatusChip,
-  sumFiles,
   useFileDiff,
 } from './Git';
 import { ChangeTree } from '../components/ChangeTree';
@@ -77,10 +80,24 @@ import {
   type IssueGitBranchValue,
 } from '../lib/issuegitbranch';
 import { tr } from '../i18n/runtime';
+import { parseBlockedNote } from '../../../shared/blocked';
 import { WorkflowGraph } from '../components/WorkflowGraph';
 import { issueWorkflowStatusKey, workflowNodeStatusKey, workflowWorktreeStatusKey } from '../lib/workflow';
 
 const POLL_MS = 5000;
+
+export function completionReportState(
+  report: CompletionReport | null,
+  _hasLegacySummary: boolean,
+  status: Issue['status'],
+): { tone: 'success' | 'warning' | 'legacy'; canContinue: boolean } {
+  if (!report) return { tone: 'legacy', canContinue: ['done', 'blocked'].includes(status) };
+  const incomplete = report.outcome !== 'complete' || report.unmetGoals.length > 0 || report.remainingWork.length > 0;
+  return {
+    tone: incomplete ? 'warning' : 'success',
+    canContinue: incomplete && ['done', 'blocked'].includes(status),
+  };
+}
 
 type WbTab = 'detail' | 'workflow' | 'exec' | 'changes';
 
@@ -109,6 +126,9 @@ export function IssueWorkbench({
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [recoveryGuidance, setRecoveryGuidance] = useState('');
   const [recoveryError, setRecoveryError] = useState('');
+  const [doneReopenOpen, setDoneReopenOpen] = useState(false);
+  const [doneReopenGuidance, setDoneReopenGuidance] = useState('');
+  const [doneReopenError, setDoneReopenError] = useState('');
   const [subtaskEditRequest, setSubtaskEditRequest] = useState<{ index: number; nonce: number } | null>(null);
   const [clarifyOpen, setClarifyOpen] = useState(false);
   // 当前在灯箱里查看的截图相对路径（null=未打开）；详情/编辑里的缩略图点击时设置。
@@ -155,6 +175,9 @@ export function IssueWorkbench({
     setRecoveryOpen(false);
     setRecoveryGuidance('');
     setRecoveryError('');
+    setDoneReopenOpen(false);
+    setDoneReopenGuidance('');
+    setDoneReopenError('');
     setSubtaskEditRequest(null);
     setLightbox(null); // 切换 issue 时收起灯箱
     load();
@@ -199,13 +222,16 @@ export function IssueWorkbench({
       const ev = events[i]!;
       if (ev.kind !== 'transition') continue;
       const d = tryJson<{ to?: string; note?: string }>(ev.dataJson);
-      if (d?.to === 'blocked') return d.note ?? tr('issue.noReason');
+      if (d?.to === 'blocked' || d?.to === 'paused') return d.note ?? tr('issue.noReason');
     }
     return tr('issue.noReason');
   }, [issue, events]);
 
   /** 弹窗自动批复记录（issue #91）：events 已在手，纯本地归约，不额外请求 */
   const approvals = useMemo(() => toApprovalLog(events), [events]);
+
+  /** 「已完成但未推送」标记（#272）：同样是纯本地归约，推成功后自动消失 */
+  const pushFailure = useMemo(() => pushFailureState(events), [events]);
 
   const act = async (fn: () => Promise<unknown>): Promise<void> => {
     if (busy) return;
@@ -234,6 +260,18 @@ export function IssueWorkbench({
     );
   };
 
+  /**
+   * 改本 issue 的推理档覆盖（#281 / I-04）：'' = 继承模块。
+   * codex 的 effort 是**进程启动参数**，所以这里改完只对**下次启动的会话**生效——
+   * 不做乐观更新也不重启会话，等接口回来刷新详情即可。
+   */
+  const changeReasoning = (value: string): void => {
+    const next = value === '' ? null : (value as ReasoningEffort);
+    void api(`/api/projects/${pid}/issues/${iid}`, 'PATCH', { reasoningEffort: next })
+      .then(() => load())
+      .catch((e: unknown) => setActErr(e instanceof ApiError ? e.message : String(e)));
+  };
+
   /** 复活重跑（#93）：二次确认必须点破「立刻开跑」——想改需求得先改完再点，落 pending 就没窗口了 */
   const reopen = (): void => {
     const plan = retryPlan('cancelled', false);
@@ -257,8 +295,22 @@ export function IssueWorkbench({
     void post(`/api/projects/${pid}/issues/${iid}/retry-gate`);
   };
 
+  /** 一键拆回智能合并（#289）：把宿主与被并项都按快照还原 */
+  const unmerge = (): void => {
+    void api(`/api/projects/${pid}/issues/${iid}/unmerge`, 'POST', {})
+      .then(() => load())
+      .catch((e: unknown) => setActErr(e instanceof ApiError ? e.message : String(e)));
+  };
+
+  /** 撤销「已排队等待恢复」（#283）：排错了/改主意了要能收回来 */
+  const cancelUnblockQueue = (): void => {
+    void api(`/api/projects/${pid}/issues/${iid}/unblock/cancel`, 'POST', {})
+      .then(() => load())
+      .catch((e: unknown) => setActErr(e instanceof ApiError ? e.message : String(e)));
+  };
+
   const openRecovery = (): void => {
-    if (issue?.status !== 'blocked') return;
+    if (!['blocked', 'paused'].includes(issue?.status ?? '')) return;
     setRecoveryError('');
     setRecoveryOpen(true);
   };
@@ -278,6 +330,28 @@ export function IssueWorkbench({
       load();
     } catch (error) {
       setRecoveryError(error instanceof ApiError ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitDoneReopen = async (): Promise<void> => {
+    if (busy || !doneReopenGuidance.trim()) {
+      if (!doneReopenGuidance.trim()) setDoneReopenError(tr('issue.continueGuidanceRequired'));
+      return;
+    }
+    setBusy(true);
+    setDoneReopenError('');
+    setActErr('');
+    try {
+      await api(`/api/projects/${pid}/issues/${iid}/reopen`, 'POST', {
+        guidance: doneReopenGuidance.trim(),
+      });
+      setDoneReopenOpen(false);
+      setDoneReopenGuidance('');
+      load();
+    } catch (error) {
+      setDoneReopenError(error instanceof ApiError ? error.message : String(error));
     } finally {
       setBusy(false);
     }
@@ -312,7 +386,7 @@ export function IssueWorkbench({
   const subs = detail?.subtasks ?? [];
   const doneN = subs.filter((s) => s.done).length;
   const blockedSubtaskIndex =
-    issue?.status === 'blocked'
+    issue && ['blocked', 'paused'].includes(issue.status)
       ? subs.findIndex((subtask, index) =>
           canEditSubtask(subtask, index, issue.subIndex, issue.status, issue.implMode),
         )
@@ -326,7 +400,7 @@ export function IssueWorkbench({
 
   const closeIssueEditor = (): void => {
     setEditing(false);
-    if (returnToRecovery && issue?.status === 'blocked') setRecoveryOpen(true);
+    if (returnToRecovery && ['blocked', 'paused'].includes(issue?.status ?? '')) setRecoveryOpen(true);
     setReturnToRecovery(false);
   };
 
@@ -354,7 +428,7 @@ export function IssueWorkbench({
   const closed = issue !== null && ['done', 'cancelled'].includes(issue.status);
   const needGateBar =
     issue !== null &&
-    ['plan_review', 'merge_review', 'blocked', 'clarifying', 'pending'].includes(issue.status);
+    ['plan_review', 'merge_review', 'blocked', 'paused', 'clarifying', 'pending'].includes(issue.status);
   const gateBar: JSX.Element | null = closed ? (
     issue!.status === 'cancelled' ? (
       // 取消不是死路（#93）：改完需求可以就地复活重跑，不用重开一条丢掉历史与模块绑定
@@ -442,13 +516,31 @@ export function IssueWorkbench({
               {issue.pinnedTs != null && issue.status === 'pending' && <span class="badge b-amber">📌 {tr('issue.pinned')}</span>}
               <CatBadge cat={issue.category} />
               <StatusBadge status={issue.status} awaitingClarify={issue.awaitingClarify} />
-              {issue.waitingInput && <WaitingBadge />}
+              {/* #275：统一的「在等什么」徽标，替掉原来的 WaitingBadge */}
+              <AttentionBadge kind={issue.attentionKind} />
               {subs.length > 0 && (
                 <span class="badge b-green">
                   {doneN}/{subs.length}
                 </span>
               )}
               {issue.module && <span class="badge b-gray">{issue.module}</span>}
+              <details class="mut small"><summary>{tr('status.executionDetails')}</summary>
+                <dl>{([
+                  ['status.injections','injected'],['status.validationRuns','validation_started'],
+                  ['status.validationReuse','validation_reused'],['status.reportRepairs','completion_report_retry'],
+                  ['status.skillUsage','skill_invoked'],
+                ] as const).map(([label,kind])=><div><dt>{tr(label)}</dt><dd>{events.filter(e=>e.kind===kind).length}</dd></div>)}</dl>
+                {events.filter(e=>['execution_route','skill_visibility','validation_passed','validation_failed','validation_reused'].includes(e.kind)).map(e=>{
+                  let data: Record<string,unknown>={};try{data=JSON.parse(e.dataJson ?? '{}');}catch{}
+                  return <div><time>{new Date(e.ts).toLocaleTimeString()}</time> {e.kind}
+                    {typeof data.reason==='string' && <p>{data.reason}</p>}
+                    {typeof data.durationMs==='number' && <span> {tr('status.durationSeconds',{value:Math.round(data.durationMs/1000)})}</span>}
+                    {Array.isArray(data.limitations) && data.limitations.map(v=><p>{String(v)}</p>)}
+                    {Array.isArray(data.inventory) && <ul>{data.inventory.map((v: {name:string;mode:string;source?:string;version?:string})=><li>{v.name} · {v.mode} {v.source} {v.version}</li>)}</ul>}
+                  </div>;
+                })}
+              </details>
+              <span class="badge">{tr(issue.executionMode === 'direct' ? 'status.direct' : 'status.planned')}</span>
               {issue.implMode === 'team' && <span class="badge b-purple">{tr('issue.team')}</span>}
               {issue.agent === 'codex' && <span class="badge b-ai">codex</span>}
               <ModelBadge model={model} />
@@ -478,7 +570,7 @@ export function IssueWorkbench({
                 {issue.pinnedTs != null ? `📌 ${tr('board.unpin')}` : `📌 ${tr('issue.pinned')}`}
               </button>
             )}
-            {issue && (issue.status === 'pending' || issue.status === 'blocked') && (
+            {issue && (issue.status === 'pending' || ['blocked', 'paused'].includes(issue.status)) && (
               <button class="btn sm" disabled={busy} onClick={() => openIssueEditor()}>
                 {tr('issue.edit')}
               </button>
@@ -495,6 +587,17 @@ export function IssueWorkbench({
 
       {/* 顶部常驻澄清提示条（tab 栏之上，任何 tab 都看得到；点击弹窗回答，答完自动收起） */}
       {clarifyPanel}
+
+      {/* 「已完成但未推送」警示条（#272）：与澄清条同层常驻，直到有一次 auto_push 成功 */}
+      {pushFailure && <PushFailedBar branch={pushFailure.branch} detail={pushFailure.detail} />}
+
+      {/* 「由多条 issue 合并而来」（#289）：给拆回入口，开跑后置灰并说明原因 */}
+      {detail?.mergedFrom && <MergedFromBar info={detail.mergedFrom} onUnmerge={unmerge} />}
+
+      {/* 「已排队等待恢复」（#283）：用户点过继续运行、项目当时忙，接力会自动接手 */}
+      {detail?.unblockRequest && (
+        <UnblockQueuedBar request={detail.unblockRequest} onCancel={cancelUnblockQueue} />
+      )}
 
       {/* iOS 分段控件（#113）：外层类名保留（测试/布局锚点），三枚 tab 收进 .seg 轨道 */}
       <div class="id-tabs wb-tabs">
@@ -530,6 +633,13 @@ export function IssueWorkbench({
             onOpenImage={setLightbox}
             onSaveSubtask={saveSubtask}
             editRequest={subtaskEditRequest}
+            onContinue={() => {
+              if (['blocked', 'paused'].includes(issue.status)) openRecovery();
+              else if (issue.status === 'done') {
+                setDoneReopenError('');
+                setDoneReopenOpen(true);
+              }
+            }}
           />
         )}
         {issue && tab === 'exec' && (
@@ -538,6 +648,10 @@ export function IssueWorkbench({
             pid={pid}
             issue={issue}
             conversationSegments={detail?.conversationSegments ?? []}
+            moduleSegments={detail?.moduleSegments ?? []}
+            validation={detail?.validation ?? null}
+            reasoning={detail?.reasoning ?? null}
+            onReasoning={changeReasoning}
             subs={subs}
             gateBar={gateBar}
             busy={busy}
@@ -559,7 +673,7 @@ export function IssueWorkbench({
       {/* 执行 tab 的卡点条在 ChatPane 内；其余 tab 常驻底部，看着 diff/提交就地拍板 */}
       {tab !== 'exec' && gateBar}
 
-      {recoveryOpen && issue?.status === 'blocked' && (
+      {recoveryOpen && ['blocked', 'paused'].includes(issue?.status ?? '') && (
         <BlockedRecoveryModal
           blockedReason={blockedReason}
           guidance={recoveryGuidance}
@@ -581,6 +695,22 @@ export function IssueWorkbench({
             setRecoveryOpen(false);
           }}
           onSubmit={() => void submitRecovery()}
+        />
+      )}
+
+      {doneReopenOpen && issue?.status === 'done' && (
+        <ContinueProcessingModal
+          guidance={doneReopenGuidance}
+          error={doneReopenError}
+          busy={busy}
+          onGuidanceChange={(value) => {
+            setDoneReopenGuidance(value);
+            if (value.trim()) setDoneReopenError('');
+          }}
+          onClose={() => {
+            if (!busy) setDoneReopenOpen(false);
+          }}
+          onSubmit={() => void submitDoneReopen()}
         />
       )}
 
@@ -629,7 +759,7 @@ function BlockedRecoveryModal(props: {
       >
         <section class="recovery-reason" aria-label={tr('issue.recoveryReason')}>
           <div class="recovery-label">{tr('issue.recoveryReason')}</div>
-          <div class="block-box">{props.blockedReason}</div>
+          <BlockedReason reason={props.blockedReason} />
         </section>
         <p class="recovery-help">{tr('issue.recoveryHelp')}</p>
         <label class="field recovery-guidance">
@@ -679,6 +809,56 @@ function BlockedRecoveryModal(props: {
           </button>
           <button class="btn primary" type="submit" disabled={props.busy || !props.guidance.trim()}>
             {props.busy ? tr('ui.saving') : tr('issue.confirmRecovery')}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function ContinueProcessingModal(props: {
+  guidance: string;
+  error: string;
+  busy: boolean;
+  onGuidanceChange: (value: string) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  return (
+    <Modal title={tr('issue.continueProcessingTitle')} onClose={props.onClose}>
+      <form
+        class="blocked-recovery"
+        onSubmit={(event) => {
+          event.preventDefault();
+          props.onSubmit();
+        }}
+      >
+        <div class="completion-report-alert" role="alert">
+          <strong>{tr('issue.continueProcessingWarningTitle')}</strong>
+          <span>{tr('issue.continueProcessingWarning')}</span>
+        </div>
+        <label class="field recovery-guidance">
+          {tr('issue.continueGuidance')}
+          <textarea
+            autoFocus
+            rows={5}
+            maxLength={4000}
+            value={props.guidance}
+            placeholder={tr('issue.continueGuidancePlaceholder')}
+            aria-invalid={props.error ? 'true' : undefined}
+            onInput={(event) => props.onGuidanceChange(event.currentTarget.value)}
+          />
+          <span class="mut small recovery-count">
+            {tr('issue.recoveryLength', { current: props.guidance.length, max: 4000 })}
+          </span>
+        </label>
+        {props.error && <div class="err">{props.error}</div>}
+        <div class="mbtns">
+          <button type="button" class="btn" disabled={props.busy} onClick={props.onClose}>
+            {tr('ui.cancel')}
+          </button>
+          <button type="submit" class="btn primary" disabled={props.busy || !props.guidance.trim()}>
+            {props.busy ? tr('ui.saving') : tr('issue.confirmContinueProcessing')}
           </button>
         </div>
       </form>
@@ -911,55 +1091,12 @@ function useIssueGit(
   return { info, err, refresh: () => setNonce((n) => n + 1) };
 }
 
-/** 推送状态 → 展示文案与徽标色（语义同后端 IssuePushState） */
-function pushBadge(p: IssuePushState): { text: string; cls: string } {
-  switch (p.state) {
-    case 'pushed':
-      return { text: tr('issue.pushed'), cls: 'b-green' };
-    case 'ahead':
-      return { text: tr('issue.aheadOrigin', { count: p.n }), cls: 'b-amber' };
-    case 'unpushed':
-      return { text: tr('issue.notPushed'), cls: 'b-amber' };
-    default:
-      return { text: tr('issue.noRemote'), cls: 'b-gray' };
-  }
-}
-
-/** 状态段（行内片段，并入头条单行）：N 条提交 · 推送状态 · 已提交文件数/增删行 · 工作区未提交数（活跃时）· 快照来源标注 */
-function IssueGitStatus({ info }: { info: IssueGitInfo }) {
-  const wtN = info.worktree?.length ?? 0;
-  const pb = info.push ? pushBadge(info.push) : null;
-  const totals = sumFiles(info.files);
-  return (
-    <>
-      <span class="mut small">{tr('issue.commitCount', { count: info.ahead })}</span>
-      {pb && <span class={`badge ${pb.cls}`}>{pb.text}</span>}
-      {info.files.length > 0 && (
-        <span class="mut small">
-          {tr('issue.fileCount', { count: info.files.length })}{' '}
-          {(totals.adds > 0 || totals.dels > 0) && <PlusMinus adds={totals.adds} dels={totals.dels} />}
-        </span>
-      )}
-      {info.worktree !== undefined && wtN > 0 && <span class="mut small">{tr('issue.uncommittedFiles', { count: wtN })}</span>}
-      {info.source === 'snapshot' && <span class="badge b-gray">{tr('issue.snapshot')}</span>}
-    </>
-  );
-}
-
-/** 改动 tab 状态头单行（#101 紧凑化）：分支 → 基线 + 状态段 + 刷新钮，窄屏靠 flex-wrap 折行 */
-function IssueGitHead({ info, onRefresh }: { info: IssueGitInfo; onRefresh: () => void }) {
+/** 改动 tab 只呈现本 issue 的文件视角，不暴露提交、推送或分支状态。 */
+function IssueGitHead({ count, onRefresh }: { count: number; onRefresh: () => void }) {
   return (
     <div class="wb-githead">
-      <span class="badge b-blue mono">⎇ {info.branch}</span>
-      {/* 固定/共享分支：改动是本 issue 自己的提交（自起点 sha 起），而非整条分支相对 base */}
-      {info.startSha ? (
-        <span class="mut small">
-          {tr('issue.sinceCommit', { sha: info.startSha.slice(0, 7) })}
-        </span>
-      ) : (
-        <span class="mut small">→ {info.base}</span>
-      )}
-      <IssueGitStatus info={info} />
+      <span class="btitle">{tr('issue.changesTab')}</span>
+      <span class="mut small">{tr('issue.fileCount', { count })}</span>
       <button class="linkbtn" style={{ marginLeft: 'auto' }} onClick={onRefresh}>
         ↻ {tr('ui.refresh')}
       </button>
@@ -1070,7 +1207,7 @@ function WorkflowRuntimePanel({ runtime }: { runtime: IssueWorkflowRuntime }) {
                 <span class="wfr-run-dot" aria-hidden="true" />
                 <div>
                   <strong>{node?.title ?? run.nodeKey}</strong>
-                  <span>{run.agent ? (run.agent === 'claude' ? 'Claude Code' : 'Codex') : tr(`workflow.nodeKind.${node?.kind ?? 'issue'}`)} · {tr('workflow.iterationAttempt', { iteration: run.iteration, attempt: run.attempt })}</span>
+                  <span>{run.agent ? <AgentLogo agent={run.agent} size="xs" /> : tr(`workflow.nodeKind.${node?.kind ?? 'issue'}`)} · {tr('workflow.iterationAttempt', { iteration: run.iteration, attempt: run.attempt })}</span>
                 </div>
                 <span class="wfr-mini-status">{tr(workflowNodeStatusKey(run.status))}</span>
               </div>
@@ -1086,6 +1223,102 @@ function WorkflowRuntimePanel({ runtime }: { runtime: IssueWorkflowRuntime }) {
   );
 }
 
+function ReportList({ items }: { items: string[] }) {
+  if (items.length === 0) return <div class="mut small">{tr('ui.none')}</div>;
+  return (
+    <ul class="completion-report-list">
+      {items.map((item, index) => <li key={index}>{item}</li>)}
+    </ul>
+  );
+}
+
+function CompletionReportCard({ issue, onContinue }: { issue: Issue; onContinue: () => void }) {
+  const report = issue.completionReport;
+  const state = completionReportState(report, !!issue.resultSummary, issue.status);
+  const outcomeKey = report?.outcome === 'complete'
+    ? 'issue.reportOutcomeComplete'
+    : report?.outcome === 'partial'
+      ? 'issue.reportOutcomePartial'
+      : report?.outcome === 'blocked'
+        ? 'issue.reportOutcomeBlocked'
+        : 'issue.reportOutcomeUnverified';
+  return (
+    <section class={`completion-report ${state.tone}`} aria-label={tr('issue.completionReport')}>
+      <header class="completion-report-head">
+        <div>
+          <div class="completion-report-kicker">{tr('issue.completionReport')}</div>
+          <div class="completion-report-title">{tr(outcomeKey)}</div>
+        </div>
+        <span class={`completion-report-badge ${state.tone}`}>{tr(outcomeKey)}</span>
+      </header>
+      {!report ? (
+        <div class="completion-report-alert" role="alert">
+          <strong>{tr('issue.reportLegacyWarningTitle')}</strong>
+          <span>{tr('issue.reportLegacyWarning')}</span>
+          {issue.resultSummary && <div class="completion-report-legacy">{issue.resultSummary}</div>}
+        </div>
+      ) : (
+        <div class="completion-report-body">
+          <section class="completion-report-section wide">
+            <h3>{tr('issue.reportObjective')}</h3>
+            <p>{report.objective}</p>
+          </section>
+          <section class="completion-report-section">
+            <h3>{tr('issue.reportImplementation')}</h3>
+            <ReportList items={report.implementation} />
+          </section>
+          <section class="completion-report-section">
+            <h3>{tr('issue.reportVerification')}</h3>
+            <ReportList items={report.verification} />
+          </section>
+          <section class="completion-report-section">
+            <h3>{tr('issue.reportAdvantages')}</h3>
+            <ReportList items={report.advantages} />
+          </section>
+          <section class="completion-report-section">
+            <h3>{tr('issue.reportDisadvantages')}</h3>
+            <ReportList items={report.disadvantages} />
+          </section>
+          <section class="completion-report-section wide completion-report-status">
+            <h3>{tr('issue.reportCompletion')}</h3>
+            <p>{report.completion}</p>
+          </section>
+          {/* #301：未达目标/后续动作只是告知——issue 已按现状收尾，系统不会因此停下，
+              也不需要用户动手。所以这里既不是 role="alert" 也不用受阻那套红档：
+              「告知」标记 + 一句话说明 + 中性 tint，与受阻面板一眼分得开。 */}
+          {!!report.optionalFollowUps?.length && <section><h4>{tr('status.optionalFollowUps')}</h4><ReportList items={report.optionalFollowUps} /></section>}
+          {(report.unmetGoals.length > 0 || report.remainingWork.length > 0) && (
+            <div class="completion-report-note wide">
+              <div class="crn-hd">
+                <span class="crn-fyi">{tr('issue.reportAttentionFyi')}</span>
+                <strong>{tr('issue.reportAttentionTitle')}</strong>
+              </div>
+              <p class="crn-note">{tr('issue.reportAttentionNote')}</p>
+              {report.unmetGoals.length > 0 && (
+                <section>
+                  <h3>{tr('issue.reportUnmetGoals')}</h3>
+                  <ReportList items={report.unmetGoals} />
+                </section>
+              )}
+              {report.remainingWork.length > 0 && (
+                <section>
+                  <h3>{tr('issue.reportRemainingWork')}</h3>
+                  <ReportList items={report.remainingWork} />
+                </section>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+      {state.canContinue && (
+        <div class="completion-report-actions">
+          <button class="btn primary" onClick={onContinue}>{tr('issue.continueProcessing')}</button>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function DetailTab({
   issue,
   pid,
@@ -1097,6 +1330,7 @@ function DetailTab({
   onOpenImage,
   onSaveSubtask,
   editRequest,
+  onContinue,
 }: {
   issue: Issue;
   pid: number;
@@ -1108,6 +1342,7 @@ function DetailTab({
   onOpenImage: (path: string) => void;
   onSaveSubtask: (index: number, text: string) => Promise<void>;
   editRequest: { index: number; nonce: number } | null;
+  onContinue: () => void;
 }) {
   const [editIndex, setEditIndex] = useState<number | null>(null);
   const [draft, setDraft] = useState('');
@@ -1150,6 +1385,7 @@ function DetailTab({
   return (
     <div class="id-scroll wb-detail">
       <IssueGitBranchSummary issue={issue} />
+      <SkillPolicyEditor pid={pid} issueId={issue.id} />
       {issue.body && <div class="id-body">{issue.body}</div>}
       {images.length > 0 && (
         <div class="id-imgs">
@@ -1158,13 +1394,8 @@ function DetailTab({
           ))}
         </div>
       )}
-      {issue.resultSummary && (
-        <div class="id-agentblock">
-          <div class="h2" style={{ margin: '2px 0 4px' }}>
-            📋 {tr('issue.executionSummary')}{issue.status === 'blocked' ? tr('issue.blockedProgress') : ''}
-          </div>
-          <div class="gate-box">{issue.resultSummary}</div>
-        </div>
+      {(issue.completionReport || issue.resultSummary || issue.status === 'done') && (
+        <CompletionReportCard issue={issue} onContinue={onContinue} />
       )}
       {(issue.clarifyFeedback || analyzing) && (
         <div class="id-agentblock">
@@ -1290,6 +1521,10 @@ function ExecTab({
   pid,
   issue,
   conversationSegments,
+  moduleSegments,
+  validation,
+  reasoning,
+  onReasoning,
   subs,
   gateBar,
   busy,
@@ -1300,6 +1535,14 @@ function ExecTab({
   pid: number;
   issue: Issue;
   conversationSegments: ConversationSegment[];
+  /** 本模块跨会话的全部分段（#277）：轮换之后历史仍在，执行页据此列出时间线 */
+  moduleSegments: ConversationSegment[];
+  /** 门禁范围与最近一次结果（#279）：只读展示，不给按钮 */
+  validation: ValidationInfo | null;
+  /** 生效推理档与来源（#281） */
+  reasoning: ReasoningInfo | null;
+  /** 改本 issue 的推理档覆盖（'' = 继承模块） */
+  onReasoning: (value: string) => void;
   /** 子任务计划（详情接口返回）：顶栏进度链用，空数组则整块不渲染 */
   subs: { text: string; done: boolean }[];
   gateBar: JSX.Element | null;
@@ -1308,13 +1551,16 @@ function ExecTab({
   onAutoApprove: (level: AutoApproveLevel) => void;
   /** 终止：取消整个 issue（带二次确认，父层实现） */
   onTerminate: () => void;
-  /** 受阻重试：解除阻塞重跑（父层实现） */
+  /** 受阻恢复：解除阻塞并从原阶段继续（父层实现） */
   onUnblock: () => void;
 }) {
   const [mode, setMode] = useState<NativeMode>('chat');
-  // 已收尾（done/cancelled）不会再有弹窗，档位锁死（#111）。受阻(blocked)仍可改——重试前调档正是它的用法
+  // 已收尾（done/cancelled）不会再有弹窗，档位锁死（#111）。受阻(blocked)仍可改——恢复执行前可调整档位
   const aaLocked = issue.status === 'done' || issue.status === 'cancelled';
-  // 顶栏行首插槽：切换钮 + 子任务进度链（对话/原生两种模式共用同一段，见 ExecNative）
+  // 顶栏行首插槽（#300 合成一行）：切换钮 + 审批档 + 门禁 + 推理档 + 子任务进度链。
+  // 门禁/推理档原本各占一整行（.val-line 带下边框），执行现场因此被三条横条切掉一大截高度——
+  // 它们都是「低频只读/低频微调」的元信息，内联进 .runctl 与运行操作同行即可，行放不下由该行横向滚动兜住。
+  // 对话与原生两种模式共用同一段（见 ExecNative），convId 为空的兜底分支也走这里。
   const seg = (
     <>
       <NativeModeSwitch mode={mode} onChange={setMode} />
@@ -1324,6 +1570,8 @@ function ExecTab({
         disabled={aaLocked}
         disabledHint={tr('issue.approvalLocked')}
       />
+      <ValidationLine validation={validation} />
+      <ReasoningLine reasoning={reasoning} onChange={onReasoning} />
       <ExecProgress subs={subs} subIndex={issue.subIndex} status={issue.status} />
     </>
   );
@@ -1344,6 +1592,7 @@ function ExecTab({
                 onUnblock,
               }}
               conversationSegments={conversationSegments}
+              moduleSegments={moduleSegments}
               currentIssueId={issue.id}
             />
           ) : (
@@ -1367,7 +1616,7 @@ type TermPaneComp = typeof import('../components/TermPane').TermPane;
 
 function nativeUnavailableReason(issue: Issue): string | null {
   if (!issue.convId) return tr('issue.nativeNotStarted');
-  if (issue.status === 'done' || issue.status === 'cancelled' || issue.status === 'blocked') {
+  if (issue.status === 'done' || issue.status === 'cancelled' || ['blocked', 'paused'].includes(issue.status)) {
     return tr('issue.nativeEnded');
   }
   if (!['planning', 'implementing', 'testing'].includes(issue.status)) {
@@ -1413,14 +1662,13 @@ function ExecNative({ pid, issue, seg }: { pid: number; issue: Issue; seg: JSX.E
   );
 }
 
-// ---------- 改动 tab（提交併入：状态头 + 未提交树 + 已提交树 + 提交记录，issue #80） ----------
+// ---------- 改动 tab（本 issue 改动文件树） ----------
 
 /**
- * 改动 tab 的选中项：range=已提交范围内文件（本 issue diff 端点），
- * wt=工作区未提交（项目级 worktree diff 端点，untracked 由码 '?' 判定）。
- * 两者都已归一成 ChangeLeaf（树的叶子）。
+ * 同一路径若同时存在于已提交范围和工作区，工作区状态优先，增删统计沿用已提交范围；
+ * source 决定单文件 diff 使用本 issue 范围还是当前工作区端点。
  */
-type ChangeSel = { kind: 'range' | 'wt'; leaf: ChangeLeaf };
+type IssueChangeLeaf = ChangeLeaf & { source: 'range' | 'wt' };
 
 function IssueChangesTab({
   pid,
@@ -1435,102 +1683,75 @@ function IssueChangesTab({
   err: string;
   onRefresh: () => void;
 }) {
-  // 选中提交（窄屏全屏 CommitPanel / 宽屏右栏展开）；与选中文件互斥
-  const [sha, setSha] = useState<string | null>(null);
-  const fd = useFileDiff<ChangeSel>((s) => {
-    const q = new URLSearchParams({ path: s.leaf.path });
-    if (s.leaf.oldPath) q.set('old', s.leaf.oldPath);
-    if (s.kind === 'wt') {
-      if (s.leaf.code === '?') q.set('untracked', '1');
+  const fd = useFileDiff<IssueChangeLeaf>((leaf) => {
+    const q = new URLSearchParams({ path: leaf.path });
+    if (leaf.oldPath) q.set('old', leaf.oldPath);
+    if (leaf.source === 'wt') {
+      if (leaf.code === '?') q.set('untracked', '1');
       return `/api/projects/${pid}/git/worktree/diff?${q}`;
     }
     return `/api/projects/${pid}/issues/${iid}/git/diff?${q}`;
   });
-  // 宽屏（≥960px）左右分栏：左列树+提交记录（可拖宽，宽度偏好与文件页文件树共享），
-  // 右栏展开 diff / 提交详情；窄屏维持点击全屏钻入。
+  // 宽屏（≥960px）左右分栏：左列文件树可拖宽，右栏展开 diff；窄屏点击后全屏钻入。
   const wide = useWide();
   const treeW = useTreeWidth();
   const splitRef = useRef<HTMLDivElement>(null);
 
-  const openLeaf = (kind: 'range' | 'wt', leaf: ChangeLeaf): void => {
-    setSha(null); // 文件与提交互斥选中
-    fd.open({ kind, leaf });
-  };
-  const openCommit = (c: string): void => {
-    fd.close();
-    setSha(c);
-  };
-
-  // 树叶子（hooks 在早退之前）：worktree 两列码按路径归一；range 文件带增删行
-  const wtLeaves = useMemo<ChangeLeaf[]>(
-    () =>
-      dedupWorktree(info?.worktree ?? []).map((w) => {
-        const l: ChangeLeaf = { key: `wt:${w.path}`, path: w.path, code: w.code };
-        if (w.oldPath) l.oldPath = w.oldPath;
-        return l;
-      }),
-    [info],
-  );
-  const rangeLeaves = useMemo<ChangeLeaf[]>(
-    () =>
-      (info?.files ?? []).map((f) => {
-        const l: ChangeLeaf = {
-          key: `range:${f.path}`,
-          path: f.path,
-          code: f.status[0] ?? 'M',
-          adds: f.adds,
-          dels: f.dels,
-        };
-        if (f.oldPath) l.oldPath = f.oldPath;
-        return l;
-      }),
-    [info],
-  );
+  // 已提交与工作区合成一棵树；同一路径仅显示一次，工作区状态和 diff 端点优先。
+  const leaves = useMemo<IssueChangeLeaf[]>(() => {
+    const byPath = new Map<string, IssueChangeLeaf>();
+    for (const f of info?.files ?? []) {
+      const leaf: IssueChangeLeaf = {
+        key: `issue:${f.path}`,
+        path: f.path,
+        code: f.status[0] ?? 'M',
+        adds: f.adds,
+        dels: f.dels,
+        source: 'range',
+      };
+      if (f.oldPath) leaf.oldPath = f.oldPath;
+      byPath.set(f.path, leaf);
+    }
+    for (const w of dedupWorktree(info?.worktree ?? [])) {
+      const previous = byPath.get(w.path);
+      const leaf: IssueChangeLeaf = {
+        ...(previous ?? { key: `issue:${w.path}`, path: w.path }),
+        code: w.code,
+        source: 'wt',
+      };
+      if (w.oldPath) leaf.oldPath = w.oldPath;
+      byPath.set(w.path, leaf);
+    }
+    return [...byPath.values()];
+  }, [info]);
 
   if (err) return <div class="empty">{err}</div>;
   if (!info) return <Loading />;
   if (info.ok === false) return <div class="empty">{info.error ?? tr('ui.loadFailed')}</div>;
 
-  // 窄屏钻入态：点提交/文件 → 全屏展开（返回回列表）；宽屏走右栏，不进这两个分支
-  if (!wide && sha) {
-    return (
-      <div class="wb-gitdetail">
-        <div class="wb-sub-hd">
-          <button class="back" onClick={() => setSha(null)}>
-            ‹
-          </button>
-          <span class="mut small">{tr('issue.backChanges')}</span>
-        </div>
-        <div class="wb-commitpanel">
-          <CommitPanel key={sha} pid={pid} sha={sha} onJump={setSha} />
-        </div>
-      </div>
-    );
-  }
-
+  // 窄屏钻入态：点文件 → 全屏展开；宽屏走右栏。
   if (!wide && fd.file) {
-    const s = fd.file;
+    const leaf = fd.file;
     return (
       <div class="wb-gitdetail">
         <div class="wb-sub-hd">
           <button class="back" onClick={fd.close}>
             ‹
           </button>
-          <StatusChip code={s.leaf.code} />
-          <PathText path={s.leaf.path} oldPath={s.leaf.oldPath} />
-          {s.kind === 'wt' && <span class="mut small">{tr('issue.uncommitted')}</span>}
+          <StatusChip code={leaf.code} />
+          <PathText path={leaf.path} oldPath={leaf.oldPath} />
         </div>
         <DiffContent
-          code={s.leaf.code}
-          path={s.leaf.path}
-          oldPath={s.leaf.oldPath}
+          code={leaf.code}
+          path={leaf.path}
+          oldPath={leaf.oldPath}
           imageUrls={gitImageUrls(
-            s.kind === 'wt'
+            leaf.source === 'wt'
               ? `/api/projects/${pid}/git/worktree/raw`
               : `/api/projects/${pid}/issues/${iid}/git/raw`,
-            s.leaf.path,
-            s.leaf.oldPath,
-            s.leaf.code,
+            leaf.path,
+            leaf.oldPath,
+            leaf.code,
           )}
           d={fd.diff}
           error={fd.err}
@@ -1541,47 +1762,16 @@ function IssueChangesTab({
 
   // 后端只对活跃（执行中/评审中）issue 附带 worktree —— 有该字段即「正在进行」视角
   const active = info.worktree !== undefined;
-  const hasAny = wtLeaves.length > 0 || info.files.length > 0 || info.commits.length > 0;
+  const hasAny = leaves.length > 0;
 
-  // 列表区（窄屏整页 / 宽屏左列共用）：未提交树 + 已提交树 + 提交记录
+  // 列表区由窄屏整页与宽屏左列共用。
   const lists = (
     <>
-      {wtLeaves.length > 0 && (
-        <>
-          <div class="wb-sect">⏳ {tr('issue.runningUncommitted')}</div>
-          <ChangeTree leaves={wtLeaves} selKey={fd.file?.leaf.key} onOpen={(l) => openLeaf('wt', l)} />
-        </>
-      )}
-      {rangeLeaves.length > 0 && (
-        <>
-          <div class="wb-sect">✅ {tr('issue.committed')}</div>
-          <ChangeTree leaves={rangeLeaves} selKey={fd.file?.leaf.key} onOpen={(l) => openLeaf('range', l)} />
-        </>
-      )}
-      {info.commits.length > 0 && (
-        <>
-          <div class="wb-sect">🧾 {tr('issue.commitHistory', { count: info.commits.length })}</div>
-          <div class="wb-commits">
-            {info.commits.map((c) => (
-              <button
-                key={c.sha}
-                class={`wb-commit${wide && sha === c.sha ? ' on' : ''}`}
-                onClick={() => openCommit(c.sha)}
-              >
-                <div class="wb-commit-r1">
-                  <RefBadges refs={c.refs} />
-                  <span class="git-subj">{c.subject}</span>
-                </div>
-                <div class="wb-commit-r2 mut">
-                  <span class="mono">{c.short}</span>
-                  <span>{c.author}</span>
-                  <span>{timeAgo(c.ts)}</span>
-                </div>
-              </button>
-            ))}
-          </div>
-        </>
-      )}
+      <ChangeTree
+        leaves={leaves}
+        selKey={fd.file?.key}
+        onOpen={(leaf) => fd.open(leaf as IssueChangeLeaf)}
+      />
       {!hasAny && (
         <div class="empty">
           {active
@@ -1597,7 +1787,7 @@ function IssueChangesTab({
   if (!wide) {
     return (
       <div class="id-scroll">
-        <IssueGitHead info={info} onRefresh={onRefresh} />
+        <IssueGitHead count={leaves.length} onRefresh={onRefresh} />
         {lists}
       </div>
     );
@@ -1608,7 +1798,7 @@ function IssueChangesTab({
   // 用普通纵向弹性列 .wb-gitwide 填满 tab 体。
   return (
     <div class="wb-gitwide">
-      <IssueGitHead info={info} onRefresh={onRefresh} />
+      <IssueGitHead count={leaves.length} onRefresh={onRefresh} />
       <div class="wb-split" ref={splitRef}>
         <div
           class="wb-list-col"
@@ -1620,31 +1810,26 @@ function IssueChangesTab({
         </div>
         <ListSplitter containerRef={splitRef} list={treeW} label={tr('issue.changeTreeWidth')} />
         <div class="wb-main">
-          {sha ? (
-            <div class="wb-commitpanel">
-              <CommitPanel key={sha} pid={pid} sha={sha} onJump={setSha} />
-            </div>
-          ) : fd.file ? (
+          {fd.file ? (
             <div class="wb-gitdetail">
               <div class="wb-sub-hd">
-                <StatusChip code={fd.file.leaf.code} />
-                <PathText path={fd.file.leaf.path} oldPath={fd.file.leaf.oldPath} />
-                {fd.file.kind === 'wt' && <span class="mut small">{tr('issue.uncommitted')}</span>}
+                <StatusChip code={fd.file.code} />
+                <PathText path={fd.file.path} oldPath={fd.file.oldPath} />
                 <button class="gs-x" title={tr('issue.collapseDiff')} onClick={fd.close}>
                   ✕
                 </button>
               </div>
               <DiffContent
-                code={fd.file.leaf.code}
-                path={fd.file.leaf.path}
-                oldPath={fd.file.leaf.oldPath}
+                code={fd.file.code}
+                path={fd.file.path}
+                oldPath={fd.file.oldPath}
                 imageUrls={gitImageUrls(
-                  fd.file.kind === 'wt'
+                  fd.file.source === 'wt'
                     ? `/api/projects/${pid}/git/worktree/raw`
                     : `/api/projects/${pid}/issues/${iid}/git/raw`,
-                  fd.file.leaf.path,
-                  fd.file.leaf.oldPath,
-                  fd.file.leaf.code,
+                  fd.file.path,
+                  fd.file.oldPath,
+                  fd.file.code,
                 )}
                 d={fd.diff}
                 error={fd.err}
@@ -1660,6 +1845,36 @@ function IssueChangesTab({
 }
 
 // ---------- 卡点操作面（底部拇指区 / 工作台底条） ----------
+
+/**
+ * 受阻原因（#301）。
+ *
+ * 代理按「在做什么｜卡在哪｜要我做什么」三段写（见 issues/prompts.ts 的 sentinelBoundary），
+ * 这里拆成三行带标签展示，最后一行单独强调——用户的原话是「显示受阻但不知道我需要做什么」，
+ * 缺的就是那行行动指引。
+ *
+ * 解析不出来一律原样显示那句话：老 issue 没有三段，引擎自己判的受阻（止损、工作区不可用、
+ * Git 失败）也不会有——宁可少一层加工，也不猜着给用户编行动指引。
+ */
+function BlockedReason({ reason }: { reason: string }) {
+  const parts = parseBlockedNote(reason);
+  if (!parts) return <div class="block-box">{reason}</div>;
+  const rows: Array<[string, string, boolean]> = [
+    [tr('issue.blockedDoing'), parts.doing, false],
+    [tr('issue.blockedStuck'), parts.stuck, false],
+    [tr('issue.blockedAction'), parts.action, true],
+  ];
+  return (
+    <div class="block-box block-lines">
+      {rows.map(([label, value, act]) => (
+        <div key={label} class={act ? 'block-line act' : 'block-line'}>
+          <span class="block-line-k">{label}</span>
+          <span class="block-line-v">{value}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 function GateBar(props: {
   issue: Issue;
@@ -1722,13 +1937,14 @@ function GateBar(props: {
     );
   }
 
-  if (st === 'blocked') {
+  if (st === 'blocked' || st === 'paused') {
     return (
       <div class="gatebar">
         <div class="gate-hd" style={{ color: '#dc2626' }}>
-          ⛔ {tr('issue.blocked')}
+          {st === 'paused' ? tr('status.paused') : tr('issue.blockedNeedsYou')}
         </div>
-        <div class="block-box">{props.blockedReason}</div>
+        {st === 'blocked' && <div class="gate-note">{tr('issue.blockedNeedsYouHint')}</div>}
+        <BlockedReason reason={props.blockedReason} />
         {actErr && <div class="err">{actErr}</div>}
         <div class="gate-row">
           <button class="btn" disabled={busy} onClick={props.onCancel}>
@@ -1779,6 +1995,150 @@ function GateBar(props: {
  * awaiting（代理停在这儿等你）时整条转实心橙白字 + 呼吸光圈（#110 样式在 .clarify-bar.awaiting）：
  * 之前淡黄条在满屏暖色里根本看不出来，卡了一夜都不知道。仍然只是提示——点了才弹窗，不自动弹。
  */
+/**
+ * 「已完成但未推送到远端」警示条（#272 / B-02）。
+ *
+ * 引擎自动收尾时 push 重试后仍失败**不阻止 issue 完成**（改动已经在本地提交了），
+ * 但也不能就这么静默 done——否则用户以为交付了，代码其实还在这台机器上。所以留一条
+ * 常驻警示：说清「完成了但没推上去」、是哪条分支、git 原话是什么，以及下一步该干嘛。
+ *
+ * 不做成按钮：这里没有一键能替用户解决的动作（多半要人去看冲突/权限），
+ * 假装可点只会让人白点一次。git 的报错原样展示，不翻译。
+ */
+/**
+ * 「由多条 issue 合并而来」提示条（#289 / B-14）。
+ *
+ * 合并会改写宿主正文（摘要在前、原文分节追加），所以必须让人看得见「这是并出来的」并能一键拆回。
+ * **开跑之后不给拆**：会话里已经按合并后的正文干过活，这时候换回去只会让代理和人各看各的版本——
+ * 按钮置灰并说明原因，比让人点了报错强。
+ */
+function MergedFromBar({ info, onUnmerge }: { info: MergedFromInfo; onUnmerge: () => void }) {
+  return (
+    <div class="push-failed-bar" role="status">
+      <span class="push-failed-t">
+        <span aria-hidden="true">🧩</span>
+        {tr('issue.mergedFrom')}
+        <span class="mut small">{info.members.map((m) => `#${m.id}`).join(' + ')}</span>
+      </span>
+      <button
+        class="btn sm"
+        disabled={!info.canUnmerge}
+        title={info.canUnmerge ? tr('issue.unmerge') : tr('issue.unmergeLocked')}
+        onClick={onUnmerge}
+      >
+        {tr('issue.unmerge')}
+      </button>
+      {!info.canUnmerge && <span class="mut small">{tr('issue.unmergeLocked')}</span>}
+    </div>
+  );
+}
+
+/**
+ * 「已排队等待恢复」提示条（#283 / B-10）。
+ *
+ * 用户点过「继续运行」但项目当时忙——旧行为是直接报错让他等会儿再点一次，现在意图已经排上队，
+ * 接力会在项目空闲时自动恢复。这里要把两件事说清楚：**不用再点第二次**，以及**可以反悔**。
+ */
+function UnblockQueuedBar({ request, onCancel }: { request: UnblockRequest; onCancel: () => void }) {
+  return (
+    <div class="push-failed-bar" role="status">
+      <span class="push-failed-t">
+        <span aria-hidden="true">⏳</span>
+        {tr('issue.unblockQueued')}
+        <span class="mut small">{timeAgo(request.ts)}</span>
+      </span>
+      <span class="mut small" title={request.guidance}>{truncate(request.guidance, 60)}</span>
+      <button class="btn sm" onClick={onCancel}>{tr('issue.unblockQueuedCancel')}</button>
+    </div>
+  );
+}
+
+/**
+ * 推理档（#281 / I-04；#300 起内联进 .runctl 工具条）：选本 issue 的覆盖档，并显示当前生效档与它来自哪一层。
+ *
+ * codex 的 `model_reasoning_effort` 是**进程启动参数**，改完只对下次启动的会话生效——
+ * 界面必须把这句说出来，否则用户会以为改了立刻就省钱/立刻就变聪明。claude 没有这个开关。
+ */
+function ReasoningLine({
+  reasoning,
+  onChange,
+}: {
+  reasoning: ReasoningInfo | null;
+  onChange: (value: string) => void;
+}) {
+  if (!reasoning) return null;
+  // 工具条里只留生效档值本身（#300）：「生效：X（来自 Y）」整句 + 「仅 codex 生效」的提醒
+  // 都塞进 title / aria-label——来源这层信息一年也用不到几次，不值得在常驻工具条上占一句话。
+  const effective = tr('issue.reasoningEffective', { effort: reasoning.effort, source: reasoning.source });
+  const hint = `${effective} · ${tr('ui.reasoningCodexOnly')}`;
+  return (
+    <div class="val-line mut" title={hint}>
+      <span>{tr('ui.reasoningEffort')}</span>
+      <select
+        class="rc-sel"
+        value={reasoning.override ?? ''}
+        aria-label={tr('ui.reasoningEffort')}
+        onChange={(e) => onChange(e.currentTarget.value)}
+      >
+        <option value="">{tr('ui.reasoningInherit')}</option>
+        {(['low', 'medium', 'high'] as const).map((v) => (
+          <option key={v} value={v}>{v}</option>
+        ))}
+      </select>
+      <span class="val-scope" title={effective} aria-label={effective}>{reasoning.effort}</span>
+    </div>
+  );
+}
+
+/**
+ * 门禁（#279 / I-03；#300 起内联进 .runctl 工具条）：范围（定向/全量）+ 最近一次结果 + 耗时。
+ *
+ * **只读、不给按钮**：门禁由引擎在会话外自己跑，这里给的是「刚才跑了什么、结果如何」。
+ * 放一个「重跑」按钮只会让人手动制造重复执行——那正是本条要消灭的开销。
+ */
+function ValidationLine({ validation }: { validation: ValidationInfo | null }) {
+  if (!validation || (!validation.scope && !validation.last)) return null;
+  const last = validation.last;
+  const scopeKind = last?.scope ?? validation.scope?.kind ?? null;
+  const scopeText = scopeKind === 'targeted'
+    ? tr('issue.validationTargeted', { files: validation.scope?.files.length ?? 0 })
+    : scopeKind === 'full' ? tr('issue.validationFull') : '';
+  const outcome = !last
+    ? tr('issue.validationPending')
+    : last.outcome === 'passed'
+      ? tr('issue.validationPassed')
+      : last.outcome === 'skipped'
+        ? tr('issue.validationSkipped')
+        : tr('issue.validationFailed', { label: last.label ?? '', code: last.code ?? 0 });
+  const tone = !last ? 'b-gray' : last.outcome === 'passed' ? 'b-blue' : last.outcome === 'failed' ? 'b-red' : 'b-gray';
+  return (
+    <div class="val-line mut" title={validation.scope?.reason ?? ''}>
+      <span>{tr('issue.validation')}</span>
+      {scopeText && <span class="val-scope">{scopeText}</span>}
+      <span class={`badge ${tone}`}>{outcome}</span>
+      {last?.durationMs != null && <span class="val-dur">{fmtDuration(last.durationMs)}</span>}
+    </div>
+  );
+}
+
+function PushFailedBar(props: { branch: string; detail: string }) {
+  return (
+    <div class="push-failed-bar" role="alert">
+      <span class="push-failed-t">
+        <span aria-hidden="true">⚠️</span>
+        {tr('issue.pushFailedTitle')}
+        {props.branch && (
+          <span class="badge b-red" title={tr('issue.pushFailedBranch', { branch: props.branch })}>
+            {props.branch}
+          </span>
+        )}
+      </span>
+      <span class="push-failed-h">{tr('issue.pushFailedHint')}</span>
+      {props.detail && <code class="push-failed-d">{props.detail}</code>}
+    </div>
+  );
+}
+
 function ClarifyBar(props: { awaiting: boolean; analyzing: boolean; count: number; onOpen: () => void }) {
   const analyzingOnly = props.analyzing && props.count === 0 && !props.awaiting;
   return (

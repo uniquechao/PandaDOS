@@ -57,6 +57,8 @@ Type=simple
 User=root
 WorkingDirectory=/srv/panda
 EnvironmentFile=-/root/.panda/env
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/root/.npm-global/bin:/root/.local/share/pnpm:/root/.bun/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/root/.bun/bin/bun run start
 Restart=always
 RestartSec=3
@@ -68,6 +70,10 @@ TimeoutStopSec=30
 [Install]
 WantedBy=multi-user.target
 ```
+
+请按 `User` 同步设置 `HOME` 和用户级命令目录。PandaDOS 会先检查服务进程的
+`PATH`，找不到时再通过执行机用户的登录 shell 解析 nvm 等配置，并且只接受绝对
+可执行路径。Agent 安装位置或 shell 配置变化后，请先在管理后台重新探测执行机能力。
 
 安装或更新单元后：
 
@@ -109,7 +115,10 @@ systemctl restart panda
 ### SSH 执行机
 
 私钥放在控制面 `~/.panda/keys/<keyRef>`，权限设为 `0600`，不要写入
-数据库或仓库。首次登记前先手动 SSH 连接，确认 host key、tmux 和代理登录状态。
+数据库或仓库。登记前确认 tmux 和代理登录状态。使用 `ssh://` 或
+`git@host:path` 导入项目时，PandaDOS 会通过 OpenSSH
+`StrictHostKeyChecking=accept-new` 将首次主机密钥写入执行机用户的
+`~/.ssh/known_hosts`；同一主机之后若更换密钥，连接仍会被拒绝，不会跳过校验。
 
 ```bash
 chmod 600 ~/.panda/keys/<keyRef>
@@ -132,10 +141,14 @@ ssh -i ~/.panda/keys/<keyRef> <user>@<host> 'tmux -V'
 | `PANDA_LLM_BASE_URL` | 无 | Admin 尚未保存地址时的部署兜底 |
 | `PANDA_LLM_MODEL` | 无 | Admin 尚未保存模型时的部署兜底 |
 | `PANDA_LLM_API_KEY` | 无 | PM LLM 密钥 |
-| `PANDA_FEISHU_APP_ID` | 无 | 飞书应用 ID |
-| `PANDA_FEISHU_APP_SECRET` | 无 | 飞书应用密钥 |
-| `PANDA_FEISHU_CHANNEL` | `on` | `off` 时关闭飞书事件长连接 |
+| `PANDA_FEISHU_APP_ID` | 无 | 管理页尚未保存登录配置时的应用 ID 兜底 |
+| `PANDA_FEISHU_APP_SECRET` | 无 | 管理页尚未保存登录配置时的应用密钥兜底 |
+| `PANDA_FEISHU_CHANNEL` | `on` | 已提供部署凭据时的初始消息开关；管理页保存的消息开关优先 |
 | `PANDA_PUBLIC_URL` | 按请求推导 | OAuth 对外基址 |
+
+飞书登录和消息都可在「管理 → 飞书」配置，保存后即时生效。登录配置整行覆盖环境兜底，
+消息开关独立保存并优先于 `PANDA_FEISHU_CHANNEL`。OAuth 回调、机器人权限、收发验证和
+同事使用步骤见[飞书使用指南](docs/feishu.md)。
 
 ## 6. 日常运维
 

@@ -44,6 +44,8 @@ description: Use whenever working on an issue or module in a repository containi
 
 # PandaDOS Issue 模块记忆（${GEN_MARK}）
 
+> 本文件仅供人阅读：运行时规则已内联进注入 prompt（见 \`src/issues/prompts.ts\` 的 \`moduleDocsRule\`），代理不再需要读这个技能。改规则请两边一起改。
+
 1. 从当前工作目录向上定位项目根目录，先读 \`.panda/modules/INDEX.md\`。
 2. 读取当前模块的 \`MODULE.md\`，再读 prompt 指定的 issue 过程页。
 3. 实施中只记录关键设计、决策、文件和测试，不写逐条终端流水。

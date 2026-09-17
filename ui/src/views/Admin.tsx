@@ -6,6 +6,7 @@
  * - 活跃概览（GET /api/admin/overview）
  */
 import { useEffect, useState } from 'preact/hooks';
+import { FeishuLoginConfigTab } from './FeishuLoginConfigTab';
 import { api, ApiError } from '../lib/api';
 import { fmtTime, timeAgo } from '../lib/fmt';
 import type {
@@ -24,11 +25,12 @@ import { ExecBadge } from '../components/badges';
 import { Modal } from '../components/Modal';
 import { Loading } from '../components/Loaders';
 import { toast } from '../lib/toast';
+import { AgentLogo } from '../components/AgentLogo';
 import { AgentPicker } from '../components/AgentPicker';
 import { DirPicker } from '../components/DirPicker';
-import { tr } from '../i18n/runtime';
+import { runtimeI18n, tr } from '../i18n/runtime';
 
-export type AdminTab = 'users' | 'execs' | 'llm' | 'owner' | 'overview' | 'personaMarkets';
+export type AdminTab = 'users' | 'execs' | 'llm' | 'feishu' | 'owner' | 'overview' | 'personaMarkets' | 'cost';
 
 export function AdminView({ initialTab = 'users' }: { initialTab?: AdminTab }) {
   const [tab, setTab] = useState<AdminTab>(initialTab);
@@ -37,9 +39,11 @@ export function AdminView({ initialTab = 'users' }: { initialTab?: AdminTab }) {
     ['users', tr('admin.users')],
     ['execs', tr('admin.executors')],
     ['llm', tr('admin.llm')],
+    ['feishu', tr('admin.feishu')],
     ['owner', tr('admin.ownership')],
     ['overview', tr('admin.overview')],
     ['personaMarkets', tr('admin.personaMarkets')],
+    ['cost', tr('admin.cost')],
   ];
   return (
     <div class="page">
@@ -54,9 +58,11 @@ export function AdminView({ initialTab = 'users' }: { initialTab?: AdminTab }) {
       {tab === 'users' && <UsersTab />}
       {tab === 'execs' && <ExecutorsTab />}
       {tab === 'llm' && <LlmConfigTab />}
+      {tab === 'feishu' && <FeishuLoginConfigTab />}
       {tab === 'owner' && <OwnerTab />}
       {tab === 'overview' && <OverviewTab />}
       {tab === 'personaMarkets' && <PersonaMarketsTab />}
+      {tab === 'cost' && <CostTab />}
     </div>
   );
 }
@@ -789,8 +795,8 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
               {(['claude', 'codex'] as AgentKind[]).map((agent) => {
                 const d = detection.agents[agent];
                 return (
-                  <span class={`badge ${d.commandFound || d.stateDirFound ? 'ok' : ''}`}>
-                    {agent === 'claude' ? 'Claude' : 'Codex'}：
+                  <span class={`badge ${d.commandFound || d.stateDirFound ? 'ok' : ''}`} key={agent}>
+                    <AgentLogo agent={agent} size="xs" />
                     {d.commandFound ? tr('admin.commandDetected') : d.stateDirFound ? tr('admin.directoryExists') : tr('admin.notDetected')}
                   </span>
                 );
@@ -917,6 +923,312 @@ function OwnerTab() {
 }
 
 // ---------- 活跃概览 ----------
+
+/** 成本视图（#282 / I-08、I-09）：跨所有项目，仅管理员可见 */
+interface UsageTotalsView {
+  requests: number; inputTokens: number; cachedInputTokens: number; outputTokens: number;
+  reasoningTokens: number; compactions: number; toolCalls: number; skillReads: number;
+}
+interface UsageBucketView extends UsageTotalsView { projectId: number; projectName: string; costUsd: number }
+interface IssueCostView {
+  issueId: number; projectId: number; projectName: string; title: string; status: string; createdTs: number;
+  usage: UsageTotalsView; testRetries: number; nudges: number; judged: number; clarifies: number;
+  validationMs: number; validationRuns: number; costUsd: number;
+}
+interface UsageResponse {
+  grand: UsageTotalsView;
+  grandCostUsd: number;
+  pricing: { currency: string; inputPerMTok: number; cachedInputPerMTok: number; outputPerMTok: number };
+  projects: UsageBucketView[];
+  chat: UsageBucketView[];
+  unattributed: UsageBucketView[];
+  issues: IssueCostView[];
+}
+
+/** 周度视图（#295）：按模块把钱与「完成 / 失败 / 恢复」并排看 */
+interface WeeklyOutcomes {
+  doneCount: number; blockedCount: number; cancelledCount: number; failedCount: number;
+  outcomeCount: number; failureRate: number; recoveredCount: number; recoveryRate: number;
+}
+interface WeeklyModuleView {
+  projectId: number; projectName: string; moduleId: number; moduleSlug: string; moduleName: string;
+  usage: UsageTotalsView; costUsd: number;
+  /** 未归因桶没有 issue，也就没有结局指标——后端给 null，前端照原样显示「—」 */
+  outcomes: WeeklyOutcomes | null;
+}
+interface WeeklyResponse {
+  week: { start: string; end: string; days: string[]; fromMs: number; toMs: number };
+  pricing: { currency: string };
+  days: Array<{ day: string; usage: UsageTotalsView; costUsd: number }>;
+  modules: WeeklyModuleView[];
+  totals: {
+    usage: UsageTotalsView; costUsd: number; doneCount: number; blockedCount: number;
+    cancelledCount: number; failedCount: number; outcomeCount: number; failureRate: number;
+    recoveredCount: number; recoveryRate: number;
+  };
+}
+
+/** 未归模块 / 未归因两个哨兵桶（口径见 core/usage-store） */
+const MODULE_NONE = 0;
+const MODULE_UNATTRIBUTED = -1;
+
+/** 日键 + n 天：周切换按日历走，不碰时区（日键本身就是北京时间的墙上日期） */
+function shiftDay(day: string, n: number): string {
+  const [y, m, d] = day.split('-').map(Number);
+  if (!y || !m || !d) return day;
+  return new Date(Date.UTC(y, m - 1, d) + n * 86_400_000).toISOString().slice(0, 10);
+}
+
+/** 大数字压成 k/M：成本表里全是六七位数，原样铺开没法看 */
+function compactNumber(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+/** 金额：小额也要看得见，统一四位小数 */
+function money(v: number): string {
+  return `$${v.toFixed(4)}`;
+}
+
+/** 比率按 locale 格式化；没有分母（还没有结局 / 未归因桶）显示「—」，不写成 0% 冒充健康 */
+function percent(v: number | null): string {
+  if (v === null) return '—';
+  return new Intl.NumberFormat(runtimeI18n().locale, { style: 'percent', maximumFractionDigits: 0 }).format(v);
+}
+
+function tokenCell(u: UsageTotalsView): string {
+  return `${compactNumber(u.inputTokens)} / ${compactNumber(u.cachedInputTokens)} / ${compactNumber(u.outputTokens)} / ${compactNumber(u.reasoningTokens)}`;
+}
+
+/**
+ * 周度视图（#295）：回答「只优化 token，有没有把可靠性一起优化没了」。
+ * 口径（北京时间日切、周一起算、失败率与恢复率的分母）在后端 core/usage-weekly 收口，
+ * 这里只负责翻周与展示——**不要在前端再算一遍比率**，两边算法迟早会分叉。
+ */
+function WeeklyPanel({ projectId }: { projectId: string }) {
+  const [week, setWeek] = useState('');       // 空 = 本周（由后端定）
+  const [data, setData] = useState<WeeklyResponse | null>(null);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (week) params.set('weekStart', week);
+    if (projectId.trim()) params.set('projectId', projectId.trim());
+    api<WeeklyResponse>(`/api/admin/usage/weekly${params.size ? `?${params.toString()}` : ''}`)
+      .then((r) => { setData(r); setErr(''); })
+      .catch((e: Error) => setErr(e.message));
+  }, [week, projectId]);
+
+  const start = data?.week.start ?? '';
+  const moduleLabel = (m: WeeklyModuleView): string => {
+    if (m.moduleId === MODULE_UNATTRIBUTED) return tr('admin.costUnattributed');
+    if (m.moduleId === MODULE_NONE) return tr('admin.costUnmoduled');
+    return m.moduleName || m.moduleSlug || `#${m.moduleId}`;
+  };
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div class="row" style={{ gap: 8, marginBottom: 8, alignItems: 'center' }}>
+        <b>{tr('admin.costWeekly')}</b>
+        <button class="btn sm" disabled={!start} onClick={() => setWeek(shiftDay(start, -7))}>
+          {tr('admin.costWeekPrev')}
+        </button>
+        <button class="btn sm" disabled={!week} onClick={() => setWeek('')}>{tr('admin.costWeekThis')}</button>
+        <button class="btn sm" disabled={!start} onClick={() => setWeek(shiftDay(start, 7))}>
+          {tr('admin.costWeekNext')}
+        </button>
+        <span class="mono">
+          {data ? tr('admin.costWeekRange', { start: data.week.start, end: data.week.end }) : '—'}
+        </span>
+      </div>
+      {err && <div class="err" style={{ marginBottom: 8 }}>{err}</div>}
+
+      <div class="mut small" style={{ marginBottom: 6 }}>
+        {tr('admin.costAmount')}：<b class="mono">{data ? money(data.totals.costUsd) : '—'}</b>
+        {'　'}{tr('admin.costDone')}：<b class="mono">{data?.totals.doneCount ?? '—'}</b>
+        {'　'}{tr('admin.costFailureRate')}：
+        <b class="mono">{data && data.totals.outcomeCount > 0 ? percent(data.totals.failureRate) : '—'}</b>
+        {'　'}{tr('admin.costRecoveryRate')}：
+        <b class="mono">{data && data.totals.blockedCount > 0 ? percent(data.totals.recoveryRate) : '—'}</b>
+      </div>
+
+      <div class="tblwrap">
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th>{tr('admin.costDay')}</th>
+              <th>{tr('admin.costAmount')}</th>
+              <th>{tr('admin.costTokens')}</th>
+              <th>{tr('admin.costRequests')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(data?.days ?? []).map((d) => (
+              <tr key={d.day}>
+                <td class="mono">{d.day}</td>
+                <td class="mono">{money(d.costUsd)}</td>
+                <td class="mono">{tokenCell(d.usage)}</td>
+                <td class="mono">{d.usage.requests}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="tblwrap" style={{ marginTop: 12 }}>
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th>{tr('admin.costModule')}</th>
+              <th>{tr('admin.project')}</th>
+              <th>{tr('admin.costAmount')}</th>
+              <th>{tr('admin.costDone')}</th>
+              <th>{tr('admin.costFailureRate')}</th>
+              <th>{tr('admin.costRecoveryRate')}</th>
+              <th>{tr('admin.costTokens')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(data?.modules ?? []).map((m) => (
+              <tr key={`${m.projectId}-${m.moduleId}`}>
+                <td>{moduleLabel(m)}</td>
+                <td>{m.projectName || `#${m.projectId}`}</td>
+                <td class="mono">{money(m.costUsd)}</td>
+                <td class="mono">{m.outcomes ? m.outcomes.doneCount : '—'}</td>
+                {/* 没有结局的模块（还在跑）不写 0%，那会把「不知道」说成「很健康」 */}
+                <td class="mono">{percent(m.outcomes && m.outcomes.outcomeCount > 0 ? m.outcomes.failureRate : null)}</td>
+                <td class="mono">{percent(m.outcomes && m.outcomes.blockedCount > 0 ? m.outcomes.recoveryRate : null)}</td>
+                <td class="mono">{tokenCell(m.usage)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div class="mut small" style={{ marginTop: 6 }}>{tr('admin.costWeeklyNote')}</div>
+    </div>
+  );
+}
+
+function CostTab() {
+  const [data, setData] = useState<UsageResponse | null>(null);
+  const [err, setErr] = useState('');
+  const [projectId, setProjectId] = useState('');
+  const [days, setDays] = useState('7');
+
+  const load = (): void => {
+    const params = new URLSearchParams();
+    if (projectId.trim()) params.set('projectId', projectId.trim());
+    if (days.trim() && Number(days) > 0) params.set('from', String(Date.now() - Number(days) * 86_400_000));
+    api<UsageResponse>(`/api/admin/usage${params.size ? `?${params.toString()}` : ''}`)
+      .then((r) => { setData(r); setErr(''); })
+      .catch((e: Error) => setErr(e.message));
+  };
+  useEffect(load, [projectId, days]);
+
+  const bucketRows = (rows: UsageBucketView[], label: string) => rows.map((r) => (
+    <tr key={`${label}-${r.projectId}`}>
+      <td>{label}</td>
+      <td>{r.projectName || `#${r.projectId}`}</td>
+      <td class="mono">{money(r.costUsd)}</td>
+      <td class="mono">{tokenCell(r)}</td>
+      <td class="mono">{r.requests}</td>
+      <td class="mono">{r.toolCalls}</td>
+      <td class="mono">{r.compactions}</td>
+    </tr>
+  ));
+
+  return (
+    <div>
+      {err && <div class="err" style={{ marginBottom: 8 }}>{err}</div>}
+      <div class="row" style={{ gap: 8, marginBottom: 8 }}>
+        <input
+          aria-label={tr('admin.project')}
+          value={projectId}
+          onInput={(e) => setProjectId(e.currentTarget.value)}
+          style={{ width: 120 }}
+        />
+        <select
+          aria-label={tr('admin.costWindowNote')}
+          value={days}
+          onChange={(e) => setDays(e.currentTarget.value)}
+        >
+          {['1', '7', '30', ''].map((d) => (
+            <option key={d || 'all'} value={d}>{d ? `${d}d` : '∞'}</option>
+          ))}
+        </select>
+        <button class="btn sm" onClick={() => { void api('/api/admin/usage/rescan', 'POST', {}).then(load).catch((e: Error) => setErr(e.message)); }}>
+          {tr('admin.costRescan')}
+        </button>
+        <span class="mut small">{tr('admin.costWindowNote')}</span>
+      </div>
+
+      <div class="mut small" style={{ marginBottom: 6 }}>
+        {tr('admin.costAmount')}：<b class="mono">{data ? money(data.grandCostUsd) : '—'}</b>
+        {'　'}{tr('admin.costTokens')}：<b class="mono">{data ? tokenCell(data.grand) : '—'}</b>
+        {'　'}{tr('admin.costRequests')}：<b class="mono">{data?.grand.requests ?? '—'}</b>
+        {'　'}{tr('admin.costTools')}：<b class="mono">{data?.grand.toolCalls ?? '—'}</b>
+        {'　'}{tr('admin.costCompactions')}：<b class="mono">{data?.grand.compactions ?? '—'}</b>
+      </div>
+
+      <div class="tblwrap">
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th>{tr('admin.scope')}</th>
+              <th>{tr('admin.project')}</th>
+              <th>{tr('admin.costAmount')}</th>
+              <th>{tr('admin.costTokens')}</th>
+              <th>{tr('admin.costRequests')}</th>
+              <th>{tr('admin.costTools')}</th>
+              <th>{tr('admin.costCompactions')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {bucketRows(data?.projects ?? [], tr('admin.project'))}
+            {bucketRows(data?.chat ?? [], tr('admin.costChat'))}
+            {bucketRows(data?.unattributed ?? [], tr('admin.costUnattributed'))}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="tblwrap" style={{ marginTop: 12 }}>
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th>issue</th>
+              <th>{tr('admin.project')}</th>
+              <th>{tr('admin.costAmount')}</th>
+              <th>{tr('admin.costTokens')}</th>
+              <th>{tr('admin.costRequests')}</th>
+              <th>{tr('admin.costTools')}</th>
+              <th>{tr('admin.costRetries')}</th>
+              <th>{`nudge / judge`}</th>
+              <th>{tr('admin.costGateTime')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(data?.issues ?? []).map((r) => (
+              <tr key={r.issueId}>
+                <td><b>#{r.issueId}</b> {r.title}</td>
+                <td>{r.projectName || `#${r.projectId}`}</td>
+                <td class="mono">{money(r.costUsd)}</td>
+                <td class="mono">{tokenCell(r.usage)}</td>
+                <td class="mono">{r.usage.requests}</td>
+                <td class="mono">{r.usage.toolCalls}</td>
+                <td class="mono">{r.testRetries}</td>
+                <td class="mono">{r.nudges} / {r.judged}</td>
+                <td class="mono">{`${Math.round(r.validationMs / 1000)}s`}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <WeeklyPanel projectId={projectId} />
+    </div>
+  );
+}
 
 function OverviewTab() {
   const [rows, setRows] = useState<OverviewUser[] | null>(null);

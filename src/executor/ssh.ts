@@ -5,8 +5,8 @@
  *   断线指数退避重连（上限 60s），在途调用报错、连接自愈；`status` 暴露连接状态。
  * - 注入净化/白名单/截断常量以 v1 src/injector.ts 为准（集成收敛后 driver.ts 的
  *   sanitizeInjectText 已统一到同一语义，本文件导出保留为别名）。
- * - 每次注入 = 单次 ssh exec 的一条 tmux send-keys（`-l --` 字面量 + 尾部 \r），
- *   文字与回车不拆两条，杜绝 v1「两次调用间可插入并发注入者」的交错窗口（评审 5.1#2）。
+ * - 注入在调用方会话锁内完成：`-l --` 字面量文本、稳定抓屏、Enter 与保守补交使用
+ *   同一 sendKeys Promise；每条远端命令均经 shq 转义。
  * - readFileRange 走 SFTP 并循环读满（SFTP 协议允许短读，v1 忽略 bytesRead 是已判命门，
  *   评审 [H19]/短读告诫）；返回 {data, size}，size=读取时刻文件总字节数，供调用方推进 offset。
  * - 其余 tmux/git/mkdir 全走 exec，参数一律 shq 严格转义。
@@ -25,6 +25,7 @@ import {
   type SshConnConfig,
 } from './conn';
 import type {
+  CommandResult,
   DirEntry,
   ExecutorDriver,
   FileRange,
@@ -36,16 +37,22 @@ import type {
   TmuxSession,
 } from './driver';
 import {
+  absoluteExecutableFromOutput,
   assertRemovablePath,
+  DEFAULT_GIT_INSTALL_TIMEOUT_MS,
   DEFAULT_GIT_TIMEOUT_MS,
   DEFAULT_TMUX_TIMEOUT_MS,
+  ENSURE_GIT_SCRIPT,
+  gitAvailabilityError,
   KEY_WHITELIST,
-  INJECT_ENTER_DELAY_MS,
+  MAX_COMMAND_OUTPUT_CHARS,
   MAX_INJECT_CHARS,
   sanitizeInjectText,
+  sendTextWithStableSubmit,
   tmuxNewSessionArgs,
   tmuxResizeWindowArgs,
   tmuxScrollPaneArgs,
+  truncateCommandOutput,
 } from './driver';
 import { shq } from './shq';
 
@@ -54,6 +61,8 @@ export interface SshDriverConfig extends SshConnConfig {
   tmuxTimeoutMs?: number;
   /** git 类命令超时（I5；默认 DEFAULT_GIT_TIMEOUT_MS=60s） */
   gitTimeoutMs?: number;
+  /** 测试时跳过真实等待；生产使用 Bun.sleep。 */
+  injectSleep?: (ms: number) => Promise<void>;
 }
 
 // ---------- 注入常量/纯函数（v1 src/injector.ts 逐字平移；评审 3.1「别删减」） ----------
@@ -63,6 +72,12 @@ export interface SshDriverConfig extends SshConnConfig {
  * 含 C-z/C-a/C-e/C-r ∪ 骨架 BTab，共 22 键），此处保留导出名作别名，只增不减。
  */
 export const SSH_ALLOWED_KEYS: ReadonlySet<string> = KEY_WHITELIST;
+
+/** SSH exec 默认不加载用户配置；用执行机用户自己的登录 shell 补查 nvm 等用户级 PATH。 */
+export function buildLoginShellFindExecutableCmd(agent: AgentKind): string {
+  if (agent !== 'claude' && agent !== 'codex') throw new Error('不支持的 Agent 命令');
+  return '"${SHELL:-/bin/sh}" -lic ' + shq(`command -v -- ${agent}`) + ' 2>/dev/null';
+}
 
 /** 单次注入截断常量 = v1 injector.ts:27 的 slice(0, 2000)（= driver.ts MAX_INJECT_CHARS，集成收敛后同源）。 */
 export const SSH_MAX_INJECT_CHARS: number = MAX_INJECT_CHARS;
@@ -76,17 +91,9 @@ export const SSH_MAX_INJECT_CHARS: number = MAX_INJECT_CHARS;
  */
 export const sanitizeSendText: (text: string) => string = sanitizeInjectText;
 
-/**
- * 构造 sendKeys 的远端命令：单次 exec 内「打字 → 停一拍 → 回车」三连（仍无并发交错窗口）。
- * - `-l --`：字面量注入（文本恰好等于 tmux 键名/以 - 开头时不被解释，评审注入侧假设①②）；
- * - 中间 sleep：codex TUI 有 paste-burst 检测，紧跟注入的回车会被并入粘贴当换行
- *   （消息滞留输入框不提交，0.144 实测；与 driver.ts INJECT_ENTER_DELAY_MS 同因）；
- * - Enter 单发（= C-m = 0x0d），不再拼进文本尾部。
- * 净化在调用方完成（cleanText 内已无控制字符）。
- */
-export function buildSendKeysCmd(session: string, cleanText: string): string {
-  const s = shq(session);
-  return `tmux send-keys -t ${s} -l -- ${shq(cleanText)}; sleep ${INJECT_ENTER_DELAY_MS / 1000}; tmux send-keys -t ${s} Enter`;
+/** 构造字面量文本注入命令；提交时序由 sendTextWithStableSubmit 统一控制。 */
+export function buildSendTextCmd(session: string, cleanText: string): string {
+  return `tmux send-keys -t ${shq(session)} -l -- ${shq(cleanText)}`;
 }
 
 /** 构造 sendKey 的远端命令（键名语义，不带 -l）。白名单校验在调用方。 */
@@ -225,11 +232,13 @@ export class SshDriver implements ExecutorDriver {
   private readonly conn: SshConn;
   private readonly tmuxTimeoutMs: number;
   private readonly gitTimeoutMs: number;
+  private readonly injectSleep: (ms: number) => Promise<void>;
 
   constructor(config: SshDriverConfig) {
     this.conn = new SshConn(config);
     this.tmuxTimeoutMs = config.tmuxTimeoutMs ?? DEFAULT_TMUX_TIMEOUT_MS;
     this.gitTimeoutMs = config.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
+    this.injectSleep = config.injectSleep ?? Bun.sleep;
   }
 
   /** 连接状态（disconnected/connecting/connected/closed），供执行机健康度上报。 */
@@ -266,9 +275,16 @@ export class SshDriver implements ExecutorDriver {
   async findExecutable(agent: AgentKind): Promise<string | null> {
     if (agent !== 'claude' && agent !== 'codex') throw new Error('不支持的 Agent 命令');
     const r = await this.exec('command', ['-v', '--', agent]);
-    if (r.code !== 0) return null;
-    const found = r.out.trim().split('\n')[0] ?? '';
-    return found.startsWith('/') ? found : null;
+    if (r.code === 0) {
+      const found = absoluteExecutableFromOutput(r.out);
+      if (found) return found;
+    }
+    try {
+      const login = await this.conn.exec(buildLoginShellFindExecutableCmd(agent), this.tmuxTimeoutMs);
+      return login.code === 0 ? absoluteExecutableFromOutput(login.out) : null;
+    } catch {
+      return null;
+    }
   }
 
   // ---- tmux ----
@@ -319,11 +335,22 @@ export class SshDriver implements ExecutorDriver {
     if (r.code !== 0) throw new Error(`tmux kill-session 失败: ${r.err || r.out}`);
   }
 
-  /** 注入文本并提交：净化（v1 语义）→ 单次 exec 的一条 send-keys（原子，见 buildSendKeysCmd）。 */
+  /** 注入文本并提交：净化后等待 pane 稳定，仅在确认未提交时补交一次 Enter。 */
   async sendKeys(session: string, text: string): Promise<void> {
     const clean = sanitizeSendText(text);
-    const r = await this.conn.exec(buildSendKeysCmd(session, clean), this.tmuxTimeoutMs);
-    if (r.code !== 0) throw new Error(`tmux send-keys 失败: ${r.err || r.out}`);
+    await sendTextWithStableSubmit({
+      inputText: clean,
+      capturePane: () => this.capturePane(session),
+      sendText: async () => {
+        const result = await this.conn.exec(buildSendTextCmd(session, clean), this.tmuxTimeoutMs);
+        if (result.code !== 0) throw new Error(`tmux send-keys 失败: ${result.err || result.out}`);
+      },
+      sendEnter: async () => {
+        const result = await this.conn.exec(buildSendKeyCmd(session, 'Enter'), this.tmuxTimeoutMs);
+        if (result.code !== 0) throw new Error(`tmux send-keys 失败: ${result.err || result.out}`);
+      },
+      sleep: this.injectSleep,
+    });
   }
 
   async sendKey(session: string, key: string): Promise<void> {
@@ -627,9 +654,40 @@ export class SshDriver implements ExecutorDriver {
 
   // ---- git ----
 
+  async ensureGitAvailable(): Promise<void> {
+    const result = await this.exec('/bin/sh', ['-c', ENSURE_GIT_SCRIPT], DEFAULT_GIT_INSTALL_TIMEOUT_MS);
+    if (result.code !== 0) throw gitAvailabilityError(result);
+  }
+
   /** git -C cwd <args>；非零退出不抛错（契约：交调用方判断 code），传输层错误/超时才抛。 */
   async git(cwd: string, args: string[]): Promise<GitResult> {
     return this.exec('git', ['-C', cwd, ...args], this.gitTimeoutMs);
+  }
+
+  /**
+   * 门禁执行（#279）：每段 argv 经 `shq` 转义后拼成一条命令行发到远端——转义之后
+   * 空格/引号/`&&`/`$` 全是字面量，**拼不出第二条命令**，这正是「不是通用 shell 入口」的
+   * 兑现方式。`cd` 也走 shq，且与命令之间用 `&&` 串（这个 `&&` 是控制面写死的，不来自入参）。
+   * conn.exec 超时是 reject，这里翻译成 `timedOut`，与 LocalDriver 行为一致。
+   */
+  async runCommand(cwd: string, argv: string[], timeoutMs: number): Promise<CommandResult> {
+    if (argv.length === 0) throw new Error('runCommand 需要至少一个命令词');
+    const started = Date.now();
+    const line = `cd ${shq(cwd)} && ${argv.map(shq).join(' ')}`;
+    try {
+      const r = await this.conn.exec(line, timeoutMs);
+      return {
+        code: r.code,
+        out: truncateCommandOutput(r.out, MAX_COMMAND_OUTPUT_CHARS),
+        err: truncateCommandOutput(r.err, MAX_COMMAND_OUTPUT_CHARS),
+        timedOut: false,
+        durationMs: Date.now() - started,
+      };
+    } catch (e) {
+      const detail = String(e);
+      if (!detail.includes('超时')) throw e; // 断连等真故障照旧抛，不伪装成门禁失败
+      return { code: -1, out: '', err: detail.slice(0, 500), timedOut: true, durationMs: Date.now() - started };
+    }
   }
 
   async readGitBlob(cwd: string, rev: string, path: string): Promise<GitBlobResult> {

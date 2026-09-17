@@ -16,14 +16,25 @@
  * optionsSig 绝不盲注入、同一菜单签名只分级一次、每会话单飞防重入。
  */
 import type { Database } from 'bun:sqlite';
-import { decideApproval, type ApprovalOutcome } from '../../agents/approval';
+import {
+  decideApproval,
+  decideTextApproval,
+  type ApprovalOutcome,
+  type TextApprovalOutcome,
+} from '../../agents/approval';
 import type { LlmClient } from '../../agents/llm';
 import { chatTmux } from '../../core/conversations';
 import { detectSelection } from '../../core/screen';
 import type { AutoApproveLevel, Project } from '../../core/types';
 import { getProject } from '../../issues/engine';
 import type { KeyedMutex } from '../../issues/mutex';
-import { actOnMenu, optionsSigOf, type MenuDriver } from './inject';
+import {
+  actOnMenu,
+  actOnTextApproval,
+  optionsSigOf,
+  textApprovalSigOf,
+  type MenuDriver,
+} from './inject';
 import { userPromptLocale } from '../../agents/prompts/language';
 
 /** 需要巡检的对话（auto_approve 已开、项目在用、对话未归档） */
@@ -56,6 +67,13 @@ export interface ChatApprovalDeps {
   retryDelayMs?: number;
   /** 决策观测口（对话侧不落 issue_events，审计/测试从这里取） */
   onDecision?(d: ChatApprovalDecision): void;
+  /** 纯文本确认的审计/观测出口。 */
+  onTextDecision?(d: {
+    convId: string;
+    session: string;
+    outcome: TextApprovalOutcome;
+    result?: string;
+  }): void;
 }
 
 interface ConvRow {
@@ -68,6 +86,7 @@ interface ConvRow {
 interface SessionState {
   /** 已处理（已注入或已判需人工）的菜单签名——同一菜单不重复分级 */
   handledSig: string;
+  handledTextSig: string;
   inFlight: boolean;
 }
 
@@ -142,7 +161,7 @@ export class ChatApprovalWatcher {
     const session = chatTmux(t.convId);
     let st = this.state.get(session);
     if (!st) {
-      st = { handledSig: '', inFlight: false };
+      st = { handledSig: '', handledTextSig: '', inFlight: false };
       this.state.set(session, st);
     }
     if (st.inFlight) return;
@@ -156,6 +175,8 @@ export class ChatApprovalWatcher {
     const sel = detectSelection(pane);
     if (!sel) {
       st.handledSig = ''; // 菜单消失即重置：同一菜单再出现视为新实例，重新分级
+      if (t.level === 'auto') await this.processTextPrompt(t, project, driver, session, pane, st);
+      else st.handledTextSig = '';
       return;
     }
     const sig = optionsSigOf(sel.options);
@@ -195,6 +216,51 @@ export class ChatApprovalWatcher {
         level: t.level,
         outcome,
         result: r.ok ? r.option : r.reason,
+      });
+    } finally {
+      st.inFlight = false;
+    }
+  }
+
+  private async processTextPrompt(
+    t: ChatApprovalTarget,
+    project: Project,
+    driver: MenuDriver,
+    session: string,
+    pane: string,
+    st: SessionState,
+  ): Promise<void> {
+    const sig = textApprovalSigOf(pane);
+    if (!sig) {
+      st.handledTextSig = '';
+      return;
+    }
+    if (st.handledTextSig === sig) return;
+    st.inFlight = true;
+    try {
+      const outcome = await decideTextApproval(this.deps.llm, {
+        pane,
+        goal: project.goal,
+        taskText: t.label,
+        locale: userPromptLocale(this.deps.db, project.ownerUserId),
+      });
+      if (outcome.action !== 'reply') {
+        st.handledTextSig = sig;
+        this.deps.onTextDecision?.({ convId: t.convId, session, outcome });
+        return;
+      }
+      const result = await actOnTextApproval(
+        { driver, mutex: this.deps.mutex },
+        session,
+        outcome.reply,
+        sig,
+      );
+      if (result.ok) st.handledTextSig = sig;
+      this.deps.onTextDecision?.({
+        convId: t.convId,
+        session,
+        outcome,
+        result: result.ok ? result.reply : result.reason,
       });
     } finally {
       st.inFlight = false;

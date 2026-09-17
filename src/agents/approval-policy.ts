@@ -13,7 +13,7 @@
 // ---------- 规则本体（正则逐条注释；v1 平移的三条保持字节不变） ----------
 
 /** 多选表单识别（v1 注释：selectOption 驱动不了且会死循环——真实死循环踩出来的疤） */
-export const MULTI_SELECT_RE = /\[[ x✔✓]\]|[☒☐]|\bsubmit\b|space to (toggle|select)/i;
+export const MULTI_SELECT_RE = /\[[ x✔✓]\]|[☒☐]|space to (toggle|select)/i;
 
 /** trust 弹窗识别（对小写化的 context+options 全文匹配） */
 export const TRUST_RE = /trust|信任/;
@@ -43,8 +43,9 @@ export const NEVER_PICK_RE =
  * **有意只分大类、不枚举命令清单**：命令列表既列不全，也会在「表里没有=危险」和
  * 「表里没有=安全」之间反复横跳。这里只圈几类「一旦做错就回不去」的动作，命中即交人工。
  *
- * 误判方向是刻意不对称的：**误判成危险只是多问主人一次（安全），漏判才会误批（危险）**，
- * 所以宁可写宽——「rebase」「publish」这类词出现在正文里被连坐升级，是可接受代价。
+ * 该正则只在管家模型不可用时兜底，误判方向刻意不对称：**误判成危险只是多问主人一次
+ * （安全），漏判才会误批（危险）**。正常审批必须交给管家结合完整语义判断，禁止把这组
+ * 关键词提升为主判逻辑；简单临时目录清理由 `isSafeTemporaryRemoval` 明确排除。
  */
 export const DANGER_RE = new RegExp(
   [
@@ -116,7 +117,25 @@ export function pickRecommended(options: string[]): number {
 
 /** 菜单是否涉及危险·不可逆操作（对 context + 全部选项一起判，命令通常在 context 里） */
 export function isDangerousMenu(context: string, options: string[]): boolean {
-  return APPROVAL_POLICY.danger.test(`${context}\n${options.join('\n')}`);
+  const text = `${context}\n${options.join('\n')}`;
+  if (!isSafeTemporaryRemoval(text)) return APPROVAL_POLICY.danger.test(text);
+  return APPROVAL_POLICY.danger.test(text.replace(/^\s*(?:\$\s*)?rm\b/im, ''));
+}
+
+/** 仅认可一条简单 rm 命令，且所有目标都位于系统或项目临时目录。复杂 shell 语法保守转人工。 */
+function isSafeTemporaryRemoval(text: string): boolean {
+  const commands = text.split('\n').map((line) => line.trim()).filter((line) => /^(?:\$\s*)?rm\b/i.test(line));
+  if (commands.length !== 1) return false;
+  const command = commands[0]!.replace(/^(?:\$\s*)?rm\s+/i, '');
+  if (/[;&|`$()<>]/.test(command)) return false;
+  const args = command.match(/(?:"[^"]*"|'[^']*'|\S+)/g) ?? [];
+  const targets = args
+    .filter((arg) => !arg.startsWith('-'))
+    .map((arg) => arg.replace(/^(['"])(.*)\1$/, '$2').replace(/\/+$/, ''));
+  return targets.length > 0 && targets.every((target) =>
+    target === '/tmp' || target.startsWith('/tmp/') ||
+    target === '.panda/tmp' || target.startsWith('.panda/tmp/') ||
+    target.endsWith('/.panda/tmp') || target.includes('/.panda/tmp/'));
 }
 
 /**

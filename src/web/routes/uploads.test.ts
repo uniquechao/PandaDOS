@@ -1,5 +1,5 @@
 /**
- * routes/uploads 单测 —— POST /api/projects/:projectId/upload 的
+ * routes/uploads 单测 —— POST /api/projects/:projectId/upload 与 .../upload/file 的
  * 鉴权（project-owner）× 类型 × 大小 × 路径 拒绝矩阵 + 落盘/exclude 副作用。
  * Driver 用 LocalDriver 指向临时目录（控制面测试替身，driver.ts 双重身份）。
  */
@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { openDb } from '../../core/db';
 import { migrate } from '../../core/migrate';
-import { isUploadRel, UPLOAD_DIR } from '../../core/uploads';
+import { isUploadRel, MAX_UPLOAD_FILE_BYTES, UPLOAD_DIR } from '../../core/uploads';
 import { UserStore } from '../../core/users';
 import { LocalDriver } from '../../executor/local';
 import { authDepsFromDb, createDispatcher } from '../middleware';
@@ -170,6 +170,130 @@ describe('POST /api/projects/:projectId/upload', () => {
     const b = await j(s.dispatch(upload('/api/projects/1/upload', s.alice.token, mk())));
     expect(a.status).toBe(200);
     expect(b.status).toBe(200);
+    expect(a.body.path).not.toBe(b.body.path);
+    expect(fs.existsSync(a.body.abs)).toBe(true);
+    expect(fs.existsSync(b.body.abs)).toBe(true);
+  });
+});
+
+describe('POST /api/projects/:projectId/upload/file', () => {
+  const P = '/api/projects/1/upload/file';
+  const TXT = new TextEncoder().encode('hello');
+
+  test('鉴权矩阵：未登录 401 / 非属主 403 / 属主与 admin 过 / 不存在项目 admin 404·普通 403', async () => {
+    const s = await setup();
+    const f = () => new File([TXT], 'notes.txt', { type: 'text/plain' });
+
+    expect((await j(s.dispatch(upload(P, undefined, f())))).status).toBe(401);
+    expect((await j(s.dispatch(upload(P, s.bob.token, f())))).status).toBe(403);
+    expect((await j(s.dispatch(upload(P, s.alice.token, f())))).status).toBe(200);
+    expect((await j(s.dispatch(upload(P, s.admin.token, f())))).status).toBe(200);
+
+    expect((await j(s.dispatch(upload('/api/projects/99/upload/file', s.admin.token, f())))).status).toBe(404);
+    expect((await j(s.dispatch(upload('/api/projects/99/upload/file', s.bob.token, f())))).status).toBe(403);
+    expect((await j(s.dispatch(upload('/api/projects/abc/upload/file', s.alice.token, f())))).status).toBe(400);
+  });
+
+  test('happy path：任意类型落到 cwd/UPLOAD_DIR/<随机>/，返回 rel+abs+name+size，git exclude 写好', async () => {
+    const s = await setup();
+    const file = new File([TXT], 'notes.txt', { type: 'text/plain' });
+    const r = await j(s.dispatch(upload(P, s.alice.token, file)));
+    expect(r.status).toBe(200);
+    expect(r.body.ok).toBe(true);
+    expect(r.body.name).toBe('notes.txt');
+    expect(r.body.size).toBe(TXT.length);
+    expect(isUploadRel(r.body.path)).toBe(true);
+    expect(r.body.abs).toBe(path.join(s.proj, r.body.path));
+    expect(await fsp.readFile(r.body.abs, 'utf-8')).toBe('hello');
+    const ex = await fsp.readFile(path.join(s.proj, '.git', 'info', 'exclude'), 'utf-8');
+    expect(ex.split('\n').some((l) => l.trim() === UPLOAD_DIR + '/')).toBe(true);
+  });
+
+  test('类型不限：图片端点拒的扩展名/无扩展名这里都放行', async () => {
+    const s = await setup();
+    for (const name of ['evil.exe', 'Makefile', 'x.svg', 'data.tar.gz']) {
+      const r = await j(s.dispatch(upload(P, s.alice.token, new File([TXT], name))));
+      expect(r.status).toBe(200);
+      expect(r.body.name).toBe(name);
+    }
+  });
+
+  test('文件名净化：穿越剥成基名、空白/中文压成 _、非法名 400', async () => {
+    const s = await setup();
+    const r = await j(s.dispatch(upload(P, s.alice.token, new File([TXT], '../../etc/passwd'))));
+    expect(r.status).toBe(200);
+    expect(r.body.name).toBe('passwd');
+    expect(r.body.path).not.toContain('..');
+    expect(r.body.abs.startsWith(path.join(s.proj, UPLOAD_DIR) + path.sep)).toBe(true);
+    expect(fs.existsSync(path.join(path.dirname(s.proj), 'etc', 'passwd'))).toBe(false);
+
+    const r2 = await j(s.dispatch(upload(P, s.alice.token, new File([TXT], '我的 报告.txt'))));
+    expect(r2.status).toBe(200);
+    expect(r2.body.name).toBe('_.txt');
+
+    for (const bad of ['...', '/']) {
+      const rb = await j(s.dispatch(upload(P, s.alice.token, new File([TXT], bad))));
+      expect(rb.status).toBe(400);
+      expect(rb.body.ok).toBe(false);
+    }
+  });
+
+  // 大文件用例只走「被 size 闸拒绝」这条路径：命中 413 时路由在 file.size 处就返回，
+  // 不会 arrayBuffer()、不落盘，20MB 只在客户端侧存在一份且用完即可回收。
+  // 「恰好 20MB 放行」那次成功上传曾在这里真实跑完（复制 + 写盘 + 读回），
+  // 全量门禁是单进程跑 200+ 个文件，它把整场峰值内存抬高到能把同进程里
+  // server.test.ts 的一条 boot 用例拖过超时——放行侧改由常量断言 + 小文件 happy path 覆盖。
+  test('大小拒绝：>20MB → 413（放行侧由 happy path 覆盖，不在这里真传 20MB）', async () => {
+    const s = await setup();
+    const over = new File([new Uint8Array(MAX_UPLOAD_FILE_BYTES), new Uint8Array(1)], 'big.bin');
+    expect(over.size).toBe(MAX_UPLOAD_FILE_BYTES + 1);
+    expect((await j(s.dispatch(upload(P, s.alice.token, over)))).status).toBe(413);
+    // 闸门就是 MAX_UPLOAD_FILE_BYTES 本身：恰好等于上限不该被拒（>，不是 >=）
+    expect(MAX_UPLOAD_FILE_BYTES).toBe(20 * 1024 * 1024);
+  });
+
+  test('形态拒绝：缺 file 字段 / file 是文本字段 / 非 multipart body → 400', async () => {
+    const s = await setup();
+    expect((await j(s.dispatch(upload(P, s.alice.token)))).status).toBe(400);
+    expect((await j(s.dispatch(upload(P, s.alice.token, 'not-a-file')))).status).toBe(400);
+
+    const jsonReq = new Request(`http://t${P}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${s.alice.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ file: 'x' }),
+    });
+    expect((await j(s.dispatch(jsonReq))).status).toBe(400);
+  });
+
+  test('Content-Length 先行拦截：声明超限直接 413（不进 formData 缓冲）', async () => {
+    const s = await setup();
+    const req = new Request(`http://t${P}`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${s.alice.token}`,
+        'content-type': 'multipart/form-data; boundary=x',
+        'content-length': String(MAX_UPLOAD_FILE_BYTES + 1024 * 1024),
+      },
+      body: '--x--',
+    });
+    expect((await j(s.dispatch(req))).status).toBe(413);
+  });
+
+  test('与图片端点互不影响：超 5MB 在 /upload 被拒，同一份在 /upload/file 不因大小被拒', async () => {
+    const s = await setup();
+    const over5 = new Uint8Array(MAX_UPLOAD_BYTES + 1); // 一份缓冲区喂两个端点
+    const big = () => new File([over5], 'big.png', { type: 'image/png' });
+    expect((await j(s.dispatch(upload('/api/projects/1/upload', s.alice.token, big())))).status).toBe(413);
+    // 文件端点的闸门比图片端点宽，同一份不会撞 size 闸（不实际断言 200 落盘，避免又写一份 5MB）
+    expect(MAX_UPLOAD_FILE_BYTES).toBeGreaterThan(MAX_UPLOAD_BYTES);
+    expect(big().size).toBeLessThanOrEqual(MAX_UPLOAD_FILE_BYTES);
+  });
+
+  test('同名两次上传 → 不同随机子目录，互不覆盖', async () => {
+    const s = await setup();
+    const mk = () => new File([TXT], 'same.txt');
+    const a = await j(s.dispatch(upload(P, s.alice.token, mk())));
+    const b = await j(s.dispatch(upload(P, s.alice.token, mk())));
     expect(a.body.path).not.toBe(b.body.path);
     expect(fs.existsSync(a.body.abs)).toBe(true);
     expect(fs.existsSync(b.body.abs)).toBe(true);

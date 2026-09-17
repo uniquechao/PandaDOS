@@ -3,7 +3,7 @@
  *
  * worktree 行是唯一事实源：节点启动前 preparing→active，节点完成后固化 head_sha；汇合按
  * finished_ts/id 顺序合并。冲突保留在主工作区并交独立 Agent 处理，无法安全收口时置 paused，
- * 用户修复主工作区后通过既有 issue unblock 入口重试同一次汇合。
+ * 用户修复主工作区后通过既有 issue unblock 入口恢复同一次汇合。
  */
 import type { Database } from 'bun:sqlite';
 import { chatTmux } from '../core/conversations';

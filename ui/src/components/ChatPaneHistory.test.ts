@@ -17,6 +17,14 @@ describe('ChatPane 历史加载契约', () => {
     expect(source).toContain('const visibleMsgs = issueScoped');
     expect(source).toContain('const needsIssueBoundary = issueScoped && !reachedIssueStart');
     expect(source).toContain('<RunStream msgs={visibleMsgs}');
-    expect(source).not.toContain('<ConversationSegments');
+  });
+
+  test('模块时间线只做历史索引：正文仍只有当前 issue 的消息（#277 / I-01）', () => {
+    // 时间线列的是**当前 issue 之前**的段（groupModuleSegments 按 currentIssueId 排除自己），
+    // 所以必须把 currentIssueId 传下去；正文那条 RunStream 依旧只吃 visibleMsgs，不能改成全量。
+    expect(source).toContain('<ConversationSegments');
+    expect(source).toContain('segments={moduleSegments ?? []}');
+    expect(source).toContain('currentIssueId={currentIssueId}');
+    expect(source).not.toContain('<RunStream msgs={msgs}');
   });
 });

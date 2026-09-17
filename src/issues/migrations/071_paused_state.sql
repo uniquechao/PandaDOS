@@ -1,0 +1,2 @@
+-- panda:add-paused-issue-state
+-- Runtime rebuild preserves all columns and dependent objects from installed module migrations.

@@ -16,6 +16,7 @@
  */
 import {
   runAgentArtifacts,
+  type AgentArtifactDiagnostics,
   type AgentArtifactDriver,
 } from '../core/agent-artifact-runner';
 import type { AgentKind, IssueCategory } from '../core/types';
@@ -211,8 +212,20 @@ export type RunClarifyResult =
       questions: string[];
       /** questions.md 原文（#110，未剥编号/未截条数；供事件留档、UI 完整展示；无该文件 = ''） */
       questionsText?: string;
+      /**
+       * 抢救来的结果（#280 / B-06）：代理没写出 done 标记就超时了，但 feedback/questions
+       * 已经落盘。这一轮的钱早花完了（独立会话完整读过一遍代码库），把结果整体丢掉是纯浪费。
+       */
+      salvaged?: true;
+      /** salvaged 时带上现场证据，供引擎落事件排查「为什么没写 done」 */
+      diagnostics?: AgentArtifactDiagnostics;
     }
-  | { ok: false; reason: 'timeout' | 'no-output' | 'error'; error?: string };
+  | {
+      ok: false;
+      reason: 'timeout' | 'no-output' | 'error';
+      error?: string;
+      diagnostics?: AgentArtifactDiagnostics;
+    };
 
 export class ClarifyRunner {
   private readonly driver: ClarifyDriver;
@@ -251,18 +264,34 @@ export class ClarifyRunner {
       },
       options,
     );
-    if (!result.ok) {
-      return result.reason === 'timeout'
-        ? { ok: false, reason: 'timeout' }
-        : { ok: false, reason: 'error', ...(result.error ? { error: result.error } : {}) };
-    }
-    const feedback = typeof result.artifacts.feedback === 'string'
-      ? result.artifacts.feedback.trim()
-      : '';
-    const questionsRaw = typeof result.artifacts.questions === 'string'
-      ? result.artifacts.questions
-      : '';
+    // 产物解析对成功与抢救两条路径完全一致：done 只是「代理自己说完事了」的标记，
+    // 真正有价值的是 feedback/questions 这两个文件写没写出来。
+    const artifacts = result.ok ? result.artifacts : (result.artifacts ?? {});
+    const feedback = typeof artifacts.feedback === 'string' ? artifacts.feedback.trim() : '';
+    const questionsRaw = typeof artifacts.questions === 'string' ? artifacts.questions : '';
     const questions = parseQuestions(questionsRaw);
+
+    if (!result.ok) {
+      const diagnostics = result.diagnostics;
+      // 抢救：超时但产物已落盘 → 按成功用，只是标明是抢救来的
+      if (result.partial && (feedback || questions.length > 0)) {
+        return {
+          ok: true,
+          feedback,
+          questions,
+          questionsText: questionsRaw.trim(),
+          salvaged: true,
+          ...(diagnostics ? { diagnostics } : {}),
+        };
+      }
+      const reason = result.reason === 'timeout' ? 'timeout' : 'error';
+      return {
+        ok: false,
+        reason,
+        ...(result.error ? { error: result.error } : {}),
+        ...(diagnostics ? { diagnostics } : {}),
+      };
+    }
     if (!feedback && questions.length === 0) return { ok: false, reason: 'no-output' };
     return { ok: true, feedback, questions, questionsText: questionsRaw.trim() };
   }

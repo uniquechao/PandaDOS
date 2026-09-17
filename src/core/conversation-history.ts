@@ -2,7 +2,7 @@
 import type { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
-import type { AgentKind, ProjectKind } from './types';
+import type { AgentKind, ConversationKind } from './types';
 
 export const CONVERSATION_ARCHIVE_DIR = '.panda/conversations';
 const ARCHIVE_READ_CHUNK_BYTES = 1024 * 1024;
@@ -20,7 +20,7 @@ export interface HistoryConversationInput {
 export interface BoundHistoryConversation {
   id: string;
   projectId: number;
-  kind: ProjectKind;
+  kind: ConversationKind;
 }
 
 export interface ImportHistoryConversationsResult {

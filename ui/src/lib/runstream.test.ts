@@ -39,6 +39,15 @@ describe('toRunEvents 配对与状态', () => {
     expect((evs[0] as RunToolEvent).durationMs).toBe(500);
   });
 
+  test('规范化后的 Codex exec → kind command', () => {
+    const evs = toRunEvents([
+      msg({ seq: 0, role: 'tool_use', tool: 'exec', input: '$ git status --short' }),
+      msg({ seq: 1, role: 'tool_result', tool: 'exec', result: 'M src/a.ts' }),
+    ]);
+    expect((evs[0] as RunToolEvent).kind).toBe('command');
+    expect((evs[0] as RunToolEvent).result).toBe('M src/a.ts');
+  });
+
   test('结果 isError → status error', () => {
     const evs = toRunEvents([
       msg({ seq: 0, role: 'tool_use', tool: 'Edit', input: 'x.ts', ts: 0 }),
@@ -94,6 +103,20 @@ describe('toRunEvents 配对与状态', () => {
     ]);
   });
 
+  test('并行同名工具乱序返回：优先按 toolCallId 精确配对', () => {
+    const evs = toRunEvents([
+      msg({ seq: 0, role: 'tool_use', tool: 'Read', toolCallId: 'call-a', input: 'A', ts: 1000 }),
+      msg({ seq: 1, role: 'tool_use', tool: 'Read', toolCallId: 'call-b', input: 'B', ts: 1100 }),
+      msg({ seq: 2, role: 'tool_result', tool: 'Read', toolCallId: 'call-b', result: 'RB', ts: 1500 }),
+      msg({ seq: 3, role: 'tool_result', tool: 'Read', toolCallId: 'call-a', result: 'RA', ts: 1700 }),
+    ]);
+    const tools = evs.filter((e): e is RunToolEvent => e.kind === 'tool' || e.kind === 'command');
+    expect(tools.map((t) => [t.seq, t.toolCallId, t.result, t.durationMs])).toEqual([
+      [0, 'call-a', 'RA', 700],
+      [1, 'call-b', 'RB', 400],
+    ]);
+  });
+
   test('孤儿结果（配套 tool_use 在窗口外）单独成事件', () => {
     const evs = toRunEvents([
       msg({ seq: 5, role: 'tool_result', tool: 'Grep', result: 'orphan', ts: 9 }),
@@ -104,6 +127,30 @@ describe('toRunEvents 配对与状态', () => {
     expect(t.result).toBe('orphan');
     expect(t.status).toBe('ok');
     expect(t.input).toBeUndefined();
+  });
+
+  test('resultOff：入参与结果各带自己的 off，供「查看完整内容」分别回源（issue #288）', () => {
+    const evs = toRunEvents([
+      msg({ seq: 0, role: 'tool_use', tool: 'Bash', toolCallId: 't1', input: '$ ls', off: 100 }),
+      msg({ seq: 1, role: 'tool_result', tool: 'Bash', toolCallId: 't1', result: 'a\nb', off: 480 }),
+    ]);
+    const t = evs[0] as RunToolEvent;
+    expect(t.off).toBe(100); // 入参那条消息
+    expect(t.resultOff).toBe(480); // 结果那条消息
+
+    // 孤儿结果：事件本身就是结果，两者同值
+    const orphan = toRunEvents([
+      msg({ seq: 5, role: 'tool_result', tool: 'Grep', result: 'orphan', off: 900 }),
+    ])[0] as RunToolEvent;
+    expect(orphan.off).toBe(900);
+    expect(orphan.resultOff).toBe(900);
+
+    // 老数据没有 off：两格都留空，不伪造
+    const noOff = toRunEvents([
+      msg({ seq: 0, role: 'tool_use', tool: 'Read', input: 'a.ts' }),
+      msg({ seq: 1, role: 'tool_result', tool: 'Read', result: 'x' }),
+    ])[0] as RunToolEvent;
+    expect(noOff.resultOff).toBeUndefined();
   });
 
   test('时间戳缺失 → 无耗时，状态仍正确', () => {

@@ -10,10 +10,10 @@ export function isDriving(status: IssueStatus): boolean {
   return DRIVING_STATUSES.includes(status);
 }
 
-/** 「重试」按当前状态派生的动作 */
+/** 运行控制按当前状态派生的动作 */
 export type RetryAction =
-  | 'unblock' // 受阻 → 解除阻塞重跑（POST /unblock）
-  | 'reopen' // 已取消 → 复活重跑（POST /reopen，#93）
+  | 'unblock' // 受阻 → 从原阶段继续运行（POST /unblock）
+  | 'reopen' // 已取消 → 重新运行（POST /reopen，#93）
   | 'inject' // 驱动中且最近失败 → 注入「请重试刚才失败的步骤」
   | 'none'; // 无可重试
 
@@ -25,9 +25,9 @@ export interface RetryPlan {
 }
 
 /**
- * 重试决策（纯函数）：
- *  - blocked → unblock 重跑（始终可用）；
- *  - cancelled → reopen 复活重跑（#93；注意它会立刻排队开跑，要改需求得先改完再点）；
+ * 运行控制决策（纯函数）：
+ *  - blocked → unblock 继续运行（始终可用）；
+ *  - cancelled → reopen 重新运行（#93；注意它会立刻排队开跑，要改需求得先改完再点）；
  *  - 驱动中 + 最近工具异常 → 注入重试提示；驱动中但无失败步骤 → 禁用；
  *  - 其余 → 无。
  *
@@ -35,7 +35,7 @@ export interface RetryPlan {
  */
 export function retryPlan(status: IssueStatus, hasError: boolean): RetryPlan {
   if (status === 'blocked') {
-    return { action: 'unblock', label: tr('action.unblockRetry'), enabled: true, hint: tr('action.unblockRetryHint') };
+    return { action: 'unblock', label: tr('action.unblockContinue'), enabled: true, hint: tr('action.unblockContinueHint') };
   }
   if (status === 'cancelled') {
     return {
@@ -151,4 +151,37 @@ export function clarifyAnalyzing(
       return false;
     }
   });
+}
+
+/** 「已完成但未推送」标记的内容（pushFailureState 的返回值；null = 没有这个问题） */
+export interface PushFailure {
+  /** 未推上去的分支名（事件里带；旧事件/detached 时为空） */
+  branch: string;
+  /** git 的原始报错（原样展示，不翻译） */
+  detail: string;
+}
+
+/**
+ * 「本 issue 已完成，但改动没进远端」派生（#272 / B-02，纯函数、事件溯源）。
+ *
+ * 引擎自动收尾时 push 失败**不阻止完成**（本地已经提交了，硬把 issue 打回 blocked
+ * 反而让人以为活没干完），但也绝不能静默 done——于是留下 `auto_push_failed` 事件，
+ * 由这里翻成详情页顶部一直挂着的警示条。
+ *
+ * 只认「最后一条 `auto_push_failed` 之后有没有成功的 `auto_push`」：重跑、人工在 Git 页
+ * 补推、后续 issue 在同一分支推成功，都会落 `auto_push`，标记随之自动消失，不需要谁去清。
+ * `push_skipped`（项目根本没有 origin）刻意**不**算解除——那说明它至今仍没被推走。
+ */
+export function pushFailureState(events: IssueEvent[]): PushFailure | null {
+  let failed: IssueEvent | null = null;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i]!.kind === 'auto_push_failed') {
+      failed = events[i]!;
+      break;
+    }
+  }
+  if (!failed) return null;
+  if (events.some((e) => e.kind === 'auto_push' && e.id > failed!.id)) return null;
+  const d = tryJson<{ branch?: string; detail?: string }>(failed.dataJson);
+  return { branch: (d?.branch ?? '').trim(), detail: (d?.detail ?? '').trim() };
 }

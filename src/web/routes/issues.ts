@@ -1,3 +1,4 @@
+import { normalizeSkillPolicy } from '../../core/skill-policy';
 /**
  * web/routes/issues —— issue CRUD + start + 卡点 approve/reject + 时间线（spec §9-2）。
  * - 状态迁移一律走引擎 applyEvent（封死 v1 web.ts:535-538 直通 store 的旁路，评审 M8）；
@@ -7,9 +8,17 @@
  * 只 export 路由定义，注册进 routes/index.ts 由集成步骤统一做。
  */
 import type { MessageBumper } from '../../core/activity';
+import type { AttentionKind } from '../../issues/attention';
 import type { Database } from 'bun:sqlite';
 import { projectAgentSupport } from '../../core/executors';
-import { parseAutoApproveLevel, type AgentKind, type IssueCategory, type ProjectModule } from '../../core/types';
+import {
+  parseAutoApproveLevel,
+  parseReasoningEffort,
+  type AgentKind,
+  type IssueCategory,
+  type ProjectModule,
+  type ReasoningEffort,
+} from '../../core/types';
 import { isUploadRel } from '../../core/uploads';
 import {
   isEditableStatus,
@@ -20,6 +29,8 @@ import {
   type ImplMode,
   type UpdateUnstartedSubtaskResult,
 } from '../../issues/engine';
+import { normalizeModuleSkills } from '../../issues/modules';
+import { resolveReasoningEffort } from '../../core/reasoning';
 import { apiError } from '../errors';
 import { json, type RouteDef } from '../middleware';
 
@@ -28,7 +39,12 @@ export interface IssuesRoutesDeps {
   engine: IssueEngine;
   modules?: {
     listByProject(projectId: number): ProjectModule[];
+    get?(id: number): ProjectModule | undefined;
     changeAgent?(projectId: number, moduleId: number, agent: AgentKind): ProjectModule;
+    /** 模块技能挂载（046 / #277）；缺省 = 该装配不支持配置 */
+    setSkills?(id: number, skills: string[] | null): ProjectModule;
+    /** 模块默认推理档（048 / #281）；缺省 = 该装配不支持配置 */
+    setReasoningEffort?(id: number, effort: ReasoningEffort | null): ProjectModule;
   };
   /**
    * waiting_input 派生标记：该 issue 是否在等人工输入（CC 弹窗升级人工未处理 / 菜单滞留）。
@@ -183,11 +199,36 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
     const support = projectAgentSupport(db, projectId, agent);
     return support.ok ? null : json({ ok: false, error: support.error }, 409);
   };
+  /**
+   * 这条 issue 生效的推理档与它来自哪一层（048 / #281）。
+   * 只读派生，给 UI 展示与排查用——真正定档发生在会话启动时（codex 的 effort 是启动参数）。
+   */
+  const reasoningOf = (issue: EngineIssue) => {
+    const module = issue.moduleId
+      ? deps.modules?.listByProject(issue.projectId).find((m) => m.id === issue.moduleId)
+      : undefined;
+    return resolveReasoningEffort({
+      issue: issue.reasoningEffort ?? null,
+      module: module?.reasoningEffort ?? null,
+    });
+  };
+
   const waitingInput = (issue: EngineIssue): boolean => {
     try {
       return deps.waitingInput?.(issue) ?? false;
     } catch {
       return false; // 派生标记失败不拖垮列表接口
+    }
+  };
+  /**
+   * 「这条 issue 在等什么」（#275 / I-07）：把 blocked 这个统一出口按原因拆开。
+   * 与 waitingInput 同款容错——派生失败降级成 'none'，不拖垮列表接口。
+   */
+  const attentionKind = (issue: EngineIssue): AttentionKind => {
+    try {
+      return engine.attentionKindOf(issue, waitingInput(issue));
+    } catch {
+      return 'none';
     }
   };
   /** 派生标记：澄清问题还没被回答（跨状态——创建时问题开跑后仍显示到回答为止，spec 第 5 点） */
@@ -314,8 +355,25 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
         const wantArchive = b.status === 'archived';
         const requestedAgent: AgentKind | null =
           b.agent === 'claude' || b.agent === 'codex' ? b.agent : null;
-        if (!displayName && !slug && !wantArchive && !requestedAgent) {
-          return json({ ok: false, error: '缺 displayName / slug / status / agent' }, 400);
+        // 技能配置（046 / #277）：显式传 null = 清回「沿用项目默认」，数组 = 显式指定。
+        // 字段缺省（undefined）表示这次请求不碰技能，不能与 null 混为一谈。
+        const skillsGiven = 'skills' in b;
+        // 模块默认推理档（048 / #281）：null = 清回未配置（用控制面默认档）
+        const effortGiven = 'reasoningEffort' in b;
+        const effort = effortGiven && b.reasoningEffort !== null
+          ? parseReasoningEffort(b.reasoningEffort)
+          : null;
+        if (effortGiven && b.reasoningEffort !== null && effort === null) {
+          return json({ ok: false, error: '非法推理档位' }, 400);
+        }
+        if (!displayName && !slug && !wantArchive && !requestedAgent && !skillsGiven && !effortGiven) {
+          return json({ ok: false, error: '缺 displayName / slug / status / agent / skills / reasoningEffort' }, 400);
+        }
+        if (skillsGiven && !deps.modules?.setSkills) {
+          return json({ ok: false, error: '当前装配不支持配置模块技能' }, 503);
+        }
+        if (effortGiven && !deps.modules?.setReasoningEffort) {
+          return json({ ok: false, error: '当前装配不支持配置模块推理档' }, 503);
         }
         if (requestedAgent) {
           const denied = unsupported(pid, requestedAgent);
@@ -326,6 +384,16 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
         }
         try {
           let updated: ProjectModule | null = null;
+          if (skillsGiven) {
+            const module = deps.modules!.get?.(mid);
+            if (module && module.projectId !== pid) throw new Error('无此模块');
+            updated = deps.modules!.setSkills!(mid, normalizeModuleSkills(b.skills));
+          }
+          if (effortGiven) {
+            const module = deps.modules!.get?.(mid);
+            if (module && module.projectId !== pid) throw new Error('无此模块');
+            updated = deps.modules!.setReasoningEffort!(mid, effort);
+          }
           if (requestedAgent) updated = deps.modules!.changeAgent!(pid, mid, requestedAgent);
           if (slug) updated = await engine.renameModuleSlug(pid, mid, slug, displayName || undefined);
           else if (displayName) updated = await engine.renameModule(pid, mid, displayName);
@@ -352,6 +420,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
               waitingInput: waitingInput(i),
               clarifyPending: clarifyPending(i),
               awaitingClarify: awaitingClarify(i),
+              attentionKind: attentionKind(i),
             })),
         );
       },
@@ -372,6 +441,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
         }
         const category: IssueCategory =
           b.category === 'debug' ? 'debug' : b.category === 'design' ? 'design' : 'task';
+        if (b.executionMode !== undefined && b.executionMode !== 'direct' && b.executionMode !== 'planned') return json({ ok: false, error: 'Invalid executionMode' }, 400);
         const implMode: ImplMode = b.implMode === 'team' ? 'team' : 'seq';
         const agent: AgentKind = b.agent === 'codex' ? 'codex' : 'claude';
         const selectedModule = num(
@@ -404,6 +474,8 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
                   ? b.module
                   : undefined,
             implMode,
+            ...(b.skillPolicy !== undefined ? {skillPolicy:normalizeSkillPolicy(b.skillPolicy)} : {}),
+            executionMode: b.executionMode as 'direct' | 'planned' | undefined,
             agent,
             // #115：新建时就能定档位；没带/带脏值 = 'medium'（引擎侧同样兜底）
             autoApprove: parseAutoApproveLevel(b.autoApprove) ?? 'medium',
@@ -437,12 +509,33 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
             waitingInput: waitingInput(issue),
             clarifyPending: clarifyPending(issue),
             awaitingClarify: awaitingClarify(issue),
+            attentionKind: attentionKind(issue),
           },
           subtasks: engine.store.subtasksOf(issue),
           gates: engine.store.listGates(issue.id),
           conversationSegments: issue.convId
             ? engine.store.listConversationSegments(issue.convId)
             : [],
+          // 模块整条时间线（跨会话，#277 / I-01）：轮换后旧记录还在，只是换了一条 conv
+          moduleSegments: issue.moduleId ? engine.store.listModuleSegments(issue.moduleId) : [],
+          // 待恢复意图（#283）：用户点过「继续运行」但项目忙，正等接力自动恢复
+          unblockRequest: engine.store.pendingUnblockRequest(issue.id),
+          // 可拆回的合并（#289）：有快照才给拆；宿主已开跑时前端把按钮置灰并说明原因
+          mergedFrom: (() => {
+            const merge = engine.store.lastUnmergeableMerge(issue.id);
+            if (!merge) return null;
+            return {
+              members: merge.snapshot.map((entry) => ({ id: entry.id, title: entry.title })),
+              canUnmerge: issue.status === 'pending',
+            };
+          })(),
+          // 推理档（048 / #281）：生效档位 + 来源（issue/模块/默认）
+          reasoning: { ...reasoningOf(issue), override: issue.reasoningEffort ?? null },
+          // 门禁（#279 / I-03）：本轮范围 + 最近一次结果，执行页只读展示
+          validation: {
+            scope: issue.validationScope ?? null,
+            last: engine.store.lastValidation(issue.id),
+          },
           workflow: engine.workflowSnapshot(issue.id),
           workflowRuntime: engine.workflowRuntime(issue.id),
         });
@@ -471,8 +564,23 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
       handler: async ({ req, params }) => {
         const issue = issueOf(engine, params);
         if (!issue) return json({ ok: false, error: '无此 issue' }, 404);
+        const body = await readBody(req);
+        // 推理档覆盖（048 / #281）**不受「可编辑状态」限制**：它不是需求内容，而是
+        // 「下次会话启动时用哪个档」的配置——codex 的 effort 是进程启动参数，改了也不会
+        // 影响正在跑的那个进程，所以跑到一半发现该提档，改完等下次启动生效即可。
+        if ('reasoningEffort' in body) {
+          const wanted = body.reasoningEffort === null ? null : parseReasoningEffort(body.reasoningEffort);
+          if (body.reasoningEffort !== null && wanted === null) {
+            return json({ ok: false, error: '非法推理档位' }, 400);
+          }
+          engine.store.setIssueReasoningEffort(issue.id, wanted);
+          if (Object.keys(body).length === 1) {
+            const fresh = engine.store.get(issue.id)!;
+            return json({ ok: true, issue: fresh, reasoning: { ...reasoningOf(fresh), override: fresh.reasoningEffort ?? null } });
+          }
+        }
         // 可改内容的状态见 EDITABLE_STATES（pending / blocked / cancelled）。blocked 保存后仍受阻，
-        // 必须再明确提交解除方法才会重新运行。
+        // 必须再明确提交解除方法，才会从受阻前的阶段继续运行。
         // 已开跑的走澄清/打回把意见带回 CC，直接改 title/body 于事无补（CC 已读过原文）且会造成
         // 人机认知不一致；done 是真终态同样不给改。
         if (!isEditableStatus(issue.status)) {
@@ -487,7 +595,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
             400,
           );
         }
-        const b = await readBody(req);
+        const b = body;
         const git = parseIssueGitPatch(b, issue.targetBranch, issue.sourceRef);
         if (git.error) return json({ ok: false, error: git.error }, 400);
         const wantsModuleChange =
@@ -516,6 +624,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
                 .slice(0, 6)
             : [];
         const patch: Parameters<typeof engine.store.patchMeta>[1] = {
+          source: b.source === 'sync' ? 'sync' : 'user',
           ...(typeof b.title === 'string' && b.title.trim() ? { title: b.title.trim() } : {}),
           ...('body' in b && (b.body === null || typeof b.body === 'string') ? { body: b.body as string | null } : {}),
           ...(b.category === 'task' || b.category === 'design' || b.category === 'debug'
@@ -548,12 +657,21 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
         }
         // 需求内容实际变化（title/body/截图）→ 重新分析，重生成代理反馈/新问题；
         // 模块/类型等元数据不触发。scheduleClarify 自带「仅 pending + 每项目链式单飞」守卫。
+        //
+        // #283 / B-11：**只有用户编辑才重新澄清**。协作文件同步回写改出来的 diff 与用户编辑
+        // 长得一模一样，靠内容比对根本分不出来，猜错的代价是白跑一次通读代码库的澄清分析
+        // （#270 实测同一条 issue 连跑两次，两次都是 questions=0）。来源由 `source` 显式说明。
+        const editSource = b.source === 'sync' ? 'sync' : 'user';
         const contentChanged =
           (patch.title !== undefined && patch.title !== issue.title) ||
           ('body' in patch && (patch.body ?? null) !== (issue.body ?? null)) ||
           ('imagesJson' in patch && (patch.imagesJson ?? null) !== (issue.imagesJson ?? null));
-        if (contentChanged) engine.scheduleClarify(issue.id);
-        return json({ ok: true, issue: updated });
+        if (contentChanged && editSource === 'user') engine.scheduleClarify(issue.id);
+        return json({
+          ok: true,
+          issue: updated,
+          reasoning: { ...reasoningOf(updated), override: updated.reasoningEffort ?? null },
+        });
       },
     },
     {
@@ -600,7 +718,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
       method: 'POST',
       path: '/api/projects/:projectId/issues/:issueId/cancel',
       auth: 'project-access',
-      handler: async ({ params, user }) => {
+      handler: async ({ req, params, user }) => {
         const issue = issueOf(engine, params);
         if (!issue) return json({ ok: false, error: '无此 issue' }, 404);
         const r = await engine.cancelIssue(issue.id, user!.id);
@@ -612,7 +730,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
       method: 'POST',
       path: '/api/projects/:projectId/issues/:issueId/retry-gate',
       auth: 'project-access',
-      handler: async ({ params, user }) => {
+      handler: async ({ req, params, user }) => {
         const issue = issueOf(engine, params);
         if (!issue) return json({ ok: false, error: '无此 issue' }, 404);
         const r = await engine.retryMissingGate(issue.id, user!.id);
@@ -631,7 +749,45 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
         if (!guidance) return json({ ok: false, error: '解除阻塞前必须填写补充意见或解除方法' }, 400);
         if (guidance.length > 4000) return json({ ok: false, error: '解除方法不能超过 4000 字' }, 400);
         const r = await engine.unblockIssue(issue.id, guidance, user!.id);
-        return r.ok ? json({ ok: true, issue: engine.store.get(issue.id) }) : json(r, 409);
+        if (!r.ok) return json(r, 409);
+        // 项目忙 → 解除意图已排队（#283）：这是成功，不是 409。前端据此显示「等当前任务结束」
+        return json({
+          ok: true,
+          ...('queued' in r ? { queued: true, requestedTs: r.requestedTs } : {}),
+          issue: engine.store.get(issue.id),
+          unblockRequest: engine.store.pendingUnblockRequest(issue.id),
+        });
+      },
+    },
+    {
+      /**
+       * 一键拆回智能合并（#289 / B-14）：按 tasks_merged 快照把宿主与被并项都还原回去。
+       * 只在宿主未开跑时可用——开跑之后会话里已经按合并后的正文干过活了。
+       */
+      method: 'POST',
+      path: '/api/projects/:projectId/issues/:issueId/unmerge',
+      auth: 'project-access',
+      handler: async ({ params, user }) => {
+        const issue = issueOf(engine, params);
+        if (!issue) return json({ ok: false, error: '无此 issue' }, 404);
+        const r = await engine.unmergeIssues(issue.id, user!.id);
+        return r.ok
+          ? json({ ok: true, restored: r.restored, issue: engine.store.get(issue.id) })
+          : json(r, 409);
+      },
+    },
+    {
+      /** 撤销尚未消费的解除意图（#283）：排错了/改主意了，得能收回来 */
+      method: 'POST',
+      path: '/api/projects/:projectId/issues/:issueId/unblock/cancel',
+      auth: 'project-access',
+      handler: ({ params, user }) => {
+        const issue = issueOf(engine, params);
+        if (!issue) return json({ ok: false, error: '无此 issue' }, 404);
+        const r = engine.cancelUnblockRequest(issue.id, user!.id);
+        return r.ok
+          ? json({ ok: true, issue: engine.store.get(issue.id), unblockRequest: null })
+          : json(r, 409);
       },
     },
     {
@@ -641,10 +797,12 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
       method: 'POST',
       path: '/api/projects/:projectId/issues/:issueId/reopen',
       auth: 'project-access',
-      handler: async ({ params, user }) => {
+      handler: async ({ req, params, user }) => {
         const issue = issueOf(engine, params);
         if (!issue) return json({ ok: false, error: '无此 issue' }, 404);
-        const r = await engine.reopenIssue(issue.id, user!.id);
+        const b = await readBody(req);
+        const guidance = typeof b.guidance === 'string' ? b.guidance : '';
+        const r = await engine.reopenIssue(issue.id, user!.id, guidance);
         return r.ok ? json({ ok: true, issue: engine.store.get(issue.id) }) : json(r, 409);
       },
     },

@@ -1,3 +1,4 @@
+import { readSkillPolicy, saveSkillPolicy, effectiveSkillPolicy } from '../../core/skill-policy';
 /**
  * web/routes/skills —— 技能与技能市场（v1 skills/market 平移 + v2 多用户/多执行机语义）。
  *
@@ -120,7 +121,24 @@ export function skillsRoutes(deps: SkillsRoutesDeps): RouteDef[] {
     }
   }
 
+  const policyRoutes: RouteDef[] = (['GET','PUT'] as const).map(method => ({
+    method, path:'/api/projects/:projectId/skill-policy', auth:'project-access',
+    handler: async ({req,params}) => {
+      const pid=Number(params.projectId), query=new URL(req.url).searchParams;
+      const mid=Number(query.get('moduleId') ?? 0), iid=Number(query.get('issueId') ?? 0);
+      if (![pid,mid,iid].every(Number.isSafeInteger) || pid<=0 || mid<0 || iid<0 || (mid && iid)) return json({ok:false,error:'Invalid policy scope'},400);
+      if (mid && !db.query('SELECT id FROM project_modules WHERE id=? AND project_id=?').get(mid,pid)) return json({ok:false,error:'Module not found'},404);
+      const issue=iid ? db.query<{module_id:number|null},[number,number]>('SELECT module_id FROM issues WHERE id=? AND project_id=?').get(iid,pid) : null;
+      if (iid && !issue) return json({ok:false,error:'Issue not found'},404);
+      const scope={projectId:pid,moduleId:mid || undefined,issueId:iid || undefined};
+      try {
+        if (method==='PUT') saveSkillPolicy(db,scope,await req.json());
+        return json({ok:true,policy:readSkillPolicy(db,scope),effective:effectiveSkillPolicy(db,{...scope,moduleId:mid || issue?.module_id || undefined}),applies:'next-session'});
+      } catch(e) { return json({ok:false,error:String(e).slice(0,200)},400); }
+    },
+  }));
   return [
+    ...policyRoutes,
     // ---------- 项目维度 ----------
     {
       method: 'GET',

@@ -8,7 +8,7 @@
  * - GET /api/executors/:id/tmux-sessions（导入候选 + 托管/已导入/越权标注）
  * - GET /api/executors/:id/agent-projects?agent=claude|codex（本地历史项目候选）
  * - POST /api/projects {name?, executorId, gitUrl?, goal?, cwd?, runUser?, withConversation?}
- * - POST /api/projects/import {source, executorId, kind, session|cwd, name?, goal?, runUser?}
+ * - POST /api/projects/import {source, executorId, session|cwd, name?, goal?, runUser?}
  */
 import { useEffect, useState } from 'preact/hooks';
 import { api, ApiError } from '../lib/api';
@@ -30,7 +30,6 @@ import type {
   Project,
   ProjectImportResponse,
   ProjectIssueSummary,
-  ProjectKind,
   ProjectsSummary,
   TmuxSessionInfo,
 } from '../lib/types';
@@ -129,44 +128,6 @@ function RunUserSelect({
   );
 }
 
-function ProjectKindField({
-  kind,
-  onChange,
-  helpId,
-}: {
-  kind: ProjectKind;
-  onChange: (kind: ProjectKind) => void;
-  helpId: string;
-}) {
-  return (
-    <fieldset class="project-kind-group">
-      <legend>{tr('project.projectType')}</legend>
-      <div class="seg project-kind-options">
-        <button
-          type="button"
-          class={`seg-btn ${kind === 'issue' ? 'on' : ''}`}
-          aria-pressed={kind === 'issue'}
-          aria-describedby={helpId}
-          onClick={() => onChange('issue')}
-        >
-          {tr('project.issueBoard')}
-        </button>
-        <button
-          type="button"
-          class={`seg-btn ${kind === 'chat' ? 'on' : ''}`}
-          aria-pressed={kind === 'chat'}
-          aria-describedby={helpId}
-          onClick={() => onChange('chat')}
-        >
-          {tr('view.conversation')}
-        </button>
-      </div>
-      <div id={helpId} class="project-kind-help" role="status" aria-live="polite">
-        {tr(kind === 'issue' ? 'project.issueModeHelp' : 'project.chatModeHelp')}
-      </div>
-    </fieldset>
-  );
-}
 
 /**
  * 迁移工程目录（admin 专属）：POST /api/projects/:id/cwd-migrate。
@@ -394,7 +355,7 @@ export function ProjectsView({ me }: { me: Me }) {
       <div
         key={p.id}
         class={'pcard' + (p.status === 'archived' ? ' archived' : '')}
-        onClick={() => nav(p.kind === 'chat' ? `/p/${p.id}/chat` : `/p/${p.id}`)}
+        onClick={() => nav(`/p/${p.id}`)}
       >
         <div class="pcard-top">
           <span class="pcard-ic" style={{ background: av.bg, color: av.fg }}>
@@ -409,7 +370,6 @@ export function ProjectsView({ me }: { me: Me }) {
               <b>{p.name}</b>
             </div>
             <div class="pcard-badges">
-              {p.kind === 'chat' && <span class="badge b-purple">{tr('view.conversation')}</span>}
               {p.status === 'archived' && <span class="badge b-gray">{tr('project.archived')}</span>}
               {!!s && s.review > 0 && <span class="badge b-amber">{tr('project.statusReview')} {s.review}</span>}
               {!!s && s.doing > 0 && <span class="badge b-green">{tr('project.statusDoing')} {s.doing}</span>}
@@ -447,8 +407,6 @@ export function ProjectsView({ me }: { me: Me }) {
                 return ex?.supportedAgents.includes(m.mode as 'claude' | 'codex') ?? false;
               })}
             />
-            {/* issue 项目：项目级自由对话入口（chat 项目整卡即进对话，无需此按钮） */}
-            {p.kind !== 'chat' && (
               <button
                 class="pcard-act"
                 onClick={(e) => {
@@ -458,7 +416,6 @@ export function ProjectsView({ me }: { me: Me }) {
               >
                 {tr('view.conversation')}
               </button>
-            )}
             <button
               class="pcard-act"
               onClick={(e) => {
@@ -637,7 +594,7 @@ export function ProjectsView({ me }: { me: Me }) {
           onImported={(p) => {
             setImporting(false);
             load();
-            nav(p.kind === 'chat' ? `/p/${p.id}/chat` : `/p/${p.id}`);
+            nav(`/p/${p.id}`);
           }}
         />
       )}
@@ -661,7 +618,6 @@ function CreateProjectModal({
   onClose: () => void;
   onCreated: (p: Project) => void;
 }) {
-  const [kind, setKind] = useState<'issue' | 'chat'>('issue');
   const [source, setSource] = useState<'blank' | 'git'>('blank');
   const [gitUrl, setGitUrl] = useState('');
   const [nameTouched, setNameTouched] = useState(false);
@@ -715,12 +671,10 @@ function CreateProjectModal({
           executorId: eid,
           ...(source === 'git' && gitUrl.trim() ? { gitUrl: gitUrl.trim() } : {}),
           ...(goal.trim() ? { goal: goal.trim() } : {}),
-          kind,
           ...(cwd.trim() ? { cwd: cwd.trim() } : anchoredCwd ? { cwd: anchoredCwd } : {}),
           ...(runUser ? { runUser } : {}),
-          // 对话模式无 issue 分支概念，也不在这里建（issue 型）对话——对话在对话视图里建
-          ...(kind === 'chat' ? {} : workBranch.trim() ? { workBranch: workBranch.trim() } : {}),
-          withConversation: kind === 'chat' ? false : withConv,
+          ...(workBranch.trim() ? { workBranch: workBranch.trim() } : {}),
+          withConversation: withConv,
         },
       );
       if (r.cloned) toast.success(tr('project.clonedCreated'));
@@ -738,7 +692,6 @@ function CreateProjectModal({
   return (
     <Modal title={tr('project.newProject')} onClose={onClose}>
       <div class="formcol">
-        <ProjectKindField kind={kind} onChange={setKind} helpId="create-project-kind-help" />
         <div class="seg" role="tablist">
           <button
             class={`seg-btn ${source === 'blank' ? 'on' : ''}`}
@@ -799,8 +752,7 @@ function CreateProjectModal({
             </button>
           </div>
         </label>
-        {kind !== 'chat' && (
-          <label class="field">
+        <label class="field">
             {tr('project.workBranch')}
             <input
               value={workBranch}
@@ -808,13 +760,10 @@ function CreateProjectModal({
               placeholder={tr('project.branchFallbackHelp')}
             />
           </label>
-        )}
-        {kind !== 'chat' && (
-          <label class="chkrow">
+        <label class="chkrow">
             <input type="checkbox" checked={withConv} onChange={(e) => setWithConv(e.currentTarget.checked)} />
             {tr('project.createConversation')}
           </label>
-        )}
         {err && <div class="err">{err}</div>}
       </div>
       <div class="mbtns">
@@ -869,7 +818,6 @@ function ImportProjectModal({
 }) {
   const executors = useExecutors();
   const [executorId, setExecutorId] = useState('');
-  const [kind, setKind] = useState<ProjectKind>('issue');
   const [source, setSource] = useState<ImportSource>('tmux');
   const [sessions, setSessions] = useState<TmuxSessionInfo[] | null>(null);
   const [agentProjects, setAgentProjects] = useState<AgentProjectImportCandidate[] | null>(null);
@@ -966,7 +914,6 @@ function ImportProjectModal({
         {
           source,
           executorId: eid,
-          kind,
           ...(source === 'tmux'
             ? { session: (picked as TmuxSessionInfo).name }
             : { cwd: (picked as AgentProjectImportCandidate).cwd }),
@@ -1006,7 +953,6 @@ function ImportProjectModal({
   return (
     <Modal title={tr('project.importTitle')} onClose={onClose} wide>
       <div class="formcol import-project" aria-busy={busy ? 'true' : 'false'}>
-        <ProjectKindField kind={kind} onChange={setKind} helpId="import-project-kind-help" />
         <label class="field">
           {tr('project.executor')}
           <ExecutorSelect executors={executors} value={executorId} onChange={setExecutorId} />

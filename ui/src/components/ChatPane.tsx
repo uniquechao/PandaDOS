@@ -4,15 +4,16 @@
  * 非 live 只读历史（服务端 mode 帧驱动，输入区自动禁用）。
  * 底部单一操作区优先级：CC 菜单 selection > gateBar（卡点面板）> live 输入条 > 只读提示。
  */
-import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { connectWs, type WsHandle } from '../lib/ws';
 import { mergeMessages } from '../lib/chatMerge';
 import { createMockChat, isMockMode } from '../lib/mockChat';
 import { markPending, maxOffOf, prunePending, type PendingMsg } from '../lib/pending';
-import { ImageAttach, type AttachedImage } from './ImageAttach';
+import { ImageAttach, type AttachedFile, type AttachedImage } from './ImageAttach';
 import { ImageLightbox } from './ImageLightbox';
-import { RunStream } from './runstream';
+import { DetailCtx, RunStream, type DetailApi, type DetailState } from './runstream';
+import { ConversationSegments } from './ConversationSegments';
 import { RunControls } from './RunControls';
 import { isDriving, retryPlan } from '../lib/issueStatus';
 import { lastToolErrored, producedFilesOf } from '../lib/runstream';
@@ -48,7 +49,7 @@ export interface RunCtl {
   busy?: boolean;
   /** 终止：取消整个 issue（父层带二次确认） */
   onTerminate: () => void;
-  /** 受阻重试：解除阻塞重跑（POST /unblock，父层实现） */
+  /** 受阻恢复：解除阻塞并从原阶段继续（POST /unblock，父层实现） */
   onUnblock: () => void;
 }
 
@@ -60,6 +61,7 @@ export function ChatPane({
   headerLeading,
   onProducedFiles,
   conversationSegments,
+  moduleSegments,
   currentIssueId,
 }: {
   pid: number;
@@ -73,8 +75,10 @@ export function ChatPane({
   headerLeading?: JSX.Element;
   /** 对话产出/改动的文件路径变化时回调（对话模式文件侧栏据此自动预览产出图片） */
   onProducedFiles?: (paths: string[]) => void;
-  /** 模块永久共享会话的 issue 分段；仅 issue 执行页传入。 */
+  /** 当前会话内的 issue 分段；仅 issue 执行页传入。 */
   conversationSegments?: ConversationSegment[];
+  /** 本模块跨会话的全部分段（#277）：当前 issue 之前的历史时间线，列在消息流最前面 */
+  moduleSegments?: ConversationSegment[];
   currentIssueId?: number;
 }) {
   const { t } = useI18n();
@@ -89,12 +93,16 @@ export function ChatPane({
   const [connErr, setConnErr] = useState<string | null>(null); // ⚠ 服务端错误码（连接状态变化即清）
   const [text, setText] = useState('');
   const [images, setImages] = useState<AttachedImage[]>([]);
+  const [files, setFiles] = useState<AttachedFile[]>([]);
   const [hasMore, setHasMore] = useState(true); // 是否还有更早历史可拉（history 帧回填；切对话重置）
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [lightbox, setLightbox] = useState<string | null>(null); // 点开的附图 rel（全屏灯箱）；null=未开
   // 我发出去的消息（issue #116）：点发送即本地插一条带送达状态的气泡，真消息从 jsonl 回流后撤掉
   const [pending, setPending] = useState<PendingMsg[]>([]);
   const pendingSeq = useRef(0);
+  // 「查看完整内容」缓存（issue #288）：按消息 off 索引，一条 WS 一份；切对话即清。
+  // 气泡流里的正文是服务端截断过的，点了才发 detail 帧回源那一行取全文。
+  const [details, setDetails] = useState<Record<number, DetailState>>({});
   // 菜单解读（issue #112「解释一下」）：点了才生成，按菜单本体签名认领——光标挪一格不算换菜单
   const [explain, setExplain] = useState<{ optionsSig: string; text: string } | null>(null);
   const [explaining, setExplaining] = useState(false);
@@ -131,6 +139,7 @@ export function ChatPane({
     setPending([]); // 乐观气泡属于上一条对话，跟着清
     setNotReady(null);
     setConnErr(null);
+    setDetails({}); // off 是「这条对话的 jsonl 字节位置」，换对话就全作废
     setLive(conv === undefined);
     setHasMore(true);
     setLoadingHistory(false);
@@ -201,6 +210,14 @@ export function ChatPane({
           setExplainErr(false);
         }
         setExplaining(false);
+      } else if (f.type === 'detail') {
+        setDetails((p) => ({
+          ...p,
+          [f.off]:
+            'error' in f
+              ? { phase: 'error' }
+              : { phase: 'ready', content: f.content, truncated: f.truncated, total: f.total },
+        }));
       } else if (f.type === 'ack') {
         setPending((p) => markPending(p, f.id, 'sent')); // 真注入成功 = 已送达
       } else if (f.type === 'err') {
@@ -274,6 +291,25 @@ export function ChatPane({
 
   const send = (f: ChatClientFrame): void => wsRef.current?.send(JSON.stringify(f));
 
+  // 展开区按 off 取全文的入口（经 context 下发，免得四个事件组件层层透传 props）。
+  // 在途的不重发——按钮此时显示「载入中…」且已禁用，重复点只是浪费一次回源。
+  const detailApi = useMemo<DetailApi>(
+    () => ({
+      get: (off) => (off === undefined ? undefined : details[off]),
+      request: (off, hint) => {
+        if (details[off]?.phase === 'loading') return;
+        setDetails((p) => ({ ...p, [off]: { phase: 'loading' } }));
+        send({
+          type: 'detail',
+          off,
+          ...(hint.role ? { role: hint.role } : {}),
+          ...(hint.tool ? { tool: hint.tool } : {}),
+        });
+      },
+    }),
+    [details],
+  );
+
   // 向上翻页拉更早历史：baseline 之后才允许（否则会在 historyHead 未定时误判到顶）；在途/到顶时短路。
   const loadOlder = (): void => {
     if (!seenBaseline.current || histInFlight.current || !canLoadOlder) return;
@@ -292,18 +328,29 @@ export function ChatPane({
     if ((needsIssueBoundary || needsViewportFill) && canLoadOlder && !loadingHistory) loadOlder();
   }, [msgs, canLoadOlder, issueScoped, reachedIssueStart, loadingHistory]);
 
-  // 有图还没上传完（rel 未回）→ 暂不能发，避免漏图
-  const uploading = images.some((im) => im.rel === null && !im.error);
-  const canSend = (text.trim().length > 0 || images.length > 0) && !uploading;
+  // 附件（图/文件）还没上传完（rel 未回）→ 暂不能发，避免漏附件
+  const uploading =
+    images.some((im) => im.rel === null && !im.error) || files.some((f) => f.rel === null && !f.error);
+  const canSend = (text.trim().length > 0 || images.length > 0 || files.length > 0) && !uploading;
 
   const sendText = (): void => {
     const t = text.trim();
     const rels = images.map((im) => im.rel).filter((r): r is string => r !== null);
-    if ((!t && rels.length === 0) || uploading) return; // 只发图也允许，但纯空/上传中不发
+    const fileRels = files.map((f) => f.rel).filter((r): r is string => r !== null);
+    if ((!t && rels.length === 0 && fileRels.length === 0) || uploading) return; // 只发附件也允许，但纯空/上传中不发
     // 乐观气泡（issue #116）：id 随帧发出，服务端把结局 ack/err 原样带回；真消息回流后自动撤
     const id = `p${pendingSeq.current++}`;
-    send({ type: 'text', text: t, ...(rels.length ? { images: rels } : {}), id });
-    setPending((p) => [...p, { id, text: t, imgCount: rels.length, sinceOff: maxOffOf(msgs), state: 'sending' }]);
+    send({
+      type: 'text',
+      text: t,
+      ...(rels.length ? { images: rels } : {}),
+      ...(fileRels.length ? { files: fileRels } : {}),
+      id,
+    });
+    setPending((p) => [
+      ...p,
+      { id, text: t, imgCount: rels.length, fileCount: fileRels.length, sinceOff: maxOffOf(msgs), state: 'sending' },
+    ]);
     setText('');
     // 释放本地预览 URL 再清空
     images.forEach((im) => {
@@ -314,6 +361,7 @@ export function ChatPane({
       }
     });
     setImages([]);
+    setFiles([]);
     stick.current = true;
   };
 
@@ -394,12 +442,28 @@ export function ChatPane({
             )}
           </div>
         )}
-        <RunStream msgs={visibleMsgs} pid={pid} onOpenImage={setLightbox} />
+        {/* 展开看全/复制的能力对整条消息流一视同仁：模块历史时间线里的 RunStream 也在里面 */}
+        <DetailCtx.Provider value={detailApi}>
+          {currentIssueId !== undefined && (moduleSegments?.length ?? 0) > 0 && (
+            <ConversationSegments
+              msgs={msgs}
+              segments={moduleSegments ?? []}
+              convId={conv}
+              currentIssueId={currentIssueId}
+              pid={pid}
+              onOpenImage={setLightbox}
+            />
+          )}
+          <RunStream msgs={visibleMsgs} pid={pid} onOpenImage={setLightbox} />
+        </DetailCtx.Provider>
         {/* 我刚发出去、还没从 jsonl 回流的消息（issue #116）：恒在流的末尾，带送达状态 */}
         {pending.map((p) => (
           <div key={p.id} class={`rs-msg user pending ${p.state}`}>
             {p.text || null}
             {p.imgCount > 0 && <div class="rs-msg-note">📎 {t('ui.imageCount', { count: p.imgCount })}</div>}
+            {(p.fileCount ?? 0) > 0 && (
+              <div class="rs-msg-note">📎 {t('ui.fileCount', { count: p.fileCount ?? 0 })}</div>
+            )}
             <span class="rs-msg-ack">{pendingHint(p.state)}</span>
           </div>
         ))}
@@ -467,6 +531,9 @@ export function ChatPane({
               projectId={pid}
               images={images}
               onChange={setImages}
+              allowFiles
+              files={files}
+              onFilesChange={setFiles}
               compact
               leading={
                 <span
@@ -499,8 +566,8 @@ export function ChatPane({
               <button
                 class="send"
                 disabled={!canSend}
-                title={uploading ? t('ui.imageUploading') : t('ui.send')}
-                aria-label={uploading ? t('ui.imageUploading') : t('ui.send')}
+                title={uploading ? t('ui.attachmentUploading') : t('ui.send')}
+                aria-label={uploading ? t('ui.attachmentUploading') : t('ui.send')}
                 onClick={sendText}
               >
                 {uploading ? '…' : '↑'}

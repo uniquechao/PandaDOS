@@ -7,6 +7,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 
 const source = readFileSync(new URL('./Projects.tsx', import.meta.url), 'utf8');
+const shellSource = readFileSync(new URL('../main.tsx', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
 const setArchivedBody =
   source.match(/const setArchived = async[\s\S]*?\n  };/)?.[0] ?? '';
@@ -121,15 +122,18 @@ describe('统一项目导入界面（issue #7/#28）', () => {
     expect(modal).toContain('/agent-projects?agent=${source}`');
   });
 
-  test('按来源提交可信标识，Agent 项目成功后进入可继续的对话页', () => {
+  test('按来源提交可信标识，导入成功后统一进入 Issue 看板', () => {
     expect(source).toContain('AgentProjectImportCandidatesResponse');
     expect(source).toContain('ProjectImportResponse');
     expect(modal).toContain("? { session: (picked as TmuxSessionInfo).name }");
     expect(modal).toContain(": { cwd: (picked as AgentProjectImportCandidate).cwd }");
-    expect(modal).toContain("const [kind, setKind] = useState<ProjectKind>('issue')");
-    expect(modal).toContain('<ProjectKindField kind={kind} onChange={setKind} helpId="import-project-kind-help" />');
-    expect(modal).toContain('executorId: eid,\n          kind,');
-    expect(source).toContain("nav(p.kind === 'chat' ? `/p/${p.id}/chat` : `/p/${p.id}`)");
+    expect(modal).not.toContain('ProjectKindField');
+    expect(modal).not.toContain('kind,');
+    expect(source).toContain('nav(`/p/${p.id}`)');
+    expect(source).not.toContain('p.kind');
+    expect(shellSource).toContain('onClick={() => nav(`/p/${p.id}`)}');
+    expect(shellSource).toContain('nav(`/p/${p.id}/chat`)');
+    expect(shellSource).not.toContain('p.kind');
     expect(modal).toContain("tr('project.linkedHistory'");
   });
 
@@ -141,8 +145,6 @@ describe('统一项目导入界面（issue #7/#28）', () => {
     expect(modal).toContain('role="alert"');
     expect(modal).toContain('disabled={!sourceEnabled(value)}');
     expect(modal).not.toContain('style={{');
-    expect(source).toContain('aria-pressed={kind === \'issue\'}');
-    expect(source).toContain('aria-describedby={helpId}');
     expect(source).toContain('role="status" aria-live="polite"');
   });
 
@@ -153,8 +155,6 @@ describe('统一项目导入界面（issue #7/#28）', () => {
     expect(css).toContain('.import-candidate:disabled { opacity: 0.45; cursor: not-allowed; transition: none; }');
     expect(css).toContain('.import-source-options { grid-template-columns: 1fr; gap: 6px; }');
     expect(css).toContain('.import-source-option, .import-candidate { min-height: 64px; }');
-    expect(css).toContain('.project-kind-options .seg-btn:focus-visible');
-    expect(css).toContain('@media (max-width: 559px) {\n  .project-kind-options { flex-direction: column;');
-    expect(css).toContain('@media (pointer: coarse) {\n  .project-kind-options .seg-btn { min-height: 44px; }');
+    expect(css).not.toContain('.project-kind-');
   });
 });

@@ -1,3 +1,6 @@
+import { effectiveSkillPolicy, skillSessionSettings, saveSkillPolicy, type SkillPolicy } from '../core/skill-policy';
+import { agentHomesFromClaudeDir, listGlobalSkills, listProjectSkills } from '../core/skills';
+import { validationIdentity, validationCheckKey } from './validation-identity';
 /**
  * issues/engine —— issue 生命周期状态机引擎（v2 的心脏，spec §5）。
  *
@@ -22,10 +25,33 @@
 import type { Database } from 'bun:sqlite';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { ensureSyncUids } from '../core/project-data';
+import { ensureProjectDataOutboxTriggers } from '../core/project-data-outbox';
+import { MAX_ISSUE_BODY_CHARS } from './limits';
 import { AgentExecutableNotFoundError } from '../core/conversations';
 import { projectAgentSupport } from '../core/executors';
+import { buildFallbackIdentity, ensureGitIdentity } from '../core/git-identity';
 import { migrate, type MigrationStatus } from '../core/migrate';
-import { parseAutoApproveLevel } from '../core/types';
+import { parseAutoApproveLevel, parseReasoningEffort, REASONING_EFFORTS } from '../core/types';
+import { emptyUsage, type UsageTotals } from '../core/usage';
+import {
+  composeMergedBody,
+  hasNoMergeDeclaration,
+  looksTruncated,
+  type MergeSnapshotEntry,
+} from './merge-guards';
+import {
+  deriveValidationScope,
+  resolveValidationCommands,
+  runValidation,
+  candidateTestFiles,
+  VALIDATION_TIMEOUT_MS,
+} from './validation';
+import {
+  parseCompletionReportJson,
+  serializeCompletionReport,
+  type CompletionReport,
+} from './completion-report';
 import type {
   AgentKind,
   AutoApproveLevel,
@@ -44,8 +70,11 @@ import type {
   ProjectModule,
   ProjectStatus,
   SummaryStatus,
+  ReasoningEffort,
+  ValidationCommand,
+  ValidationScope,
 } from '../core/types';
-import type { ExecutorDriver } from '../executor/driver';
+import type { ExecutorDriver, GitResult } from '../executor/driver';
 import {
   readRecentMessages,
   tailConversation,
@@ -61,7 +90,7 @@ import {
 } from '../core/agent-liveness';
 import { isCodexUpdatePrompt, pickAffirmative } from '../core/agent-summary';
 import { readDriverText } from '../core/skills';
-import { transition, type IssueMachineEvent } from './machine';
+import { isResumableState, transition, type IssueMachineEvent } from './machine';
 import {
   countSubtaskDone,
   extractAssistantTexts,
@@ -74,6 +103,7 @@ import {
   MAX_CLARIFY_QUESTIONS,
   MAX_CLARIFY_TEXT_CHARS,
   parseClarifyQuestions,
+  parseCompletionReportBlock,
   parseSubtasksBlock,
   RATE_LIMIT_BACKOFF_MS,
 } from './sentinel';
@@ -81,6 +111,8 @@ import {
   buildClarifyContinue,
   buildNudge,
   buildPlanningPrompt,
+  buildDirectPrompt,
+  buildRecoveryResumePrompt,
   buildReplanRequest,
   buildReworkPrompt,
   buildSubtaskPrompt,
@@ -88,12 +120,19 @@ import {
   buildTestingPrompt,
   imageReadHint,
 } from './prompts';
+import { attentionKindOf, type AttentionKind } from './attention';
 import { clarifyPaths, clarifySessionName } from './clarify-runner';
+import {
+  buildBlockedSummary,
+  buildDoneSummary,
+  MAX_SUMMARY_CHARS,
+} from './result-summary';
 import { parseOrganizePlan, type OrganizeAction } from './organize-runner';
 import { BUSY_STATES, isBusy, moduleKeyOf, pickNext } from './queue';
 import { gitLockKey, KeyedMutex, projectLockKey, tmuxLockKey } from './mutex';
 import { outputLanguageInstruction, promptLanguage, userPromptLocale } from '../agents/prompts/language';
 import { moduleIssueRelPath } from './module-docs';
+import { parseModuleSkills } from './modules';
 import {
   validateWorkflowGraph,
   WorkflowTemplateStore,
@@ -112,6 +151,9 @@ function issueMetaLockKey(projectId: number): string {
 
 // ---------- 模块自带迁移（030 编号空间） ----------
 
+/** 澄清失败事件里 pane 尾部的留档上限（#280；诊断够用即可，别把事件表撑爆） */
+export const MAX_CLARIFY_PANE_TAIL_CHARS = 1200;
+
 /** issue 引擎的增量迁移目录（issues/migrations/030_*.sql） */
 export const ISSUE_ENGINE_MIGRATIONS_DIR = join(import.meta.dir, 'migrations');
 
@@ -121,7 +163,18 @@ export const ISSUE_ENGINE_MIGRATIONS_DIR = join(import.meta.dir, 'migrations');
  * （编号 030 记录在同一张 schema_migrations，与核心 001 不冲突）。
  */
 export function migrateIssueEngine(db: Database): MigrationStatus {
-  return migrate(db, ISSUE_ENGINE_MIGRATIONS_DIR);
+  const status = migrate(db, ISSUE_ENGINE_MIGRATIONS_DIR);
+  ensureSyncUids(db, [
+    { table: 'project_modules', timestampColumn: 'created_ts' },
+    { table: 'issues', timestampColumn: 'created_ts' },
+    { table: 'project_workflow_templates', timestampColumn: 'created_ts' },
+  ]);
+  ensureProjectDataOutboxTriggers(db, [
+    { table: 'project_modules', kind: 'module', archivedWhen: "NEW.status = 'archived'" },
+    { table: 'issues', kind: 'issue', archivedWhen: "NEW.status = 'cancelled'" },
+    { table: 'project_workflow_templates', kind: 'workflow', archivedWhen: "NEW.status = 'archived'" },
+  ]);
+  return status;
 }
 
 // ---------- 引擎侧类型（core/types.ts 不许动，扩展列/接口放这里） ----------
@@ -163,6 +216,7 @@ export interface EngineIssue extends Issue {
   moduleId: number | null;
   module: string;
   implMode: ImplMode;
+  executionMode?: 'direct' | 'planned';
   /** 驱动本 issue 的 CLI 代理；绑对话后不可改（对话 agent 生命周期内不变） */
   agent: AgentKind;
   /** 置顶时刻（ms）；null = 未置顶。仅影响 pending 排队顺序（queue.pickNext 置顶层） */
@@ -171,6 +225,8 @@ export interface EngineIssue extends Issue {
   clarifyFeedback: string | null;
   /** 收尾（done/blocked）时执行代理的结果总结（033 迁移）；null = 尚未总结或失败 */
   resultSummary: string | null;
+  /** 044：可机读的 v1 完成报告；旧记录及无效数据均回退为 null。 */
+  completionReport: CompletionReport | null;
   /** 用户期望的目标分支名（036）；null = 沿用引擎默认现场。与 branch（实际执行分支）不同。 */
   targetBranch: string | null;
   /** 创建目标分支所基于的完整 ref（036，refs/heads/* 或 refs/remotes/*）；null = 默认现场。 */
@@ -363,7 +419,6 @@ export interface IssueDependencyBlocker {
 }
 
 const MAX_PUBLICATION_BATCH = 200;
-const MAX_PUBLICATION_BODY = 8_000;
 const MAX_EXECUTION_SYNC_JSON = 200_000;
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
@@ -454,6 +509,8 @@ export type UpdateUnstartedSubtaskResult =
 export interface ConversationSegment {
   /** 稳定键：显式边界事件 id；老数据回退为 legacy-<issueId>。 */
   id: string;
+  /** 这段挂在哪条会话上（#277 轮换后模块会有多条 conv，前端据此区分「不在当前会话里」） */
+  convId: string;
   issueId: number;
   title: string;
   status: IssueState;
@@ -463,6 +520,20 @@ export interface ConversationSegment {
 
 /** 驱动中的阶段：cc 进程在干活、watcher 要 tail 的状态 */
 export const DRIVING_STATES: readonly IssueState[] = ['planning', 'implementing', 'testing'];
+
+/**
+ * 受阻恢复的阶段降级：`merge_review` / `merging` 这两个阶段**没有代理参与**——
+ * 完成报告在 testing 阶段由哨兵写死后收尾不再重取（collectResultSummary 明确不清它），
+ * 总结也是确定性拼装。因此从这两个阶段受阻时，解除意见既送不到代理
+ * （buildKickoffPrompt 的恢复注入只覆盖驱动阶段），报告也不会变，
+ * 解除后必然在同一个完成度门禁上再次受阻 —— 反复解除只会空转烧钱。
+ *
+ * 降级到 `testing`：这是能让代理重新验证并重发 REPORT_BEGIN 报告的最近阶段，
+ * 解除意见也能随恢复提示送达。其余阶段保持原样。
+ */
+export function demoteAgentlessResume(state: IssueState): IssueState {
+  return state === 'merging' || state === 'merge_review' ? 'testing' : state;
+}
 
 /**
  * 可以直接改内容（标题/正文/类别/模块/截图/分支意图）的状态——**唯一真相**（#93）。
@@ -477,7 +548,7 @@ export const DRIVING_STATES: readonly IssueState[] = ['planning', 'implementing'
  * 守卫落在四处（路由前置判断、updatePendingMeta 的两次检查、patchPendingGitMeta 的 SQL CAS），
  * 全部从这里派生，别再各写各的字符串。
  */
-export const EDITABLE_STATES: readonly IssueState[] = ['pending', 'blocked', 'cancelled'];
+export const EDITABLE_STATES: readonly IssueState[] = ['pending', 'blocked', 'paused', 'cancelled'];
 
 export function isEditableStatus(status: IssueState): boolean {
   return EDITABLE_STATES.includes(status);
@@ -488,7 +559,8 @@ const EDITABLE_STATES_SQL = EDITABLE_STATES.map((s) => `'${s}'`).join(', ');
 
 // ---------- 骨架接口的结构化镜像（不 import agents/notify 实现，评审 5.4#1 依赖方向） ----------
 
-export type EngineDoneJudgement = 'done' | 'not_done' | 'blocked' | 'clarify';
+/** PM 完成判定的取值（#275 / B-09：不含 'blocked'，那个分支从来走不到，已删） */
+export type EngineDoneJudgement = 'done' | 'not_done' | 'clarify';
 
 /** 同模块智能合并的候选/结果形状（agents/pm.ts MergeCandidate/MergeGroup 结构一致） */
 export interface EngineMergeCandidate {
@@ -505,11 +577,23 @@ export interface EngineMergeGroup {
 /** PmAgent 骨架签名子集（agents/pm.ts）；结构兼容，直接传 PmAgent 实例即可 */
 export interface EnginePm {
   judgeDone(issue: Issue, recentOutput: string): Promise<EngineDoneJudgement>;
+  judgeAgentFailure?(agent: AgentKind, pane: string): Promise<'resume_conflict' | 'ordinary_exit' | 'unknown'>;
   /**
    * 可选：同模块任务智能合并（LLM）。引擎调度前对同模块 pending 候选调用，拿到合并建议后
    * 确定性折叠（校验/取消/改 body 全在引擎侧）。未实现（老 stub/离线）→ 引擎跳过合并。
    */
   mergeModuleTasks?(module: string, candidates: EngineMergeCandidate[]): Promise<EngineMergeGroup[]>;
+  /**
+   * 可选：收尾摘要的**降级**出口（#275 / I-05）。引擎优先用结构化数据确定性拼装，
+   * 只有一个字都拼不出来（既没报告、没子任务、没提交、没失败事件）时才调这里。
+   * 未实现（老 stub/离线）→ 引擎退到一句确定性兜底文案，不影响收尾。
+   */
+  summarizeOutcome?(input: {
+    title: string;
+    kind: 'done' | 'blocked';
+    facts: string;
+    locale?: SupportedLocale;
+  }): Promise<string | null>;
 }
 
 /** 模块智能整理分析入参（issues/organize-runner RunOrganizeInput 结构一致） */
@@ -557,56 +641,58 @@ export interface EngineClarifyInput {
   history?: Array<{ questions: string[]; answer: string | null }>;
   /** false = 提问轮数到顶：本轮只更新反馈不出新题（引擎对结果另有确定性压制） */
   allowQuestions?: boolean;
+  /**
+   * 分析超时（ms，#280 / B-06）：由引擎按 `clarifyRunTimeoutMs` 下发，装配层必须真的传给
+   * runner——不传就会退回 runner 自己的 8 分钟默认值，生产上正是这么白跑了 49 次。
+   */
+  timeoutMs?: number;
   locale?: SupportedLocale;
 }
 
 /** 创建时澄清分析结果（issues/clarify-runner RunClarifyResult 结构一致） */
+/**
+ * 一条 issue 的成本视图数据（#282 / I-08）：token 用量 + 非 token 类指标。
+ *
+ * token 侧来自 `issue_usage`（采集器按 segment 边界归因，见 core/usage-collector）；
+ * 非 token 侧全部**按事件溯源派生**，不加列——这些数早就都在 `issue_events` 里了，
+ * 再存一份只会多一个会对不上的真相。
+ */
+export interface IssueCostStats {
+  issueId: number;
+  usage: UsageTotals;
+  /** 测试返工次数（tests_failed） */
+  testRetries: number;
+  /** 催办次数（nudged） */
+  nudges: number;
+  /** PM 兜底判定次数（judged） */
+  judged: number;
+  /** 创建时澄清分析跑过几次（clarify_started） */
+  clarifies: number;
+  /** 门禁执行总耗时（#279 的 validation_passed/failed 的 durationMs 求和，ms） */
+  validationMs: number;
+  /** 门禁跑过几轮 */
+  validationRuns: number;
+}
+
+/** 澄清分析的现场证据（#280 / B-06；结构同 core/agent-artifact-runner 的 diagnostics） */
+export interface EngineClarifyDiagnostics {
+  paneTail: string;
+  files: Array<{ name: string; size: number }>;
+  hadArtifacts: number;
+  elapsedMs: number;
+}
+
 export type EngineClarifyResult =
-  | { ok: true; feedback: string; questions: string[]; questionsText?: string }
-  | { ok: false; reason: string; error?: string };
-
-// ---------- 执行结果总结（文件哨兵；与 clarify-runner/agent-summary 同理，抓屏必误命中） ----------
-
-/** 总结 scratch 根目录名（挂在项目 cwd 下；子目录按 issueId 隔离） */
-export const RESULT_SUMMARY_SCRATCH_BASE = '.panda/tmp/result';
-
-/** 给 cwd + issueId 算出总结 scratch 各绝对路径 */
-export function resultSummaryPaths(cwd: string, issueId: number): {
-  scratch: string;
-  summary: string;
-  done: string;
-} {
-  const base = `${cwd.replace(/\/+$/, '')}/${RESULT_SUMMARY_SCRATCH_BASE}/${issueId}`;
-  return { scratch: base, summary: `${base}/summary.md`, done: `${base}/done` };
-}
-
-/** 组装注入 CC 会话的总结 prompt（单段；哨兵是文件不是输出行，不受回显歧义影响） */
-export function buildResultSummaryPrompt(
-  issueId: number,
-  kind: 'done' | 'blocked',
-  locale: SupportedLocale = 'zh-Hans',
-): string {
-  const rel = `${RESULT_SUMMARY_SCRATCH_BASE}/${issueId}`;
-  if (promptLanguage(locale) === 'en') {
-    const ask = kind === 'done' ? 'This task is complete.' : 'This task is blocked and has been handed to a person.';
-    const points = kind === 'done'
-      ? 'what was done, changed files, test results, and remaining work'
-      : 'current progress, changed files, the blocker, and what a person must provide';
-    return `[Execution summary] ${ask} Write ${points} to ${rel}/summary.md in at most 300 words. Then create ${rel}/done containing ok as the final step. Write only these two files and do nothing else. ${outputLanguageInstruction(locale)}`;
-  }
-  const ask =
-    kind === 'done'
-      ? '本任务已完成。请把执行结果总结写到文件'
-      : '本任务已受阻转人工。请把当前进展总结写到文件';
-  const points =
-    kind === 'done'
-      ? '做了什么、改动了哪些文件、测试情况、遗留事项'
-      : '做到哪一步、已改动哪些文件、卡在哪里/需要人提供什么';
-  return (
-    `【执行总结】${ask} ${rel}/summary.md：${points}，简洁中文 300 字以内；` +
-    `写完后最后创建标记文件 ${rel}/done（内容写 ok）。只写这两个文件，不要做任何其他事。 ${outputLanguageInstruction(locale)}`
-  );
-}
+  | {
+      ok: true;
+      feedback: string;
+      questions: string[];
+      questionsText?: string;
+      /** done 标记没出现但产物已落盘，按抢救结果用（#280） */
+      salvaged?: true;
+      diagnostics?: EngineClarifyDiagnostics;
+    }
+  | { ok: false; reason: string; error?: string; diagnostics?: EngineClarifyDiagnostics };
 
 /**
  * 澄清答复并入正文的格式：有未答的问题批 → 问答成对写入（编号问题 + 答），
@@ -626,7 +712,7 @@ function bodyExcerpt(body: string | null | undefined, n = 120): string {
 
 /** NotifyRouter.dispatch 的事件形状（notify/router.ts NotifyEvent 结构一致） */
 export interface EngineNotifyEvent {
-  kind: 'status_change' | 'gate_waiting' | 'issue_done' | 'issue_blocked';
+  kind: 'status_change' | 'gate_waiting' | 'issue_done' | 'issue_blocked' | 'choice_waiting';
   projectId: number;
   issueId: number;
   from?: IssueState;
@@ -641,6 +727,10 @@ export interface EngineNotifyEvent {
     | 'conversation_displaced'
     | 'menu_stuck'
     | 'rate_limited'
+    | 'auto_retry_exhausted'
+    | 'stop_loss_paused'
+    | 'regression_failed'
+    | 'clarify_success_low'
     | 'clarification_needed'
     | 'module_organization'
     | 'analysis_clarification';
@@ -700,6 +790,7 @@ export interface EngineExecutionWorkspaceOps {
 
 interface IssueRow {
   id: number;
+  sync_uid?: string | null;
   project_id: number;
   title: string;
   body: string | null;
@@ -718,12 +809,15 @@ interface IssueRow {
   done_ts: number | null;
   module: string;
   impl_mode: string;
+  execution_mode?: string;
   agent: string;
   /** 032 迁移；SELECT * 在旧库上可能拿不到该列，映射时兜底 null */
   pinned_ts?: number | null;
   /** 033 迁移；同上，旧库兜底 null */
   clarify_feedback?: string | null;
   result_summary?: string | null;
+  /** 044 迁移；旧库或旧记录均允许为空。 */
+  completion_report_json?: string | null;
   /** 036 迁移；同上，旧库兜底 null */
   target_branch?: string | null;
   source_ref?: string | null;
@@ -731,11 +825,65 @@ interface IssueRow {
   auto_approve?: string | null;
   /** 039 迁移；发布节点禁止自动合并。 */
   publication_locked?: number | null;
+  /** 047 迁移；旧库/未算过均为 null */
+  validation_scope_json?: string | null;
+  /** 048 迁移；旧库/未覆盖均为 null（= 继承模块） */
+  reasoning_effort?: string | null;
+  /** 045 迁移；协作过程页路径，旧库/未同步为 null */
+  doc_path?: string | null;
+}
+
+/**
+ * 门禁范围列的解析（047 / #279）：**坏数据一律当未配置**。
+ * 读不出来就退回全量门禁（调用方语义），比整块抛错安全——门禁宁可多跑，不能不跑。
+ */
+export function parseValidationScope(json: string | null): ValidationScope | null {
+  if (!json) return null;
+  try {
+    const v = JSON.parse(json) as unknown;
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+    const o = v as Record<string, unknown>;
+    const kind = o.kind === 'targeted' ? 'targeted' : o.kind === 'full' ? 'full' : o.kind === 'docs' ? 'docs' : null;
+    if (!kind) return null;
+    const files = Array.isArray(o.files)
+      ? o.files.filter((f): f is string => typeof f === 'string' && f.trim().length > 0).map((f) => f.trim())
+      : [];
+    return {
+      kind,
+      files: kind === 'full' ? [] : files,
+      reason: typeof o.reason === 'string' ? o.reason.slice(0, 300) : '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** 项目门禁命令列的解析（047）：坏数据当未配置（null），不当成「不跑门禁」（空数组） */
+export function parseValidationCommands(json: string | null): ValidationCommand[] | null {
+  if (!json) return null;
+  try {
+    const v = JSON.parse(json) as unknown;
+    if (!Array.isArray(v)) return null;
+    const out: ValidationCommand[] = [];
+    for (const raw of v) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const o = raw as Record<string, unknown>;
+      const argv = Array.isArray(o.argv)
+        ? o.argv.filter((a): a is string => typeof a === 'string' && a.length > 0)
+        : [];
+      if (argv.length === 0) continue; // 空命令没有意义，直接丢
+      out.push({ label: typeof o.label === 'string' && o.label.trim() ? o.label.trim().slice(0, 60) : argv[0]!, argv });
+    }
+    return out;
+  } catch {
+    return null;
+  }
 }
 
 function mapIssue(r: IssueRow): EngineIssue {
   return {
     id: r.id,
+    ...(r.sync_uid ? { syncUid: r.sync_uid } : {}),
     projectId: r.project_id,
     title: r.title,
     body: r.body,
@@ -754,15 +902,20 @@ function mapIssue(r: IssueRow): EngineIssue {
     doneTs: r.done_ts,
     module: r.module,
     implMode: r.impl_mode === 'team' ? 'team' : 'seq',
+    executionMode: r.execution_mode === 'direct' ? 'direct' : 'planned',
     agent: r.agent === 'codex' ? 'codex' : 'claude',
     pinnedTs: r.pinned_ts ?? null,
     clarifyFeedback: r.clarify_feedback ?? null,
     resultSummary: r.result_summary ?? null,
+    completionReport: parseCompletionReportJson(r.completion_report_json),
     targetBranch: r.target_branch ?? null,
     sourceRef: r.source_ref ?? null,
     // 认不出的值（旧库无此列/脏数据）落回 'medium'——issue 侧的现状行为，不因脏数据变严或变松
     autoApprove: parseAutoApproveLevel(r.auto_approve) ?? 'medium',
     publicationLocked: (r.publication_locked ?? 0) === 1,
+    validationScope: parseValidationScope(r.validation_scope_json ?? null),
+    reasoningEffort: parseReasoningEffort(r.reasoning_effort ?? null),
+    docPath: r.doc_path ?? null,
   };
 }
 
@@ -879,6 +1032,7 @@ function mapGate(r: GateRow): Gate {
 
 interface ProjectRow {
   id: number;
+  sync_uid?: string | null;
   name: string;
   executor_id: number;
   cwd: string;
@@ -903,11 +1057,14 @@ interface ProjectRow {
   manual_review?: number | null;
   /** 009 迁移；同上，旧库兜底 'issue'（= issue 看板） */
   kind?: string | null;
+  /** 047 迁移；旧库/未配置均为 null（= 按 package.json 探测，不等于「不跑门禁」） */
+  validation_commands_json?: string | null;
 }
 
 export function mapProject(r: ProjectRow): Project {
   return {
     id: r.id,
+    ...(r.sync_uid ? { syncUid: r.sync_uid } : {}),
     name: r.name,
     executorId: r.executor_id,
     cwd: r.cwd,
@@ -928,7 +1085,8 @@ export function mapProject(r: ProjectRow): Project {
     summaryStatus: (r.summary_status ?? 'idle') as SummaryStatus,
     summaryError: r.summary_error ?? null,
     manualReview: (r.manual_review ?? 0) !== 0,
-    kind: r.kind === 'chat' ? 'chat' : 'issue',
+    validationCommands: parseValidationCommands(r.validation_commands_json ?? null),
+    kind: 'issue',
   };
 }
 
@@ -975,6 +1133,12 @@ function getPublicationModule(db: Database, id: number): ProjectModule | undefin
 
 /** git log 字段分隔符（提交信息里不会出现的控制符；与 web/routes/git.ts 同构） */
 const GIT_FIELD_SEP = '\x1f';
+
+/**
+ * 「远端有我没有的提交」这一类 push 失败的判据（#272 / B-02）：fetch + rebase 后重试一次通常就过。
+ * 认得宽一点是刻意的——多试一次 fetch/rebase 的代价，远小于「done 了但代码没进远端」。
+ */
+const PUSH_REJECTED_RE = /\[rejected\]|fetch first|non-fast-forward|updates were rejected/i;
 
 /** numstat 的重命名路径归一：'dir/{old => new}/f'、'old => new' → 新路径 */
 function normNumstatPath(p: string): string {
@@ -1044,6 +1208,8 @@ export interface IssueInput {
   moduleId?: number;
   moduleName?: string;
   implMode?: ImplMode;
+  executionMode?: 'direct' | 'planned';
+  skillPolicy?: SkillPolicy;
   agent?: AgentKind;
   targetBranch?: string | null;
   sourceRef?: string | null;
@@ -1072,7 +1238,18 @@ export class IssueWorkflowSelectionError extends Error {
   }
 }
 
+/**
+ * 这次改动是谁发起的（#283 / B-11）。
+ *
+ * 别再靠内容比对猜：协作文件同步回写与用户编辑改出来的 diff 长得一模一样，猜错的代价是
+ * **白跑一次创建时澄清**（#270 实测同一条 issue 连跑两次，两次都是 questions=0）。
+ * 缺省 'user'：老调用方行为不变，新的同步类写入必须显式传 'sync'。
+ */
+export type IssueEditSource = 'user' | 'sync';
+
 export interface IssueMetaPatch {
+  /** 改动来源（#283 / B-11）；不落库，只影响「要不要重新澄清」这类副作用 */
+  source?: IssueEditSource;
   title?: string;
   body?: string | null;
   module?: string;
@@ -1097,10 +1274,13 @@ function parseTransData(dataJson: string | null): {
   to?: string;
   note?: string;
   stage?: string;
+  resumeState?: string;
+  /** #274：这次 blocked 是止损闸自己打的，计数时必须排除，否则闸会自我放大 */
+  stopLoss?: boolean;
 } {
   if (!dataJson) return {};
   try {
-    return JSON.parse(dataJson) as Record<string, string>;
+    return JSON.parse(dataJson) as Record<string, never>;
   } catch {
     return {};
   }
@@ -1123,7 +1303,7 @@ export class IssueStore {
       .get(
         projectId,
         input.title.slice(0, 200),
-        input.body ? input.body.slice(0, 2000) : null,
+        input.body ? input.body.slice(0, MAX_ISSUE_BODY_CHARS) : null,
         input.category === 'debug' ? 'debug' : input.category === 'design' ? 'design' : 'task',
         (input.module || '未分类').slice(0, 60),
         input.moduleId ?? null,
@@ -1138,8 +1318,9 @@ export class IssueStore {
         Date.now(),
       );
     if (!row) throw new Error('insert issue failed');
+    this.db.run('UPDATE issues SET execution_mode = ? WHERE id = ?', [input.executionMode ?? 'planned', row.id]);
     this.logEvent(row.id, 'created', { title: row.title });
-    return mapIssue(row);
+    return this.get(row.id)!;
   }
 
   /** 039 publication-only insert: validated exact bytes, pending, locked, and no async side effects. */
@@ -1171,7 +1352,7 @@ export class IssueStore {
       );
     if (!row) throw new Error('insert published issue failed');
     this.logEvent(row.id, 'created', { title: row.title, publication: true, nodeId: input.nodeId });
-    return mapIssue(row);
+    return this.get(row.id)!;
   }
 
   get(id: number): EngineIssue | undefined {
@@ -1290,13 +1471,13 @@ export class IssueStore {
         throw new Error('design sync local contract changed');
       }
       if (!input.next.title.trim() || input.next.title.length > 200
-        || input.next.body.length === 0 || input.next.body.length > MAX_PUBLICATION_BODY) {
+        || input.next.body.length === 0 || input.next.body.length > MAX_ISSUE_BODY_CHARS) {
         throw new Error('invalid design sync Issue content');
       }
-      const project = this.db.query<{ id: number; status: string; kind: string }, [number]>(
-        'SELECT id, status, kind FROM projects WHERE id = ?',
+      const project = this.db.query<{ id: number; status: string }, [number]>(
+        'SELECT id, status FROM projects WHERE id = ?',
       ).get(fresh.projectId);
-      if (!project || project.status !== 'active' || project.kind !== 'issue') {
+      if (!project || project.status !== 'active') {
         throw new Error('design sync project is not active');
       }
       const support = projectAgentSupport(this.db, project.id, input.next.agent);
@@ -1923,10 +2104,15 @@ export class IssueStore {
   /**
    * 绑对话；约束：一 conv 同时只属一条未关闭 issue（评审 3.2-4 修复）。
    *
-   * 例外：**模块会话按设计被同模块 issue 顺序复用**（project_modules.conversation_id 持久持有），
-   * 所以占用者只要已不在驱动中（典型是 blocked，或 unblock 回 pending 的），就放行——否则一条
+   * 例外：**模块会话可被同模块 issue 顺序复用**（project_modules.conversation_id 持久持有），
+   * 所以占用者只要已不在驱动中（典型是 blocked，或缺少恢复上下文而暂入 pending 的），就放行——否则一条
    * blocked 会永久攥着模块会话，让该模块再也起不来。真正的「同时只有一条在跑」由项目级
    * isBusy 保证，不靠这里。非模块会话（debug/项目对话）仍按老规矩独占。
+   *
+   * #277 / I-01 之后这条豁免退居**兜底**：正常情况下 startIssue 会给每条 issue 轮换一条新
+   * conv（见 moduleConvInUse），根本走不到共用；只有「旧会话还挂着未结束的 segment」时才
+   * 不轮换，那时仍要靠这里放行。所以豁免不能收紧——一收紧，那条崩在半路的 blocked 就把
+   * 整个模块锁死了。
    */
   setConv(id: number, convId: string): void {
     const clash = this.db
@@ -1957,7 +2143,7 @@ export class IssueStore {
   }
 
   setBody(id: number, body: string): void {
-    this.db.query('UPDATE issues SET body = ? WHERE id = ?').run(body.slice(0, 8000), id);
+    this.db.query('UPDATE issues SET body = ? WHERE id = ?').run(body.slice(0, MAX_ISSUE_BODY_CHARS), id);
   }
 
   setNote(id: number, note: string | null): void {
@@ -1988,9 +2174,68 @@ export class IssueStore {
       .run(text ? text.slice(0, 16000) : null, id);
   }
 
+  /**
+   * 本轮门禁范围（047 / #279）：进 testing 时算出来落库，供 UI 展示与复跑。
+   * null = 清空（回到「还没算过」）；文件清单截到 200 条，防一次巨改把整列撑爆。
+   */
+  setValidationScope(id: number, scope: ValidationScope | null): void {
+    const value = scope
+      ? JSON.stringify({
+          kind: scope.kind,
+          files: scope.kind === 'full' ? [] : scope.files.slice(0, 200),
+          reason: scope.reason.slice(0, 300),
+        })
+      : null;
+    this.db.query('UPDATE issues SET validation_scope_json = ? WHERE id = ?').run(value, id);
+  }
+
+  /** 读回本轮门禁范围（坏数据当没配过，调用方据此退回全量） */
+  validationScope(id: number): ValidationScope | null {
+    const r = this.db
+      .query<{ validation_scope_json: string | null }, [number]>(
+        'SELECT validation_scope_json FROM issues WHERE id = ?',
+      )
+      .get(id);
+    return parseValidationScope(r?.validation_scope_json ?? null);
+  }
+
+  /**
+   * 项目门禁命令（047）：null = 清回「未配置」（由控制面按 package.json 探测），
+   * 空数组 = 显式「不跑门禁」。两者语义不同，不许在这里合并。
+   */
+  setValidationCommands(projectId: number, commands: ValidationCommand[] | null): void {
+    const value = commands
+      ? JSON.stringify(
+          commands
+            .filter((c) => c.argv.length > 0)
+            .slice(0, 10)
+            .map((c) => ({ label: c.label.slice(0, 60), argv: c.argv.slice(0, 20) })),
+        )
+      : null;
+    this.db.query('UPDATE projects SET validation_commands_json = ? WHERE id = ?').run(value, projectId);
+  }
+
+  /**
+   * 本条 issue 的推理档覆盖（048 / #281）：null = 清空，回到继承模块。
+   * 非法值直接拒绝——存进去只会在启动命令里变成一个谁也不认识的参数。
+   */
+  setIssueReasoningEffort(id: number, effort: ReasoningEffort | null): void {
+    if (effort !== null && !REASONING_EFFORTS.includes(effort)) {
+      throw new Error(`非法推理档位: ${String(effort)}`);
+    }
+    this.db.query('UPDATE issues SET reasoning_effort = ? WHERE id = ?').run(effort, id);
+  }
+
+  /** 结构化完成报告（044）；写入前按 v1 契约规范化，null = 清空。 */
+  setCompletionReport(id: number, report: CompletionReport | null): void {
+    this.db
+      .query('UPDATE issues SET completion_report_json = ? WHERE id = ?')
+      .run(report ? serializeCompletionReport(report) : null, id);
+  }
+
   patchMeta(id: number, meta: IssueMetaPatch): void {
     if (meta.title !== undefined) this.db.query('UPDATE issues SET title = ? WHERE id = ?').run(meta.title.slice(0, 200), id);
-    if (meta.body !== undefined) this.db.query('UPDATE issues SET body = ? WHERE id = ?').run(meta.body ? meta.body.slice(0, 8000) : null, id);
+    if (meta.body !== undefined) this.db.query('UPDATE issues SET body = ? WHERE id = ?').run(meta.body ? meta.body.slice(0, MAX_ISSUE_BODY_CHARS) : null, id);
     if (meta.module !== undefined) this.db.query('UPDATE issues SET module = ? WHERE id = ?').run((meta.module || '未分类').slice(0, 60), id);
     if (meta.moduleId !== undefined) this.db.query('UPDATE issues SET module_id = ? WHERE id = ?').run(meta.moduleId, id);
     if (meta.category !== undefined) this.db.query('UPDATE issues SET category = ? WHERE id = ?').run(meta.category, id);
@@ -2204,6 +2449,7 @@ export class IssueStore {
         });
         out.push({
           id: `legacy-${issue.id}`,
+          convId,
           issueId: issue.id,
           title: issue.title,
           status: issue.status,
@@ -2234,6 +2480,7 @@ export class IssueStore {
         }
         out.push({
           id: `event-${start.id}`,
+          convId,
           issueId: issue.id,
           title: issue.title,
           status,
@@ -2243,6 +2490,270 @@ export class IssueStore {
       }
     }
     return out.sort((a, b) => a.startTs - b.startTs || a.issueId - b.issueId);
+  }
+
+  /**
+   * 一个模块的**全部** segment，跨会话汇总（#277 / I-01）。
+   *
+   * 轮换之后一个模块的历史散在多条 conv 上，只按当前 conv 读会让人以为「换了对话记录就没了」。
+   * 收口在 store 这一层：把该模块沾过的每条 conv 都读一遍，按开始时间拼成一条时间线，
+   * 每段自带 convId，前端据此区分「这段在当前会话里」还是「在更早的会话里」。
+   */
+  listModuleSegments(moduleId: number): ConversationSegment[] {
+    const convIds = this.db
+      .query<{ conv_id: string }, [number]>(
+        `SELECT DISTINCT conv_id FROM issues WHERE module_id = ? AND conv_id IS NOT NULL`,
+      )
+      .all(moduleId)
+      .map((r) => r.conv_id);
+    // 模块指针刚轮换、还没有 issue 绑上来的那条也要算进去，否则新会话在时间线上是空的
+    const current = this.db
+      .query<{ conversation_id: string | null }, [number]>(
+        'SELECT conversation_id FROM project_modules WHERE id = ?',
+      )
+      .get(moduleId)?.conversation_id;
+    if (current && !convIds.includes(current)) convIds.push(current);
+    return convIds
+      .flatMap((convId) => this.listConversationSegments(convId))
+      .sort((a, b) => a.startTs - b.startTs || a.issueId - b.issueId);
+  }
+
+  /**
+   * 最近一次门禁结果（#279）：给详情页只读展示用。
+   * 从事件里派生，不加列——门禁可以跑很多轮，列只能存最后一次，事件本来就全都有。
+   */
+  lastValidation(issueId: number): {
+    outcome: 'passed' | 'failed' | 'skipped' | 'error';
+    scope: 'targeted' | 'full' | 'docs' | null;
+    label: string | null;
+    code: number | null;
+    timedOut: boolean;
+    durationMs: number | null;
+    ts: number;
+  } | null {
+    const kinds = new Set(['validation_passed', 'validation_failed', 'validation_skipped', 'validation_error']);
+    let latest: IssueEvent | null = null;
+    for (const e of this.listEvents(issueId)) {
+      if (kinds.has(e.kind) && (!latest || e.id > latest.id)) latest = e;
+    }
+    if (!latest) return null;
+    let d: Record<string, unknown> = {};
+    try {
+      d = latest.dataJson ? (JSON.parse(latest.dataJson) as Record<string, unknown>) : {};
+    } catch {
+      d = {}; // 坏事件只丢细节，不丢「跑过一轮」这件事
+    }
+    const scope = d.scope === 'targeted' ? 'targeted' : d.scope === 'full' ? 'full' : d.scope === 'docs' ? 'docs' : null;
+    return {
+      outcome: latest.kind === 'validation_passed'
+        ? 'passed'
+        : latest.kind === 'validation_failed' ? 'failed' : latest.kind === 'validation_error' ? 'error' : 'skipped',
+      scope,
+      label: typeof d.label === 'string' ? d.label : null,
+      code: typeof d.code === 'number' ? d.code : null,
+      timedOut: d.timedOut === true,
+      durationMs: typeof d.durationMs === 'number' ? d.durationMs : null,
+      ts: latest.ts,
+    };
+  }
+
+  /**
+   * 这条 issue 参与过的合并是否被人拆回过（#289 / B-14）。
+   *
+   * 拆回是一次明确的人工否决：「这几条不该并」。所以拆回过的 issue 不再进自动合并候选，
+   * 否则下一轮调度立刻又并回去，拆了个寂寞。
+   */
+  wasUnmerged(issueId: number): boolean {
+    return this.listEvents(issueId)
+      .some((e) => e.kind === 'tasks_unmerged' || e.kind === 'unmerged_from');
+  }
+
+  /**
+   * 最近一次**还没被拆回过**的合并（#289 / B-14）：拆回的依据。
+   *
+   * 事件溯源：取最后一条带快照的 `tasks_merged`，若其后出现 `tasks_unmerged` 则说明已经拆过，
+   * 不给拆第二次（否则会把手工改过的正文又覆盖回旧快照）。老数据没有 snapshot 字段 → 拆不了，
+   * 如实返回 null（发起人已明确：历史误合并不做人工补救）。
+   */
+  lastUnmergeableMerge(issueId: number): {
+    eventId: number;
+    snapshot: MergeSnapshotEntry[];
+  } | null {
+    let merged: { eventId: number; snapshot: MergeSnapshotEntry[] } | null = null;
+    for (const e of this.listEvents(issueId)) {
+      if (e.kind === 'tasks_unmerged') {
+        merged = null;
+        continue;
+      }
+      if (e.kind !== 'tasks_merged') continue;
+      let snapshot: MergeSnapshotEntry[] = [];
+      try {
+        const data = JSON.parse(e.dataJson ?? '{}') as { snapshot?: unknown };
+        snapshot = Array.isArray(data.snapshot)
+          ? data.snapshot.flatMap((raw) => {
+            if (!raw || typeof raw !== 'object') return [];
+            const entry = raw as Record<string, unknown>;
+            if (typeof entry.id !== 'number' || typeof entry.title !== 'string') return [];
+            return [{
+              id: entry.id,
+              title: entry.title,
+              body: typeof entry.body === 'string' ? entry.body : null,
+              clarifyFeedback: typeof entry.clarifyFeedback === 'string' ? entry.clarifyFeedback : null,
+            }];
+          })
+          : [];
+      } catch {
+        snapshot = [];
+      }
+      merged = snapshot.length >= 2 ? { eventId: e.id, snapshot } : null;
+    }
+    return merged;
+  }
+
+  /**
+   * 这条 issue 有没有**尚未消费**的解除意图（#283 / B-10）。
+   *
+   * 事件溯源，不加列：以最后一条 `unblock_requested` 为准（重复提交天然幂等，
+   * 以最后一次的 guidance 为准），若其后出现 `unblock_request_cancelled` 或真正的
+   * `unblock` transition，则意图已作废。issue 已经不是 blocked 也一律作废——
+   * 它可能被取消、被手动开跑，这时候再自动恢复就是「用户没让我做的事」。
+   */
+  pendingUnblockRequest(issueId: number): PendingUnblockRequest | null {
+    const issue = this.get(issueId);
+    if (!issue || (issue.status !== 'blocked' && issue.status !== 'paused')) return null;
+    let request: { data: Record<string, unknown>; ts: number } | null = null;
+    for (const e of this.listEvents(issueId)) {
+      if (e.kind === 'unblock_requested') {
+        let data: Record<string, unknown> = {};
+        try {
+          data = e.dataJson ? (JSON.parse(e.dataJson) as Record<string, unknown>) : {};
+        } catch {
+          data = {};
+        }
+        request = { data, ts: e.ts };
+        continue;
+      }
+      if (e.kind === 'unblock_request_cancelled') request = null;
+      // 真正恢复过一次之后，之前的意图当然不再有效（又被 block 回来则以新意图为准）
+      if (e.kind === 'unblock_guidance') request = null;
+    }
+    if (!request) return null;
+    const guidance = typeof request.data.guidance === 'string' ? request.data.guidance : '';
+    if (!guidance.trim()) return null;
+    const resumeState = typeof request.data.resumeState === 'string'
+      ? (request.data.resumeState as IssueState)
+      : null;
+    return {
+      issueId,
+      guidance,
+      resumeState,
+      actor: typeof request.data.actor === 'number' ? request.data.actor : null,
+      ts: request.ts,
+    };
+  }
+
+  /**
+   * 本项目所有待消费的解除意图，**按与 pickNext 同样的口径排序**：置顶优先（后置顶在前），
+   * 其余按 id（= 创建顺序）FIFO。恢复一条受阻的比开一条新的更值得优先——那条已经花过钱了。
+   */
+  listPendingUnblockRequests(projectId: number): PendingUnblockRequest[] {
+    const blocked = this.listByProject(projectId).filter((i) => i.status === 'blocked' || i.status === 'paused');
+    const out: Array<PendingUnblockRequest & { pinnedTs: number | null }> = [];
+    for (const issue of blocked) {
+      const request = this.pendingUnblockRequest(issue.id);
+      if (request) out.push({ ...request, pinnedTs: issue.pinnedTs });
+    }
+    return out
+      .sort((a, b) => {
+        if (a.pinnedTs !== b.pinnedTs) {
+          if (a.pinnedTs === null) return 1;
+          if (b.pinnedTs === null) return -1;
+          return b.pinnedTs - a.pinnedTs; // 后置顶的在前，与 queue.orderPending 同口径
+        }
+        return a.issueId - b.issueId;
+      })
+      .map(({ pinnedTs: _pinned, ...rest }) => rest);
+  }
+
+  /**
+   * 一条 issue 的成本视图数据（#282 / I-08）：`issue_usage` 的 token 用量 + 事件溯源的非 token 指标。
+   *
+   * 口径统一在这一处：UI 与离线核对都读它，别在调用方各自数一遍事件——那样迟早会出现
+   * 「详情页说重试 3 次、成本页说 2 次」这种谁也说不清的分歧。
+   */
+  issueCostStats(issueId: number): IssueCostStats {
+    const usageRow = this.db
+      .query<{
+        requests: number; input_tokens: number; cached_input_tokens: number; output_tokens: number;
+        reasoning_tokens: number; compactions: number; tool_calls: number; skill_reads: number;
+      }, [number]>('SELECT * FROM issue_usage WHERE issue_id = ?')
+      .get(issueId);
+    const usage: UsageTotals = usageRow
+      ? {
+        requests: usageRow.requests,
+        inputTokens: usageRow.input_tokens,
+        cachedInputTokens: usageRow.cached_input_tokens,
+        outputTokens: usageRow.output_tokens,
+        reasoningTokens: usageRow.reasoning_tokens,
+        compactions: usageRow.compactions,
+        toolCalls: usageRow.tool_calls,
+        skillReads: usageRow.skill_reads,
+      }
+      : emptyUsage(); // 还没扫到 = 全零，不是「没有这条 issue」
+
+    // 门禁耗时：durationMs 落在 validation_passed / validation_failed 的事件数据里
+    let validationMs = 0;
+    let validationRuns = 0;
+    for (const e of this.db
+      .query<{ data_json: string | null }, [number]>(
+        `SELECT data_json FROM issue_events
+          WHERE issue_id = ? AND kind IN ('validation_passed', 'validation_failed')`,
+      )
+      .all(issueId)) {
+      validationRuns++;
+      try {
+        const d = JSON.parse(e.data_json ?? '{}') as { durationMs?: unknown };
+        if (typeof d.durationMs === 'number' && Number.isFinite(d.durationMs) && d.durationMs > 0) {
+          validationMs += Math.trunc(d.durationMs);
+        }
+      } catch {
+        /* 坏事件只丢这一轮的耗时，不影响轮次计数 */
+      }
+    }
+
+    return {
+      issueId,
+      usage,
+      testRetries: this.countEvents(issueId, 'tests_failed'),
+      nudges: this.countEvents(issueId, 'nudged'),
+      judged: this.countEvents(issueId, 'judged'),
+      clarifies: this.countEvents(issueId, 'clarify_started'),
+      validationMs,
+      validationRuns,
+    };
+  }
+
+  /**
+   * 项目维度「最近 N 次创建时澄清」的成功率（#280 / B-06）。
+   *
+   * 口径：一次分析的**终局**只有两种——`clarify_done`（成功，含抢救来的）与
+   * `error{where:'clarify'}`（失败）。`clarify_skipped` / `clarify_discarded` 是「还没跑就作废」，
+   * 既不算成功也不算失败，必须排除，否则告警会被一堆取消掉的 issue 稀释成永远不触发。
+   * 事件溯源，不加表：窗口按事件 id 倒序取 N 条。
+   */
+  clarifySuccessRate(projectId: number, window: number): { ok: number; total: number; rate: number } {
+    const rows = this.db
+      .query<{ kind: string; data_json: string | null }, [number, number]>(
+        `SELECT e.kind, e.data_json FROM issue_events e
+           JOIN issues i ON i.id = e.issue_id
+          WHERE i.project_id = ?
+            AND (e.kind = 'clarify_done' OR (e.kind = 'error' AND e.data_json LIKE '%"where":"clarify"%'))
+          ORDER BY e.id DESC LIMIT ?`,
+      )
+      .all(projectId, Math.max(1, window));
+    const total = rows.length;
+    const ok = rows.filter((r) => r.kind === 'clarify_done').length;
+    return { ok, total, rate: total === 0 ? 1 : ok / total };
   }
 
   /** 项目维度最近一次某类事件（issue_events 免迁移复用：跨 issue 冷却/读最新建议） */
@@ -2285,6 +2796,32 @@ export class IssueStore {
   }
 
   /** 最近一次某类事件的 id；从未发生过返回 0（可直接当作「不设下界」用） */
+  /**
+   * 这条会话「还有人用着吗」（#277 / I-01）——模块会话轮换的唯一判据：只有没人用了，
+   * 才允许把模块指针挪到一条新 conv（每条 issue 一段独立 transcript）。
+   *
+   * 两条判据缺一不可：
+   * - **还有未结束的 segment**：典型是 blocked/崩溃后没来得及落 `conversation_segment_ended`
+   *   的那条，它的半截上下文仍挂在这条会话上，此刻换 conv 等于把人家的活儿扔了；
+   * - **还有在驱动中的占用者**：上线前的历史数据根本没有 segment 事件，只看事件会把一条
+   *   正跑着的会话判成「没人用」，轮换后两条 issue 同名 tmux 互相踩。
+   */
+  moduleConvInUse(convId: string): boolean {
+    const busy = BUSY_STATES.map((s) => `'${s}'`).join(', ');
+    return !!this.db
+      .query<{ n: number }, [string]>(
+        `SELECT 1 AS n FROM issues i
+          WHERE i.conv_id = ?
+            AND ((SELECT COALESCE(MAX(e.id), 0) FROM issue_events e
+                   WHERE e.issue_id = i.id AND e.kind = 'conversation_segment_started')
+                > (SELECT COALESCE(MAX(e.id), 0) FROM issue_events e
+                   WHERE e.issue_id = i.id AND e.kind = 'conversation_segment_ended')
+                 OR i.status IN (${busy}))
+          LIMIT 1`,
+      )
+      .get(convId);
+  }
+
   lastEventId(issueId: number, kind: string): number {
     const r = this.db
       .query<{ id: number }, [number, string]>(
@@ -2313,7 +2850,7 @@ export class IssueStore {
    */
   clearRunState(id: number): void {
     this.db
-      .query('UPDATE issues SET plan_json = NULL, subtasks_json = NULL, sub_index = 0, note = NULL, done_ts = NULL WHERE id = ?')
+      .query('UPDATE issues SET plan_json = NULL, subtasks_json = NULL, sub_index = 0, note = NULL, done_ts = NULL, result_summary = NULL, completion_report_json = NULL WHERE id = ?')
       .run(id);
   }
 
@@ -2409,11 +2946,20 @@ export class IssueStore {
   }
 
   /** 最近一次「转入 stage」的事件详情（event/from/note）——返工 prompt 取意见用 */
-  lastEnterInfo(issueId: number, stage: IssueState): { event: string; from: string; note?: string } | null {
+  lastEnterInfo(
+    issueId: number,
+    stage: IssueState,
+  ): { event: string; from: string; note?: string; resumeState?: string; stopLoss?: boolean } | null {
     for (const e of this.recentEvents(issueId, 'transition')) {
       const d = parseTransData(e.dataJson);
       if (d.to === stage) {
-        return { event: d.event ?? '', from: d.from ?? '', ...(d.note ? { note: d.note } : {}) };
+        return {
+          event: d.event ?? '',
+          from: d.from ?? '',
+          ...(d.note ? { note: d.note } : {}),
+          ...(d.resumeState ? { resumeState: d.resumeState } : {}),
+          ...(d.stopLoss ? { stopLoss: true } : {}), // #274：这次 blocked 是止损闸打的
+        };
       }
     }
     return null;
@@ -2435,6 +2981,95 @@ export class IssueStore {
       n++;
     }
     return n;
+  }
+
+  /**
+   * 自 sinceEventId 以来末尾**连续同结论**的 judged 次数（#273 / B-04 的退避依据）。
+   * `consecutiveJudgedDone` 的推广：那个写死只认 `done`，这个认「最后一次是什么结论就
+   * 数到什么结论断掉为止」，于是 not_done 反复轮询也能被退避住。
+   *
+   * 返回 `{ result, streak }`；没有可数的 judged（或事件损坏）时 result 为 null、streak 0。
+   * 结论一变 streak 归 1，退避间隔随之落回基准——判定结论变了说明现场在动，不该继续拉长。
+   */
+  consecutiveJudged(
+    issueId: number,
+    sinceEventId: number,
+  ): { result: string | null; streak: number } {
+    let result: string | null = null;
+    let streak = 0;
+    for (const e of this.recentEvents(issueId, 'judged')) {
+      if (e.id <= sinceEventId) break;
+      let current: string | null = null;
+      try {
+        const parsed = (JSON.parse(e.dataJson ?? '{}') as { result?: unknown }).result;
+        if (typeof parsed === 'string' && parsed) current = parsed;
+      } catch {
+        break; // 事件损坏：宁可少数一次（退避变短），也不要把不同结论串成一条
+      }
+      if (current === null) break;
+      if (result === null) result = current;
+      else if (current !== result) break;
+      streak++;
+    }
+    return { result, streak };
+  }
+
+  /**
+   * 止损闸的三项计数（#274 / I-06），一次遍历 transition 事件全部算出来：
+   *
+   * - `blockCount`：进入 blocked 的次数，**排除止损自己打的那些**（transition 数据带
+   *   `stopLoss: true`）。不排除的话闸会自我放大——暂停一次计数就 +1，人工恢复后立刻又够阈值。
+   * - `stageReentry`：**重新**进入 `stage` 的次数 = 进入次数 - 1。减这个 1 不是凑数：
+   *   `plan_approved → implementing` 这种首次进入不是「重入」，把它算进去会让阈值 3 在
+   *   第 2 次 tests_failed 就触发，把正常的测试回退循环（MAX_TEST_FAILURES=3）整个吃掉。
+   * - `runtimeMs`：**只累计停留在 BUSY 状态的时长**。停在 blocked/pending 等人的那段不算——
+   *   那是用户的响应时间，不该由 issue 来背。
+   *
+   * 一律事件溯源、按 sinceEventId 截断（锚点之后重新计），重启不丢；
+   * 事件损坏就跳过那一条，宁可少算（晚一点触发）也不要把闸算早。
+   */
+  stopLossStats(
+    issueId: number,
+    sinceEventId: number,
+    stage: IssueState,
+    now: number,
+  ): { blockCount: number; stageReentry: number; runtimeMs: number } {
+    const all = this.recentEvents(issueId, 'transition', 500).reverse(); // 按时间正序走
+    const after = all.filter((e) => e.id > sinceEventId);
+    let blockCount = 0;
+    let stageEntries = 0;
+    for (const e of after) {
+      const d = parseTransData(e.dataJson);
+      if (!d.to) continue;
+      if (d.to === 'blocked' && d.stopLoss !== true) blockCount++;
+      if (d.to === stage) stageEntries++;
+    }
+
+    // 时长的计时窗口比事件窗口多一段头：锚点（人工确认继续）当时 issue 已经被 unblock
+    // 回到了某个 BUSY 阶段，而那条 transition 的 id 小于锚点、不在 `after` 里。少了这一段，
+    // 恢复之后只要没有新的状态迁移，运行时长就永远算 0——运行时长闸会在第一次恢复后直接哑掉。
+    const segments: Array<{ ts: number; to: string }> = [];
+    if (sinceEventId > 0) {
+      const anchorTs = this.db
+        .query<{ ts: number }, [number]>('SELECT ts FROM issue_events WHERE id = ?')
+        .get(sinceEventId)?.ts;
+      const prior = all.filter((e) => e.id <= sinceEventId);
+      const lastBefore = prior.length > 0 ? parseTransData(prior[prior.length - 1]!.dataJson) : null;
+      if (anchorTs !== undefined && lastBefore?.to) segments.push({ ts: anchorTs, to: lastBefore.to });
+    }
+    for (const e of after) {
+      const d = parseTransData(e.dataJson);
+      if (d.to) segments.push({ ts: e.ts, to: d.to });
+    }
+    let runtimeMs = 0;
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i]!;
+      if (!BUSY_STATES.includes(seg.to as IssueState)) continue;
+      // 这段区间的状态就是 seg.to，直到下一段（没有下一段就算到此刻）
+      const until = segments[i + 1]?.ts ?? now;
+      if (until > seg.ts) runtimeMs += until - seg.ts;
+    }
+    return { blockCount, stageReentry: Math.max(0, stageEntries - 1), runtimeMs };
   }
 
   /** stage 进入后是否已注入过该阶段首条 prompt（kickoff 幂等判据，重启安全） */
@@ -2510,15 +3145,70 @@ export class IssueStore {
 // ---------- 引擎 ----------
 
 export interface EngineConfig {
+  directExecution: boolean;
   /** 安静多久后催哨兵（v1 AUTOPILOT_NUDGE_SEC=180 平移） */
   nudgeSec: number;
   /** 安静多久后 PM 保守判定（v1 AUTOPILOT_FALLBACK_SEC=360 平移） */
   fallbackSec: number;
   /**
+   * 单 issue 催办次数上限（#273 / B-03）。到顶不再催，落 nudge_exhausted + 通知转人工，
+   * **不 block**——催不动多半是代理在长跑或真卡住，把 issue 打死只会丢掉现场。
+   * 与 `judgeMaxCount` **各算各的**，但任一到顶就彻底停催停判、静等人工。
+   * 计数锚点见 `attentionAnchor`：人一插手就重新给预算。
+   * ≤0 = 关闭催办（测试用），不等同于「已耗尽」。
+   */
+  nudgeMaxCount: number;
+  /** 催办退避的间隔封顶（#273）：`nudgeSec * 2^已催次数` 再高也不超过它 */
+  nudgeMaxIntervalSec: number;
+  /**
+   * 单 issue PM 兜底判定次数上限（#273 / B-04）；到顶落 judge_exhausted + 通知转人工。
+   * 与 `nudgeMaxCount` **各算各的**，但任一到顶就彻底停催停判、静等人工。
+   * ≤0 = 关闭判定（测试用），不等同于「已耗尽」。
+   */
+  judgeMaxCount: number;
+  /** 判定退避的间隔封顶（#273）：`fallbackSec * 2^同结论连击` 再高也不超过它 */
+  judgeMaxIntervalSec: number;
+  /**
+   * reclaim 连续失败多少次后判定「会话确已丢失」（#273 / B-05），转 agent_down 恢复路径
+   * （重启 + 既有次数上限），而不是每分钟空转重扫。
+   */
+  reclaimMaxFailures: number;
+  /** reclaim 退避冷却的封顶（#273）：`sessionStaleMs * 2^连续失败数` 再高也不超过它 */
+  reclaimMaxCooldownMs: number;
+  /**
+   * 止损闸（#274 / I-06）：累计进入 blocked 多少次就暂停。**只数非止损来源的那些**——
+   * 止损自己打的 blocked 带 `stopLoss` 标记，把它计进去闸就会自我放大（暂停一次 → 计数 +1
+   * → 人工恢复后立刻又够阈值）。
+   */
+  stopLossBlockCount: number;
+  /** 止损闸：BUSY 状态累计运行多久就暂停。不计停在 blocked/pending 等人的那段时间。 */
+  stopLossRuntimeMs: number;
+  /** 止损闸：同一阶段重入多少次就暂停（规划↔实现↔测试来回打转的形态） */
+  stopLossStageReentry: number;
+  /**
    * 执行中澄清等待的自动继续时限（spec 第 2 点）：代理输出 NEED_CLARIFY 后进入「等待用户澄清」，
    * 引擎停催停判；超过此时长仍没等到答复 → 注入「按最佳判断继续」并记 clarify_timeout 复位续跑。
    */
+  /**
+   * 「等**用户**回答澄清问题」的超时：到点注入「按最佳判断继续」，与分析本身无关。
+   * **别拿它当分析超时用**——#280 之前生产上真正触发的是 runner 的 8 分钟默认值，
+   * 而这个 20 分钟的常量根本没接到 runner 上，导致根因排查一路跑偏。
+   */
   clarifyTimeoutMs: number;
+  /**
+   * 「创建时澄清**分析**本身」的超时（#280 / B-06）：clr-<id> 独立会话从注入提示词起算，
+   * 到点仍没写出 done 就收尾（产物已落盘的会被抢救）。与上面那条是两个不同的闸。
+   */
+  clarifyRunTimeoutMs: number;
+  /**
+   * 创建时澄清成功率告警（#280 / B-06）：最近 `clarifyAlertWindow` 次分析里成功率低于
+   * `clarifyAlertRate` 就发一次通知；不足窗口条数不告警（样本太少的比率没有意义）。
+   * 阈值可配置，别硬编码——发起人拍板的默认值是「最近 10 次 < 50%」。
+   * `clarifyAlertCooldownMs <= 0` 或窗口 <= 0 = 关掉告警。
+   */
+  clarifyAlertWindow: number;
+  clarifyAlertRate: number;
+  clarifyAlertCooldownMs: number;
   /**
    * 创建时澄清的提问轮数上限：pending 期每轮答复/改需求都会重新分析，但最多抛这么多轮
    * 新问题；到顶后仍更新反馈、不再出题（反复追问比按最佳判断做更打扰人）。
@@ -2554,13 +3244,19 @@ export interface EngineConfig {
   /** 同模块智能合并开关：调度前把同模块 pending 交 LLM 判归并（默认开） */
   autoMerge: boolean;
   /**
-   * 执行结果总结：进入 done/blocked 后、接力之前，向该 issue 的 CC 会话注入总结 prompt
-   * 并轮询文件哨兵的总超时（0 = 关闭总结）。等待会占住当次 applyEvent 调用链（含 tick）——
-   * 必须在接力前完成（下一条 issue 会接管同一 tmux 会话），默认 3 分钟是权衡上限。
+   * 收尾摘要的开关（>0 启用，0 关闭；#275 / I-05 之后**不再是超时**）。
+   *
+   * 历史包袱：这个字段原本是「注入总结 prompt 后轮询文件哨兵的总超时」。I-05 把整轮满窗
+   * 注入换成了确定性拼装，已经没有任何东西需要计时，但 45 处既有用例靠 `0` 来关掉
+   * 「收尾摘要 + 完成度门禁」，改名的收益远小于churn，故保留字段名、只改语义。
+   * 关掉它 = 不拼摘要、也不做「原始目标是否全部达成」的门禁（merging→done 直接放行）。
    */
   resultSummaryTimeoutMs: number;
-  /** 执行结果总结轮询间隔 */
-  resultSummaryPollMs: number;
+  /**
+   * 门禁执行的单条命令超时（ms）；**0 = 整个门禁执行关闭**（引擎不跑，直接放行到收尾）。
+   * 关掉它就回到 #279 之前的口径：门禁由代理在会话里自己跑，引擎只认哨兵。
+   */
+  validationTimeoutMs: number;
   /** 时钟注入（测试用） */
   now: () => number;
   /** sleep 注入（测试用；与 now 配套做确定性轮询） */
@@ -2568,12 +3264,39 @@ export interface EngineConfig {
 }
 
 export const DEFAULT_ENGINE_CONFIG: EngineConfig = {
-  // 2026-07-27 提速：生产库统计 292 次 nudge ≈ 14.6h 纯空等。下调到 120/240——
-  // 下限由「代理单次工具调用最长静默」定：本仓库全量 bun test 实测 49s、typecheck 30s，
-  // 串成一条命令约 90s，故 nudgeSec 不能低于 120，否则会在门禁跑到一半时催办。
+  directExecution: true,
+  // 2026-07-27 提速：生产库统计 292 次 nudge ≈ 14.6h 纯空等，下调到 120/240。
+  // #279 之后这个下限的**理由变了**：门禁已经搬到会话外（ValidationRunner 经 Driver 直跑），
+  // 代理不再需要为了跑 typecheck / bun test 静默一两分钟，所以「不能低于 90s 门禁串跑时长」
+  // 这条旧约束已经作废。现在的下限只由「代理自己一次工具调用/一次长思考的正常静默」定，
+  // 120 仍然够用；真要再压低，先量一遍代理侧的静默分布，别再拿门禁耗时当依据。
   nudgeSec: 120,
   fallbackSec: 240,
+  // #273：本周 274 次催办、单条最多 71 次（272 分钟，约 $21）。每次 nudge 都是一次带
+  // 100k+ 上下文的完整模型请求，所以退避比封顶更省——5 次的实际跨度是
+  // 2+4+8+16+32 ≈ 62 分钟，覆盖绝大多数真·长跑，超出就该人来看一眼了。
+  nudgeMaxCount: 5,
+  nudgeMaxIntervalSec: 30 * 60,
+  // 单条 issue 曾在 384 分钟里判了 97 次、结论全是 not_done。与催办同为 5 次
+  // （发起人拍板：两条各算 5 次，任一到顶就彻底停催停判、静等人工）。
+  judgeMaxCount: 5,
+  judgeMaxIntervalSec: 60 * 60,
+  reclaimMaxFailures: 3,
+  reclaimMaxCooldownMs: 10 * 60 * 1000,
+  // #274：本周归因到 Issue 的支出里 49%（约 $106）花在最终 cancelled 的任务上。
+  // 三个阈值都取需求正文给的默认值，可由 EngineConfig 覆盖，不硬编码。
+  stopLossBlockCount: 3,
+  stopLossRuntimeMs: 4 * 60 * 60 * 1000,
+  stopLossStageReentry: 3,
   clarifyTimeoutMs: 20 * 60 * 1000,
+  // #280：生产实测 codex 路径大量跑不满 8 分钟默认值就被判超时；发起人拍板调到 15 分钟，
+  // 并且必须真的传下去——不传的话 runner 依旧用它自己的 8 分钟默认值。
+  clarifyRunTimeoutMs: 15 * 60 * 1000,
+  // #280：本周 53 次分析只成了 4 次（8%）却无人知晓——这类「一直在烧钱但一直没产出」的
+  // 故障必须自己喊出来。冷却 6 小时：跌破之后每次失败都发一遍只会让人把通知静音。
+  clarifyAlertWindow: 10,
+  clarifyAlertRate: 0.5,
+  clarifyAlertCooldownMs: 6 * 60 * 60 * 1000,
   clarifyMaxQuestionRounds: 2,
   kickoffMinBootMs: 5000,
   kickoffReadyTimeoutMs: 120_000,
@@ -2586,10 +3309,10 @@ export const DEFAULT_ENGINE_CONFIG: EngineConfig = {
   tickMs: 3000,
   diffMaxChars: 200_000,
   autoMerge: true,
-  // 生产 32 次成功总结实测：最快 16s、平均 24s、最慢 60s。90s 覆盖全部观测样本还留 50% 余量，
-  // 而超时的那 5 次原本要白等 3 分钟才放行接力。
+  // #279：门禁在会话外跑，单条命令的超时——全量 bun test 实测 ~70s，15 分钟是给慢机器的余量
+  validationTimeoutMs: VALIDATION_TIMEOUT_MS,
+  // #275 起这个值只表示「开」（见 EngineConfig 上的说明），具体数字不再有语义
   resultSummaryTimeoutMs: 90 * 1000,
-  resultSummaryPollMs: 4000,
   now: () => Date.now(),
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
 };
@@ -2603,6 +3326,14 @@ export interface EngineMenuCtx {
   pane: string;
 }
 
+/** 结构化菜单之外的纯文本执行确认，由审批管道在全自动档保守判定。 */
+export interface EngineTextPromptCtx {
+  issue: EngineIssue;
+  project: Project;
+  session: string;
+  pane: string;
+}
+
 export interface EngineDeps {
   db: Database;
   driver: ExecutorDriver;
@@ -2613,6 +3344,8 @@ export interface EngineDeps {
   pmFor(project: Project): EnginePm;
   notify: EngineNotifier;
   mutex: KeyedMutex;
+  /** 自动 Git 收尾前刷新该项目已提交的 `.panda` 投影；失败必须阻止 git add/commit。 */
+  flushProjectData?(projectId: number): Promise<void>;
   /** 正式模块编排；缺省时保留旧测试/旧库的 module 文本行为。 */
   modulesFor?(project: Project): {
     resolve(input: {
@@ -2634,6 +3367,14 @@ export interface EngineDeps {
       module: ProjectModule,
       issue: EngineIssue,
       summary: string,
+    ): Promise<void>;
+    /**
+     * 模块知识增量（#277 / I-01）：segment 结束时由引擎确定性写入 MODULE.md 的知识区，
+     * 替代「继承上一条 issue 的 transcript」。缺省（老装配）→ 引擎跳过，不影响收尾。
+     */
+    recordModuleKnowledge?(
+      module: ProjectModule,
+      entry: { issueId: number; status: string; title: string; note?: string },
     ): Promise<void>;
     /** 模块合并（归档来源前经 repoint 让引擎重指 issues）；缺省 = 旧装配不支持合并。 */
     merge?(input: {
@@ -2682,6 +3423,8 @@ export interface EngineDeps {
   onMenu?(ctx: EngineMenuCtx): void;
   /** 菜单从「有」变「无」时回调一次（审批管道据此重置去重签名——v1 agent.ts:621 语义） */
   onMenuGone?(session: string): void;
+  /** 无结构化菜单时的纯文本确认观察口；外层负责候选识别、分级、去重与锁内复核。 */
+  onTextPrompt?(ctx: EngineTextPromptCtx): void;
   /**
    * Wave3 进度管道钩子：watch tail 出新消息时回调（复用引擎 tail，外层严禁再 tail 同一
    * 文件）。同步签名，异常由引擎捕获落事件。
@@ -2706,6 +3449,13 @@ export interface WatchState {
   growTs: number;
   /** 最近一次 reclaim 尝试时刻（失败冷却，防每 tick 轰炸重扫） */
   reclaimAt: number;
+  /**
+   * 连续 reclaim 失败次数（#273 / B-05）：既用来指数退避冷却，也用来判「会话确已丢失」
+   * 转 agent_down。与 `agentRestarts` 同理，**必须跨 resetWatch 传递**——转 agent_down 会
+   * 重启并 resetWatch，计数丢了就永远到不了上限，只会一分钟一次地空转重扫。
+   * 认领成功即清零。
+   */
+  reclaimFailures: number;
   /** 最近一次对 codex 升级弹窗自动选「升级」的时刻（冷却防重复把 '1' 打进 composer） */
   codexUpdateAt: number;
   /** 最近一次死会话重建尝试时刻（issue #88 会话自愈；冷却防 3s tick 打转刷错） */
@@ -2725,9 +3475,43 @@ export interface WatchState {
   resumePending: boolean;
 }
 
+/**
+ * 「这次没开成」的原因分类（#283 / B-10）。
+ *
+ * 分两档是因为它们该被完全不同地对待：**正常排队**（项目忙、被别的 flight 抢先、issue 刚被取消）
+ * 是调度器每天都要走的路径，落 error 只会把事件表塞满噪音，还让人以为系统坏了——生产库里
+ * `error{where:'scheduleNext',error:'项目忙（已有 issue 在跑），先排队'}` 就是这么来的；
+ * 真故障（工作区不可用、绑会话失败、开跑后状态无进展）才值得报 error。
+ */
+export type SchedulingDeferralReason = 'project-busy' | 'not-pending' | 'issue-gone';
+
 export type ApplyResult =
   | { ok: true; from: IssueState; to: IssueState }
-  | { ok: false; error: string };
+  | { ok: false; error: string; deferral?: SchedulingDeferralReason };
+
+/** 调度来源（#283）：事件里带上它，才说得清这次接力是谁触发的 */
+export type ScheduleSource = 'relay' | 'created' | 'unblock' | 'manual' | 'publication';
+
+/**
+ * 受阻解除的结果（#283）：项目忙时不再拒绝，而是把「解除意图」排队，
+ * 等当前任务结束、接力跑到它时自动恢复。`queued` 就是这一档。
+ */
+export type UnblockResult = ApplyResult | { ok: true; queued: true; requestedTs: number };
+
+/** 一条待消费的解除意图 */
+export interface PendingUnblockRequest {
+  issueId: number;
+  guidance: string;
+  resumeState: IssueState | null;
+  actor: number | null;
+  ts: number;
+}
+
+export interface ScheduleNextOptions {
+  /** 必须是 moduleKeyOf(issue) 的结果（module_id 优先），别传 issues.module 文本 */
+  preferModuleKey?: string;
+  source?: ScheduleSource;
+}
 
 /** I5：在途 tick 超过该时长未归还即告警（不重置——强行重入会造成双驾驶员） */
 export const TICK_STUCK_WARN_MS = 5 * 60 * 1000;
@@ -2765,6 +3549,8 @@ export class IssueEngine {
   private readonly watch = new Map<string, WatchState>();
   /** 同 issue 状态迁移尾队列；首项同步启动，后续项严格等待前项完成。 */
   private readonly issueTransitionTails = new Map<number, Promise<void>>();
+  /** 正在实际执行 entry action 的 issue；收尾接力不得重新挑中自身，否则会等待自己的 tail。 */
+  private readonly activeIssueTransitions = new Set<number>();
   /** 项目启动最小 reservation：只覆盖空闲检查/绑会话到 pending→planning commit。 */
   private readonly startingProjects = new Set<number>();
   /** reservation 等待信号；并发 start 等前一个 commit 后重读 busy 状态。 */
@@ -2873,7 +3659,6 @@ export class IssueEngine {
   ): Promise<EngineIssue> {
     const proj = this.project(projectId);
     if (!proj) throw new Error(`项目 ${projectId} 不存在`);
-    if (proj.kind === 'chat') throw new Error('对话模式项目不支持创建 issue');
     const workflows = new WorkflowTemplateStore(this.deps.db, () => this.now());
     let selectedWorkflow: WorkflowTemplateDetail | null = null;
     if (input.workflowTemplateId !== undefined) {
@@ -2913,10 +3698,13 @@ export class IssueEngine {
     const create = (): EngineIssue => {
       const issue = this.store.create(projectId, {
         ...input,
+        executionMode: proj.manualReview || selectedWorkflow ? 'planned'
+          : input.executionMode ?? (this.cfg.directExecution ? 'direct' : 'planned'),
         ...(resolved
           ? { module: resolved.slug, moduleId: resolved.id, agent: resolved.agent }
           : {}),
       });
+      if (input.skillPolicy) saveSkillPolicy(this.deps.db,{projectId,issueId:issue.id},input.skillPolicy);
       if (selectedWorkflow) {
         const context: IssueWorkflowSharedContext = {
           schemaVersion: 1,
@@ -2962,8 +3750,8 @@ export class IssueEngine {
     if (resolved && modules) {
       await modules.recordIssue(resolved, issue, this.store.listByProject(projectId));
     }
-    if (autoStart) await this.scheduleNext(projectId, moduleKeyOf(issue));
-    this.scheduleClarify(issue.id); // 建即开跑（项目空闲）的不分析——规划阶段自会对齐
+    if (autoStart) await this.scheduleNext(projectId, { preferModuleKey: moduleKeyOf(issue), source: 'created' });
+    if (issue.executionMode !== 'direct') this.scheduleClarify(issue.id); // 建即开跑（项目空闲）的不分析——规划阶段自会对齐
     return this.store.get(issue.id)!;
   }
 
@@ -3149,7 +3937,7 @@ export class IssueEngine {
       } else {
         await perform(operation, async () => {
           requireActive();
-          await this.scheduleNext(projectId);
+          await this.scheduleNext(projectId, { source: 'publication' });
           requireActive();
         });
       }
@@ -3312,7 +4100,10 @@ export class IssueEngine {
         const issueId = payload.issueId as number;
         if (payload.action.kind === 'issue-event') {
           const event = payload.action.event as IssueMachineEvent;
-          const actionOptions = (payload.action.options ?? {}) as { note?: string; failCount?: number; actor?: number };
+          const actionOptions = (payload.action.options ?? {}) as {
+            note?: string; failCount?: number; actor?: number;
+            resumeState?: IssueState; stopLoss?: boolean;
+          };
           const result = await this.applyEvent(issueId, event, actionOptions);
           if (options.signal?.aborted) break;
           if (!result.ok) throw new Error(result.error);
@@ -3397,7 +4188,6 @@ export class IssueEngine {
   private requirePublicationProject(projectId: number): Project {
     const project = this.project(projectId);
     if (!project) throw new Error(`project ${projectId} does not exist`);
-    if (project.kind !== 'issue') throw new Error('chat project cannot publish issues');
     if (project.status !== 'active') throw new Error('archived project cannot publish issues');
     return project;
   }
@@ -3407,8 +4197,8 @@ export class IssueEngine {
     const title = input.title.trim();
     if (!nodeId || nodeId.length > 120) throw new Error('invalid publication node id');
     if (!title || title.length > 200) throw new Error('publication title must contain 1-200 characters');
-    if (typeof input.body !== 'string' || input.body.length === 0 || input.body.length > MAX_PUBLICATION_BODY) {
-      throw new Error(`publication body must contain 1-${MAX_PUBLICATION_BODY} characters`);
+    if (typeof input.body !== 'string' || input.body.length === 0 || input.body.length > MAX_ISSUE_BODY_CHARS) {
+      throw new Error(`publication body must contain 1-${MAX_ISSUE_BODY_CHARS} characters`);
     }
     if (input.implMode !== 'direct' && input.implMode !== 'team') throw new Error('invalid publication mode');
     if (input.agent !== 'claude' && input.agent !== 'codex') throw new Error('invalid publication agent');
@@ -3474,7 +4264,7 @@ export class IssueEngine {
     }
     const project = this.project(initial.projectId);
     if (!project) throw new Error('项目不存在');
-    const modules = moduleSelection ? this.deps.modulesFor?.(project) : undefined;
+    const modules = this.deps.modulesFor?.(project);
     const resolved =
       moduleSelection && modules
         ? await modules.resolve({
@@ -3518,7 +4308,8 @@ export class IssueEngine {
               }
             : {}),
       };
-      const { targetBranch, sourceRef, ...rest } = combined;
+      // source 只是「谁改的」这条元信息，不进 SQL 更新集
+      const { targetBranch, sourceRef, source: _source, ...rest } = combined;
       const finalTarget = targetBranch !== undefined ? targetBranch : fresh.targetBranch;
       const requestedSource = sourceRef !== undefined ? sourceRef : fresh.sourceRef;
       if (targetBranch === undefined && finalTarget === null && requestedSource !== null) {
@@ -3541,8 +4332,22 @@ export class IssueEngine {
       return this.store.get(issueId)!;
     });
 
+    const documentModule = resolved ?? (
+      modules && updated.moduleId
+        ? await modules.resolve({
+            projectId: updated.projectId,
+            title: updated.title,
+            body: updated.body,
+            agent: updated.agent,
+            moduleId: updated.moduleId,
+            createdBy: updated.createdBy,
+          })
+        : null
+    );
+    if (documentModule && modules) {
+      await modules.recordIssue(documentModule, updated, this.store.listByProject(initial.projectId));
+    }
     if (resolved && modules) {
-      await modules.recordIssue(resolved, updated, this.store.listByProject(initial.projectId));
       this.store.logEvent(issueId, 'module_changed', {
         fromModuleId: initial.moduleId,
         toModuleId: resolved.id,
@@ -3581,7 +4386,7 @@ export class IssueEngine {
       const editableBeforeDispatch =
         !subtask.done &&
         (fresh.status === 'plan_review' ||
-          (fresh.status === 'blocked' && index >= fresh.subIndex) ||
+          ((fresh.status === 'blocked' || fresh.status === 'paused') && index >= fresh.subIndex) ||
           (fresh.implMode === 'seq' &&
             fresh.status === 'implementing' &&
             index > fresh.subIndex));
@@ -4212,18 +5017,31 @@ export class IssueEngine {
         projectName: project.name,
         history,
         allowQuestions,
+        timeoutMs: this.cfg.clarifyRunTimeoutMs,
         locale: this.promptLocale(issue, project),
       });
     } catch (e) {
       r = { ok: false, reason: 'error', error: String(e).slice(0, 200) };
     }
     if (!r.ok) {
-      // 分析失败不影响排队执行（评审铁律：失败落事件可见）
+      // 分析失败不影响排队执行（评审铁律：失败落事件可见）。
+      // #280：光记 reason=timeout 等于没记——现场证据（代理卡在哪一屏、产物写没写出来、
+      // 跑了多久）必须一起落库，否则下次还是只能靠猜。
+      const d = r.diagnostics;
       this.store.logEvent(issueId, 'error', {
         where: 'clarify',
         reason: r.reason,
         ...(r.error ? { error: r.error.slice(0, 200) } : {}),
+        ...(d
+          ? {
+              elapsedMs: d.elapsedMs,
+              hadArtifacts: d.hadArtifacts,
+              files: d.files.slice(0, 20),
+              paneTail: d.paneTail.slice(-MAX_CLARIFY_PANE_TAIL_CHARS),
+            }
+          : {}),
       });
+      await this.alertClarifySuccessRate(project, issueId);
       return;
     }
     // 归来竞态：分析期间 issue 已开跑/取消/删除 → 丢弃只记事件（CC 已读过原文，再补于事无补）
@@ -4237,7 +5055,18 @@ export class IssueEngine {
     this.store.logEvent(issueId, 'clarify_done', {
       questions: r.questions.length,
       ...(r.feedback ? { feedback: r.feedback.slice(0, 300) } : {}),
+      // #280：抢救来的结果照常用，但要标出来——「done 没写出来」本身是个待查的信号，
+      // 混进普通成功里就再也看不见了。
+      ...(r.salvaged
+        ? {
+            salvaged: true,
+            ...(r.diagnostics
+              ? { elapsedMs: r.diagnostics.elapsedMs, paneTail: r.diagnostics.paneTail.slice(-MAX_CLARIFY_PANE_TAIL_CHARS) }
+              : {}),
+          }
+        : {}),
     });
+    await this.alertClarifySuccessRate(project, issueId);
     if (r.questions.length > 0) {
       if (!allowQuestions) {
         // 轮数到顶：prompt 已禁止出题，LLM 不听话也在这里确定性压制（不落问题不打扰）
@@ -4266,6 +5095,41 @@ export class IssueEngine {
   }
 
   /**
+   * 创建时澄清成功率告警（#280 / B-06）。
+   *
+   * 为什么值得单独喊一嗓子：这类故障**一直在烧钱但一直没产出**——每次失败的分析都照付了
+   * 一次「独立会话通读代码库」的钱，而单看一条 `error{where:'clarify'}` 没人会在意，
+   * 于是本周 53 次里失败 49 次都没人发现。成功率是唯一能把它暴露出来的指标。
+   *
+   * 三条纪律：不足窗口条数不告警（样本太少的比率没有意义）；带冷却（跌破之后每次失败都发
+   * 一遍只会让人把通知静音）；告警本身失败绝不影响澄清流程。
+   */
+  private async alertClarifySuccessRate(project: Project, issueId: number): Promise<void> {
+    const window = this.cfg.clarifyAlertWindow;
+    if (window <= 0 || this.cfg.clarifyAlertCooldownMs <= 0) return; // 关掉了
+    const stat = this.store.clarifySuccessRate(project.id, window);
+    if (stat.total < window) return; // 样本不足
+    if (stat.rate >= this.cfg.clarifyAlertRate) return;
+
+    const lastTs = this.store.lastProjectEventTs(project.id, 'clarify_success_low');
+    if (lastTs !== null && Date.now() - lastTs < this.cfg.clarifyAlertCooldownMs) return;
+
+    this.store.logEvent(issueId, 'clarify_success_low', {
+      projectId: project.id,
+      ok: stat.ok,
+      total: stat.total,
+      rate: Number(stat.rate.toFixed(2)),
+    });
+    await this.notifySafe({
+      kind: 'status_change',
+      projectId: project.id,
+      issueId,
+      summaryCode: 'clarify_success_low',
+      summaryParams: { project: project.name.slice(0, 40), ok: stat.ok, total: stat.total },
+    });
+  }
+
+  /**
    * 队列接力：项目空闲时按「模块聚合」挑下一条 pending 开跑（同模块优先→模块间不交错→FIFO）。
    * 开跑前先对**将要运行的那个模块**的 pending 做一次 LLM 智能合并（同模块小任务并成一条，
    * 减少反复起会话/重复读代码）。合并会 cancel 掉被并入项，其接力经 scheduling 单飞挡掉重入。
@@ -4273,25 +5137,43 @@ export class IssueEngine {
    * `preferModuleKey` 必须是 `moduleKeyOf(issue)` 的结果（module_id 优先），不能直接传
    * issues.module 文本——文本列可能与模块 slug 不同步，会让「同模块连着跑」静默失效。
    */
-  async scheduleNext(projectId: number, preferModuleKey?: string): Promise<void> {
+  async scheduleNext(projectId: number, opts: ScheduleNextOptions | string = {}): Promise<void> {
+    // 旧签名（第二个参数直接传 preferModuleKey）仍然可用：调用点多，一次性全改风险大于收益
+    const options: ScheduleNextOptions = typeof opts === 'string' ? { preferModuleKey: opts } : opts;
+    const source: ScheduleSource = options.source ?? 'relay';
     if (this.scheduling.has(projectId)) return; // 合并 cancel 触发的嵌套接力：本轮外层会收尾
     this.scheduling.add(projectId);
     const mergedHosts: number[] = [];
     try {
-      let preferred = preferModuleKey;
+      let preferred = options.preferModuleKey;
       for (;;) {
-        let next = pickNext(this.store.listRunnableByProject(projectId), preferred);
+        // #283：先看有没有「等项目空闲就恢复」的受阻 issue——恢复一条已经花过钱的，
+        // 比开一条全新的更值得优先。**但手动置顶的 pending 又压过它**（发起人拍板）：
+        // 置顶是用户当场表达的「先跑这个」，比系统的成本优化更该被尊重。
+        // 消费成功后项目就忙了，本轮到此为止。
+        if (await this.consumeUnblockRequest(projectId, source, preferred)) return;
+
+        let next = pickNext(this.schedulableIssues(projectId), preferred);
         if (!next) return;
         const pickedModule = moduleKeyOf(next); // 模块身份用键（module_id 优先），不用可能过期的文本列
         // 目标模块的 pending 先智能合并，再在同模块内重挑（合并后 host 仍是最早的一条）
         mergedHosts.push(...(await this.maybeMergeModule(projectId, pickedModule)));
-        next = pickNext(this.store.listRunnableByProject(projectId), pickedModule);
+        next = pickNext(this.schedulableIssues(projectId), pickedModule);
         if (!next) return;
 
         const beforeStatus = next.status;
         const r = await this.startIssue(next.id);
         if (!r.ok) {
-          this.store.logEvent(next.id, 'error', { where: 'scheduleNext', error: r.error });
+          // 正常排队 vs 真故障：前者是调度器每天都走的路径，落 error 只会制造噪音并掩盖真问题
+          if (r.deferral) {
+            this.store.logEvent(next.id, 'scheduling_deferred', {
+              source,
+              reason: r.deferral,
+              issueId: next.id,
+            });
+          } else {
+            this.store.logEvent(next.id, 'error', { where: 'scheduleNext', source, error: r.error });
+          }
           return;
         }
 
@@ -4299,8 +5181,10 @@ export class IssueEngine {
         if (isBusy(projectIssues)) return; // 正常开跑成功：项目已有唯一 active，接力结束
         const fresh = projectIssues.find((issue) => issue.id === next.id);
         if (!fresh || fresh.status === beforeStatus) {
+          // 这一档是真故障：开跑调用返回成功，issue 却没动——多半是 entry action 半路失败
           this.store.logEvent(next.id, 'error', {
             where: 'scheduleNext',
+            source,
             error: fresh ? `开跑后状态无进展（仍为 ${fresh.status}）` : '开跑后 issue 不存在',
           });
           return;
@@ -4316,6 +5200,55 @@ export class IssueEngine {
       // pending，scheduleClarify 无声跳过（放在 startIssue 之后调度即为消除这层竞态）
       for (const hid of mergedHosts) this.scheduleClarify(hid);
     }
+  }
+
+  /**
+   * 消费一条待恢复意图（#283）：项目空闲时把「用户点过继续运行」的那条真正恢复起来。
+   *
+   * 走的是与手动解除**完全相同**的 `applyUnblock` 路径，所以 `unblock_guidance` 留痕、
+   * resumeState 注入、止损锚点这些一个都不会少。返回 true 表示本轮已经把项目占上了。
+   */
+  private async consumeUnblockRequest(
+    projectId: number,
+    source: ScheduleSource,
+    preferModuleKey?: string,
+  ): Promise<boolean> {
+    if (isBusy(this.store.listByProject(projectId))) return false;
+    const [request] = this.store.listPendingUnblockRequests(projectId);
+    if (!request) return false;
+    if (this.activeIssueTransitions.has(request.issueId)) return false; // 正在迁移，等下一轮
+
+    // 手动置顶的 pending 优先（发起人拍板）：置顶是用户当场说的「先跑这个」。
+    // 受阻那条自己也被置顶时按置顶时刻比——后置顶的在前，与 queue.orderPending 同口径。
+    const topPending = pickNext(this.schedulableIssues(projectId), preferModuleKey);
+    if (topPending?.pinnedTs != null) {
+      const requestPinnedTs = this.store.get(request.issueId)?.pinnedTs ?? null;
+      if (requestPinnedTs === null || requestPinnedTs < topPending.pinnedTs) return false;
+    }
+
+    const r = await this.applyUnblock(
+      request.issueId,
+      request.guidance,
+      request.actor ?? undefined,
+    );
+    if (!r.ok) {
+      // 恢复失败不该把意图吃掉：留着下一轮再试，但要留痕说明这轮为什么没成
+      this.store.logEvent(request.issueId, 'scheduling_deferred', {
+        source,
+        reason: 'unblock-failed',
+        issueId: request.issueId,
+        error: r.error.slice(0, 200),
+      });
+      return false;
+    }
+    this.store.logEvent(request.issueId, 'unblock_request_consumed', { source, requestedTs: request.ts });
+    return true;
+  }
+
+  private schedulableIssues(projectId: number): EngineIssue[] {
+    return this.store
+      .listRunnableByProject(projectId)
+      .filter((issue) => !this.activeIssueTransitions.has(issue.id));
   }
 
   /**
@@ -4336,14 +5269,35 @@ export class IssueEngine {
 
     // 只并「从未起跑」的 pending（convId=null）：已绑对话/分支的（如 unblock 回来的）
     // 可能已有落地改动，折叠会丢工作，绝不动。
-    const pending = this.store
+    const runnable = this.store
       .listRunnableByProject(projectId)
       .filter((i) =>
         i.status === 'pending'
+        && !this.activeIssueTransitions.has(i.id)
         && moduleKeyOf(i) === moduleKey
         && !i.convId
         && !i.publicationLocked
       );
+
+    // #289 / B-14：范围声明与「正文疑似被截断」在**引擎侧**判掉，绝不依赖 LLM 看到——
+    // 候选正文是 midTruncate 保头保尾截过的，声明写在中段就会被省略掉（#277 就是这么被合并的）。
+    // 这里读的是**原始正文**，不经任何截断。
+    const pending: EngineIssue[] = [];
+    for (const issue of runnable) {
+      const reason = hasNoMergeDeclaration(issue.body)
+        ? 'no-merge-declared'
+        : looksTruncated({ title: issue.title, body: issue.body, docPath: issue.docPath ?? null })
+          ? 'body-truncated'
+          // 拆回过的不再自动合并：人已经明确表示过「这几条不该并」，下一轮再并回去等于拆了个寂寞
+          : this.store.wasUnmerged(issue.id)
+            ? 'previously-unmerged'
+            : null;
+      if (reason) {
+        this.store.logEvent(issue.id, 'merge_skipped', { issueId: issue.id, reason });
+        continue;
+      }
+      pending.push(issue);
+    }
     if (pending.length < 2) return hosts;
     // LLM 提示词要人看得懂的模块名：优先模块行显示名，退回 issue 的文本列
     const label = this.moduleLabel(projectId, pending[0]!);
@@ -4381,6 +5335,67 @@ export class IssueEngine {
       if (row) return row.displayName;
     }
     return issue.module;
+  }
+
+  /**
+   * 一键拆回（#289 / B-14）：把一次智能合并**原样退回去**。
+   *
+   * 只在**宿主仍未起跑（pending）**时可用（发起人拍板）：一旦开跑，宿主会话里已经按合并后的
+   * 正文干过活了，这时候把正文换回去只会让代理和人各看各的版本。
+   *
+   * 依据是 `tasks_merged` 事件里的快照（合并时存的全文），所以：宿主恢复自己的 title/body/
+   * 澄清反馈，被并项 reopen 回 pending 并各自恢复原文。已经拆过的那次合并不会被拆第二次。
+   */
+  async unmergeIssues(hostId: number, actor?: number): Promise<
+    { ok: true; restored: number[] } | { ok: false; error: string }
+  > {
+    const host = this.store.get(hostId);
+    if (!host) return { ok: false, error: '无此 issue' };
+    if (host.status !== 'pending') {
+      return { ok: false, error: `只有未开跑（待办）的宿主可以拆回（当前 ${host.status}）` };
+    }
+    const merge = this.store.lastUnmergeableMerge(hostId);
+    if (!merge) return { ok: false, error: '这条 issue 没有可拆回的合并记录' };
+
+    const byId = new Map(merge.snapshot.map((entry) => [entry.id, entry]));
+    const hostSnapshot = byId.get(hostId);
+    if (!hostSnapshot) return { ok: false, error: '合并快照缺少宿主原文，无法拆回' };
+
+    const restored: number[] = [];
+    // 宿主先复原：拆回失败时宁可停在「宿主已还原、被并项还没回来」，也不要反过来
+    this.store.patchMeta(hostId, { title: hostSnapshot.title, body: hostSnapshot.body });
+    this.store.setClarifyFeedback(hostId, hostSnapshot.clarifyFeedback ?? null);
+
+    for (const entry of merge.snapshot) {
+      if (entry.id === hostId) continue;
+      const folded = this.store.get(entry.id);
+      if (!folded) continue; // 被删了，跳过——拆回是尽力而为，不能因为一条没了就整体失败
+      if (folded.status === 'cancelled') {
+        const r = await this.applyEvent(entry.id, 'reopen', {
+          ...(actor !== undefined ? { actor } : {}),
+        }, () => {
+          this.store.clearRunState(entry.id);
+          this.store.patchMeta(entry.id, { title: entry.title, body: entry.body });
+          this.store.setClarifyFeedback(entry.id, entry.clarifyFeedback ?? null);
+          this.store.logEvent(entry.id, 'unmerged_from', { host: hostId });
+        });
+        if (!r.ok) continue;
+      } else {
+        // 已经被人手工 reopen 过：只补回原文，不动状态
+        this.store.patchMeta(entry.id, { title: entry.title, body: entry.body });
+        this.store.setClarifyFeedback(entry.id, entry.clarifyFeedback ?? null);
+        this.store.logEvent(entry.id, 'unmerged_from', { host: hostId });
+      }
+      restored.push(entry.id);
+    }
+
+    this.store.logEvent(hostId, 'tasks_unmerged', {
+      host: hostId,
+      restored,
+      mergedEventId: merge.eventId,
+      ...(actor !== undefined ? { actor } : {}),
+    });
+    return { ok: true, restored };
   }
 
   /** 落地一个合并组：校验成员仍 pending、选 host（最早）、折叠其余为 cancelled；返回 host id */
@@ -4426,13 +5441,34 @@ export class IssueEngine {
     members.sort((a, b) => a.createdTs - b.createdTs || a.id - b.id);
     const host = members[0]!;
     const foldedIds = members.slice(1).map((i) => i.id);
-    this.store.patchMeta(host.id, { title: merge.title, body: merge.body });
-    this.store.setClarifyFeedback(host.id, null); // 正文已并入多条，旧反馈作废（调度收尾后重新分析）
+
+    // #289 / B-14：**绝不用摘要覆盖原文**。旧实现是 patchMeta(host, {title, body: merge.body})，
+    // 宿主正文从 1400~1700 字被压成 500~760 字的 LLM 摘要，代码定位（`engine.ts:6533` 这类行号）、
+    // 量化依据与验收段全丢，且无法回溯、无法拆回。现在：摘要在前，各分支原文按 #id 分节追加；
+    // 完整快照（含宿主自己的原文与澄清反馈）存进 tasks_merged 事件，供拆回使用。
+    const snapshot = members.map((m) => ({
+      id: m.id,
+      title: m.title,
+      body: m.body,
+      clarifyFeedback: m.clarifyFeedback,
+    }));
+    this.store.patchMeta(host.id, {
+      title: merge.title,
+      body: composeMergedBody(merge.body, snapshot),
+    });
+    // 旧反馈作废（正文已并入多条，调度收尾后重新分析）——但它先进了上面的快照，拆回时能还原
+    this.store.setClarifyFeedback(host.id, null);
     // 置顶不能被合并吞掉：若被并入项里有置顶（且比 host 更晚置顶），把置顶带到 host——
     // 否则「置顶了一条，却被同模块更早的一条合并掉」会让置顶意图无声丢失。
     const maxPin = Math.max(...members.map((i) => i.pinnedTs ?? 0));
     if (maxPin > (host.pinnedTs ?? 0)) this.store.setPinned(host.id, maxPin);
-    this.store.logEvent(host.id, 'tasks_merged', { from: foldedIds, module: host.module, title: merge.title.slice(0, 120) });
+    this.store.logEvent(host.id, 'tasks_merged', {
+      from: foldedIds,
+      module: host.module,
+      title: merge.title.slice(0, 120),
+      // 快照存全文（不截断）：它是拆回的唯一依据，截了就等于拆不回来
+      snapshot,
+    });
     for (const m of members.slice(1)) {
       this.store.logEvent(m.id, 'merged_into', { host: host.id, module: host.module });
       await this.applyEvent(m.id, 'cancel', { note: `已合并入 #${host.id}` });
@@ -4467,8 +5503,12 @@ export class IssueEngine {
 
   async startIssue(issueId: number): Promise<ApplyResult> {
     const issue = this.store.get(issueId);
-    if (!issue) return { ok: false, error: '无此 issue' };
-    if (issue.status !== 'pending') return { ok: false, error: `仅 pending 可开跑（当前 ${issue.status}）` };
+    // 这两条与锁内的同款判定要一起标 deferral（#283）：调度器多半是在这里被挡下的——
+    // 挑中之后、真正开跑之前，issue 被取消/被别的 flight 抢先都走这里。
+    if (!issue) return { ok: false, error: '无此 issue', deferral: 'issue-gone' };
+    if (issue.status !== 'pending') {
+      return { ok: false, error: `仅 pending 可开跑（当前 ${issue.status}）`, deferral: 'not-pending' };
+    }
     const project = this.project(issue.projectId);
     if (!project) return { ok: false, error: '项目不存在' };
 
@@ -4506,11 +5546,12 @@ export class IssueEngine {
       await this.deps.mutex.runExclusive(issueMetaLockKey(issue.projectId), async () => {
         const fresh = this.store.get(issueId);
         if (!fresh) {
-          immediate = { ok: false, error: '无此 issue' };
+          immediate = { ok: false, error: '无此 issue', deferral: 'issue-gone' };
           return;
         }
         if (fresh.status !== 'pending') {
-          immediate = { ok: false, error: `仅 pending 可开跑（当前 ${fresh.status}）` };
+          // 被别的 flight 抢先/用户手动开跑：正常竞态，不是故障
+          immediate = { ok: false, error: `仅 pending 可开跑（当前 ${fresh.status}）`, deferral: 'not-pending' };
           return;
         }
         const blockers = this.store.dependencyBlockers(fresh.id);
@@ -4523,10 +5564,10 @@ export class IssueEngine {
         }
         const siblings = this.store.listByProject(fresh.projectId).filter((i) => i.id !== fresh.id);
         const pausedWorkflow = siblings.some(
-          (candidate) => candidate.status === 'blocked' && this.workflowSnapshot(candidate.id)?.status === 'paused',
+          (candidate) => (candidate.status === 'blocked' || candidate.status === 'paused') && this.workflowSnapshot(candidate.id)?.status === 'paused',
         );
         if (isBusy(siblings) || pausedWorkflow) {
-          immediate = { ok: false, error: '项目忙（已有 issue 在跑），先排队' };
+          immediate = { ok: false, error: '项目忙（已有 issue 在跑），先排队', deferral: 'project-busy' };
           return;
         }
 
@@ -4539,6 +5580,10 @@ export class IssueEngine {
           immediate = { ok: false, error: `执行工作区不可用：${detail}` };
           return;
         }
+
+        // #277 / I-02：技能按模块挂载。必须赶在代理进程起来之前——它一启动就会把
+        // `.claude/skills` 下的 SKILL.md 全部扫一遍，那时候再摘已经晚了。
+        // Session-specific settings replace mutations of shared project skill symlinks.
 
         // 正式模块永久绑定唯一逻辑对话；tmux 只是可随时休眠/恢复的运行容器。
         if (!fresh.convId && !this.workflowSnapshot(fresh.id)) {
@@ -4566,7 +5611,19 @@ export class IssueEngine {
               immediate = { ok: false, error: '绑定模块不存在' };
               return;
             }
-            if (module.conversation_id) conv = this.deps.convs.get(module.conversation_id);
+            const held = module.conversation_id
+              ? this.deps.convs.get(module.conversation_id)
+              : undefined;
+            // #277 / I-01 决策 1A：**每条 issue 一条独立 transcript**。模块仍是长期身份
+            // （固定 slug、固定代理、固定 tmux 名），但不再让所有 issue 挤在同一条对话里——
+            // 上一条的整段 transcript 会被下一条无差别继承进窗口，越跑越贵，还把不相干的
+            // 上下文喂给新任务。跨 issue 的连续性改由模块知识（MODULE.md 知识区）承担。
+            //
+            // 轮换只在「这条会话上没有未结束的 segment」时发生：还有人半截活儿挂在上面就
+            // 接着用（典型是 blocked 后没落 segment_ended 的），否则等于把人家的上下文扔了。
+            // 旧 conv 不归档、不删，保留可查；tmux 名仍由 slug 派生，所以这里是**同一个运行
+            // 容器重起**（activate 走 kill+new 换 --session-id），不是新开一个进程。
+            conv = held && this.store.moduleConvInUse(held.id) ? held : undefined;
             if (!conv) {
               conv = this.deps.convs.create(
                 fresh.projectId,
@@ -4574,14 +5631,24 @@ export class IssueEngine {
                 module.agent === 'codex' ? 'codex' : 'claude',
               );
               this.deps.db
-                .query('UPDATE project_modules SET conversation_id = ? WHERE id = ? AND conversation_id IS NULL')
-                .run(conv.id, fresh.moduleId);
+                .query(
+                  `UPDATE project_modules SET conversation_id = ?
+                    WHERE id = ? AND (conversation_id IS NULL OR conversation_id = ?)`,
+                )
+                .run(conv.id, fresh.moduleId, module.conversation_id);
               const bound = this.deps.db
                 .query<{ conversation_id: string }, [number]>(
                   'SELECT conversation_id FROM project_modules WHERE id = ?',
                 )
                 .get(fresh.moduleId)?.conversation_id;
               if (bound !== conv.id) conv = bound ? this.deps.convs.get(bound) : undefined;
+              else if (module.conversation_id) {
+                this.store.logEvent(fresh.id, 'module_conv_rotated', {
+                  moduleId: fresh.moduleId,
+                  from: module.conversation_id,
+                  to: conv.id,
+                });
+              }
             }
           } else if (fresh.category === 'debug') {
             const busy = this.store.busyConvIds(fresh.projectId);
@@ -4622,6 +5689,7 @@ export class IssueEngine {
           }
         }
         const bound = this.store.get(fresh.id);
+        if (bound?.convId) await this.prepareSkillSession(bound, workspace.cwd);
         if (bound?.moduleId && bound.convId) {
           const lastStart = this.store.lastEventId(bound.id, 'conversation_segment_started');
           const lastEnd = this.store.lastEventId(bound.id, 'conversation_segment_ended');
@@ -4646,7 +5714,9 @@ export class IssueEngine {
           signalMetaRelease();
         };
         transitionPromise = this.runIssueTransition(issueId, () =>
-          this.applyEventLocked(issueId, 'skip_clarifying', {}, () => {
+          this.applyEventLocked(issueId, this.store.get(issueId)?.executionMode === 'direct'
+            && !project.manualReview && !this.workflowSnapshot(issueId)
+            && !this.store.get(issueId)?.publicationLocked ? 'start_direct' : 'skip_clarifying', {}, () => {
             releaseStarting();
             signalOnce();
           }),
@@ -4794,16 +5864,81 @@ export class IssueEngine {
     return this.applyEvent(issueId, 'block', { note, actor });
   }
 
-  /** blocked → pending 重新入队；解除方法单独完整留痕，供下一轮规划可靠注入。 */
-  async unblockIssue(issueId: number, guidance: string, actor?: number): Promise<ApplyResult> {
+  /**
+   * blocked → 受阻来源阶段；解除方法单独完整留痕，供恢复后的阶段可靠注入。
+   *
+   * **项目忙时不再拒绝**（#283）：旧行为是回一句「请在当前任务结束后继续运行」，
+   * 于是用户点了「继续运行」什么也没发生，还得盯着前一条跑完再回来点一次——
+   * 这正是本条要消灭的人工守候。现在把解除意图排队（`unblock_requested`），
+   * 由接力在项目空闲时自动消费；意图可撤销、重复提交以最后一次为准。
+   */
+  async unblockIssue(issueId: number, guidance: string, actor?: number): Promise<UnblockResult> {
     const normalized = guidance.trim();
     if (!normalized) return { ok: false, error: '解除阻塞前必须填写补充意见或解除方法' };
     if (normalized.length > 4000) return { ok: false, error: '解除方法不能超过 4000 字' };
-    return this.applyEvent(issueId, 'unblock', { note: normalized, actor }, () => {
-      this.store.logEvent(issueId, 'unblock_guidance', {
+    const fresh = this.store.get(issueId);
+    if (!fresh) return { ok: false, error: '无此 issue' };
+    if (fresh.status !== 'blocked' && fresh.status !== 'paused') {
+      return { ok: false, error: `仅受阻或暂停可继续运行（当前 ${fresh.status}）` };
+    }
+    const siblings = this.store.listByProject(fresh.projectId).filter((candidate) => candidate.id !== issueId);
+    if (isBusy(siblings)) {
+      const ts = this.now();
+      // 重复请求幂等：只落一条新意图，读取侧永远取最后一条（以最后一次的 guidance 为准）
+      this.store.logEvent(issueId, 'unblock_requested', {
         guidance: normalized,
+        resumeState: this.resumeStateOf(issueId) ?? 'pending',
         ...(actor !== undefined ? { actor } : {}),
       });
+      return { ok: true, queued: true, requestedTs: ts };
+    }
+    return this.applyUnblock(issueId, normalized, actor);
+  }
+
+  /** 撤销一条尚未消费的解除意图（#283）；没有意图时返回失败，避免静默无操作 */
+  cancelUnblockRequest(issueId: number, actor?: number): { ok: true } | { ok: false; error: string } {
+    const request = this.store.pendingUnblockRequest(issueId);
+    if (!request) return { ok: false, error: '没有待恢复的请求' };
+    this.store.logEvent(issueId, 'unblock_request_cancelled', {
+      ...(actor !== undefined ? { actor } : {}),
+    });
+    return { ok: true };
+  }
+
+  /** 受阻前的可恢复阶段（读不出来就回 pending，与既有口径一致） */
+  private resumeStateOf(issueId: number): IssueState | undefined {
+    const blocked = this.store.lastEnterInfo(issueId, this.store.get(issueId)?.status === 'paused' ? 'paused' : 'blocked');
+    const raw = isResumableState(blocked?.resumeState)
+      ? blocked.resumeState
+      : isResumableState(blocked?.from)
+        ? blocked.from
+        : undefined;
+    return raw === undefined ? undefined : demoteAgentlessResume(raw);
+  }
+
+  /** 真正执行恢复：手动解除与接力消费意图共用这一条路径，保证留痕与注入完全一致 */
+  private async applyUnblock(issueId: number, guidance: string, actor?: number): Promise<ApplyResult> {
+    const blocked = this.store.lastEnterInfo(issueId, this.store.get(issueId)?.status === 'paused' ? 'paused' : 'blocked');
+    const resumeState = this.resumeStateOf(issueId);
+    return this.applyEvent(issueId, 'unblock', {
+      note: guidance,
+      actor,
+      ...(resumeState ? { resumeState } : {}),
+    }, () => {
+      this.store.logEvent(issueId, 'unblock_guidance', {
+        guidance,
+        resumeState: resumeState ?? 'pending',
+        ...(actor !== undefined ? { actor } : {}),
+      });
+      // #274：这次受阻是止损闸打的 → 落新锚点。少了它，用户点「继续运行」之后
+      // 三项计数还是原样超标，下一个 tick 立刻又被暂停，人根本推不动。
+      // 只对止损来源落：普通受阻的恢复不该把烧钱账目一笔勾销。
+      if (blocked?.stopLoss) {
+        this.store.logEvent(issueId, 'stop_loss_resumed', {
+          resumeState: resumeState ?? 'pending',
+          ...(actor !== undefined ? { actor } : {}),
+        });
+      }
     });
   }
 
@@ -4815,16 +5950,28 @@ export class IssueEngine {
    * 清理挂在 afterCommit（CAS 之后、调度之前，同步执行、仍在 transition 临界区内），
    * 不能放到 applyEvent 返回之后：那时接力可能已经把它开跑，清理会连新计划一起抹掉。
    */
-  async reopenIssue(issueId: number, actor?: number): Promise<ApplyResult> {
+  async reopenIssue(issueId: number, actor?: number, guidance = ''): Promise<ApplyResult> {
     const issue = this.store.get(issueId);
     if (!issue) return { ok: false, error: '无此 issue' };
     // 友好错误；真正的守卫是状态机（非 cancelled 一律「非法转换」）
-    if (issue.status !== 'cancelled') {
-      return { ok: false, error: `仅已取消的 issue 可重新运行（当前 ${issue.status}）` };
+    if (issue.status !== 'cancelled' && issue.status !== 'done') {
+      return { ok: false, error: `仅已取消或已完成的 issue 可重新运行（当前 ${issue.status}）` };
     }
-    return this.applyEvent(issueId, 'reopen', actor !== undefined ? { actor } : {}, () => {
+    const normalized = guidance.trim();
+    if (issue.status === 'done' && !normalized) {
+      return { ok: false, error: '退回已完成 issue 前必须填写未达目标或继续处理说明' };
+    }
+    if (normalized.length > 4000) return { ok: false, error: '继续处理说明不能超过 4000 字' };
+    return this.applyEvent(issueId, 'reopen', {
+      ...(actor !== undefined ? { actor } : {}),
+      ...(normalized ? { note: normalized } : {}),
+    }, () => {
       this.store.clearRunState(issueId);
-      this.store.logEvent(issueId, 'reopened', actor !== undefined ? { actor } : undefined);
+      this.store.logEvent(issueId, 'reopened', {
+        from: issue.status,
+        ...(normalized ? { guidance: normalized } : {}),
+        ...(actor !== undefined ? { actor } : {}),
+      });
     });
   }
 
@@ -4879,7 +6026,7 @@ export class IssueEngine {
     if (issue.status !== 'pending') return { ok: false, error: `仅待办（pending）可置顶（当前 ${issue.status}）` };
     this.store.setPinned(issueId, pinned ? this.now() : null);
     this.store.logEvent(issueId, pinned ? 'pinned' : 'unpinned', actor !== undefined ? { actor } : undefined);
-    await this.scheduleNext(issue.projectId, moduleKeyOf(issue));
+    await this.scheduleNext(issue.projectId, { preferModuleKey: moduleKeyOf(issue), source: 'manual' });
     return { ok: true, from: issue.status, to: issue.status };
   }
 
@@ -4887,7 +6034,7 @@ export class IssueEngine {
    * 改 issue 的自动批准档位（issue #108）。未开跑/驱动中都能改——正在跑的 issue 改完
    * 下一次弹窗就按新档位走（管道每轮现取），这正是「跑着跑着觉得太啰嗦/太放飞」时的用法。
    * 只有已收尾的（done/cancelled）拒改：不会再有弹窗，改了纯属误导（#111）。
-   * **blocked 仍可改**——受阻能重试，重试前调档正是它的用法，别顺手把它一起锁掉。
+   * **blocked 仍可改**——受阻能恢复，继续前调档正是它的用法，别顺手把它一起锁掉。
    */
   setAutoApprove(issueId: number, level: AutoApproveLevel, actor?: number): ApplyResult {
     const issue = this.store.get(issueId);
@@ -4913,7 +6060,14 @@ export class IssueEngine {
   async applyEvent(
     issueId: number,
     ev: IssueMachineEvent,
-    opts: { note?: string; failCount?: number; actor?: number } = {},
+    opts: {
+      note?: string;
+      failCount?: number;
+      actor?: number;
+      resumeState?: IssueState;
+      /** #274：本次 blocked 是止损闸打的。写进 transition 事件供计数排除与 #275 派生 */
+      stopLoss?: boolean;
+    } = {},
     /** CAS 落库后、任何调度之前**同步**执行（仍在本 issue 的 transition 临界区内）。
      *  reopen 的清理挂在这里：先落 pending 再清，接力可能已经把它开跑，会抹掉新计划。 */
     afterCommit?: () => void,
@@ -4924,10 +6078,12 @@ export class IssueEngine {
     const result = await this.runIssueTransition(issueId, () =>
       this.applyEventLocked(issueId, ev, opts, afterCommit),
     );
-    // unblock → pending 的接力可能立刻重新 start 同一 issue，必须等 transition 锁释放后执行。
+    // 仅缺少有效恢复上下文的 unblock 会回 pending，并在 transition 锁释放后走既有启动入口。
     if (result.ok && result.to === 'pending' && result.from !== 'pending') {
       const issue = this.store.get(issueId);
-      if (issue?.status === 'pending') await this.scheduleNext(issue.projectId, moduleKeyOf(issue));
+      if (issue?.status === 'pending') {
+        await this.scheduleNext(issue.projectId, { preferModuleKey: moduleKeyOf(issue), source: 'unblock' });
+      }
     }
     return result;
   }
@@ -4945,12 +6101,20 @@ export class IssueEngine {
     });
     this.issueTransitionTails.set(issueId, tail);
 
+    const execute = async (): Promise<T> => {
+      this.activeIssueTransitions.add(issueId);
+      try {
+        return await fn();
+      } finally {
+        this.activeIssueTransitions.delete(issueId);
+      }
+    };
     let result: Promise<T>;
     if (previous) {
-      result = previous.then(fn);
+      result = previous.then(execute);
     } else {
       try {
-        result = Promise.resolve(fn());
+        result = execute();
       } catch (e) {
         result = Promise.reject(e);
       }
@@ -4966,13 +6130,23 @@ export class IssueEngine {
   private async applyEventLocked(
     issueId: number,
     ev: IssueMachineEvent,
-    opts: { note?: string; failCount?: number; actor?: number } = {},
+    opts: {
+      note?: string;
+      failCount?: number;
+      actor?: number;
+      resumeState?: IssueState;
+      /** #274：本次 blocked 是止损闸打的。写进 transition 事件供计数排除与 #275 派生 */
+      stopLoss?: boolean;
+    } = {},
     afterCommit?: () => void,
   ): Promise<ApplyResult> {
     let issue = this.store.get(issueId);
     if (!issue) return { ok: false, error: '无此 issue' };
     const from = issue.status;
-    const to = transition(from, ev, opts.failCount !== undefined ? { failCount: opts.failCount } : undefined);
+    const to = transition(from, ev, {
+      ...(opts.failCount !== undefined ? { failCount: opts.failCount } : {}),
+      ...(opts.resumeState !== undefined ? { resumeState: opts.resumeState } : {}),
+    });
     if (to === null) return { ok: false, error: `非法转换：${from} -[${ev}]->` };
     const boundaryKind = this.executionSyncBoundaryKind(from, ev);
     if (boundaryKind) {
@@ -4983,6 +6157,8 @@ export class IssueEngine {
           ...(opts.note !== undefined ? { note: opts.note } : {}),
           ...(opts.failCount !== undefined ? { failCount: opts.failCount } : {}),
           ...(opts.actor !== undefined ? { actor: opts.actor } : {}),
+          ...(opts.resumeState !== undefined ? { resumeState: opts.resumeState } : {}),
+          ...(opts.stopLoss !== undefined ? { stopLoss: opts.stopLoss } : {}),
         },
       });
       if (held) return { ok: true, from, to: from };
@@ -4995,7 +6171,38 @@ export class IssueEngine {
         to,
         ...(opts.note ? { note: opts.note.slice(0, 500) } : {}),
         ...(opts.actor !== undefined ? { actor: opts.actor } : {}),
+        ...(opts.stopLoss ? { stopLoss: true } : {}),
+        ...((to === 'blocked' || to === 'paused') ? {
+          resumeState: from,
+          resumeContext: {
+            subIndex: fresh.subIndex,
+            convId: fresh.convId,
+            branch: fresh.branch,
+            targetBranch: fresh.targetBranch,
+            sourceRef: fresh.sourceRef,
+            workflowStatus: this.workflowSnapshot(issueId)?.status ?? null,
+          },
+        } : {}),
+        ...(ev === 'unblock' && opts.resumeState !== undefined ? { resumeState: opts.resumeState } : {}),
       });
+      if (ev === 'request_plan' || (ev === 'skip_clarifying' && fresh.executionMode === 'direct')) {
+        this.deps.db.run("UPDATE issues SET execution_mode = 'planned' WHERE id = ?", [issueId]);
+      }
+      if (ev === 'start_direct' || ev === 'request_plan' || ev === 'skip_clarifying') {
+        this.store.logEvent(issueId, 'execution_route', {
+          mode: ev === 'start_direct' ? 'direct' : 'planned', reason: opts.note ?? ev,
+        });
+      }
+      if (to === 'implementing') {
+        this.deps.db.run('UPDATE issues SET completion_report_json = NULL WHERE id = ?', [issueId]);
+      }
+      if (ev === 'unblock' && to === 'testing' && fresh.completionReport
+        && (fresh.completionReport.outcome !== 'complete'
+          || fresh.completionReport.unmetGoals.length > 0 || fresh.completionReport.remainingWork.length > 0)) {
+        // 旧报告记录的是解除之前的障碍，不能拿它重新判定本轮恢复失败。
+        // 已验证完整的报告仍可用于执行器/门禁异常后的继续收尾。
+        this.store.setCompletionReport(issueId, null);
+      }
       issue = fresh;
       afterCommit?.();
       return true;
@@ -5013,8 +6220,11 @@ export class IssueEngine {
         try { workspace = await this.resolveExecutionWorkspace(issue, project); }
         catch (e) {
           this.store.logEvent(issueId, 'error', { where: 'execution-workspace', error: String(e).slice(0, 200) });
-          return this.applyEventLocked(issueId, 'block', { note: '执行工作区不可用' }, afterCommit);
+          return this.applyEventLocked(issueId, 'pause', { note: '执行工作区不可用' }, afterCommit);
         }
+        // git 身份预检（#272 / B-01）：必须在 git_branch_prepared 之前，且**两条路径都要过**——
+        // 只读/只补 config，不碰工作树与 HEAD，故不破坏下面 legacy 路径「不动 Git 状态」的语义。
+        await this.precheckGitIdentity(project, issueId, workspace.cwd);
         if (workspace.kind === 'project' && !issue.targetBranch) {
           // Preserve the legacy no-target path byte-for-byte: no Git observation or mutation.
         } else {
@@ -5059,11 +6269,19 @@ export class IssueEngine {
         try { workspace = await this.resolveExecutionWorkspace(issue, project); }
         catch (e) {
           this.store.logEvent(issueId, 'error', { where: 'execution-workspace', error: String(e).slice(0, 200) });
-          return this.applyEventLocked(issueId, 'block', { note: '执行工作区不可用' }, afterCommit);
+          return this.applyEventLocked(issueId, 'pause', { note: '执行工作区不可用' }, afterCommit);
         }
+        if (ev === 'start_direct') await this.precheckGitIdentity(project, issueId, workspace.cwd);
         const inspected = await this.deps.mutex.runExclusive(gitLockKey(project.id), async () => {
           const fresh = this.store.get(issueId);
           if (!fresh || fresh.status !== from) return { kind: 'stale' as const };
+          if (ev === 'start_direct') {
+            if (fresh.targetBranch || workspace.kind === 'design-worktree') {
+              const prepared = await this.prepareIssueBranchLocked(project, fresh, workspace);
+              if (!prepared.ok) return { kind: 'blocked' as const, err: prepared.err };
+              this.store.logEvent(issueId, 'git_branch_prepared', prepared);
+            }
+          }
           const branch = await this.inspectIssueBranchLocked(project, fresh, workspace);
           if (!branch.ok) return { kind: 'blocked' as const, err: branch.err };
           if (!commitTransition(fresh)) return { kind: 'stale' as const };
@@ -5099,11 +6317,13 @@ export class IssueEngine {
       from,
       to,
       summaryCode: 'status_transition',
-      summaryParams: { title: issue.title.slice(0, 60) },
+      summaryParams: { title: issue.title.slice(0, 60), ...(to === 'paused' ? {detail:opts.note ?? ''} : {}) },
     });
     if (to === 'done') {
       await this.notifySafe({ kind: 'issue_done', projectId: issue.projectId, issueId, summary: issue.title });
-    } else if (to === 'blocked') {
+    } else if (to === 'blocked' && !opts.stopLoss) {
+      // 止损打的这次由 tripStopLoss 发专用通知（说清「不是失败」），这里不再发通用受阻通知，
+      // 否则一次事件会给用户推两条、还互相打架
       await this.notifySafe({
         kind: 'issue_blocked',
         projectId: issue.projectId,
@@ -5114,11 +6334,20 @@ export class IssueEngine {
     }
     await this.onEnter(issueId, from, to, opts.note);
     await this.syncModuleIssue(issueId);
+    // 止损闸（#274）：迁移落定后评估一次，这样「第 3 次解除阻塞」这类条件当场就能拦住，
+    // 不用等下一轮 tick。必须走 applyEventLocked——本方法已在该 issue 的 transition 队列里，
+    // 走 public applyEvent 会排进同一条尾队列自等。
+    const settled = this.store.get(issueId);
+    if (settled) {
+      await this.tripStopLoss(settled, (id, blockEvent, blockOpts) =>
+        this.applyEventLocked(id, blockEvent, blockOpts));
+    }
     return { ok: true, from, to };
   }
 
   private executionSyncBoundaryKind(from: IssueState, ev: IssueMachineEvent): string | null {
-    if (from === 'pending' && ev === 'skip_clarifying') return 'skip_clarifying';
+    if (from === 'pending' && (ev === 'skip_clarifying' || ev === 'start_direct')) return ev;
+    if (from === 'implementing' && ev === 'request_plan') return ev;
     if (from === 'clarifying' && ev === 'clarified') return 'clarified';
     if (from === 'planning' && ev === 'plan_ready') return 'plan_ready';
     if (from === 'plan_review' && (ev === 'plan_approved' || ev === 'plan_rejected')) return ev;
@@ -5162,9 +6391,13 @@ export class IssueEngine {
     let workspace: EngineExecutionWorkspace;
     try { workspace = await this.resolveExecutionWorkspace(issue, project); }
     catch (e) {
-      this.store.logEvent(issue.id, 'error', {
-        where: 'execution-workspace', error: String(e).slice(0, 200),
-      });
+      this.store.logEvent(issue.id, 'error', { where: 'execution-workspace', error: String(e).slice(0, 200) });
+      if (to === 'paused') {
+        this.workflowScheduler.pause(issueId,note ?? 'execution.error');
+        if (issue.convId) this.watch.delete(issue.convId);
+        this.store.expireWaitingGates(issueId);
+        await this.scheduleNext(issue.projectId, { source: 'relay' });
+      }
       return;
     }
 
@@ -5182,12 +6415,12 @@ export class IssueEngine {
           try {
             await this.activateConv(issue);
           } catch (e) {
-            await this.applyEventLocked(issueId, 'block', {
+            await this.applyEventLocked(issueId, 'pause', {
               note: `激活对话失败：${String(e).slice(0, 200)}`,
             });
             return;
           }
-        } else if (!(await this.ensureActiveConv(issue))) {
+        } else if (!(await this.ensureActiveConv(issue, from === 'blocked' || from === 'paused'))) {
           return;
         }
         break;
@@ -5236,7 +6469,7 @@ export class IssueEngine {
           if (result?.state === 'completed') {
             await this.applyEventLocked(issueId, 'impl_done', { note: '工作流已完成' });
           } else if (result?.state === 'failed' || result?.state === 'paused') {
-            await this.applyEventLocked(issueId, 'block', {
+            await this.applyEventLocked(issueId, 'pause', {
               note: `${result.state === 'paused' ? '工作流已暂停' : '工作流执行失败'}：${result.reason}`,
             });
           }
@@ -5246,16 +6479,31 @@ export class IssueEngine {
         // 实际分支校验、issues.branch 与首条 impl_base 已在 implementing CAS 发布前原子准备。
         // I1：plan_review approve 等路径进 implementing 时项目可能没有激活对话
         // （迁移场景：issue/conv 已入库但 project_active_conv 空）——此时激活，别静默冻结。
-        if (!(await this.ensureActiveConv(issue))) return;
+        if (!(await this.ensureActiveConv(issue, from === 'blocked' || from === 'paused'))) return;
         break;
       }
-      case 'testing':
+      case 'testing': {
         if (this.workflowSnapshot(issueId)) {
           await this.applyEventLocked(issueId, 'tests_passed', { note: '工作流节点已全部完成' });
           break;
         }
-        if (!(await this.ensureActiveConv(issue))) return; // I1 同上
+        if (!(await this.ensureActiveConv(issue, from === 'blocked' || from === 'paused'))) return;
+        // #279：进 testing 就把门禁范围算出来落库——UI 立刻能显示「这轮打算跑什么」，
+        // 真正执行要等代理输出 STAGE_DONE:testing（决策 2A：代理仍出完成报告块）。
+        // 失败不阻断：留 error 事件，跑门禁时会重算一次。
+        if (this.cfg.validationTimeoutMs > 0) {
+          try {
+            this.store.setValidationScope(issueId, await this.computeValidationScope(issue, workspace));
+          } catch (e) {
+            this.store.logEvent(issueId, 'error', { where: 'validation-scope', error: String(e).slice(0, 200) });
+          }
+        }
+        if ((from === 'paused' || from === 'blocked') && issue.executionMode === 'direct' && !issue.completionReport && issue.convId) {
+          await this.inject(this.deps.convs.tmuxName(issue.projectId,issue.convId),this.buildIssueNudge({issue,stage:'testing',locale:this.promptLocale(issue,project)}));
+          this.store.logEvent(issue.id,'injected',{stage:'testing',kind:'report_recovery'});
+        }
         break; // kickoff 注入测试 prompt
+      }
       case 'merge_review': {
         // 默认（manual_review 关）：不建卡点——自动 commit/push 收尾后直接放行到 done。
         // 先 commit 再 stampImplTip：自动提交要落进本 issue 的 impl_base..impl_tip 范围。
@@ -5263,13 +6511,31 @@ export class IssueEngine {
           if (this.store.holdExecutionSyncBoundary(issueId, 'merge_review_auto', {
             kind: 'resume_entry', from, to: 'merge_review',
           })) return;
+          try {
+            await this.deps.flushProjectData?.(project.id);
+          } catch (e) {
+            const detail = String(e).slice(0, 300);
+            this.store.logEvent(issueId, 'error', { where: 'projectDataFlush', error: detail });
+            await this.applyEventLocked(issueId, 'block', {
+              note: `自动收尾已停止：协作过程页刷新失败：${detail}`,
+            });
+            return;
+          }
           const finished = await this.deps.mutex
             .runExclusive(gitLockKey(project.id), async () => {
               const branch = await this.inspectIssueBranchLocked(project, issue, workspace);
               if (!branch.ok) return branch;
               const autoFailure = await this.autoCommitPushLocked(project, issue, workspace);
               await this.stampImplTip(project, issue, workspace);
-              return { ok: true as const, autoFailure };
+              const status = await this.deps.driver.git(workspace.cwd, ['status', '--porcelain']);
+              const snapshot = this.implCommits(issue.id);
+              const emptyImplRange = !snapshot
+                || (snapshot.commits.length === 0 && snapshot.files.length === 0);
+              return {
+                ok: true as const,
+                autoFailure,
+                dirtyEmptyImplRange: status.code === 0 && status.out.trim().length > 0 && emptyImplRange,
+              };
             })
             .catch((e: unknown) => ({ ok: false as const, err: String(e).slice(0, 300) }));
           if (!finished.ok) {
@@ -5292,6 +6558,18 @@ export class IssueEngine {
                 detail: detail.slice(0, 160),
               },
             });
+            if (where === 'auto_commit') {
+              await this.applyEventLocked(issueId, 'block', {
+                note: `自动提交失败，工作区改动已保留：${detail.slice(0, 300)}`,
+              });
+              return;
+            }
+          }
+          if (finished.dirtyEmptyImplRange) {
+            await this.applyEventLocked(issueId, 'block', {
+              note: '自动收尾已停止：本 issue 的实现范围为空，但工作区仍有未提交改动',
+            });
+            return;
           }
           this.store.logEvent(issueId, 'auto_approved', { kind: 'merge_review' });
           await this.applyEventLocked(issueId, 'review_approved', {
@@ -5330,13 +6608,19 @@ export class IssueEngine {
         // 引擎不做本地合并：改动已经落在 issue 的实际工作分支上，合并/MR 由开发者在 GitLab 侧处理。
         // 保留 merging 这个过渡态只为不动状态机；此处直接放行到 done。
         this.store.logEvent(issueId, 'merge_skipped', { branch: issue.branch ?? '', reason: 'no-local-merge' });
-        await this.applyEventLocked(issueId, 'merged');
+        const completion = await this.collectResultSummary(project, issue, 'done', workspace);
+        if (completion.kind === 'disabled' || completion.kind === 'complete') {
+          await this.applyEventLocked(issueId, 'merged');
+        } else {
+          await this.applyEventLocked(issueId, 'block', { note: completion.reason });
+        }
         break;
       }
       case 'done':
       case 'blocked':
+      case 'paused':
       case 'cancelled': {
-        if (to === 'blocked') this.workflowScheduler.pause(issueId, note ?? 'issue.blocked');
+        if (to === 'blocked' || to === 'paused') this.workflowScheduler.pause(issueId, note ?? 'issue.blocked');
         if (to === 'cancelled') this.workflowScheduler.cancel(issueId);
         if (issue.convId) this.watch.delete(issue.convId);
         this.store.expireWaitingGates(issueId);
@@ -5358,7 +6642,16 @@ export class IssueEngine {
         }
         // 执行结果总结：必须在接力**之前**（下一条 issue 会接管同一 tmux 会话）；
         // cancelled 不总结；超时/失败降级记事件，不阻断收尾。
-        if (to !== 'cancelled') await this.collectResultSummary(project, issue, to, workspace);
+        if (
+          to === 'blocked' &&
+          this.store.countEventsSince(
+            issueId,
+            'summary_requested',
+            this.store.lastEventId(issueId, 'reopened'),
+          ) === 0
+        ) {
+          await this.collectResultSummary(project, issue, to, workspace);
+        }
         if (
           issue.moduleId &&
           issue.convId &&
@@ -5369,10 +6662,17 @@ export class IssueEngine {
             convId: issue.convId,
             status: to,
           });
+          // 模块知识增量（#277 / I-01）：跨 issue 的连续性从此由这一小段结构化知识承担，
+          // 不再靠把上一条的 transcript 整段拖进窗口。**由引擎确定性生成**——全部取自
+          // 库里已有的事实（标题 / 收尾状态 / 摘要首段 / 改动文件数），代理不参与，
+          // 所以不会因为代理偷懒或跑飞就丢失。cancelled 不写：那是「这版不做了」，
+          // 沉淀进模块知识只会误导下一条 issue。
+          if (to !== 'cancelled') await this.recordModuleKnowledge(project, issue, to);
         }
-        const reservesProject = to === 'blocked' && this.workflowSnapshot(issueId)?.status === 'paused';
+        const reservesProject = (to === 'blocked' || to === 'paused') && this.workflowSnapshot(issueId)?.status === 'paused';
         if (!reservesProject) {
-          await this.scheduleNext(issue.projectId, moduleKeyOf(issue)); // done/普通 blocked 接力
+          // done/普通 blocked 接力
+          await this.scheduleNext(issue.projectId, { preferModuleKey: moduleKeyOf(issue), source: 'relay' });
         }
         if (
           issue.convId &&
@@ -5385,7 +6685,7 @@ export class IssueEngine {
         break;
       }
       case 'pending': {
-        // unblock 接力在 public applyEvent 释放 issue 锁后执行，避免 startIssue 同 key 自锁。
+        // 缺少恢复上下文的 unblock 接力在 public applyEvent 释放 issue 锁后执行，避免同 key 自锁。
         break;
       }
       default:
@@ -5397,12 +6697,121 @@ export class IssueEngine {
   // ---- git 分支流（确定性，Driver.git） ----
 
   /**
-   * 在规划开始前把仓库准备到 issue.targetBranch：
-   * - 已在目标上：不检查脏状态、不切换，保留历史行为；
-   * - 目标本地分支存在：仅干净工作区可 checkout；
-   * - 目标不存在：仅干净工作区可从完整本地/远程跟踪 sourceRef 创建。
-   * 所有 Git 调用与手动 stage/commit/push 共用 git:<projectId> 锁。
+   * git 提交身份预检（#272 / B-01）：在 `git_branch_prepared` 之前跑一次，缺身份就补齐。
+   *
+   * 为什么必须放在这里而不是等自动提交时再说：执行机上曾经根本没有 `~/.gitconfig`，
+   * 导入进来的项目也没人写过 local 身份，于是每个新项目的第一次自动提交必然
+   * `Author identity unknown`，而 commit 失败会把 issue 直接打成 blocked——一整周
+   * 45% 的 auto_commit 失败就是这么来的。开跑前先把身份坐实，故障根本不会发生。
+   *
+   * 两条纪律：
+   * - **覆盖「无目标分支」这条 legacy 路径**：那条路径刻意不做任何 Git 观察与变更，
+   *   但它恰恰是最常走的一条，漏掉它等于没修。身份预检只读/只补 config，不碰
+   *   工作树、index、HEAD，放进来不破坏那条路径「不动工作树」的语义。
+   * - **失败绝不 block**：身份补不上还有自动提交时的自愈重试兜底；在这里把 issue
+   *   打成 blocked，只会把本 issue 要消灭的那个人工介入换个地方再制造一遍。
    */
+  private async precheckGitIdentity(
+    project: Project,
+    issueId: number,
+    cwd: string,
+  ): Promise<void> {
+    const fallback = buildFallbackIdentity({
+      runUser: project.runUser,
+      ownerUsername: this.ownerUsername(project),
+    });
+    const ensured = await this.deps.mutex
+      .runExclusive(gitLockKey(project.id), () => ensureGitIdentity(this.deps.driver, cwd, fallback))
+      .catch((e: unknown) => ({ ok: false as const, error: String(e).slice(0, 300) }));
+    if (!ensured.ok) {
+      this.store.logEvent(issueId, 'error', {
+        where: 'git-identity',
+        error: (ensured.error ?? 'Git 身份预检失败').slice(0, 300),
+      });
+      return;
+    }
+    this.store.logEvent(issueId, 'git_identity', {
+      applied: ensured.changed, // false = 本来就有身份，一个字没动
+      scope: ensured.scope,
+      name: ensured.name,
+      email: ensured.email,
+    });
+  }
+
+  /**
+   * 写一条模块知识（#277 / I-01）。内容只取库里已有的确定性事实，不调模型、不问代理：
+   * issue 标题 + 收尾状态 + 收尾摘要首段 + 本 issue 改动的文件数。
+   *
+   * **写失败绝不阻断收尾**：这是给下一条 issue 看的便条，丢一条的代价远小于卡住队列。
+   */
+  private async recordModuleKnowledge(
+    project: Project,
+    issue: EngineIssue,
+    status: IssueState,
+  ): Promise<void> {
+    const modules = this.deps.modulesFor?.(project);
+    if (!modules?.recordModuleKnowledge || issue.moduleId === null) return;
+    try {
+      const module = this.moduleRow(issue.projectId, issue.moduleId);
+      if (!module) return;
+      const fresh = this.store.get(issue.id) ?? issue;
+      const firstLine = (fresh.resultSummary ?? '')
+        .split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? '';
+      const files = this.implCommits(issue.id)?.files.length ?? 0;
+      const note = [firstLine, files > 0 ? `改动 ${files} 个文件` : '']
+        .filter(Boolean).join('；');
+      await modules.recordModuleKnowledge(module, {
+        issueId: issue.id,
+        status,
+        title: fresh.title,
+        ...(note ? { note } : {}),
+      });
+    } catch (e) {
+      this.store.logEvent(issue.id, 'error', {
+        where: 'module-knowledge',
+        error: String(e).slice(0, 200),
+      });
+    }
+  }
+
+  /** Snapshot session visibility without mutating shared skill directories. */
+  private async prepareSkillSession(issue: EngineIssue, cwd: string): Promise<void> {
+    if (!issue.convId) return;
+    try {
+      const project = this.project(issue.projectId)!;
+      const ex = this.deps.db.query<{claude_dir:string},[number]>('SELECT claude_dir FROM executors WHERE id=?').get(project.executorId);
+      const homes = ex ? agentHomesFromClaudeDir(ex.claude_dir) : null;
+      const skills = [...await listProjectSkills(this.deps.driver,cwd),
+        ...(homes ? await listGlobalSkills(this.deps.driver,homes) : [])];
+      const policy = effectiveSkillPolicy(this.deps.db,{projectId:issue.projectId,moduleId:issue.moduleId ?? undefined,issueId:issue.id});
+      // Preserve explicit module allow-lists during migration to three-state policy.
+      if (issue.moduleId) {
+        const row=this.deps.db.query<{skills_json:string|null},[number]>('SELECT skills_json FROM project_modules WHERE id=?').get(issue.moduleId);
+        const legacy=parseModuleSkills(row?.skills_json ?? null);
+        if (legacy) for(const skill of skills) if (!(skill.name in policy)) policy[skill.name]=legacy.includes(skill.name)?'auto':'manual';
+      }
+      const snapshot=skillSessionSettings(issue.agent,skills,policy);
+      if (!skills.length) { this.store.logEvent(issue.id,'skill_visibility',snapshot); return; }
+      this.deps.db.run(`INSERT INTO skill_session_policies(conv_id,issue_id,snapshot_json) VALUES(?,?,?)
+        ON CONFLICT(conv_id) DO UPDATE SET issue_id=excluded.issue_id,snapshot_json=excluded.snapshot_json`,
+        [issue.convId,issue.id,JSON.stringify(snapshot)]);
+      this.store.logEvent(issue.id,'skill_visibility',{...snapshot,config:undefined});
+    } catch(e) {
+      this.store.logEvent(issue.id,'skill_visibility',{limitations:['Skill policy could not be applied'],error:String(e).slice(0,200)});
+    }
+  }
+
+  /** 项目属主用户名（兜底身份的第二顺位）；users 表读不到就当没有，不影响预检 */
+  private ownerUsername(project: Project): string | null {
+    try {
+      return this.deps.db
+        .query<{ username: string }, [number]>('SELECT username FROM users WHERE id = ?')
+        .get(project.ownerUserId)?.username ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   private async prepareIssueBranchLocked(
     project: Project,
     issue: EngineIssue,
@@ -5690,10 +7099,96 @@ export class IssueEngine {
   }
 
   /**
+   * commit 失败后的身份自愈（#272 / B-01）：绝大多数自动提交失败其实只是
+   * `Author identity unknown`。补上身份返回 true（值得原样重试一次）；本来就有身份
+   * （说明失败另有原因）或补不上，返回 false 让调用方照常降级。
+   *
+   * 调用方已持有 `git:<projectId>`，这里**不得**再取同 key（KeyedMutex 非重入）。
+   */
+  private async healGitIdentityLocked(
+    project: Project,
+    issueId: number,
+    cwd: string,
+  ): Promise<boolean> {
+    const fallback = buildFallbackIdentity({
+      runUser: project.runUser,
+      ownerUsername: this.ownerUsername(project),
+    });
+    const ensured = await ensureGitIdentity(this.deps.driver, cwd, fallback);
+    if (!ensured.ok) {
+      this.store.logEvent(issueId, 'error', {
+        where: 'git-identity',
+        error: (ensured.error ?? 'Git 身份自愈失败').slice(0, 300),
+      });
+      return false;
+    }
+    if (!ensured.changed) return false; // 身份本来就在，重试同一条 commit 只会再失败一次
+    this.store.logEvent(issueId, 'git_identity', {
+      applied: true,
+      recovered: true, // 与开跑前的预检区分：这条是提交失败后现补的
+      scope: ensured.scope,
+      name: ensured.name,
+      email: ensured.email,
+    });
+    return true;
+  }
+
+  /**
+   * push 被远端拒（远端有我没有的提交）→ `fetch origin <branch>` + `rebase FETCH_HEAD`
+   * 后重试一次（#272 / B-02）。返回重试后的 push 结果；没条件重试则返回 null（保留原始失败）。
+   *
+   * 两个必须守住的点：
+   * - **rebase 冲突一定要 `--abort`**：否则仓库停在 rebase 中途，下一条 issue 一开跑
+   *   就撞上「工作区有未保存改动」，一个推送失败会连坐整条队列。
+   * - **detached HEAD 不重试**：没有对应的远端分支可 fetch/rebase，硬试只会把现场搅乱。
+   */
+  private async rebaseAndRetryPushLocked(
+    issueId: number,
+    cwd: string,
+    pushArgs: string[],
+  ): Promise<GitResult | null> {
+    const head = await this.deps.driver.git(cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+    const branch = head.code === 0 ? head.out.trim() : '';
+    if (!branch) return null;
+    const fetched = await this.gitTransport(cwd, ['fetch', 'origin', branch]);
+    if (fetched.code !== 0) return fetched;
+    const rebased = await this.deps.driver.git(cwd, ['rebase', 'FETCH_HEAD']);
+    if (rebased.code !== 0) {
+      await this.deps.driver.git(cwd, ['rebase', '--abort']); // 收干净，别把仓库留在半途
+      this.store.logEvent(issueId, 'auto_push_retry', {
+        reason: 'rejected',
+        branch,
+        result: 'rebase_failed',
+        error: (rebased.err || rebased.out).slice(0, 300),
+      });
+      return null;
+    }
+    this.store.logEvent(issueId, 'auto_push_retry', { reason: 'rejected', branch, result: 'rebased' });
+    return this.gitTransport(cwd, pushArgs);
+  }
+
+  // 网络命令超时与普通非零退出码走同一条“未推送”路径。
+  // 不包住 commit/rebase 等本地写操作：这些失败可能影响开发现场，仍须单独处理。
+  private async gitTransport(cwd: string, args: string[]): Promise<GitResult> {
+    try {
+      return await this.deps.driver.git(cwd, args);
+    } catch (error) {
+      return { code: 1, out: '', err: String(error) };
+    }
+  }
+
+  /**
    * 自动收尾（manual_review 关，tests_passed 后）：git add -A → 有暂存改动才 commit
-   * 「<标题> (#id)」→ push origin 当前分支（HEAD）。commit/push 失败只记事件+通知、
-   * **不挡完成**——改动本体已在工作树/分支上，人工随时可补救；卡住流程才是更大的伤害。
+   * 「<标题> (#id)」→ push origin 当前分支（HEAD）。commit 失败会保留现场并阻止完成；
+   * push 失败只记事件+通知，不阻止本地已经提交完成的 issue 收尾。
    * 没有新 commit 也照样 push（CC 实施中自己 commit 过、只欠 push 是常态）。
+   *
+   * #272 加固的三处：
+   * - commit 失败先补身份重试一次（见 healGitIdentityLocked），仍失败才降级；
+   * - **push 前预检 origin**：没有远端的项目（本地私有仓库）记 `push_skipped` 就收工，
+   *   那不是故障，不该每次收尾都刷一条 error 和一次通知；
+   * - 被拒（fetch first / non-fast-forward）fetch+rebase 重试一次；最终仍失败要留下
+   *   `auto_push_failed` 这个**持久可见标记**——push 失败不挡完成，但绝不能静默 done。
    */
   private async autoCommitPushLocked(
     project: Project,
@@ -5701,6 +7196,7 @@ export class IssueEngine {
     workspace: EngineExecutionWorkspace,
   ): Promise<{ where: 'auto_commit' | 'auto_push'; detail: string } | null> {
     const cwd = workspace.cwd;
+    const branchLabel = issue.branch ?? 'HEAD';
     const fail = (where: 'auto_commit' | 'auto_push', detail: string) => {
       this.store.logEvent(issue.id, 'error', { where, error: detail.slice(0, 300) });
       return { where, detail };
@@ -5713,11 +7209,21 @@ export class IssueEngine {
     const staged = await this.deps.driver.git(cwd, ['diff', '--cached', '--quiet']);
     if (staged.code !== 0) {
       const msg = `${issue.title.slice(0, 120)} (#${issue.id})`;
-      const commit = await this.deps.driver.git(cwd, ['commit', '-m', msg]);
+      let commit = await this.deps.driver.git(cwd, ['commit', '-m', msg]);
       if (commit.code !== 0) {
-        return fail('auto_commit', commit.err || commit.out); // commit 失败就没有新提交可推
+        // 自愈一次：身份补上了就原样重试，别为 Author identity unknown 叫醒用户
+        if (!(await this.healGitIdentityLocked(project, issue.id, cwd))) {
+          return fail('auto_commit', commit.err || commit.out); // commit 失败就没有新提交可推
+        }
+        commit = await this.deps.driver.git(cwd, ['commit', '-m', msg]);
+        if (commit.code !== 0) return fail('auto_commit', commit.err || commit.out);
       }
       this.store.logEvent(issue.id, 'auto_commit', { message: msg });
+    }
+    const remote = await this.deps.driver.git(cwd, ['remote', 'get-url', 'origin']);
+    if (remote.code !== 0) {
+      this.store.logEvent(issue.id, 'push_skipped', { reason: 'no-remote', branch: branchLabel });
+      return null; // 没有远端可推 ≠ 推失败
     }
     let pushArgs = ['push', 'origin', 'HEAD'];
     if (workspace.kind === 'design-worktree') {
@@ -5728,11 +7234,21 @@ export class IssueEngine {
         pushArgs = ['push', '--set-upstream', 'origin', 'HEAD'];
       }
     }
-    const push = await this.deps.driver.git(cwd, pushArgs);
-    if (push.code !== 0) {
-      return fail('auto_push', push.err || push.out);
+    let push = await this.gitTransport(cwd, pushArgs);
+    if (push.code !== 0 && PUSH_REJECTED_RE.test(push.err || push.out)) {
+      const retried = await this.rebaseAndRetryPushLocked(issue.id, cwd, pushArgs);
+      if (retried) push = retried;
     }
-    this.store.logEvent(issue.id, 'auto_push', { branch: issue.branch ?? 'HEAD' });
+    if (push.code !== 0) {
+      const detail = push.err || push.out;
+      // 持久可见标记：本地已提交，issue 照常完成，但详情页要一直挂着「未推送」
+      this.store.logEvent(issue.id, 'auto_push_failed', {
+        branch: branchLabel,
+        detail: detail.slice(0, 300),
+      });
+      return fail('auto_push', detail);
+    }
+    this.store.logEvent(issue.id, 'auto_push', { branch: branchLabel });
     return null;
   }
 
@@ -5770,122 +7286,110 @@ export class IssueEngine {
   // ---- 执行结果总结（done/blocked 收尾，接力之前） ----
 
   /**
-   * 向该 issue 的 CC 会话注入「执行总结」prompt，限时轮询文件哨兵读回存 result_summary。
-   * 跳过条件（记 summary_skipped 事件）：从未起跑（无 conv）/ 项目 tmux 会话已不在 /
-   * 激活对话已被切走（注入会打扰别的对话）。超时/无产出/异常 → error 事件降级，不上抛。
+   * 收尾摘要（#275 / I-05）：**从引擎手里已有的结构化数据确定性拼装**，不再注入、不再等文件。
+   *
+   * 旧实现是收尾时另起一轮满窗注入让代理写 summary.md + report.json + done 哨兵，那一轮正好
+   * 落在全程上下文最高点（#270 实测 218k），四次工具调用只换 300 字——单条 issue 里最贵的
+   * 一笔非生产性支出。现在报告由代理随最后一次 STAGE_DONE 内联带出（见 captureCompletionReport），
+   * 摘要由 result-summary.ts 纯函数拼。
+   *
+   * 降级顺序：确定性拼装 → PM（可选的 summarizeOutcome）→ 一句确定性兜底文案。
+   * 实际上前者几乎总能拼出东西（blocked 必有 note，done 必有子任务或提交），后两级是安全网。
+   *
+   * 返回值语义不变（调用方据此决定 merging→done 还是 block）：完成度门禁仍看结构化报告，
+   * 没有报告 = 无法证明「原始目标全部达成」→ incomplete。
    */
   private async collectResultSummary(
     project: Project,
     issue: EngineIssue,
     kind: 'done' | 'blocked',
     workspace: EngineExecutionWorkspace,
-  ): Promise<void> {
-    if (this.cfg.resultSummaryTimeoutMs <= 0) return; // 关闭
-    if (!issue.convId) {
-      this.store.logEvent(issue.id, 'summary_skipped', { reason: 'no-conv' });
-      return;
-    }
-    const session = this.deps.convs.tmuxName(issue.projectId, issue.convId);
-    const p = resultSummaryPaths(workspace.cwd, issue.id);
-    try {
-      // 统一门禁（issue #97）：会话没了不必说，**窗格里只剩 bash 也不能发**——
-      // 总结 prompt 会被 shell 当命令跑掉，然后干等到超时。此处不重启：issue 已经收尾，
-      // 为了一段总结去重起代理不值当，记事件跳过即可。
-      const live = await this.sessionLiveness(issue.agent, session, undefined, await this.convQuietMs(issue.convId));
-      if (live === 'no-session' || live === 'shell') {
-        this.store.logEvent(issue.id, 'summary_skipped', {
-          reason: live === 'shell' ? 'agent-down' : 'no-session',
-        });
-        return;
-      }
-      if (this.deps.convs.currentConv(issue.projectId) !== issue.convId) {
-        this.store.logEvent(issue.id, 'summary_skipped', { reason: 'conv-displaced' });
-        return;
-      }
-      await this.deps.driver.removeTree(p.scratch).catch(() => {}); // 清残留，防读到上轮旧产物
-      await this.inject(session, buildResultSummaryPrompt(issue.id, kind, this.promptLocale(issue, project)));
-      this.store.logEvent(issue.id, 'summary_requested', { kind });
-      const deadline = this.now() + this.cfg.resultSummaryTimeoutMs;
-      let found = false;
-      while (this.now() < deadline) {
-        // 清菜单：issue 已收尾、watch 已删，审批管道不再盯这个会话——写 scratch 文件的
-        // 权限弹窗没人过就会卡死到超时（实测踩坑）。与 agent-summary/clarify-runner 同款。
-        await this.clearSummaryMenusOnce(session);
-        const st = await this.deps.driver.statPath(p.done).catch(() => null);
-        if (st) {
-          found = true;
-          break;
-        }
-        await this.cfg.sleep(this.cfg.resultSummaryPollMs);
-      }
-      if (!found) {
-        this.store.logEvent(issue.id, 'error', { where: 'resultSummary', reason: 'timeout' });
-        return;
-      }
-      const text = ((await readDriverText(this.deps.driver, p.summary, 64 * 1024)) ?? '').trim();
-      if (!text) {
-        this.store.logEvent(issue.id, 'error', { where: 'resultSummary', reason: 'no-output' });
-        return;
-      }
-      this.store.setResultSummary(issue.id, text);
-      if (workspace.kind === 'design-worktree') {
-        await this.deps.executionWorkspaces?.recordResult?.(issue, workspace, text).catch((e) => {
-          this.store.logEvent(issue.id, 'error', {
-            where: 'design-result', error: String(e).slice(0, 200),
-          });
-        });
-      }
-      const module = issue.moduleId === null ? null : this.moduleRow(issue.projectId, issue.moduleId);
-      const modules = this.deps.modulesFor?.(project);
-      if (workspace.kind === 'project' && module && modules?.recordResultSummary) {
-        await modules.recordResultSummary(module, { ...issue, status: kind }, text).catch((e) => {
-          this.store.logEvent(issue.id, 'error', {
-            where: 'resultSummaryDoc',
-            error: String(e).slice(0, 200),
-          });
-        });
-      }
-      this.store.logEvent(issue.id, 'summary_done', { kind, chars: text.length });
-    } catch (e) {
-      this.store.logEvent(issue.id, 'error', { where: 'resultSummary', error: String(e).slice(0, 200) });
-    } finally {
-      await this.deps.driver.removeTree(p.scratch).catch(() => {});
-    }
-  }
+  ): Promise<
+    { kind: 'disabled' } | { kind: 'complete' } | { kind: 'incomplete'; reason: string }
+  > {
+    if (this.cfg.resultSummaryTimeoutMs <= 0) return { kind: 'disabled' }; // 显式关闭兼容测试引擎
+    // 每次收尾都是一次全新的采集：先清旧摘要，免得失败后 UI 还挂着上一轮的结论。
+    // **不清 completionReport**——它是本轮 testing 阶段刚由哨兵写进来的，清了等于白拿。
+    this.store.setResultSummary(issue.id, null);
 
-  /** 总结轮询期间的清菜单一轮（agent-summary 同款：不去重，重复点只是多个空 Enter，无害） */
-  private async clearSummaryMenusOnce(session: string): Promise<void> {
-    const pane = await this.deps.driver.capturePane(session).catch(() => '');
-    if (isCodexUpdatePrompt(pane)) {
-      await this.deps.driver.sendKeys(session, '2').catch(() => {});
-      return;
+    const fresh = this.store.get(issue.id) ?? issue;
+    const snapshot = this.implCommits(issue.id);
+    const events = this.store.listEvents(issue.id);
+    const locale = this.promptLocale(fresh, project);
+    const subtasks = this.store.subtasksOf(fresh);
+    const commits = snapshot?.commits ?? [];
+
+    let text = kind === 'done'
+      ? buildDoneSummary({
+        report: fresh.completionReport,
+        subtasks,
+        commits,
+        files: snapshot?.files ?? [],
+        events,
+        locale,
+      })
+      : buildBlockedSummary({
+        blockNote: this.store.lastEnterInfo(issue.id, 'blocked')?.note ?? null,
+        subtasks,
+        commits,
+        events,
+        locale,
+      });
+    let via: 'assembled' | 'pm' | 'fallback' = 'assembled';
+
+    if (!text) {
+      text = kind === 'done' ? '已完成（没有可展示的结构化信息）' : '已受阻转人工（没有可展示的结构化信息）';
+      via = 'fallback';
     }
-    const sel = detectSelection(pane);
-    if (!sel) return;
-    const target = pickAffirmative(sel.options);
-    const delta = target - sel.cursorIndex;
-    const key = delta < 0 ? 'Up' : 'Down';
-    for (let i = 0; i < Math.abs(delta); i++) {
-      await this.deps.driver.sendKey(session, key).catch(() => {});
+
+    this.store.setResultSummary(issue.id, text);
+    if (workspace.kind === 'design-worktree') {
+      await this.deps.executionWorkspaces?.recordResult?.(issue, workspace, text).catch((e) => {
+        this.store.logEvent(issue.id, 'error', {
+          where: 'design-result', error: String(e).slice(0, 200),
+        });
+      });
     }
-    await this.deps.driver.sendKey(session, 'Enter').catch(() => {});
+    const module = issue.moduleId === null ? null : this.moduleRow(issue.projectId, issue.moduleId);
+    const modules = this.deps.modulesFor?.(project);
+    if (workspace.kind === 'project' && module && modules?.recordResultSummary) {
+      await modules.recordResultSummary(module, { ...issue, status: kind }, text).catch((e) => {
+        this.store.logEvent(issue.id, 'error', {
+          where: 'resultSummaryDoc',
+          error: String(e).slice(0, 200),
+        });
+      });
+    }
+    this.store.logEvent(issue.id, 'summary_done', { kind, via, chars: text.length });
+
+    // 完成度门禁（口径不变）：没有结构化报告就无法证明「原始目标全部达成」，
+    // 只是拿不到报告的原因从「注入超时」换成了「代理没按协议内联输出」。
+    const report = fresh.completionReport;
+    if (!report) return { kind: 'incomplete', reason: '完成报告缺失或格式无效' };
+    if (report.outcome !== 'complete' || report.unmetGoals.length > 0 || report.remainingWork.length > 0) {
+      const detail = report.remainingWork[0] ?? report.unmetGoals[0] ?? report.completion;
+      return { kind: 'incomplete', reason: `原始目标未全部达成：${detail}`.slice(0, 500) };
+    }
+    return { kind: 'complete' };
   }
 
   // ---- 对话激活 / watcher ----
 
   /**
    * I1：进入驱动阶段时，若项目**没有任何**激活对话（迁移只登记了 conv、重启丢激活行），
-   * 激活本 issue 的对话；已有激活对话（哪怕不是本 issue 的）则不夺占——浏览优先，
-   * 门禁与让位观测在 tickIssue（I2）。失败 → block（返回 false，调用方停止本阶段动作）。
+   * 激活本 issue 的对话；普通阶段切换不夺占已有对话。显式/排队恢复已取得执行权，
+   * 必须切回本 issue，否则会被 tick 的 conv_displaced 门禁永久跳过。
+   * 门禁与让位观测在 tickIssue（I2）。失败 → paused（返回 false，调用方停止本阶段动作）。
    */
-  private async ensureActiveConv(issue: EngineIssue): Promise<boolean> {
-    if (this.deps.convs.currentConv(issue.projectId) !== undefined) return true;
+  private async ensureActiveConv(issue: EngineIssue, resuming = false): Promise<boolean> {
+    const current = this.deps.convs.currentConv(issue.projectId);
+    if (current !== undefined && (!resuming || current === issue.convId)) return true;
     try {
       await this.activateConv(issue);
       return true;
     } catch (e) {
       // ensureActiveConv 只从 onEnter 调用，此处已持有本 issue 的 transition 锁。
-      await this.applyEventLocked(issue.id, 'block', {
+      await this.applyEventLocked(issue.id, 'pause', {
         note: `激活对话失败：${String(e).slice(0, 200)}`,
       });
       return false;
@@ -5929,6 +7433,7 @@ export class IssueEngine {
       displacedNotified: false,
       growTs: now,
       reclaimAt: 0,
+      reclaimFailures: 0,
       codexUpdateAt: 0,
       recoverAt: 0,
       agentDownAt: 0,
@@ -6010,7 +7515,7 @@ export class IssueEngine {
       restarts: w.agentRestarts,
     });
     if (w.agentRestarts >= MAX_AGENT_RESTARTS) {
-      await this.applyEvent(issue.id, 'block', {
+      await this.applyEvent(issue.id, 'pause', {
         note:
           `代理起不来：已自动重启 ${w.agentRestarts} 次，${session} 窗格里仍只剩 shell` +
           `（常见原因：登录过期、CLI 装坏、项目目录没了）`,
@@ -6019,14 +7524,18 @@ export class IssueEngine {
     }
     w.agentRestarts++;
     const restarts = w.agentRestarts;
+    const reclaimFailures = w.reclaimFailures;
     try {
       await this.relaunchConv(issue);
       // 冷却与计数都要带进新 watch（relaunchConv 内部 resetWatch 会重置它们）：
       // 冷却防「重启后立刻又判死」的 3s 打转，计数丢了则永远到不了上限。
+      // reclaimFailures 同理（#273）：reclaim 连续失败会走到这里，重启后清零就等于
+      // 又能从头空转三轮再来一次重启。
       const fresh = issue.convId ? this.watch.get(issue.convId) : undefined;
       if (fresh) {
         fresh.agentDownAt = now;
         fresh.agentRestarts = restarts;
+        fresh.reclaimFailures = reclaimFailures;
         fresh.resumePending = true; // 等它真就绪再补催办（见 tickIssue 的接续块）
       }
       this.store.logEvent(issue.id, 'agent_restarted', { session, restarts });
@@ -6036,7 +7545,7 @@ export class IssueEngine {
         error: String(e).slice(0, 200),
       });
       if (e instanceof AgentExecutableNotFoundError) {
-        await this.applyEvent(issue.id, 'block', { note: e.message });
+        await this.applyEvent(issue.id, 'pause', { note: e.message });
       }
     }
   }
@@ -6059,6 +7568,136 @@ export class IssueEngine {
     );
     if (!got) throw new Error(`对话 ${convId} 不存在`);
     await this.resetWatch(convId);
+  }
+
+  /**
+   * 自动重试计数的锚点事件 id（#273）：nudge / judge 的次数上限都从这里往后数。
+   *
+   * 取「最近一次**人工介入**」——复活重跑（`reopened`）、解除阻塞并给指引
+   * （`unblock_guidance`）、回答澄清（`clarified`）。人一插手就重新给一份预算，
+   * 因为现场刚被改变，之前那几次白催的记录不该继续压着新一轮。
+   *
+   * **刻意不按阶段重置**：验收要的是「单 issue nudge ≤ 5 次」，按 stage 重置会变成
+   * planning/implementing/testing 各 5 次共 15 次，对不上；而真正的病灶（#41 的 71 次）
+   * 本来就集中在同一个阶段里。从未介入过返回 0 = 从 issue 创建起算全量。
+   */
+  private attentionAnchor(issueId: number): number {
+    return Math.max(
+      this.store.lastEventId(issueId, 'reopened'),
+      this.store.lastEventId(issueId, 'unblock_guidance'),
+      this.store.lastEventId(issueId, 'clarified'),
+    );
+  }
+
+  /**
+   * 止损计数的锚点（#274）：最近一次**止损恢复**（`stop_loss_resumed`）之后重新计。
+   *
+   * 与 #273 的 `attentionAnchor` 分开是刻意的：那个锚点还认答澄清/解除阻塞，
+   * 因为催办/判定的预算该随任何一次人工介入回满；而止损闸盯的是「这条 issue 到底
+   * 烧了多少」，只有用户明确看过账单说「继续」才应该重新计。
+   */
+  private stopLossAnchor(issueId: number): number {
+    return this.store.lastEventId(issueId, 'stop_loss_resumed');
+  }
+
+  /**
+   * 止损闸判定（#274 / I-06）：三个条件满足任一即返回命中原因与当时的三项计数；
+   * 都没命中返回 null。纯读，不产生任何副作用——触发动作由调用方负责。
+   *
+   * 幂等由调用方按事件保证：同一锚点周期内已经有 `stop_loss_triggered` 就不该再触发。
+   */
+  private evaluateStopLoss(issue: EngineIssue): {
+    reason: 'blocked' | 'runtime' | 'stage_reentry';
+    blockCount: number;
+    stageReentry: number;
+    runtimeMs: number;
+  } | null {
+    const anchor = this.stopLossAnchor(issue.id);
+    // 时间基准必须与事件对齐：`logEvent` 写的是真实 `Date.now()`，而 `this.now()` 是可注入时钟。
+    // 两者相减在生产上等价，但在注入了假时钟的测试里会把「刚落库的事件」算成几百秒前。
+    const stats = this.store.stopLossStats(issue.id, anchor, issue.status, Date.now());
+    // 顺序即优先级：先报「反复受阻」这种最有信息量的，跑太久放最后（它对什么都成立）
+    if (stats.blockCount >= this.cfg.stopLossBlockCount) return { reason: 'blocked', ...stats };
+    if (stats.stageReentry >= this.cfg.stopLossStageReentry) {
+      return { reason: 'stage_reentry', ...stats };
+    }
+    if (stats.runtimeMs > this.cfg.stopLossRuntimeMs) return { reason: 'runtime', ...stats };
+    return null;
+  }
+
+  /**
+   * 止损闸的触发动作（#274 / I-06）：命中即落 `stop_loss_triggered` + 打 `blocked`，
+   * 并给这次 blocked 带上 `stopLoss` 标记。返回是否真的触发了。
+   *
+   * 为什么复用 blocked 而不是新造一个状态：blocked 已经具备本闸需要的全部行为——停自动调度、
+   * 保留 `resumeState` 恢复上下文、被 pickNext 天然跳过、收尾时 `scheduleNext` 接力不卡队列，
+   * 而独立状态要动 issues 表的 CHECK 约束（SQLite 只能整表重建，风险远大于收益）。
+   * 「受阻」与「已暂停」在界面上的区分交给 #275 的 attentionKind 统一收口，本条只保证
+   * 事件结构化、可被读取派生。
+   *
+   * **`stopLoss` 标记不是装饰**：`stopLossStats` 数 blockCount 时要跳过它，否则闸会自我放大
+   * ——暂停一次计数就 +1，人工恢复后立刻又够阈值。
+   *
+   * 幂等以事件为凭：同一锚点周期内已经触发过就不再触发（每 3s 一个 tick，不幂等就是刷屏）。
+   */
+  private async tripStopLoss(
+    issue: EngineIssue,
+    apply: (id: number, ev: IssueMachineEvent, opts: {
+      note?: string; stopLoss?: boolean;
+    }) => Promise<ApplyResult>,
+  ): Promise<boolean> {
+    if (!BUSY_STATES.includes(issue.status)) return false;
+    const anchor = this.stopLossAnchor(issue.id);
+    if (this.store.countEventsSince(issue.id, 'stop_loss_triggered', anchor) > 0) return false;
+    const hit = this.evaluateStopLoss(issue);
+    if (!hit) return false;
+    this.store.logEvent(issue.id, 'stop_loss_triggered', {
+      reason: hit.reason,
+      blockCount: hit.blockCount,
+      stageReentry: hit.stageReentry,
+      runtimeMs: hit.runtimeMs,
+      stage: issue.status,
+    });
+    const hours = Math.round((hit.runtimeMs / 3_600_000) * 10) / 10;
+    const why = hit.reason === 'blocked'
+      ? `已累计受阻 ${hit.blockCount} 次`
+      : hit.reason === 'stage_reentry'
+        ? `已在「${issue.status}」阶段反复重入 ${hit.stageReentry} 次`
+        : `已累计运行 ${hours} 小时`;
+    await apply(issue.id, 'pause', {
+      note: `止损暂停：${why}，先停下来等你确认。这不是执行失败——现场与恢复上下文都在，` +
+        `确认后从原阶段继续即可。`,
+      stopLoss: true,
+    });
+    await this.notifySafe({
+      kind: 'issue_blocked',
+      projectId: issue.projectId,
+      issueId: issue.id,
+      summaryCode: 'stop_loss_paused',
+      summaryParams: {
+        title: issue.title.slice(0, 60),
+        reason: hit.reason,
+        blocks: hit.blockCount,
+        reentries: hit.stageReentry,
+        hours,
+      },
+    });
+    return true;
+  }
+
+  /**
+   * 「这条 issue 在等什么」的统一派生（#275 / I-07）。判定规则全在 issues/attention.ts，
+   * 这里只负责把引擎才拿得到的三样东西喂进去：状态、事件流、以及**外部**的弹窗等待标记
+   * （waitingInput 是审批管道的内存态，引擎自己看不到，由路由层传入）。
+   */
+  attentionKindOf(issue: EngineIssue, waitingInput = false): AttentionKind {
+    return attentionKindOf({
+      status: issue.status,
+      events: this.store.listEvents(issue.id),
+      clarifyPending: this.store.clarifyPendingOf(issue.id),
+      waitingInput,
+      unblockQueued: this.store.pendingUnblockRequest(issue.id) !== null,
+    });
   }
 
   /**
@@ -6137,7 +7776,7 @@ export class IssueEngine {
         if (result?.state === 'completed') {
           await this.applyEvent(issue.id, 'impl_done', { note: '工作流已完成' });
         } else if (result?.state === 'failed' || result?.state === 'paused') {
-          await this.applyEvent(issue.id, 'block', {
+          await this.applyEvent(issue.id, 'pause', {
             note: `${result.state === 'paused' ? '工作流已暂停' : '工作流执行失败'}：${result.reason}`,
           });
         }
@@ -6148,7 +7787,7 @@ export class IssueEngine {
         if (workflow?.status === 'completed') {
           await this.applyEvent(issue.id, 'tests_passed', { note: '工作流节点已全部完成' });
         } else if (workflow?.status === 'failed') {
-          await this.applyEvent(issue.id, 'block', {
+          await this.applyEvent(issue.id, 'pause', {
             note: `工作流执行失败：${workflow.pauseReason ?? 'workflow.failed'}`,
           });
         }
@@ -6159,6 +7798,27 @@ export class IssueEngine {
     }
   }
 
+  /**
+   * 从 assistant 文本里捞结构化完成报告（#275 / I-05）：多条文本取**第一份能解析通过的**。
+   * 报告是锦上添花——解析不通过只落一条观测事件，绝不影响收尾流程本身。
+   */
+  private captureCompletionReport(issueId: number, texts: string[]): void {
+    let sawBlock = false;
+    for (const t of texts) {
+      if (!/^\s*REPORT_BEGIN\s*$/m.test(t)) continue;
+      sawBlock = true;
+      const report = parseCompletionReportBlock(t);
+      if (!report) continue;
+      this.store.setCompletionReport(issueId, report);
+      this.store.logEvent(issueId, 'completion_report', { via: 'sentinel', outcome: report.outcome });
+      return;
+    }
+    // 有块但解析不出来：代理格式写错了，值得留痕（否则「报告怎么没了」无从查起）
+    if (sawBlock) {
+      this.store.logEvent(issueId, 'completion_report', { via: 'sentinel', invalid: true });
+    }
+  }
+
   private async tickIssue(issue: EngineIssue): Promise<void> {
     // A durable design-sync boundary freezes every watcher-driven side effect, including session
     // recovery, kickoff and nudge. Restart therefore cannot drive past an undecided revision.
@@ -6166,8 +7826,16 @@ export class IssueEngine {
       || this.store.hasUnresolvedExecutionSyncEffect(issue.id)) return;
     const project = this.project(issue.projectId);
     if (!project) return;
+    // 止损闸（#274）：放在最前面。「累计运行 > 4 小时」这类条件不依赖任何状态迁移，
+    // 只有 tick 会发现它；命中就收手，本 tick 一个字都不再注入。
+    if (await this.tripStopLoss(issue, (id, blockEvent, blockOpts) =>
+      this.applyEvent(id, blockEvent, blockOpts))) return;
     if (this.workflowSnapshot(issue.id)) {
       await this.tickWorkflowIssue(issue, project);
+      return;
+    }
+    if (issue.executionMode === 'direct' && issue.status === 'testing' && issue.completionReport) {
+      await this.completeTesting(issue.id, 'sentinel');
       return;
     }
     if (!issue.convId) return;
@@ -6184,7 +7852,7 @@ export class IssueEngine {
           error: String(e).slice(0, 200),
         });
         if (e instanceof AgentExecutableNotFoundError) {
-          await this.applyEvent(issue.id, 'block', { note: e.message });
+          await this.applyEvent(issue.id, 'pause', { note: e.message });
         }
         return;
       }
@@ -6228,7 +7896,7 @@ export class IssueEngine {
       } catch (e) {
         this.store.logEvent(issue.id, 'error', { where: 'recover', error: String(e).slice(0, 200) });
         if (e instanceof AgentExecutableNotFoundError) {
-          await this.applyEvent(issue.id, 'block', { note: e.message });
+          await this.applyEvent(issue.id, 'pause', { note: e.message });
         }
       }
       return; // 本 tick 到此为止：让新会话启动，下轮再驱动
@@ -6255,6 +7923,16 @@ export class IssueEngine {
     // pane_current_command 双双像 shell——生产实测靠这两个信号会误杀，见 agent-liveness 常量注释）
     const liveness = await this.sessionLiveness(issue.agent, session, pane, now - w.growTs);
     if (liveness === 'shell') {
+      const pm = this.deps.pmFor(project);
+      const failure = issue.agent === 'codex' && pm.judgeAgentFailure
+        ? await pm.judgeAgentFailure(issue.agent, pane).catch(() => 'unknown' as const)
+        : 'ordinary_exit';
+      if (failure === 'resume_conflict') {
+        this.store.logEvent(issue.id, 'agent_resume_conflict', { session });
+        await this.applyEvent(issue.id, 'block', { note: 'Codex 恢复失败：该会话仍被另一个 active writer/active turn 占用。请先结束占用该会话的 Codex 进程，或新建会话后再解除受阻。' });
+        return;
+      }
+      if (failure === 'unknown') return;
       await this.handleAgentDown(issue, w, session, now);
       return;
     }
@@ -6273,7 +7951,9 @@ export class IssueEngine {
         w.menuNotified = true;
         this.store.logEvent(issue.id, 'menu_stuck', { context: sel.context.slice(0, 300) });
         await this.notifySafe({
-          kind: 'issue_blocked',
+          // #275 / B-07：状态并没有进 blocked，这里发受阻通知是误导——用户会去找一个
+          // 并不存在的故障，而实际上只要去窗格里点一下选项就完了
+          kind: 'choice_waiting',
           projectId: issue.projectId,
           issueId: issue.id,
           summaryCode: 'menu_stuck',
@@ -6294,6 +7974,11 @@ export class IssueEngine {
       }
       w.menuSince = 0;
       w.menuNotified = false;
+      try {
+        this.deps.onTextPrompt?.({ issue, project, session, pane });
+      } catch (e) {
+        this.store.logEvent(issue.id, 'error', { where: 'onTextPrompt', error: String(e).slice(0, 200) });
+      }
     }
 
     // kickoff（幂等 + 单飞 + 启动下限 + 无弹窗 + I4 就绪真检测）。
@@ -6322,7 +8007,7 @@ export class IssueEngine {
           !this.isRework(resumed);
         await this.inject(
           session,
-          buildNudge({
+          this.buildIssueNudge({
             issue: resumed,
             stage: resumed.status as 'planning' | 'implementing' | 'testing',
             seqPending,
@@ -6392,7 +8077,7 @@ export class IssueEngine {
       w.nudged &&
       w.growTs < w.fedTs &&
       now - w.fedTs > this.cfg.sessionStaleMs &&
-      now - w.reclaimAt > this.cfg.sessionStaleMs
+      now - w.reclaimAt > this.reclaimCooldownMs(w.reclaimFailures)
     ) {
       w.reclaimAt = now;
       let np: string | null = null;
@@ -6402,6 +8087,7 @@ export class IssueEngine {
         this.store.logEvent(issue.id, 'error', { where: 'reclaim', error: String(e).slice(0, 200) });
       }
       if (np && np !== path) {
+        w.reclaimFailures = 0; // 认领到新会话即视作恢复，退避从头开始
         const st = await this.reader.statPath(np).catch(() => null);
         w.offset = st?.size ?? 0;
         w.growTs = this.now();
@@ -6413,7 +8099,7 @@ export class IssueEngine {
             fresh2.implMode === 'seq' && subs2.length > 0 && fresh2.subIndex < subs2.length && !this.isRework(fresh2);
           await this.inject(
             session,
-            buildNudge({
+            this.buildIssueNudge({
               issue: fresh2,
               stage: fresh2.status as 'planning' | 'implementing' | 'testing',
               seqPending: seqPending2,
@@ -6425,8 +8111,20 @@ export class IssueEngine {
         }
         return; // 本 tick 到此为止，静默判定下轮再说（fedTs 已刷新）
       }
+      // 认不到（或认回同一条）都算一次没进展（#273 / B-05）：本周 130 次
+      // 「未发现可认领的活跃会话」全出自这里——sessionStaleMs 既当判定阈值又当重试冷却，
+      // 失败后每分钟原地重扫一遍，扫到天荒地老也不会升级。
+      w.reclaimFailures++;
       if (!np) {
         this.store.logEvent(issue.id, 'error', { where: 'reclaim', error: '未发现可认领的活跃会话' });
+      }
+      if (w.reclaimFailures >= this.cfg.reclaimMaxFailures) {
+        // 连着几轮都找不到活跃会话 = 会话确已丢失，交给 #97 的恢复路径（重启 + 既有
+        // 重启次数上限 + 到顶 block），别再空转重扫。先清零再调：handleAgentDown 会把
+        // reclaimFailures 带进重启后的新 watch，重启后理应重新给一份预算。
+        w.reclaimFailures = 0;
+        await this.handleAgentDown(issue, w, session, now);
+        return; // 会话刚被重起，本 tick 一个字都不再往旧 watch 上注入
       }
     }
 
@@ -6435,43 +8133,135 @@ export class IssueEngine {
     if (!fresh || !DRIVING_STATES.includes(fresh.status)) return;
 
     // 执行中澄清等待（spec 1/2）：代理输出 NEED_CLARIFY 后停催停判，静静等用户回答；
-    // 超过 clarifyTimeoutMs 仍没答 → 注入「按最佳判断继续」+ 记 clarify_timeout + 复位续跑。
+    // 关键澄清超过等待阈值只提醒，不推定回答或恢复执行。
     const wait = this.store.execClarifyWait(fresh.id);
     if (wait) {
-      if (now - wait.since >= this.cfg.clarifyTimeoutMs) {
-        await this.inject(session, buildClarifyContinue(this.promptLocale(fresh, project)));
-        this.store.logEvent(fresh.id, 'clarify_timeout', { stage: fresh.status });
-        w.fedTs = this.now();
-        w.activityTs = this.now();
-        w.nudged = false;
-        w.doneChecked = 0;
+      if (now - wait.since >= this.cfg.clarifyTimeoutMs &&
+        this.store.lastEventId(fresh.id, 'clarify_wait_reminder') < this.store.lastEventId(fresh.id, 'clarify_questions')) {
+        this.store.logEvent(fresh.id, 'clarify_wait_reminder', { stage: fresh.status, reason: 'essential-answer-required' });
       }
       return; // 未到点：既不 nudge 也不 judge
     }
 
     const idleMs = now - Math.max(w.fedTs, w.activityTs);
+    // quiet 是「静默且没有弹窗挡着」这个基础判据，judge 仍按它 + fallbackSec 走；
+    // 催办另有一条按次数退避、会越抬越高的阈值（见下）。
     const quiet = idleMs > this.cfg.nudgeSec * 1000 && !sel;
-    if (quiet && !w.nudged) {
-      const subs = this.store.subtasksOf(fresh);
-      const seqPending = fresh.implMode === 'seq' && subs.length > 0 && fresh.subIndex < subs.length && !this.isRework(fresh);
-      const msg = buildNudge({
-        issue: fresh,
-        stage: fresh.status as 'planning' | 'implementing' | 'testing',
-        seqPending,
-        locale: this.promptLocale(fresh, project),
-      });
-      await this.inject(session, msg);
-      w.nudged = true;
-      w.fedTs = this.now();
-      this.store.logEvent(fresh.id, 'nudged', { stage: fresh.status });
-    } else if (
-      quiet &&
-      idleMs > this.cfg.fallbackSec * 1000 &&
-      now - w.doneChecked > this.cfg.fallbackSec * 1000
-    ) {
-      w.doneChecked = now;
-      await this.judgeFallback(fresh, project, path, session, w);
+
+    // 催办退避与封顶（#273 / B-03）。#41 曾在 272 分钟里被催 71 次，每次都是一发带
+    // 100k+ 上下文的完整模型请求。次数取「人工介入锚点之后的 nudged 事件数」——事件为凭、
+    // 重启不丢，也不会被 reclaim/relaunch 的 resetWatch 抹掉；`w.nudged` 那个布尔只挡得住
+    // 同一空闲窗口内每 3s 重复注入，挡不住「代理动一下 → 又静默 → 再催」的无限循环
+    // （tail 里一有 assistant/tool 消息就把它清零，正是 71 次的成因）。
+    // 自动手段的总闸（#273）：催办与判定**各算各的 5 次**，任一到顶就**彻底停催停判、静等人工**。
+    // 之所以是「一个到顶两个都停」而不是各停各的：到这一步已经证明自动手段推不动了，
+    // 判定本身也是一次带上下文的模型请求，继续判只是换个名目接着烧钱。
+    // 封顶判定**不受 `!w.nudged` 约束**：催完最后一次后代理彻底哑了的话 `w.nudged` 会一直
+    // 停在 true，挂在它下面就永远提醒不出来。exhaustAutoRetry 自身幂等。
+    // 上限 ≤0 表示**关闭该机制**（测试用），不是「一上来就耗尽」——否则关掉催办会连带停掉判定。
+    if (quiet) {
+      const anchor = this.attentionAnchor(fresh.id);
+      const sentSoFar = this.store.countEventsSince(fresh.id, 'nudged', anchor);
+      const judgedSoFar = this.store.countEventsSince(fresh.id, 'judged', anchor);
+      const nudgeUsedUp = this.cfg.nudgeMaxCount > 0 && sentSoFar >= this.cfg.nudgeMaxCount;
+      const judgeUsedUp = this.cfg.judgeMaxCount > 0 && judgedSoFar >= this.cfg.judgeMaxCount;
+      if (nudgeUsedUp) await this.exhaustAutoRetry(fresh, 'nudge', sentSoFar, anchor);
+      if (judgeUsedUp) {
+        const last = this.store.consecutiveJudged(fresh.id, anchor);
+        await this.exhaustAutoRetry(fresh, 'judge', judgedSoFar, anchor, {
+          ...(last.result ? { result: last.result } : {}),
+        });
+      }
+      // 到顶转人工：只落事件 + 通知，**不 block**——推不动多半是代理在长跑或真卡住，
+      // 打死 issue 会丢掉现场；哨兵与存活门禁仍在跑，它自己完事照样能收尾。
+      if (nudgeUsedUp || judgeUsedUp) return;
     }
+
+    let nudgedThisTick = false;
+    if (quiet && this.cfg.nudgeMaxCount > 0) {
+      const anchor = this.attentionAnchor(fresh.id);
+      const sent = this.store.countEventsSince(fresh.id, 'nudged', anchor);
+      if (!w.nudged && idleMs > this.backoffMs(this.cfg.nudgeSec, sent, this.cfg.nudgeMaxIntervalSec)) {
+        const subs = this.store.subtasksOf(fresh);
+        const seqPending = fresh.implMode === 'seq' && subs.length > 0 && fresh.subIndex < subs.length && !this.isRework(fresh);
+        const msg = this.buildIssueNudge({
+          issue: fresh,
+          stage: fresh.status as 'planning' | 'implementing' | 'testing',
+          seqPending,
+          locale: this.promptLocale(fresh, project),
+        });
+        await this.inject(session, msg);
+        w.nudged = true;
+        w.fedTs = this.now();
+        nudgedThisTick = true;
+        this.store.logEvent(fresh.id, 'nudged', { stage: fresh.status, count: sent + 1 });
+      }
+    }
+    // 判定从原来的 `else if (quiet && !w.nudged)` 里拆出来：催办正在退避时兜底判定照常跑
+    // （封顶那一档已在上面的总闸里连带停掉）。仍保持「同一 tick 不既催又判」——
+    // nudgedThisTick 就是原 else 分支的等价守卫。
+    if (!nudgedThisTick && quiet && this.cfg.judgeMaxCount > 0 && idleMs > this.cfg.fallbackSec * 1000) {
+      // 判定退避（#273 / B-04）。#266 一条 issue 在 384 分钟里判了 97 次、结论全是 not_done——
+      // fallbackSec 是等距硬轮询，判定结论完全不参与下次调度。
+      // 现在改成「同结论连击越多、下次越晚」，结论一变立刻回落基准（现场在动，不该继续拉长）。
+      const anchor = this.attentionAnchor(fresh.id);
+      {
+        // streak-1 而不是 streak：结论一变 streak 归 1，此时要的是**基准**间隔而不是 2 倍。
+        // 于是首判与紧随其后的第一次复判都还是 fallbackSec，从第三次起才开始翻倍。
+        const { streak } = this.store.consecutiveJudged(fresh.id, anchor);
+        const due = this.backoffMs(this.cfg.fallbackSec, streak - 1, this.cfg.judgeMaxIntervalSec);
+        if (now - w.doneChecked > due) {
+          w.doneChecked = now;
+          await this.judgeFallback(fresh, project, path, session, w);
+        }
+      }
+    }
+  }
+
+  /**
+   * 指数退避间隔（#273 三条共用）：`baseSec * 2^steps`，封顶 maxSec，返回毫秒。
+   * steps=0 即基准值——**第一次的时机与改造前完全一致**，健康 issue 零回归。
+   */
+  private backoffMs(baseSec: number, steps: number, maxSec: number): number {
+    const grown = baseSec * 2 ** Math.max(0, steps);
+    return Math.min(grown, maxSec) * 1000;
+  }
+
+  /**
+   * reclaim 重试冷却（#273 / B-05）：`sessionStaleMs * 2^连续失败数`，封顶
+   * reclaimMaxCooldownMs。failures=0 即原来的 sessionStaleMs——**第一次重试的节奏不变**。
+   * 与 backoffMs 分开写是因为这条的基准本来就是毫秒（sessionStaleMs），换算反而更绕。
+   */
+  private reclaimCooldownMs(failures: number): number {
+    const grown = this.cfg.sessionStaleMs * 2 ** Math.max(0, failures);
+    return Math.min(grown, this.cfg.reclaimMaxCooldownMs);
+  }
+
+  /**
+   * 自动重试到顶 → 转人工待处理（#273 / B-03、B-04）。
+   *
+   * 预算耗尽进入 paused，保存现场并释放普通队列占用；不等同于目标失败或外部受阻。
+   *
+   * 幂等以事件为凭：同一锚点周期内只提醒一次，否则每 3s 一个 tick 就会刷屏。
+   */
+  private async exhaustAutoRetry(
+    issue: EngineIssue,
+    reason: 'nudge' | 'judge',
+    count: number,
+    anchor: number,
+    extra: Record<string, unknown> = {},
+  ): Promise<void> {
+    const kind = reason === 'nudge' ? 'nudge_exhausted' : 'judge_exhausted';
+    if (this.store.countEventsSince(issue.id, kind, anchor) > 0) return;
+    this.store.logEvent(issue.id, kind, { count, stage: issue.status, ...extra });
+    await this.notifySafe({
+      kind: 'status_change',
+      projectId: issue.projectId,
+      issueId: issue.id,
+      summaryCode: 'auto_retry_exhausted',
+      summaryParams: { title: issue.title.slice(0, 60), reason, count },
+    });
+    await this.applyEvent(issue.id,'pause',{note:`自动${reason === 'nudge' ? '催办' : '判定'}已达 ${count} 次上限，保留现场，检查执行状态后继续`});
   }
 
   /** kickoff：进入阶段后的首条 prompt。幂等判据 = 该阶段进入事件之后是否已有 injected 事件 */
@@ -6493,7 +8283,7 @@ export class IssueEngine {
       // I4：CC 未就绪（jsonl 未落地 且 pane 无输入框特征）——prompt 打进 bash 会被当
       // shell 命令执行。等就绪；超时（默认 120s，从本进程开始盯（bootTs）计）→ block 交人工。
       if (this.now() - w.bootTs > this.cfg.kickoffReadyTimeoutMs) {
-        await this.applyEvent(issue.id, 'block', {
+        await this.applyEvent(issue.id, 'pause', {
           note: `CC 启动超时：${Math.round(this.cfg.kickoffReadyTimeoutMs / 1000)}s 未就绪（jsonl 未落地且无输入框特征）`,
         });
       }
@@ -6509,7 +8299,7 @@ export class IssueEngine {
         this.store.logEvent(fresh.id, 'error', {
           where: 'execution-workspace', error: String(e).slice(0, 200),
         });
-        await this.applyEvent(fresh.id, 'block', { note: '执行工作区不可用' });
+        await this.applyEvent(fresh.id, 'pause', { note: '执行工作区不可用' });
         return;
       }
       const built = this.buildKickoffPrompt(fresh, project, workspace);
@@ -6545,6 +8335,15 @@ export class IssueEngine {
     return userPromptLocale(this.deps.db, issue.createdBy, project.ownerUserId);
   }
 
+  private buildIssueNudge(opts: Parameters<typeof buildNudge>[0]): string {
+    const issue = this.store.get(opts.issue.id);
+    if (issue?.executionMode === 'direct' && (issue.status === 'implementing' || issue.status === 'testing')) {
+      const marker = `ISSUE_READY:${issue.id}:${this.store.lastEnterEventId(issue.id, 'implementing')}`;
+      return buildNudge({ ...opts, stage: 'testing' }).replaceAll(`STAGE_DONE:${issue.id}:testing`, marker);
+    }
+    return buildNudge(opts);
+  }
+
   private buildKickoffPrompt(
     issue: EngineIssue,
     project: Project,
@@ -6553,6 +8352,47 @@ export class IssueEngine {
     const branch = issue.branch ?? ''; // 进 implementing 时已记下目标分支或历史 issue 的当前分支
     const imgHint = imageReadHint(this.absImages(workspace, issue));
     const locale = this.promptLocale(issue, project);
+    const stageEntry = this.store.lastEnterInfo(issue.id, issue.status);
+    if (issue.executionMode === 'direct' && issue.status === 'implementing') {
+      return {
+        text: buildDirectPrompt({ issue, branch, locale, imgHint,
+          attempt: this.store.lastEnterEventId(issue.id, 'implementing'),
+          feedback: stageEntry?.note, docPath: issue.docPath }),
+        meta: { kind: 'direct', attempt: this.store.lastEnterEventId(issue.id, 'implementing') },
+      };
+    }
+    if (issue.executionMode === 'direct' && issue.status === 'testing') return null;
+    if (
+      stageEntry?.event === 'unblock' &&
+      (issue.status === 'planning' || issue.status === 'implementing' || issue.status === 'testing')
+    ) {
+      const recoveryEvent = [...this.store.listEvents(issue.id)].reverse()
+        .find((event) => event.kind === 'unblock_guidance');
+      let guidance = stageEntry.note ?? '';
+      if (recoveryEvent?.dataJson) {
+        try {
+          const data = JSON.parse(recoveryEvent.dataJson) as { guidance?: unknown };
+          if (typeof data.guidance === 'string' && data.guidance.trim()) guidance = data.guidance;
+        } catch {
+          // transition.note 仍提供保守兜底，损坏的审计扩展字段不阻断恢复。
+        }
+      }
+      const subtasks = this.store.subtasksOf(issue);
+      return {
+        text: buildRecoveryResumePrompt({
+          issue,
+          stage: issue.status,
+          guidance,
+          branch,
+          currentSubtask: subtasks[issue.subIndex]?.text,
+          subtaskIndex: issue.subIndex,
+          subtaskTotal: subtasks.length,
+          team: issue.implMode === 'team',
+          locale,
+        }),
+        meta: { kind: 'recovery_resume', stage: issue.status, subIndex: issue.subIndex },
+      };
+    }
     switch (issue.status) {
       case 'planning': {
         const entry = this.store.lastEnterInfo(issue.id, 'planning');
@@ -6590,19 +8430,19 @@ export class IssueEngine {
                 .get(issue.moduleId)?.display_name
             : null;
         return {
-          text: buildPlanningPrompt({ issue, goal: project.goal, feedback, recovery, imgHint, moduleName, locale }),
+          text: buildPlanningPrompt({ issue, goal: project.goal, feedback, recovery, imgHint, moduleName, locale, manualReview: project.manualReview }),
           meta: { kind: 'planning', ...(feedback ? { rework: true } : {}), ...(recovery ? { recovery: true } : {}) },
         };
       }
       case 'implementing': {
         const entry = this.store.lastEnterInfo(issue.id, 'implementing');
-        if (entry && (entry.event === 'tests_failed' || entry.event === 'review_rejected')) {
+        if (entry && (entry.event === 'tests_failed' || entry.event === 'work_remaining' || entry.event === 'review_rejected')) {
           return {
             text: buildReworkPrompt({
               issue,
               feedback: entry.note ?? '',
               branch,
-              source: entry.event === 'tests_failed' ? 'tests_failed' : 'review_rejected',
+              source: entry.event !== 'review_rejected' ? 'tests_failed' : 'review_rejected',
               locale,
             }),
             meta: { kind: 'rework', source: entry.event },
@@ -6635,6 +8475,10 @@ export class IssueEngine {
    * （public 以便测试直接投喂；生产只有 tick 调用）
    */
   async ingest(issueId: number, msgs: ChatMessage[], w: WatchState | null, session: string): Promise<void> {
+    for (const msg of msgs) {
+      if (msg.role === 'tool_use' && msg.tool === 'Skill') this.store.logEvent(issueId,'skill_invoked',{tool:msg.tool,input:msg.input?.slice(0,300),callId:msg.toolCallId});
+      else if (msg.role === 'tool_use' && /SKILL\.md/.test(msg.input ?? '')) this.store.logEvent(issueId,'skill_read',{tool:msg.tool,input:msg.input?.slice(0,300),callId:msg.toolCallId});
+    }
     const texts = extractAssistantTexts(msgs);
     if (texts.length > 0) {
       await this.handleAssistantTexts(issueId, texts, session);
@@ -6666,31 +8510,41 @@ export class IssueEngine {
       || this.store.hasUnresolvedExecutionSyncEffect(issueId)) return;
     const id = issue.id;
 
-    // ISSUE_BLOCKED 在任何驱动阶段都认
-    for (const t of texts) {
-      const b = findBlocked(t, id);
-      if (b) {
-        this.store.logEvent(id, 'sentinel', { kind: 'blocked', note: b.note });
-        await this.applyEvent(id, 'block', { note: b.note || '(未说明)' });
-        return;
-      }
-    }
+    // 两个协议标记在任何驱动阶段都认，**NEED_CLARIFY 优先**（#275 / B-08）。
+    //
+    // 原来是 ISSUE_BLOCKED 的循环在前、命中即 return，于是同一条回复里两个都出现时
+    // 一律被判 blocked——代理问的问题连记都没记，用户只看到「受阻」，还得人工解阻再问一遍
+    // （本周 41 次 blocked 里有相当一部分就是这么来的）。混发时按澄清处理才是对的：
+    // 澄清是可逆的（答了就继续、20 分钟不答自动继续），而 blocked 要人工解锁且会中断接力，
+    // 判错的代价不对称。prompts 那边也把边界讲清了（sentinelBoundary），两头配套。
+    const blocked = texts.map((t) => findBlocked(t, id)).find((b) => !!b) ?? null;
+    const clarifyHits = texts.filter((t) => findNeedClarify(t, id));
 
-    // NEED_CLARIFY 在任何驱动阶段都认：代理声明「必须先问清才能继续」→ 记问题(source:exec)+通知，
-    // 不推进状态（停在原地等用户回答或超时自动继续，watcher 据 execClarifyWait 停催停判）。
-    // 幂等：已在等待中（execClarifyWait 非空）不重复记/推——避免每 tick 重复。
-    if (texts.some((t) => findNeedClarify(t, id))) {
+    if (clarifyHits.length > 0) {
+      // 幂等：已在等待中（execClarifyWait 非空）不重复记/推——避免每 tick 重复。
       if (!this.store.execClarifyWait(id)) {
-        const hits = texts.filter((t) => findNeedClarify(t, id));
-        const qs = hits.flatMap((t) => parseClarifyQuestions(t));
+        const qs = clarifyHits.flatMap((t) => parseClarifyQuestions(t));
         const questions = [...new Set(qs)].slice(0, MAX_CLARIFY_QUESTIONS); // 多条文本各自抽，去重保序
+        if (blocked) {
+          // 观测埋点：用来看 prompt 的边界描述到底改好没有，混发次数应当随之下降
+          this.store.logEvent(id, 'sentinel_conflict', {
+            blockedNote: (blocked.note || '').slice(0, 300),
+            questions,
+          });
+        }
         // 原文留档（#110）：清单项之外的前提/现状散文也要给用户看全
-        const text = extractClarifyText(hits.join('\n\n'));
+        const text = extractClarifyText(clarifyHits.join('\n\n'));
         await this.enterExecClarify(issue, issue.status, questions, 'sentinel', text);
         const w = issue.convId ? this.watch.get(issue.convId) : undefined;
         if (w) w.nudged = false; // 清掉残留催促态，等待期不再触发 nudge
       }
       return; // 不推进：等用户回答或超时
+    }
+
+    if (blocked) {
+      this.store.logEvent(id, 'sentinel', { kind: 'blocked', note: blocked.note });
+      await this.applyEvent(id, 'block', { note: blocked.note || '(未说明)' });
+      return;
     }
 
     switch (issue.status) {
@@ -6708,6 +8562,21 @@ export class IssueEngine {
         return;
       }
       case 'implementing': {
+        if (issue.executionMode === 'direct') {
+          const attempt = this.store.lastEnterEventId(id, 'implementing');
+          const ready = `ISSUE_READY:${id}:${attempt}`;
+          const reportTexts = texts.filter(t => t.split('\n').some(line => line.trim() === ready));
+          if (reportTexts.length) {
+            this.captureCompletionReport(id, reportTexts);
+            this.store.logEvent(id, 'direct_ready', { attempt });
+            await this.applyEvent(id, 'impl_done');
+            if (this.store.get(id)?.status === 'testing') await this.completeTesting(id, 'sentinel');
+          } else {
+            const plan = texts.flatMap(t => t.split('\n')).find(line => line.startsWith(`NEED_PLAN:${id}:${attempt} `));
+            if (plan) await this.applyEvent(id, 'request_plan', { note: plan.slice(plan.indexOf(' ') + 1, 500) });
+          }
+          return;
+        }
         let stageDone = texts.some((t) => findStageDone(t, id, 'implementing'));
         const subs = this.store.subtasksOf(issue);
         const seqDriving = issue.implMode === 'seq' && subs.length > 0 && !this.isRework(issue);
@@ -6760,9 +8629,17 @@ export class IssueEngine {
         return;
       }
       case 'testing': {
-        if (texts.some((t) => findStageDone(t, id, 'testing'))) {
+        if (texts.some((t) => issue.executionMode === 'direct'
+          ? t.split('\n').some(line => line.trim() === `ISSUE_READY:${id}:${this.store.lastEnterEventId(id, 'implementing')}`)
+          : findStageDone(t, id, 'testing'))) {
+          // 收尾报告随同一条回复内联带出（#275 / I-05）：解析成功就存，失败/缺失一律忽略，
+          // 退回确定性拼装。**必须在 tests_passed 之前存**——那一步会一路推到 merge_review，
+          // 收尾的摘要拼装就要读这份报告了。
+          this.captureCompletionReport(id, issue.executionMode === 'direct' ? texts.filter(t =>
+            t.split('\n').some(line => line.trim() === `ISSUE_READY:${id}:${this.store.lastEnterEventId(id, 'implementing')}`)) : texts);
           this.store.logEvent(id, 'sentinel', { kind: 'stage_done', stage: 'testing' });
-          await this.applyEvent(id, 'tests_passed');
+          // #279：代理只做自检与完成报告，门禁由引擎在会话外跑（通过才放行）
+          await this.completeTesting(id, 'sentinel');
           return;
         }
         let failed: { note: string } | null = null;
@@ -6783,6 +8660,212 @@ export class IssueEngine {
       default:
         return;
     }
+  }
+
+  // ---- 门禁执行（#279 / I-03）：在会话外跑，代理这几分钟是空闲的、不烧 token ----
+
+  /**
+   * 本轮门禁的执行范围：进 testing 时算一次并落库（UI 要看、复跑要用）。
+   *
+   * 改动清单取自 `impl_base..工作区`（含未提交改动）+ 未跟踪文件；候选测试文件要**真的存在**
+   * 才进定向清单（存在性用 driver 校验，推导本身是纯函数）。任何一步取不到就退回全量——
+   * 门禁宁可多跑，也不能给一个「定向全绿、全量爆炸」的假绿灯。
+   */
+  private async computeValidationScope(
+    issue: EngineIssue,
+    workspace: EngineExecutionWorkspace,
+  ): Promise<ValidationScope> {
+    const cwd = workspace.cwd;
+    const base = this.implBaseSha(issue.id);
+    const changed = new Set<string>();
+    try {
+      if (base) {
+        const diff = await this.deps.driver.git(cwd, ['diff', '--name-only', base]);
+        if (diff.code === 0) for (const line of diff.out.split('\n')) if (line.trim()) changed.add(line.trim());
+      }
+      const status = await this.deps.driver.git(cwd, ['status', '--porcelain']);
+      if (status.code === 0) {
+        for (const line of status.out.split('\n')) {
+          const p = line.slice(3).trim();
+          if (p) changed.add(p.includes(' -> ') ? p.split(' -> ')[1]!.trim() : p);
+        }
+      }
+    } catch (e) {
+      this.store.logEvent(issue.id, 'error', { where: 'validation-scope', error: String(e).slice(0, 200) });
+      return { kind: 'full', files: [], reason: '读改动清单失败' };
+    }
+    const files = [...changed];
+    const existing = new Set<string>();
+    for (const f of files) {
+      for (const candidate of candidateTestFiles(f)) {
+        if (existing.has(candidate)) continue;
+        const stat = await this.deps.driver.statPath(join(cwd, candidate)).catch(() => null);
+        if (stat?.isFile) existing.add(candidate);
+      }
+    }
+    if (existing.size === 0 && files.length) {
+      const tracked = await this.deps.driver.git(cwd, ['ls-files', '-z']);
+      if (tracked.code === 0) for (const name of tracked.out.split('\0')) {
+        if (/\.test\.[cm]?[jt]sx?$/.test(name) && (await this.deps.driver.statPath(join(cwd, name)))?.isFile) existing.add(name);
+      }
+    }
+    return deriveValidationScope(files, existing);
+  }
+
+  /** 读项目 package.json（探测默认门禁命令用）；读不到返回 null，由调用方降级 */
+  private async readPackageJson(cwd: string): Promise<string | null> {
+    try {
+      const path = join(cwd, 'package.json');
+      const stat = await this.deps.driver.statPath(path);
+      if (!stat?.isFile || stat.size === 0) return null;
+      const r = await this.deps.driver.readFileRange(path, 0, Math.min(stat.size, 256 * 1024));
+      return new TextDecoder().decode(r.data);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 跑一轮门禁。返回 'passed' | 'failed' | 'skipped'；**skipped 一律按放行处理**——
+   * 没配命令、也探测不到（不是 bun 项目、临时仓库），不能因此把 issue 卡在 testing。
+   */
+  private async runValidationGate(
+    issue: EngineIssue,
+    project: Project,
+  ): Promise<{ outcome: 'passed' | 'failed' | 'skipped' | 'error'; note: string }> {
+    if (this.cfg.validationTimeoutMs <= 0) return { outcome: 'skipped', note: '门禁执行已关闭' };
+    let workspace: EngineExecutionWorkspace;
+    try {
+      workspace = await this.resolveExecutionWorkspace(issue, project);
+    } catch (e) {
+      this.store.logEvent(issue.id, 'error', { where: 'validation-workspace', error: String(e).slice(0, 200) });
+      this.store.logEvent(issue.id,'validation_error',{reason:'workspace-unavailable'});
+      return { outcome: 'error', note: '执行工作区不可用，恢复后重试验证' };
+    }
+    const scope = await this.computeValidationScope(issue, workspace);
+    this.store.setValidationScope(issue.id, scope);
+
+    const commands = resolveValidationCommands(
+      project.validationCommands,
+      await this.readPackageJson(workspace.cwd),
+    );
+    if (commands.length === 0) {
+      this.store.logEvent(issue.id, 'validation_skipped', { reason: 'no-commands' });
+      return { outcome: 'skipped', note: '没有可执行的门禁命令' };
+    }
+    this.store.logEvent(issue.id, 'validation_started', {
+      scope: scope.kind,
+      files: scope.files.length,
+      commands: commands.map((c) => c.label),
+    });
+    const cacheable = project.validationCommands === null && commands.every(c => c.argv[0] === 'bun');
+    const identity = cacheable ? await validationIdentity(this.deps.driver, workspace.cwd) : null;
+    const passed = new Set(this.store.listEvents(issue.id).filter(e => e.kind === 'validation_check_passed')
+      .flatMap(e => { try { return [JSON.parse(e.dataJson ?? '{}').key as string]; } catch { return []; } }));
+    const executor = {
+      runCommand: async (cwd: string, argv: string[], timeoutMs: number) => {
+        const key = identity ? validationCheckKey(identity, argv) : null;
+        if (key && passed.has(key)) {
+          this.store.logEvent(issue.id, 'validation_reused', { key, argv });
+          return { code: 0, out: '', err: '', durationMs: 0, timedOut: false };
+        }
+        const result = await this.deps.driver.runCommand(cwd, argv, timeoutMs);
+        if (key && result.code === 0 && !result.timedOut) {
+          // Commands that change inputs must never certify the old identity.
+          if (await validationIdentity(this.deps.driver, cwd) === identity) {
+            this.store.logEvent(issue.id, 'validation_check_passed', { key, argv, durationMs: result.durationMs });
+          } else this.store.logEvent(issue.id, 'validation_invalidated', { reason: 'inputs-changed-during-check' });
+        }
+        return result;
+      },
+    };
+    let run;
+    try {
+      run = await runValidation(executor, workspace.cwd, commands, project.validationCommands !== null ? { kind: 'full', files: [], reason: '项目明确配置' } : scope, {
+        timeoutMs: this.cfg.validationTimeoutMs,
+      });
+    } catch (e) {
+      // 执行入口本身炸了（连接断、命令不存在）不是「门禁未通过」：放行交给后续人工，
+      // 把它算成失败会让一条本来好好的 issue 因为执行机抖动被打回返工。
+      this.store.logEvent(issue.id, 'error', { where: 'validation', error: String(e).slice(0, 300) });
+      this.store.logEvent(issue.id,'validation_error',{reason:'executor-error'});
+      return { outcome: 'error', note: '门禁执行失败（执行机异常），恢复后重试验证' };
+    }
+    if (run.skipped) {
+      this.store.logEvent(issue.id, 'validation_skipped', { reason: 'no-commands' });
+      return { outcome: 'skipped', note: '没有可执行的门禁命令' };
+    }
+    if (run.ok) {
+      this.store.logEvent(issue.id, 'validation_passed', {
+        scope: scope.kind,
+        durationMs: run.durationMs,
+        steps: run.steps.map((x) => ({ label: x.label, durationMs: x.durationMs })),
+      });
+      return { outcome: 'passed', note: '' };
+    }
+    const failed = run.failed!;
+    this.store.logEvent(issue.id, 'validation_failed', {
+      scope: scope.kind,
+      label: failed.label,
+      code: failed.code,
+      timedOut: failed.timedOut,
+      durationMs: run.durationMs,
+      tail: run.tail.slice(0, 2000),
+    });
+    return {
+      outcome: 'failed',
+      note: `门禁「${failed.label}」未通过（退出码 ${failed.code}）：\n${run.tail}`.slice(0, 1600),
+    };
+  }
+
+  /**
+   * testing 收尾的**唯一出口**（#279）：代理说完事了（哨兵或 PM 兜底判定）之后，
+   * 由引擎在会话外跑门禁，通过才 `tests_passed`，不通过按 `tests_failed` 回灌输出尾部返工。
+   * 两个调用点（哨兵、空闲兜底）都走这里，别再各自 applyEvent('tests_passed')。
+   */
+  private async completeTesting(issueId: number, source: 'sentinel' | 'judge'): Promise<void> {
+    const issue = this.store.get(issueId);
+    const project = issue ? this.project(issue.projectId) : undefined;
+    if (!issue || !project) return;
+    // A missing report is a protocol repair, not a user-action blocker. Ask once before
+    // running gates, so the repair does not repeat validation or lose the testing context.
+    if (this.cfg.resultSummaryTimeoutMs > 0 && !issue.completionReport && issue.convId
+      && this.store.countEventsSince(issueId, 'completion_report_retry', this.store.lastEnterEventId(issueId, 'implementing')) === 0) {
+      const session = this.deps.convs.tmuxName(issue.projectId, issue.convId);
+      await this.inject(session, this.buildIssueNudge({ issue, stage: 'testing', locale: this.promptLocale(issue, project) }));
+      this.store.logEvent(issueId, 'completion_report_retry', { source });
+      const watch = this.watch.get(issue.convId);
+      if (watch) { watch.nudged = true; watch.fedTs = this.now(); }
+      return;
+    }
+    if (this.cfg.resultSummaryTimeoutMs > 0 && !issue.completionReport) {
+      await this.applyEvent(issueId, 'pause', { note: '完成报告补报仍无效；保留现场，修复报告协议后继续验证' });
+      return;
+    }
+    if (issue.completionReport && (issue.completionReport.outcome !== 'complete'
+      || issue.completionReport.unmetGoals.length || issue.completionReport.remainingWork.length)) {
+      const report = issue.completionReport;
+      await this.applyEvent(issueId, report.outcome === 'blocked' ? 'block' : 'work_remaining', {
+        note: [...report.unmetGoals, ...report.remainingWork, report.completion].join('；').slice(0, 1400),
+      });
+      return;
+    }
+    const gate = await this.runValidationGate(issue, project);
+    if (gate.outcome === 'error') {
+      await this.applyEvent(issueId, 'pause', { note: gate.note });
+      return;
+    }
+    if (gate.outcome !== 'failed') {
+      await this.applyEvent(issueId, 'tests_passed', ...(source === 'judge'
+        ? [{ note: '空闲兜底：PM 判定已完成' }] as const
+        : [] as const));
+      return;
+    }
+    // 只数**本轮**的失败（复活后重新开始，口径同哨兵路径）
+    const failCount =
+      this.store.countEventsSince(issueId, 'tests_failed', this.store.lastEventId(issueId, 'reopened')) + 1;
+    this.store.logEvent(issueId, 'tests_failed', { note: gate.note, failCount, source: 'validation' });
+    await this.applyEvent(issueId, 'tests_failed', { failCount, note: gate.note });
   }
 
   /** 三级判定第 3 级：PM 保守判（读-判-重读-CAS，applyEvent 的 CAS 即重读端） */
@@ -6810,20 +8893,23 @@ export class IssueEngine {
     }
     this.store.logEvent(issue.id, 'judged', { stage: issue.status, result: j });
     if (j === 'done') {
-      if (issue.status === 'implementing') {
+      if (issue.status === 'implementing' && issue.executionMode === 'direct') {
+        await this.inject(session, this.buildIssueNudge({ issue, stage: 'implementing', locale: this.promptLocale(issue, project) }));
+        w.fedTs = this.now();
+      } else if (issue.status === 'implementing') {
         this.store.markAllSubtasksDone(issue.id);
         await this.applyEvent(issue.id, 'impl_done', { note: '空闲兜底：PM 判定已完成' });
       } else if (issue.status === 'testing') {
-        await this.applyEvent(issue.id, 'tests_passed', { note: '空闲兜底：PM 判定已完成' });
+        await this.completeTesting(issue.id, 'judge'); // #279：兜底判定同样要过门禁
       } else if (issue.status === 'planning') {
         // planning：判 done 但没解析到 SUBTASKS 块 = 无计划产物，不能直接推进；
         // 也不能保守不动（#41/#47 无限 judged=done 死循环实锤）。出口：先催代理
-        // 按格式重新输出（前 2 次），连续第 3 次仍无块 → 转 blocked 交人工
+        // 按格式重新输出（前 2 次），连续第 3 次仍无块 → 协议异常暂停
         // （applyEvent 自带 issue_blocked 通知）。计数以事件为凭，重启不丢。
         const entryId = this.store.lastEnterEventId(issue.id, 'planning');
         const strikes = this.store.consecutiveJudgedDone(issue.id, entryId);
         if (strikes >= 3) {
-          await this.applyEvent(issue.id, 'block', {
+          await this.applyEvent(issue.id, 'pause', {
             note: `planning 连续 ${strikes} 次判完成但未收到 SUBTASKS 块（产物丢失或格式不符），转人工`,
           });
         } else {
@@ -6847,8 +8933,6 @@ export class IssueEngine {
         );
         w.nudged = false;
       }
-    } else if (j === 'blocked') {
-      await this.applyEvent(issue.id, 'block', { note: '空闲兜底：PM 判定疑似卡住/在等输入' });
     }
   }
 

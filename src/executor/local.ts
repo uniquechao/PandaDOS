@@ -6,10 +6,11 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, promises as fsp } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { AgentKind } from '../core/types';
 import {
+  type CommandResult,
   type DirEntry,
   type ExecutorDriver,
   type FileRange,
@@ -19,15 +20,21 @@ import {
   type PtyChannel,
   type TmuxScrollDirection,
   type TmuxSession,
+  absoluteExecutableFromOutput,
   assertRemovablePath,
+  DEFAULT_GIT_INSTALL_TIMEOUT_MS,
   DEFAULT_GIT_TIMEOUT_MS,
   DEFAULT_TMUX_TIMEOUT_MS,
-  INJECT_ENTER_DELAY_MS,
+  ENSURE_GIT_SCRIPT,
+  gitAvailabilityError,
   KEY_WHITELIST,
+  MAX_COMMAND_OUTPUT_CHARS,
   sanitizeInjectText,
+  sendTextWithStableSubmit,
   tmuxNewSessionArgs,
   tmuxResizeWindowArgs,
   tmuxScrollPaneArgs,
+  truncateCommandOutput,
 } from './driver';
 
 interface ExecResult {
@@ -46,6 +53,7 @@ export function runCommand(
   args: string[],
   cwd?: string,
   timeoutMs?: number,
+  env?: NodeJS.ProcessEnv,
 ): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
     execFile(
@@ -55,6 +63,7 @@ export function runCommand(
         cwd,
         maxBuffer: 16 * 1024 * 1024,
         encoding: 'utf8',
+        ...(env ? { env } : {}),
         ...(timeoutMs && timeoutMs > 0 ? { timeout: timeoutMs, killSignal: 'SIGKILL' as const } : {}),
       },
       (error, stdout, stderr) => {
@@ -80,6 +89,12 @@ export interface LocalDriverOpts {
   tmuxTimeoutMs?: number;
   /** git 类命令超时（I5；默认 DEFAULT_GIT_TIMEOUT_MS=60s） */
   gitTimeoutMs?: number;
+  /** 测试/嵌入式覆盖；生产默认取执行服务用户的登录 shell。 */
+  agentShell?: string;
+  /** 测试/嵌入式覆盖；生产默认取执行服务用户的 Home。 */
+  agentHome?: string;
+  /** 测试时跳过真实等待；生产使用 Bun.sleep。 */
+  injectSleep?: (ms: number) => Promise<void>;
 }
 
 export interface PtySpawnSpec {
@@ -154,10 +169,24 @@ export function sttyResizeArgs(
 export class LocalDriver implements ExecutorDriver {
   private readonly tmuxTimeoutMs: number;
   private readonly gitTimeoutMs: number;
+  private readonly agentShell: string;
+  private readonly agentHome: string;
+  private readonly injectSleep: (ms: number) => Promise<void>;
 
   constructor(opts: LocalDriverOpts = {}) {
     this.tmuxTimeoutMs = opts.tmuxTimeoutMs ?? DEFAULT_TMUX_TIMEOUT_MS;
     this.gitTimeoutMs = opts.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
+    this.injectSleep = opts.injectSleep ?? Bun.sleep;
+    this.agentHome = opts.agentHome ?? homedir();
+    if (opts.agentShell) {
+      this.agentShell = opts.agentShell;
+    } else {
+      try {
+        this.agentShell = userInfo().shell || '/bin/sh';
+      } catch {
+        this.agentShell = process.env.SHELL || '/bin/sh';
+      }
+    }
   }
 
   /** 全部 tmux 子命令入口（统一限时） */
@@ -167,7 +196,25 @@ export class LocalDriver implements ExecutorDriver {
 
   async findExecutable(agent: AgentKind): Promise<string | null> {
     if (agent !== 'claude' && agent !== 'codex') throw new Error('不支持的 Agent 命令');
-    return Bun.which(agent, { PATH: process.env.PATH ?? '' });
+    const direct = Bun.which(agent, { PATH: process.env.PATH ?? '' });
+    if (direct) return direct;
+    if (!isAbsolute(this.agentShell)) return null;
+    try {
+      const result = await runCommand(
+        this.agentShell,
+        ['-lic', `command -v -- ${agent}`],
+        undefined,
+        this.tmuxTimeoutMs,
+        { ...process.env, HOME: this.agentHome, SHELL: this.agentShell },
+      );
+      if (result.code !== 0) return null;
+      const found = absoluteExecutableFromOutput(result.out);
+      if (!found) return null;
+      await fsp.access(found, constants.X_OK);
+      return found;
+    } catch {
+      return null;
+    }
   }
 
   // ---- tmux ----
@@ -211,13 +258,19 @@ export class LocalDriver implements ExecutorDriver {
 
   async sendKeys(session: string, text: string): Promise<void> {
     const clean = sanitizeInjectText(text);
-    const r1 = await this.tmux(['send-keys', '-t', session, '-l', '--', clean]);
-    if (r1.code !== 0) throw new Error(`tmux send-keys failed: ${r1.err || r1.out}`);
-    // 文本与 Enter 之间必须停一拍：codex TUI 有 paste-burst 检测，紧跟注入的 Enter
-    // 会被并入粘贴当换行（消息滞留输入框不提交，0.144 实测）；CC 不受影响。
-    await Bun.sleep(INJECT_ENTER_DELAY_MS);
-    const r2 = await this.tmux(['send-keys', '-t', session, 'Enter']);
-    if (r2.code !== 0) throw new Error(`tmux send-keys Enter failed: ${r2.err || r2.out}`);
+    await sendTextWithStableSubmit({
+      inputText: clean,
+      capturePane: () => this.capturePane(session),
+      sendText: async () => {
+        const result = await this.tmux(['send-keys', '-t', session, '-l', '--', clean]);
+        if (result.code !== 0) throw new Error(`tmux send-keys failed: ${result.err || result.out}`);
+      },
+      sendEnter: async () => {
+        const result = await this.tmux(['send-keys', '-t', session, 'Enter']);
+        if (result.code !== 0) throw new Error(`tmux send-keys Enter failed: ${result.err || result.out}`);
+      },
+      sleep: this.injectSleep,
+    });
   }
 
   async sendKey(session: string, key: string): Promise<void> {
@@ -548,8 +601,39 @@ export class LocalDriver implements ExecutorDriver {
 
   // ---- git ----
 
+  async ensureGitAvailable(): Promise<void> {
+    const result = await runCommand('/bin/sh', ['-c', ENSURE_GIT_SCRIPT], undefined, DEFAULT_GIT_INSTALL_TIMEOUT_MS);
+    if (result.code !== 0) throw gitAvailabilityError(result);
+  }
+
   async git(cwd: string, args: string[]): Promise<GitResult> {
     return runCommand('git', args, cwd, this.gitTimeoutMs);
+  }
+
+  /**
+   * 门禁执行（#279）：argv 直送 execFile，**不经 shell**，所以 `&&`、管道、通配符都不生效——
+   * 想串两条命令就调两次。超时不抛错，按 `timedOut` 返回（底层 execFile 超时会 reject，
+   * 那条路径拿不到半截输出，只能如实报空）。
+   */
+  async runCommand(cwd: string, argv: string[], timeoutMs: number): Promise<CommandResult> {
+    const [cmd, ...args] = argv;
+    if (!cmd) throw new Error('runCommand 需要至少一个命令词');
+    const started = Date.now();
+    try {
+      const r = await runCommand(cmd, args, cwd, timeoutMs);
+      return {
+        code: r.code,
+        out: truncateCommandOutput(r.out, MAX_COMMAND_OUTPUT_CHARS),
+        err: truncateCommandOutput(r.err, MAX_COMMAND_OUTPUT_CHARS),
+        timedOut: false,
+        durationMs: Date.now() - started,
+      };
+    } catch (e) {
+      const detail = String(e);
+      const timedOut = detail.includes('超时');
+      if (!timedOut) throw e; // 命令不存在等真故障照旧抛，别伪装成门禁失败
+      return { code: -1, out: '', err: detail.slice(0, 500), timedOut: true, durationMs: Date.now() - started };
+    }
   }
 
   async readGitBlob(cwd: string, rev: string, path: string): Promise<GitBlobResult> {

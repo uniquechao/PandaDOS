@@ -26,11 +26,20 @@ describe('PandaDOS 品牌视觉系统', () => {
     expect(visible).not.toMatch(/MandoAI|曼拓/);
   });
 
+  test('标签页标题跟随当前项目：项目内「项目名-PandaDOS」，项目外回落品牌名', () => {
+    const docTitle = readFileSync(new URL('./lib/docTitle.ts', import.meta.url), 'utf8');
+    expect(main).toContain("import { useDocumentTitle } from './lib/docTitle'");
+    expect(main).toContain('useDocumentTitle(curPid)');
+    expect(docTitle).toContain("export const BRAND_TITLE = 'PandaDOS'");
+    expect(docTitle).toContain('${name}-${BRAND_TITLE}');
+  });
+
   test('侧栏品牌锁定在展开、折叠和移动端保持清晰比例', () => {
-    expect(main).toContain('<button type="button" class="brand" title="PandaDOS"');
-    expect(main).toContain("import packageInfo from '../../package.json'");
-    expect(main).toContain('const APP_VERSION = `v${packageInfo.version}`');
-    expect(main).toContain('<span class="brand-version">{APP_VERSION}</span>');
+    expect(main).toContain('<button type="button" class="brand-home" title="PandaDOS"');
+    expect(main).toContain("import releaseInfo from '../../release.json'");
+    expect(main).toContain('class="brand-version"');
+    expect(main).toContain('setReleaseOpen(true)');
+    expect(main).toContain('<ReleaseNotes');
     expect(main).not.toContain('BRAND_SLOGAN');
     expect(main).not.toContain('brand-slogan');
     expect(css).toMatch(/\.brand-version\s*\{[^}]*font-size:\s*11px[^}]*color:\s*var\(--mut\)/s);

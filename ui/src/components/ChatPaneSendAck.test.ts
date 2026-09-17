@@ -13,7 +13,8 @@ const cssUrl = new URL('../style.css', import.meta.url);
 describe('ChatPane 发送回执（issue #116）', () => {
   test('点发送即插一条乐观气泡，id 随帧发出', async () => {
     const src = await Bun.file(paneUrl).text();
-    expect(src).toContain("send({ type: 'text', text: t, ...(rels.length ? { images: rels } : {}), id })");
+    expect(src).toContain("...(rels.length ? { images: rels } : {}),"); // 附图随帧发
+    expect(src).toContain("...(fileRels.length ? { files: fileRels } : {}),"); // 附件随帧发
     expect(src).toContain("sinceOff: maxOffOf(msgs), state: 'sending'");
     expect(src).toContain('{pendingHint(p.state)}');
   });
@@ -36,7 +37,7 @@ describe('ChatPane 发送回执（issue #116）', () => {
     const types = await Bun.file(typesUrl).text();
     expect(types).toContain("{ type: 'ack'; id: string }");
     expect(types).toContain("{ type: 'err'; code: string; msg?: string; id?: string }");
-    expect(types).toContain("{ type: 'text'; text: string; images?: string[]; id?: string }");
+    expect(types).toContain("{ type: 'text'; text: string; images?: string[]; files?: string[]; id?: string }");
 
     const mock = await Bun.file(mockUrl).text();
     expect(mock).toContain("if (f.id) emit({ type: 'ack', id: f.id }, 120);");

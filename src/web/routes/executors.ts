@@ -26,6 +26,7 @@ export interface ExecutorProbe {
   statPath(path: string): Promise<PathStat | null>;
   listDir(path: string): Promise<DirEntry[]>;
   mkdirp(path: string): Promise<void>;
+  ensureGitAvailable(): Promise<void>;
   git(cwd: string, args: string[]): Promise<{ code: number; out: string; err: string }>;
 }
 

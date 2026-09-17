@@ -13,11 +13,11 @@ import { promises as fsp } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import type { ExecStreamLike, SftpDirEntryLike, SftpLike, SftpStatsLike, SshClientLike } from './conn';
-import { KEY_WHITELIST } from './driver';
+import { ENSURE_GIT_SCRIPT, KEY_WHITELIST } from './driver';
 import { shq } from './shq';
 import {
   buildSendKeyCmd,
-  buildSendKeysCmd,
+  buildSendTextCmd,
   sanitizeSendText,
   SSH_ALLOWED_KEYS,
   SSH_MAX_INJECT_CHARS,
@@ -73,6 +73,45 @@ describe('sanitizeSendText（v1 injector.ts:27 语义）', () => {
   });
 });
 
+describe('runCommand（#279 门禁执行入口）', () => {
+  it('argv 逐段 shq 后拼成一条命令行，注入字符全成字面量', async () => {
+    const { driver, clients } = mkDriver({
+      onExec: tmuxStub([[/^cd /, { out: 'ok\n' }]]),
+    });
+    const r = await driver.runCommand('/ws/demo', ['bun', 'run', 'typecheck'], 5000);
+    expect(r).toMatchObject({ code: 0, out: 'ok\n', timedOut: false });
+    expect(clients[0]!.execCalls[0]!.cmd).toBe("cd '/ws/demo' && 'bun' 'run' 'typecheck'");
+
+    // 想借参数串第二条命令：转义之后整段都是字面量，拼不出来
+    await driver.runCommand('/ws/demo', ['bun', 'test; rm -rf /'], 5000);
+    expect(clients[0]!.execCalls[1]!.cmd).toBe(`cd '/ws/demo' && 'bun' 'test; rm -rf /'`);
+    await driver.close();
+  });
+
+  it('非零退出照常返回，不抛错', async () => {
+    const { driver } = mkDriver({ onExec: tmuxStub([[/^cd /, { code: 1, err: '3 fail\n' }]]) });
+    const r = await driver.runCommand('/ws/demo', ['bun', 'test'], 5000);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain('3 fail');
+    expect(r.timedOut).toBe(false);
+    await driver.close();
+  });
+
+  it('超时不抛错，按 timedOut 返回（门禁跑挂是常态，抛错只会多一层 catch）', async () => {
+    const { driver } = mkDriver({ onExec: () => { /* 永不响应 */ } });
+    const r = await driver.runCommand('/ws/demo', ['bun', 'test'], 30);
+    expect(r).toMatchObject({ timedOut: true, code: -1 });
+    expect(r.durationMs).toBeGreaterThanOrEqual(0);
+    await driver.close();
+  });
+
+  it('空 argv 直接拒绝', async () => {
+    const { driver } = mkDriver({ onExec: tmuxStub([]) });
+    await expect(driver.runCommand('/ws/demo', [], 5000)).rejects.toThrow(/至少一个命令词/);
+    await driver.close();
+  });
+});
+
 describe('SSH_ALLOWED_KEYS 白名单', () => {
   it('包含 v1 全部 21 键（评审裁定，别删减）', () => {
     const v1 = [
@@ -95,20 +134,16 @@ describe('SSH_ALLOWED_KEYS 白名单', () => {
 });
 
 describe('send-keys 命令构造', () => {
-  it('sendKeys = 单次 exec 内 打字→sleep→Enter 三连（codex paste-burst 兼容）', () => {
-    const cmd = buildSendKeysCmd('cc-a b', 'hello 世界');
-    expect(cmd).toBe(
-      `tmux send-keys -t 'cc-a b' -l -- 'hello 世界'; sleep 0.3; tmux send-keys -t 'cc-a b' Enter`,
-    );
-    // 文字注入恰好一条 -l，Enter 恰好一条；无第三条 send-keys
-    expect(cmd.match(/send-keys/g)).toHaveLength(2);
+  it('文本命令只做字面量注入，Enter 由稳定提交时序单独发送', () => {
+    const cmd = buildSendTextCmd('cc-a b', 'hello 世界');
+    expect(cmd).toBe(`tmux send-keys -t 'cc-a b' -l -- 'hello 世界'`);
+    expect(cmd.match(/send-keys/g)).toHaveLength(1);
+    expect(cmd).not.toContain('Enter');
   });
   it('恶意文本留在引号内，不成为 shell 语法', () => {
     const evil = `'; rm -rf / #`;
-    const cmd = buildSendKeysCmd('s', evil);
-    // 取第一段（文字注入）经 bash 解析后应还原为 6 个词：send-keys -t s -l -- <evil>
-    const first = cmd.split('; sleep')[0]!;
-    const out = execFileSync('bash', ['-c', `printf '%s\\n' ${first.slice('tmux '.length)}`], {
+    const cmd = buildSendTextCmd('s', evil);
+    const out = execFileSync('bash', ['-c', `printf '%s\\n' ${cmd.slice('tmux '.length)}`], {
       encoding: 'utf8',
     });
     const words = out.split('\n');
@@ -333,6 +368,7 @@ function mkDriver(behaviors: MockBehavior[] | MockBehavior) {
     port: 22,
     username: 'u',
     privateKeyPath: '/dev/null', // dial 会读它；/dev/null 可读即可
+    injectSleep: async () => {},
     baseBackoffMs: 5,
     maxBackoffMs: 20,
     clientFactory: () => {
@@ -371,8 +407,37 @@ describe('SshDriver（mock ssh2）', () => {
     expect(clients[0]!.execCalls.map((x) => x.cmd)).toEqual([
       "command '-v' '--' 'claude'",
       "command '-v' '--' 'codex'",
+      '"${SHELL:-/bin/sh}" -lic \'command -v -- codex\' 2>/dev/null',
     ]);
     await expect(driver.findExecutable('bash' as never)).rejects.toThrow(/Agent/);
+    await driver.close();
+  });
+
+  it('findExecutable 在 SSH 非登录 PATH 缺失时回退执行机用户登录 shell', async () => {
+    const { driver, clients } = mkDriver({
+      onExec: tmuxStub([
+        [/^command '-v' '--' 'codex'$/, { code: 1 }],
+        [/^"\$\{SHELL:-\/bin\/sh\}" -lic 'command -v -- codex' 2>\/dev\/null$/, {
+          out: 'login banner\n/home/u/.local/bin/codex\n',
+        }],
+      ]),
+    });
+    expect(await driver.findExecutable('codex')).toBe('/home/u/.local/bin/codex');
+    expect(clients[0]!.execCalls.map((x) => x.cmd)).toEqual([
+      "command '-v' '--' 'codex'",
+      '"${SHELL:-/bin/sh}" -lic \'command -v -- codex\' 2>/dev/null',
+    ]);
+    await driver.close();
+  });
+
+  it('findExecutable 忽略登录 shell 横幅、别名和相对命令结果', async () => {
+    const { driver } = mkDriver({
+      onExec: tmuxStub([
+        [/^command '-v' '--' 'claude'$/, { code: 1 }],
+        [/^"\$\{SHELL:-\/bin\/sh\}" -lic/, { out: 'welcome\nclaude\nalias claude=wrapper\n' }],
+      ]),
+    });
+    expect(await driver.findExecutable('claude')).toBeNull();
     await driver.close();
   });
 
@@ -398,14 +463,22 @@ describe('SshDriver（mock ssh2）', () => {
     await d2.close();
   });
 
-  it('sendKeys：净化 + 恰好一次 exec + 命令等于 buildSendKeysCmd', async () => {
-    const { driver, clients } = mkDriver({ onExec: (_c, _o, s) => respond(s, { code: 0 }) });
+  it('sendKeys：净化 + 稳定抓屏 + 响应后不重复 Enter', async () => {
+    let pane = '› 空输入框';
+    let enters = 0;
+    const { driver, clients } = mkDriver({
+      onExec: (cmd, _opts, stream) => {
+        if (cmd.includes("'capture-pane'")) respond(stream, { out: pane });
+        else if (cmd.includes(' -l -- ')) { pane = '› line1 line2 tail'; respond(stream, {}); }
+        else if (cmd.endsWith("'Enter'")) { enters++; pane = '• Working'; respond(stream, {}); }
+        else respond(stream, { code: 127, err: `unexpected ${cmd}` });
+      },
+    });
     await driver.sendKeys('cc-main', 'line1\nline2\ttail');
     expect(clients).toHaveLength(1);
-    expect(clients[0]!.execCalls).toHaveLength(1);
-    expect(clients[0]!.execCalls[0]!.cmd).toBe(
-      buildSendKeysCmd('cc-main', sanitizeSendText('line1\nline2\ttail')),
-    );
+    expect(clients[0]!.execCalls.some((call) => call.cmd ===
+      buildSendTextCmd('cc-main', sanitizeSendText('line1\nline2\ttail')))).toBe(true);
+    expect(enters).toBe(1);
     await driver.close();
   });
 
@@ -446,6 +519,7 @@ describe('SshDriver（mock ssh2）', () => {
     expect(cmd).toBe(
       `tmux 'new-session' '-d' '-s' 't1' '-c' '/tmp/回归 目录' '-x' '220' '-y' '50'` +
         ` ';' 'set-window-option' '-t' 't1' 'window-size' 'manual'` +
+        ` ';' 'set-window-option' '-t' 't1' 'alternate-screen' 'off'` +
         ` ';' 'resize-window' '-t' 't1' '-x' '220' '-y' '50'`,
     );
     expect(await driver.capturePane('t1')).toBe('PANE\nCONTENT');
@@ -461,6 +535,15 @@ describe('SshDriver（mock ssh2）', () => {
     expect(r.code).toBe(128);
     expect(r.err).toContain('not a git repository');
     expect(clients[0]!.execCalls[0]!.cmd).toBe(`git '-C' '/tmp/a'\\''b' 'status' '--porcelain'`);
+    await driver.close();
+  });
+
+  it('ensureGitAvailable：执行固定脚本，并把安装权限失败转换为明确错误', async () => {
+    const { driver, clients } = mkDriver({
+      onExec: tmuxStub([[/^\/bin\/sh /, { code: 126, err: 'PANDA_GIT_NO_PRIVILEGE' }]]),
+    });
+    await expect(driver.ensureGitAvailable()).rejects.toThrow('没有免密 sudo');
+    expect(clients[0]!.execCalls[0]!.cmd).toBe(`/bin/sh '-c' ${shq(ENSURE_GIT_SCRIPT)}`);
     await driver.close();
   });
 

@@ -7,6 +7,7 @@
  * 只 export 路由定义，注册进 routes/index.ts 由集成步骤统一做。
  */
 import type { Database } from 'bun:sqlite';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import type { LlmClient } from '../../agents/llm';
 import { userPromptLocale } from '../../agents/prompts/language';
@@ -20,18 +21,21 @@ import {
   importHistoryConversations,
 } from '../../core/conversation-history';
 import { projectAgentSupport, supportedAgents } from '../../core/executors';
+import { buildFallbackIdentity, ensureGitIdentity, type GitIdentity } from '../../core/git-identity';
 import { ProjectMemberStore } from '../../core/members';
 import { generateProjectReadmeSummary, type ReadmeDriver } from '../../core/readme-summary';
-import type { AgentKind, Conversation, Executor, Project, ProjectKind, User } from '../../core/types';
+import type { AgentKind, Conversation, Executor, Project, User } from '../../core/types';
 import {
   discoverExecutorAgentHistory,
   type AgentHistorySession,
 } from '../../executor/agent-history';
+import { shq } from '../../executor/shq';
 import { getProject, mapProject } from '../../issues/engine';
 import { BUSY_STATES } from '../../issues/queue';
 import { apiError } from '../errors';
 import { json, type RouteDef } from '../middleware';
 import { llmErrorResponse } from '../llm-error';
+import type { ProjectDataSyncStatus } from '../project-data-sync';
 import {
   getExecutorById,
   managedProjectIdOf,
@@ -87,6 +91,11 @@ export interface ProjectsRoutesDeps {
    * 结构接口天然满足）。缺省 = 迁移目录接口 503（离线/测试装配可不接）。
    */
   fullDriverForProject?(project: Project): CwdMigrateDriver;
+  /** `.panda` 文件主导同步；创建、导入与打开项目时调用。 */
+  projectDataSync?: {
+    sync(project: Project): Promise<unknown>;
+    status(projectId: number): ProjectDataSyncStatus;
+  };
 }
 
 /** cwd-migrate 需要的执行机能力最小面（ExecutorDriver 结构子集） */
@@ -168,14 +177,14 @@ function parseWorkBranch(b: Record<string, unknown>): { value?: string | null; e
 }
 
 /**
- * 解析 body.kind（009 迁移，项目类型）：未给/空 → undefined（POST 落默认 'issue'；PATCH 不动）；
- * 'issue'|'chat' → 值；非法 → 错误响应。
+ * 项目统一使用 issue 看板。缺省或显式 issue 均兼容；chat 与其他值明确拒绝，
+ * 防止旧客户端继续创建或切换为已经下线的纯对话项目。
  */
-function parseProjectKind(b: Record<string, unknown>): { value?: ProjectKind; error?: Response } {
+function parseProjectKind(b: Record<string, unknown>): { error?: Response } {
   const k = b.kind;
   if (k === undefined || k === null || k === '') return {};
-  if (k === 'issue' || k === 'chat') return { value: k };
-  return { error: json({ ok: false, error: 'kind 必须是 issue 或 chat' }, 400) };
+  if (k === 'issue') return {};
+  return { error: json({ ok: false, error: '项目类型已固定为 issue' }, 400) };
 }
 
 /** 「更新简介」模式：llm=现有同步 README 路径；claude/codex=后台 Agent 认知总结任务 */
@@ -197,6 +206,19 @@ function parseSummaryMode(b: Record<string, unknown>): SummaryMode | null {
  * （何况 clone 调用处已用 `--` 终止选项解析，双保险）。
  */
 export const GIT_URL_RE = /^(?:https?:\/\/|git:\/\/|ssh:\/\/|git@)[A-Za-z0-9._~:/@+-]+$/;
+
+/** 只有 OpenSSH 传输需要首次主机密钥接纳；HTTPS 与 git:// 保持原行为。 */
+export function isSshGitUrl(url: string): boolean {
+  return url.startsWith('ssh://') || url.startsWith('git@');
+}
+
+/**
+ * accept-new 是 TOFU：首次连接写入 known_hosts，已有主机密钥变化时仍拒绝。
+ * UserKnownHostsFile 使用严格 shell 引用，因为 Git 会再通过 shell 解析 core.sshCommand。
+ */
+export function gitSshCommand(knownHostsFile: string): string {
+  return `ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=${shq(knownHostsFile)}`;
+}
 
 /** 从 git URL 推导仓库名（basename 去 .git），过 projectSlug 白名单；推不出返回 '' */
 export function repoNameFromGitUrl(url: string): string {
@@ -290,6 +312,24 @@ async function homeOfOsUser(driver: ExecutorProbe, username: string): Promise<st
   }
 }
 
+/** Git 命令实际以 Driver 所属 OS 用户运行，而不是项目的 runUser 标记。 */
+async function executorUserHome(driver: ExecutorProbe, executor: Executor): Promise<string | null> {
+  const local = (executor.host === '127.0.0.1' || executor.host === 'localhost') && !executor.keyRef;
+  const home = local ? homedir() : executor.sshUser ? await homeOfOsUser(driver, executor.sshUser) : null;
+  return home?.startsWith('/') ? home.replace(/\/+$/, '') || '/' : null;
+}
+
+function cloneFailure(detail: string, ssh: boolean): string {
+  const tail = detail.slice(-400);
+  if (ssh && /REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed/i.test(detail)) {
+    return `git clone 失败：SSH 主机密钥与 known_hosts 不一致，已拒绝连接：${tail}`;
+  }
+  if (ssh && /Permission denied \(publickey/i.test(detail)) {
+    return `git clone 失败：SSH 密钥认证失败，请检查执行机用户的 Git 私钥权限：${tail}`;
+  }
+  return `git clone 失败：${tail}`;
+}
+
 /**
  * 把 gitUrl clone 到执行机上的 target 目录：target 必须不存在或为空目录；
  * 父目录 mkdir -p 后在父目录下 `git clone -- <url> <basename>`（`--` 终止选项解析）。
@@ -299,6 +339,7 @@ async function cloneInto(
   driver: ExecutorProbe,
   gitUrl: string,
   target: string,
+  sshHome: string | null,
 ): Promise<Response | null> {
   try {
     const st = await driver.statPath(target);
@@ -308,13 +349,77 @@ async function cloneInto(
     }
     const parent = path.posix.dirname(target);
     await driver.mkdirp(parent);
-    const r = await driver.git(parent, ['clone', '--', gitUrl, path.posix.basename(target)]);
+    const ssh = isSshGitUrl(gitUrl);
+    if (ssh && !sshHome) {
+      return json({ ok: false, error: '无法解析执行机用户 Home，不能安全持久化 Git SSH 主机密钥' }, 502);
+    }
+    const cloneArgs = ['clone', '--', gitUrl, path.posix.basename(target)];
+    if (ssh) {
+      const sshDir = path.posix.join(sshHome!, '.ssh');
+      await driver.mkdirp(sshDir);
+      cloneArgs.unshift('-c', `core.sshCommand=${gitSshCommand(path.posix.join(sshDir, 'known_hosts'))}`);
+    }
+    const r = await driver.git(parent, cloneArgs);
     if (r.code !== 0) {
-      return json({ ok: false, error: `git clone 失败：${(r.err || r.out).slice(-400)}` }, 502);
+      return json({ ok: false, error: cloneFailure(r.err || r.out, ssh) }, 502);
     }
     return null;
   } catch (e) {
     return json({ ok: false, error: `git clone 失败：${String(e).slice(0, 300)}` }, 502);
+  }
+}
+
+/**
+ * 保证项目目录可直接参与后续 Git 自动提交：已有工作区不重复 init；提交身份仅在有效配置缺失时
+ * 写入**仓库本地**配置，避免覆盖执行机已有的 local/global 配置。
+ *
+ * 身份判定与补齐统一走 core/git-identity（唯一维护点，与引擎侧自愈同源），
+ * 但这里必须收窄到 `scopes: ['local']`：这写的是「本项目属主」的身份，
+ * 落进 global 就等于让先建项目的那个人变成整台执行机的默认提交人。
+ */
+async function prepareProjectGit(
+  driver: ExecutorProbe,
+  cwd: string,
+  identity: GitIdentity,
+): Promise<Response | null> {
+  try {
+    const inside = await driver.git(cwd, ['rev-parse', '--is-inside-work-tree']);
+    if (inside.code !== 0 || inside.out.trim() !== 'true') {
+      const initialized = await driver.git(cwd, ['init']);
+      if (initialized.code !== 0) {
+        return json({ ok: false, error: `git init 失败：${(initialized.err || initialized.out).slice(-400)}` }, 502);
+      }
+    }
+
+    const ensured = await ensureGitIdentity(driver, cwd, identity, { scopes: ['local'] });
+    if (!ensured.ok) return json({ ok: false, error: ensured.error ?? 'Git 身份预检失败' }, 502);
+    return null;
+  } catch (e) {
+    return json({ ok: false, error: `Git 仓库初始化失败：${String(e).slice(0, 400)}` }, 502);
+  }
+}
+
+/**
+ * 导入项目的 Git 身份预检（B-01）：导入路径以前完全不写身份，于是 danzhan / robot-train /
+ * desktop 这些导入进来的项目第一次自动提交必然 `Author identity unknown`。
+ *
+ * 与建项目路径的两点不同：
+ * - **不 init**：导入的是既有目录，不是 Git 仓库就直接跳过（不该替用户建仓库，也不该报警）；
+ * - **失败不阻塞导入**：项目本身已经登记成功，身份补不上只降级成 warning——引擎侧自动提交
+ *   前还有一次自愈机会。
+ */
+async function ensureImportedProjectGitIdentity(
+  driver: ExecutorProbe,
+  cwd: string,
+  identity: GitIdentity,
+): Promise<string | null> {
+  try {
+    const inside = await driver.git(cwd, ['rev-parse', '--is-inside-work-tree']);
+    if (inside.code !== 0 || inside.out.trim() !== 'true') return null; // 非 Git 目录：无需身份
+    const ensured = await ensureGitIdentity(driver, cwd, identity, { scopes: ['local'] });
+    return ensured.ok ? null : (ensured.error ?? 'Git 身份预检失败');
+  } catch (e) {
+    return `Git 身份预检失败：${String(e).slice(0, 200)}`;
   }
 }
 
@@ -423,12 +528,16 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
 
         // 归属：默认自己；admin 可代建
         let ownerUserId = u.id;
+        let ownerUsername = u.username;
         if (b.ownerUserId !== undefined) {
           if (u.role !== 'admin') return json({ ok: false, error: '仅 admin 可指定归属' }, 403);
           const oid = Number(b.ownerUserId);
-          const owner = db.query<{ id: number }, [number]>('SELECT id FROM users WHERE id = ?').get(oid);
+          const owner = db
+            .query<{ id: number; username: string }, [number]>('SELECT id, username FROM users WHERE id = ?')
+            .get(oid);
           if (!owner) return json({ ok: false, error: '无此用户' }, 400);
           ownerUserId = oid;
+          ownerUsername = owner.username;
         }
 
         // Linux 用户（可选，admin-only）：本期 = 归属标记 + 默认 cwd 锚点（/home/<user>/…）
@@ -438,9 +547,7 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
         if (wb.error) return wb.error;
         const pk = parseProjectKind(b);
         if (pk.error) return pk.error;
-        const kind: ProjectKind = pk.value ?? 'issue';
-        // chat（对话模式）项目跳过 work_branch 等 issue 专属项（分支/合并对纯对话无意义）
-        const workBranch = kind === 'chat' ? null : (wb.value ?? null);
+        const workBranch = wb.value ?? null;
 
         const warnings: string[] = [];
 
@@ -465,13 +572,37 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
           cwd = `${anchor === '/' ? '' : anchor}/${projectSlug(name)}`;
         }
 
-        // clone 先行：成功才落项目行（失败不留半截项目；目录残留由错误信息指认）
+        // Git 准备先行：成功才落项目行（失败不留半截项目；目录残留由错误信息指认）。
+        // clone 与空项目都必须先确保执行机有 Git；空项目显式建目录。
+        if (!driver) return json({ ok: false, error: '未接入执行机驱动，无法初始化 Git 仓库' }, 503);
         if (gitUrl) {
-          if (!driver) return json({ ok: false, error: '未接入执行机驱动，无法 clone' }, 503);
           if (cwd === '/') return json({ ok: false, error: 'clone 目标不能是根目录' }, 400);
-          const failed = await cloneInto(driver, gitUrl, cwd);
+          try {
+            await driver.ensureGitAvailable();
+          } catch (e) {
+            return json({ ok: false, error: String(e).slice(0, 500) }, 502);
+          }
+          const sshHome = isSshGitUrl(gitUrl) ? await executorUserHome(driver, ex) : null;
+          if (isSshGitUrl(gitUrl) && !sshHome) {
+            return json({ ok: false, error: `无法解析执行机用户 ${ex.sshUser || '(local)'} 的 Home，不能安全持久化 Git SSH 主机密钥` }, 502);
+          }
+          const failed = await cloneInto(driver, gitUrl, cwd, sshHome);
           if (failed) return failed;
+        } else {
+          if (cwd === '/') return json({ ok: false, error: '项目目录不能是根目录' }, 400);
+          try {
+            await driver.mkdirp(cwd);
+            await driver.ensureGitAvailable();
+          } catch (e) {
+            return json({ ok: false, error: `Git 仓库初始化失败：${String(e).slice(0, 400)}` }, 502);
+          }
         }
+        const gitFailure = await prepareProjectGit(
+          driver,
+          cwd,
+          buildFallbackIdentity({ runUser: ru.value, ownerUsername }),
+        );
+        if (gitFailure) return gitFailure;
 
         const row = db
           .query<
@@ -491,7 +622,7 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
             Date.now(),
             ru.value ?? '',
             workBranch,
-            kind,
+            'issue',
           );
         if (!row) return json({ ok: false, error: '创建失败' }, 500);
         const project = mapProject(row);
@@ -511,9 +642,14 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
           if (!deps.convs) warnings.push('未接入对话管理器，未建对话');
           else conversation = deps.convs.create(project.id, name.slice(0, 40), availableAgents[0]);
         }
+        if (deps.projectDataSync) {
+          try { await deps.projectDataSync.sync(project); }
+          catch (e) { warnings.push(`.panda 同步失败，已保留待重试：${String(e).slice(0, 160)}`); }
+        }
+        const syncedProject = getProject(db, project.id) ?? project;
         return json({
           ok: true,
-          project,
+          project: syncedProject,
           ...(gitUrl ? { cloned: true } : {}),
           ...(conversation ? { conversation } : {}),
           ...(warnings.length ? { warnings } : {}),
@@ -525,7 +661,7 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
        * 统一项目导入：
        * - tmux：执行机现查 session/cwd 后登记终端 attach 权限；
        * - claude/codex：执行机现扫 Agent 历史，以服务端候选核对 cwd，登记项目并批量绑定
-       *   kind=chat 的可恢复 conversations；项目类型由 kind 指定，默认 issue。
+       *   kind=chat 的可恢复 conversations；导入项目统一使用 Issue 看板。
        * 同执行机同 cwd 的活跃项目一律合并；会话标识重复时幂等，不复制历史或覆盖归属。
        */
       method: 'POST',
@@ -543,7 +679,6 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
         const b = await readBody(req);
         const pk = parseProjectKind(b);
         if (pk.error) return pk.error;
-        const importKind: ProjectKind = pk.value ?? 'issue';
         const source = parseImportSource(b.source);
         if (!source) {
           return json(apiError(
@@ -641,7 +776,8 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
                   403,
                 ), 403);
               }
-              return json({ ok: true, project, created: false });
+              await deps.projectDataSync?.sync(project).catch(() => {});
+              return json({ ok: true, project: getProject(db, project.id) ?? project, created: false });
             }
           }
         } else {
@@ -699,14 +835,18 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
 
         // 归属：默认自己；admin 可代建（与建项目同一纪律）
         let ownerUserId = u.id;
+        let ownerUsername = u.username;
         if (b.ownerUserId !== undefined) {
           if (u.role !== 'admin') {
             return json(apiError('auth.admin_required', 'Administrator access is required.', 403), 403);
           }
           const oid = Number(b.ownerUserId);
-          const owner = db.query<{ id: number }, [number]>('SELECT id FROM users WHERE id = ?').get(oid);
+          const owner = db
+            .query<{ id: number; username: string }, [number]>('SELECT id, username FROM users WHERE id = ?')
+            .get(oid);
           if (!owner) return json(apiError('user.not_found', 'The user does not exist.', 400), 400);
           ownerUserId = oid;
+          ownerUsername = owner.username;
         }
         // 越权面与建项目一致：普通用户只能导入自己 workspace 内的会话
         const myRoot = `${ex.workspaceRoot.replace(/\/+$/, '')}/u${ownerUserId}`;
@@ -755,7 +895,7 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
           const row = db
             .query<
               ProjectRowRaw,
-              [string, number, string, number, string | null, number, string, ProjectKind]
+              [string, number, string, number, string | null, number, string, string]
             >(
               `INSERT INTO projects
                  (name, executor_id, cwd, owner_user_id, goal, created_ts, run_user, kind)
@@ -769,7 +909,7 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
               str(b, 'goal')?.slice(0, 2000) ?? null,
               Date.now(),
               ru.value ?? '',
-              importKind,
+              'issue',
             );
           if (!row) {
             return json(apiError(
@@ -780,6 +920,16 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
           }
           project = mapProject(row);
           created = true;
+        }
+
+        // Git 身份预检（B-01）：并入既有项目时身份早已就位，只对本次新登记的项目做。
+        if (created) {
+          const identityWarning = await ensureImportedProjectGitIdentity(
+            driver,
+            project.cwd,
+            buildFallbackIdentity({ runUser: project.runUser, ownerUsername }),
+          );
+          if (identityWarning) warnings.push(identityWarning);
         }
 
         if (source === 'tmux') {
@@ -798,7 +948,11 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
               warnings.push(`属主自动订阅失败：${String(e).slice(0, 200)}`);
             }
           }
-          return json({ ok: true, project, created, ...(warnings.length ? { warnings } : {}) });
+          if (deps.projectDataSync) {
+            try { await deps.projectDataSync.sync(project); }
+            catch (e) { warnings.push(`.panda 同步失败，已保留待重试：${String(e).slice(0, 160)}`); }
+          }
+          return json({ ok: true, project: getProject(db, project.id) ?? project, created, ...(warnings.length ? { warnings } : {}) });
         }
 
         let historyResult;
@@ -827,9 +981,13 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
             warnings.push(`属主自动订阅失败：${String(e).slice(0, 200)}`);
           }
         }
+        if (deps.projectDataSync) {
+          try { await deps.projectDataSync.sync(project); }
+          catch (e) { warnings.push(`.panda 同步失败，已保留待重试：${String(e).slice(0, 160)}`); }
+        }
         return json({
           ok: true,
-          project,
+          project: getProject(db, project.id) ?? project,
           created,
           importedConversations: historyResult.importedIds.length,
           existingConversations: historyResult.existingIds.length,
@@ -841,11 +999,36 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
     },
     {
       method: 'GET',
-      path: '/api/projects/:projectId',
+      path: '/api/projects/:projectId/sync',
       auth: 'project-access',
       handler: ({ params }) => {
+        const project = getProject(db, Number(params.projectId));
+        if (!project) return json({ ok: false, error: '无此项目' }, 404);
+        if (!deps.projectDataSync) return json({ ok: false, error: '未接入项目同步' }, 503);
+        return json({ ok: true, status: deps.projectDataSync.status(project.id) });
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/projects/:projectId/sync',
+      auth: 'project-access',
+      handler: async ({ params }) => {
+        const project = getProject(db, Number(params.projectId));
+        if (!project) return json({ ok: false, error: '无此项目' }, 404);
+        if (!deps.projectDataSync) return json({ ok: false, error: '未接入项目同步' }, 503);
+        await deps.projectDataSync.sync(project).catch(() => {});
+        return json({ ok: true, status: deps.projectDataSync.status(project.id) });
+      },
+    },
+    {
+      method: 'GET',
+      path: '/api/projects/:projectId',
+      auth: 'project-access',
+      handler: async ({ params }) => {
         const p = getProject(db, Number(params.projectId));
-        return p ? json(p) : json({ ok: false, error: '无此项目' }, 404);
+        if (!p) return json({ ok: false, error: '无此项目' }, 404);
+        await deps.projectDataSync?.sync(p).catch(() => {});
+        return json(getProject(db, p.id) ?? p);
       },
     },
     {
@@ -1224,13 +1407,34 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
           sets.push('manual_review = ?');
           vals.push(b.manualReview ? 1 : 0);
         }
-        // 项目类型（009）：issue 看板 ↔ chat 对话模式
+        // 门禁命令（047 / #279）：数组 = 显式配置；null = 清回「未配置」（按 package.json 探测）。
+        // 空数组是「显式不跑门禁」，与 null 不同，必须原样落库。
+        if ('validationCommands' in b) {
+          if (b.validationCommands === null) {
+            sets.push('validation_commands_json = ?');
+            vals.push(null);
+          } else if (Array.isArray(b.validationCommands)) {
+            const commands: Array<{ label: string; argv: string[] }> = [];
+            for (const raw of b.validationCommands as unknown[]) {
+              if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+              const o = raw as Record<string, unknown>;
+              const argv = Array.isArray(o.argv)
+                ? o.argv.filter((a): a is string => typeof a === 'string' && a.trim().length > 0)
+                  .map((a) => a.trim()).slice(0, 20)
+                : [];
+              if (argv.length === 0) continue; // 空命令没有意义
+              const label = typeof o.label === 'string' && o.label.trim() ? o.label.trim() : argv[0]!;
+              commands.push({ label: label.slice(0, 60), argv });
+            }
+            sets.push('validation_commands_json = ?');
+            vals.push(JSON.stringify(commands.slice(0, 10)));
+          } else {
+            return json({ ok: false, error: 'validationCommands 必须是数组或 null' }, 400);
+          }
+        }
+        // 项目类型固定为 issue；仅保留显式 issue 供旧客户端兼容。
         const pk = parseProjectKind(b);
         if (pk.error) return pk.error;
-        if (pk.value !== undefined) {
-          sets.push('kind = ?');
-          vals.push(pk.value);
-        }
         if (!sets.length) return json({ ok: false, error: '没有可更新的字段' }, 400);
         db.query(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).run(...vals, id);
         return json({ ok: true, project: getProject(db, id) });

@@ -1,8 +1,8 @@
 /**
  * lib/runstream —— 把对话 ChatMessage[] 归约为「运行事件流」（执行页的展示模型）。
  * 纯函数、无副作用（可单测）：
- *  - tool_use ↔ tool_result 就近配对：优先同工具名的最早未配对项，退化取最早未配对项——
- *    与并行工具调用「结果按调用顺序返回」一致；
+ *  - tool_use ↔ tool_result 就近配对：有源协议调用 ID 时精确关联；旧记录无 ID 时，
+ *    优先同工具名的最早未配对项，最后退化取最早未配对项；
  *  - 派生状态 running（未见结果）/ ok / error（结果 isError）；
  *  - 耗时 = 结果行 ts − 调用行 ts（两端时间戳都在且非负时）；
  *  - 识别命令（Bash/shell）与异常（isError），供执行页选不同组件渲染。
@@ -17,7 +17,14 @@ export interface RunToolEvent {
   kind: 'tool' | 'command'; // command = Bash/shell（终端风渲染）
   seq: number; // tool_use 的 seq（孤儿结果用 tool_result 的 seq）
   off?: number; // 跨连接稳定渲染键（源行字节 offset）——合并去重后 seq 会撞，键走 off
+  /**
+   * 结果那条消息自己的 off（issue #288）。入参与结果来自**两条**消息，折叠成一个事件后
+   * 结果的 off 就没处放了；「查看完整内容」要按 off 分别回源，故单独留一格。
+   * 孤儿结果事件里 off 与 resultOff 同值。
+   */
+  resultOff?: number;
   tool: string; // 工具名
+  toolCallId?: string; // 源协议调用 ID（并行同名工具乱序返回时稳定关联）
   title?: string; // 人话标题（tool_use 带）
   input?: string; // 入参人话正文（路径/±diff/$命令）
   result?: string; // 配到的结果正文（未配到=undefined→运行中）
@@ -36,6 +43,8 @@ export interface RunMessageEvent {
   text: string;
   /** 用户消息附图的 cwd 相对路径（后端 ws/chat.ts 富化）；渲染成可点缩略图 → 灯箱预览 */
   images?: string[];
+  /** 用户消息附件（非图片）的 cwd 相对路径；渲染成可下载的文件 chip */
+  files?: string[];
   /** 消息行 ts：正文里的 UTC 时间点换算本地时间时当参照日（issue #116，见 lib/utctime） */
   ts?: number;
 }
@@ -50,9 +59,9 @@ export interface RunThinkingEvent {
 export type RunEvent = RunToolEvent | RunMessageEvent | RunThinkingEvent;
 
 /** tool 名是否为命令（Bash / codex shell）——大小写不敏感 */
-export function isCommandTool(tool: string | undefined): boolean {
+export function isCommandTool(tool: string | undefined, input?: string): boolean {
   const t = (tool ?? '').toLowerCase();
-  return t === 'bash' || t === 'shell';
+  return t === 'bash' || t === 'shell' || (/^(?:exec|exec_command)$/.test(t) && /^\s*\$\s+/.test(input ?? ''));
 }
 
 function durationOf(startTs: number | undefined, endTs: number | undefined): number | undefined {
@@ -61,9 +70,17 @@ function durationOf(startTs: number | undefined, endTs: number | undefined): num
   return d >= 0 ? d : undefined;
 }
 
-/** 取一个未配对的 tool_use 事件：优先同工具名最早项，否则最早项；取出即从队列移除 */
-function takeOpen(open: RunToolEvent[], tool: string | undefined): RunToolEvent | undefined {
+/** 取一个未配对的 tool_use 事件：优先调用 ID，再按工具名/FIFO 兼容旧记录；取出即移除 */
+function takeOpen(
+  open: RunToolEvent[],
+  toolCallId: string | undefined,
+  tool: string | undefined,
+): RunToolEvent | undefined {
   if (open.length === 0) return undefined;
+  if (toolCallId) {
+    const i = open.findIndex((e) => e.toolCallId === toolCallId);
+    if (i >= 0) return open.splice(i, 1)[0];
+  }
   if (tool) {
     const i = open.findIndex((e) => e.tool === tool);
     if (i >= 0) return open.splice(i, 1)[0];
@@ -86,14 +103,16 @@ export function toRunEvents(msgs: ChatMessage[]): RunEvent[] {
         role: m.role,
         text: m.text ?? '',
         ...(m.images && m.images.length ? { images: m.images } : {}),
+        ...(m.files && m.files.length ? { files: m.files } : {}),
         ...(m.ts !== undefined ? { ts: m.ts } : {}),
       });
     } else if (m.role === 'tool_use') {
       const ev: RunToolEvent = {
-        kind: isCommandTool(m.tool) ? 'command' : 'tool',
+        kind: isCommandTool(m.tool, m.input) ? 'command' : 'tool',
         seq: m.seq,
         off: m.off,
         tool: m.tool ?? 'tool',
+        ...(m.toolCallId !== undefined ? { toolCallId: m.toolCallId } : {}),
         ...(m.title !== undefined ? { title: m.title } : {}),
         ...(m.input !== undefined ? { input: m.input } : {}),
         status: 'running',
@@ -102,9 +121,10 @@ export function toRunEvents(msgs: ChatMessage[]): RunEvent[] {
       out.push(ev);
       open.push(ev);
     } else if (m.role === 'tool_result') {
-      const ev = takeOpen(open, m.tool);
+      const ev = takeOpen(open, m.toolCallId, m.tool);
       if (ev) {
         ev.result = m.result ?? '';
+        if (m.off !== undefined) ev.resultOff = m.off;
         ev.isError = Boolean(m.isError);
         ev.status = m.isError ? 'error' : 'ok';
         if (m.ts !== undefined) ev.endTs = m.ts;
@@ -116,6 +136,8 @@ export function toRunEvents(msgs: ChatMessage[]): RunEvent[] {
           seq: m.seq,
           off: m.off,
           tool: m.tool ?? 'tool',
+          ...(m.toolCallId !== undefined ? { toolCallId: m.toolCallId } : {}),
+          ...(m.off !== undefined ? { resultOff: m.off } : {}),
           result: m.result ?? '',
           isError: Boolean(m.isError),
           status: m.isError ? 'error' : 'ok',

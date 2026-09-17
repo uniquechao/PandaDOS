@@ -1,3 +1,4 @@
+import { SkillPolicyEditor } from './SkillPolicyEditor';
 /**
  * 项目模块管理面板（Modal，Board 头部「模块」入口）：
  * - 智能整理：手动触发（可选 claude/codex），执行代理在独立会话扫全部历史 issue + 代码库，
@@ -5,10 +6,14 @@
  *   （服务端按当前事实重校验 + 防重放），或「忽略本批」（localStorage 同批不再提示）。
  * - 模块列表：显示名 · slug · 代理 · 来源 · issue 数；行内改名（PATCH displayName）、
  *   归档（PATCH status=archived，有未完结 issue 时服务端会拒绝）。
+ * - 技能挂载（#277 / I-02）：每行可展开勾选该模块要挂哪些技能。未配置 = 沿用项目默认
+ *   （superpowers 一类重技能默认不挂，要在这里显式勾）；「恢复默认」= PATCH skills:null。
+ * - 推理档（#281 / I-04）：每行可选模块默认档（继承/low/medium/high）。codex 的
+ *   model_reasoning_effort 是进程启动参数，所以改了只对**之后启动的会话**生效。
  */
 import { useEffect, useState } from 'preact/hooks';
 import { api, ApiError } from '../lib/api';
-import type { AgentKind, Issue, ProjectModule } from '../lib/types';
+import type { AgentKind, Issue, ProjectModule, ReasoningEffort, SkillsList } from '../lib/types';
 import {
   actionKindMessage,
   actionMessage,
@@ -20,6 +25,7 @@ import {
   type OrganizeApplyResult,
   type OrganizeStatus,
 } from '../lib/organize';
+import { AgentLogo } from './AgentLogo';
 import { Modal } from './Modal';
 import { toast } from '../lib/toast';
 import { reconcileAgent } from './AgentPicker';
@@ -51,6 +57,9 @@ export function ModulesPanel({
   const [busy, setBusy] = useState(false);
   const [applying, setApplying] = useState<number | null>(null);
   const [err, setErr] = useState('');
+  // 技能挂载：可选技能清单（全局 + 项目，去重按名字）与「展开哪一行」
+  const [skills, setSkills] = useState<string[] | null>(null);
+  const [skillsFor, setSkillsFor] = useState<number | null>(null);
 
   const load = (): void => {
     api<{ modules: ProjectModule[] }>(`/api/projects/${pid}/modules`)
@@ -63,6 +72,11 @@ export function ModulesPanel({
       .then(setOrg)
       .catch(() => {});
   useEffect(load, [pid]);
+  useEffect(() => {
+    api<SkillsList>(`/api/projects/${pid}/skills`)
+      .then((r) => setSkills([...new Set([...r.global, ...r.project].map((s2) => s2.name))].sort()))
+      .catch(() => setSkills([])); // 取不到清单不挡面板其它功能
+  }, [pid]);
   useEffect(() => {
     const next = reconcileAgent(orgAgent, supportedAgents);
     if (next) setOrgAgent(next);
@@ -155,6 +169,21 @@ export function ModulesPanel({
     }
   };
 
+  /** 模块默认推理档：'' = 继承（清回未配置） */
+  const changeReasoning = async (m: ProjectModule, value: string): Promise<void> => {
+    const next = value === '' ? null : (value as ReasoningEffort);
+    if (busy || next === (m.reasoningEffort ?? null)) return;
+    setBusy(true);
+    try {
+      await api(`/api/projects/${pid}/modules/${m.id}`, 'PATCH', { reasoningEffort: next });
+      load();
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const changeAgent = async (m: ProjectModule, agent: AgentKind): Promise<void> => {
     if (busy || agent === m.agent) return;
     setBusy(true);
@@ -168,6 +197,29 @@ export function ModulesPanel({
     } finally {
       setBusy(false);
     }
+  };
+
+  /** 写模块技能配置：next=null 表示恢复「沿用项目默认」 */
+  const saveSkills = async (m: ProjectModule, next: string[] | null): Promise<void> => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await api(`/api/projects/${pid}/modules/${m.id}`, 'PATCH', { skills: next });
+      load();
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleSkill = (m: ProjectModule, name: string): void => {
+    const cur = m.skills ?? null;
+    // 未配置状态下第一次勾选：以「当前这一个」为准显式化，不去猜项目默认里有什么
+    const next = cur === null
+      ? [name]
+      : cur.includes(name) ? cur.filter((s2) => s2 !== name) : [...cur, name];
+    void saveSkills(m, next);
   };
 
   return (
@@ -216,7 +268,8 @@ export function ModulesPanel({
             <div class="org-hd">
               <span class="org-hd-t">{t('ui.organizePlan')}</span>
               <span class="org-hd-meta">
-                {sugg.agent} · {t('ui.awaitingActionCount', { pending: sugg.actions.filter((a) => !a.applied).length, total: sugg.actions.length })}
+                <AgentLogo agent={sugg.agent} size="xs" />
+                {t('ui.awaitingActionCount', { pending: sugg.actions.filter((a) => !a.applied).length, total: sugg.actions.length })}
               </span>
               {sugg.actions.some((a) => !a.applied) && (
                 <button class="org-ignore" disabled={applying !== null} onClick={ignore}>
@@ -299,10 +352,32 @@ export function ModulesPanel({
                         {!supportedAgents.includes(m.agent) && <option value={m.agent}>{m.agent} ({t('ui.unavailable')})</option>}
                         {supportedAgents.map((a) => <option key={a} value={a}>{a}</option>)}
                       </select>
+                      <select
+                        class="mrow-agent"
+                        value={m.reasoningEffort ?? ''}
+                        disabled={busy}
+                        title={t('ui.reasoningCodexOnly')}
+                        aria-label={`${m.displayName} · ${t('ui.reasoningEffort')}`}
+                        onChange={(e) => void changeReasoning(m, e.currentTarget.value)}
+                      >
+                        <option value="">{t('ui.reasoningEffort')}: {t('ui.reasoningInherit')}</option>
+                        {(['low', 'medium', 'high'] as const).map((v) => (
+                          <option key={v} value={v}>{t('ui.reasoningEffort')}: {v}</option>
+                        ))}
+                      </select>
                       <span class="badge b-gray mrow-count" title={t('ui.relatedIssueCount')}>
                         {t('ui.moduleIssueCount', { count: issueCount(m.id) })}
                       </span>
                       <span class="mrow-acts">
+                        <button
+                          class="mrow-act"
+                          disabled={busy}
+                          title={t('ui.moduleSkills')}
+                          onClick={() => setSkillsFor(skillsFor === m.id ? null : m.id)}
+                        >
+                          {t('ui.moduleSkills')}
+                          {m.skills ? ` · ${m.skills.length}` : ''}
+                        </button>
                         <button
                           class="mrow-act"
                           disabled={busy}
@@ -320,6 +395,7 @@ export function ModulesPanel({
                     </span>
                   </>
                 )}
+                {skillsFor === m.id && <SkillPolicyEditor pid={pid} moduleId={m.id} />}
               </div>
             ))}
           </div>

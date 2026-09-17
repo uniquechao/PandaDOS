@@ -32,7 +32,12 @@ import type { EngineIssue, IssueEngine } from '../../issues/engine';
 import type { KeyedMutex } from '../../issues/mutex';
 import type { ModuleStore } from '../../issues/modules';
 import type { SubscriptionStore } from '../../notify/router';
+import type { FeishuLoginConfigStore } from '../feishu-login-config';
+import { feishuLoginConfigRoutes } from './feishu-login-config';
+import { feishuMessagingRoutes } from './feishu-messaging';
+import type { FeishuMessaging } from '../feishu-messaging';
 import type { FeishuOauthPort } from '../feishu-oauth';
+import type { ProjectDataSyncStatus } from '../project-data-sync';
 import { authDepsFromDb, createDispatcher, type RouteDef } from '../middleware';
 import { adminRoutes } from './admin';
 import { authRoutes } from './auth';
@@ -111,6 +116,8 @@ export interface ApiDeps {
   sessions: SessionStore;
   /** 飞书 OAuth 客户端（未配置 app 凭据传 null → 扫码接口 503/按钮不显示） */
   feishuOauth: FeishuOauthPort | null;
+  feishuLoginConfig?: FeishuLoginConfigStore;
+  feishuMessaging?: FeishuMessaging;
   /** 对外基址（PANDA_PUBLIC_URL；缺省按请求 Host 推导 OAuth 回调地址） */
   publicUrl?: string | undefined;
   /** 通知钩子：建项目自动订阅属主（NotifyRouter 结构兼容） */
@@ -119,6 +126,7 @@ export interface ApiDeps {
   waitingInput?(issue: EngineIssue): boolean;
   /** 用户消息计数（013 user_message_counts）：目前给 issues 的澄清答复用；缺省不接 = 不统计 */
   messages?: MessageBumper;
+  projectDataSync?: { sync(project: Project): Promise<unknown>; status(projectId: number): ProjectDataSyncStatus };
   /** 在等人工输入的 issue id 集合（projects summary 把它们补进待确认角标）；缺省不补 */
   waitingIssueIds?(): Set<number>;
   /** 「Agent 认知总结/记忆」后台任务编排（core/summary-orchestrator；缺省 = claude/codex 模式 503） */
@@ -155,6 +163,7 @@ export function allRoutes(deps: ApiDeps): RouteDef[] {
       driverForProject: deps.driverForProject,
       fullDriverForProject: deps.driverForProject,
       summaryOrchestrator: deps.summaryOrchestrator,
+      projectDataSync: deps.projectDataSync,
       ...(deps.waitingIssueIds ? { waitingIssueIds: deps.waitingIssueIds } : {}),
     }),
     ...workflowsRoutes({ db: deps.db }),
@@ -185,7 +194,9 @@ export function allRoutes(deps: ApiDeps): RouteDef[] {
       db: deps.db,
       service: deps.designs.worktrees,
       onExecuted: async (run) => {
-        try { await deps.engine.scheduleNext(run.projectId); } catch { /* durable pending Issues retry on tick */ }
+        try {
+          await deps.engine.scheduleNext(run.projectId, { source: 'publication' });
+        } catch { /* durable pending Issues retry on tick */ }
       },
     }),
     ...designFilesRoutes({ store: deps.designs.store, service: deps.designs.files }),
@@ -245,8 +256,11 @@ export function allRoutes(deps: ApiDeps): RouteDef[] {
       driverForProject: deps.driverForProject,
       driverFor: deps.driverFor,
     }),
-    ...subscriptionsRoutes({ db: deps.db, users: deps.users, subs: deps.subs, feishu: deps.feishu }),
+    ...subscriptionsRoutes({ db: deps.db, users: deps.users, subs: deps.subs, get feishu() { return deps.feishu; } }),
+    ...(deps.feishuLoginConfig ? feishuLoginConfigRoutes(deps.feishuLoginConfig, () => deps.feishuMessaging?.refresh()) : []),
+    ...(deps.feishuMessaging ? feishuMessagingRoutes(deps.db, deps.feishuMessaging) : []),
     ...feishuOauthRoutes({
+      config: deps.feishuLoginConfig,
       db: deps.db,
       users: deps.users,
       sessions: deps.sessions,

@@ -108,8 +108,8 @@ export interface ExecutorDetection {
 /** 「Agent 认知总结」后台任务态（后端 007 迁移 summary_status） */
 export type SummaryStatus = 'idle' | 'running' | 'done' | 'error';
 
-/** 项目类型（后端 009 迁移）：'issue'=issue 看板；'chat'=纯对话模式 */
-export type ProjectKind = 'issue' | 'chat';
+/** 对话类型：Issue 引擎执行会话或项目级独立聊天会话。 */
+export type ConversationKind = 'issue' | 'chat';
 
 export interface Project {
   id: number;
@@ -139,8 +139,23 @@ export interface Project {
   summaryError: string | null;
   /** 开启后在计划与合并评审节点等待人工确认。 */
   manualReview: boolean;
-  /** 项目类型（009）：'issue'=issue 看板；'chat'=纯对话模式 */
-  kind: ProjectKind;
+  /** 门禁命令（#279）：null = 未配置，按 package.json 探测；空数组 = 显式不跑门禁 */
+  validationCommands?: ValidationCommand[] | null;
+  /** 项目统一使用 Issue 看板。 */
+  kind: 'issue';
+}
+
+export interface ProjectDataSyncStatus {
+  state: 'never' | 'syncing' | 'success' | 'warning' | 'error';
+  lastAttemptTs: number | null;
+  lastSuccessTs: number | null;
+  detectedUpdates: number;
+  imported: number;
+  archived: number;
+  unchanged: number;
+  conflicts: number;
+  parseErrors: number;
+  details: string[];
 }
 
 export type ExternalIssueProvider = 'github' | 'gitlab';
@@ -310,7 +325,7 @@ export interface Conversation {
   /** 驱动本对话的 CLI 代理（生命周期内不变） */
   agent: AgentKind;
   /** 'issue'=引擎绑定执行会话；'chat'=独立聊天对话 */
-  kind: ProjectKind;
+  kind: ConversationKind;
   /** 最近活跃时刻（毫秒；null=从未激活），列表按它倒序 */
   lastActiveTs: number | null;
   /** 本对话的弹窗自动批准档位（默认 cautious = 全部等人点） */
@@ -351,7 +366,15 @@ export type IssueStatus =
   | 'merging'
   | 'done'
   | 'blocked'
+  | 'paused'
   | 'cancelled';
+
+/**
+ * 「这条 issue 在等什么」（#275 / I-07）：由后端 issues/attention.ts 派生。
+ * 取值顺序即优先级，见那边的文件头；前端只负责呈现，不再各自拼状态判断。
+ */
+export type AttentionKind =
+  | 'none' | 'clarify' | 'choice' | 'review' | 'stalled' | 'verify' | 'blocked';
 
 /** EngineIssue（issues 路由返回的行） */
 export interface Issue {
@@ -361,6 +384,8 @@ export interface Issue {
   body: string | null;
   category: IssueCategory;
   status: IssueStatus;
+  /** 后端派生：这条 issue 在等什么（#275）；老接口/派生失败为 undefined 或 'none' */
+  attentionKind?: AttentionKind;
   convId: string | null;
   planJson: string | null;
   subtasksJson: string | null;
@@ -381,6 +406,7 @@ export interface Issue {
   module: string;
   moduleId?: number | null;
   implMode: ImplMode;
+  executionMode?: 'direct' | 'planned';
   agent: AgentKind;
   /** 置顶时刻（ms）；null = 未置顶。置顶的 pending 排队时优先调度（queue.pickNext 置顶层） */
   pinnedTs: number | null;
@@ -388,6 +414,8 @@ export interface Issue {
   clarifyFeedback: string | null;
   /** 收尾（done/blocked）时执行代理的执行结果总结（033 迁移）；null = 尚未总结或失败 */
   resultSummary: string | null;
+  /** v1 结构化完成报告；历史自由文本总结没有该字段时为 null。 */
+  completionReport: CompletionReport | null;
   /** waiting_input 派生标记：CC 弹窗在等人工选择（升级卡未处理/菜单滞留）。列表/详情接口下发 */
   waitingInput?: boolean;
   /** 派生标记：澄清问题还没被回答（跨状态——创建时问题开跑后仍为 true 直到回答）。列表/详情接口下发 */
@@ -396,6 +424,20 @@ export interface Issue {
   awaitingClarify?: boolean;
   /** 本 issue 执行时的弹窗自动批准档位（默认 medium = 分级判定） */
   autoApprove: AutoApproveLevel;
+}
+
+export interface CompletionReport {
+  version: 1;
+  outcome: 'complete' | 'partial' | 'blocked';
+  objective: string;
+  implementation: string[];
+  advantages: string[];
+  disadvantages: string[];
+  verification: string[];
+  completion: string;
+  unmetGoals: string[];
+  remainingWork: string[];
+  optionalFollowUps?: string[];
 }
 
 export interface ProjectModule {
@@ -407,6 +449,10 @@ export interface ProjectModule {
   source: 'auto' | 'manual' | 'legacy';
   status: 'active' | 'archived';
   conversationId: string | null;
+  /** 模块技能挂载（046）：缺省/null = 未配置，沿用项目默认；数组 = 显式指定 */
+  skills?: string[] | null;
+  /** 模块默认推理档（048）：null = 未配置，用控制面默认档 */
+  reasoningEffort?: ReasoningEffort | null;
   lastUsedTs: number | null;
 }
 
@@ -423,14 +469,71 @@ export interface IssueEvent {
   ts: number;
 }
 
-/** 同一模块共享 conversation 内的一次 issue 工作片段。 */
+/** 一个模块在某条 conversation 内的一次 issue 工作片段（#277 后一个模块可有多条 conv）。 */
 export interface ConversationSegment {
   id: string;
+  /** 这段挂在哪条会话上：与当前 issue 的 convId 不同 = 轮换之前的历史会话 */
+  convId: string;
   issueId: number;
   title: string;
   status: IssueStatus;
   startTs: number;
   endTs: number | null;
+}
+
+/** 门禁范围与最近一次结果（#279 / I-03；详情接口 validation 字段） */
+export interface ValidationScope {
+  kind: 'targeted' | 'full' | 'docs';
+  files: string[];
+  reason: string;
+}
+
+export interface ValidationResult {
+  outcome: 'passed' | 'failed' | 'skipped' | 'error';
+  scope: 'targeted' | 'full' | 'docs' | null;
+  label: string | null;
+  code: number | null;
+  timedOut: boolean;
+  durationMs: number | null;
+  ts: number;
+}
+
+export interface ValidationInfo {
+  scope: ValidationScope | null;
+  last: ValidationResult | null;
+}
+
+export interface ValidationCommand {
+  label: string;
+  argv: string[];
+}
+
+/** 待恢复意图（#283）：用户点过「继续运行」但项目忙，等接力自动恢复 */
+export interface UnblockRequest {
+  issueId: number;
+  guidance: string;
+  resumeState: IssueStatus | null;
+  actor: number | null;
+  ts: number;
+}
+
+/** 可拆回的智能合并（#289）：宿主由哪几条并来，以及此刻还能不能拆 */
+export interface MergedFromInfo {
+  members: Array<{ id: number; title: string }>;
+  /** 只有宿主仍未开跑（pending）时才允许拆回 */
+  canUnmerge: boolean;
+}
+
+/** 推理档（048 / #281）：codex 的 model_reasoning_effort，只在会话启动时定档 */
+export type ReasoningEffort = 'low' | 'medium' | 'high';
+
+export interface ReasoningInfo {
+  /** 生效档位 */
+  effort: ReasoningEffort;
+  /** 它来自哪一层 */
+  source: 'issue' | 'module' | 'default';
+  /** 本 issue 的覆盖值；null = 继承模块 */
+  override: ReasoningEffort | null;
 }
 
 export type GateKind = 'plan' | 'merge_review';
@@ -449,6 +552,7 @@ export interface Gate {
 export interface PlanGatePayload {
   subtasks?: string[];
   implMode?: ImplMode;
+  executionMode?: 'direct' | 'planned';
   decisionNote?: string;
 }
 
@@ -469,6 +573,16 @@ export interface IssueDetail {
   subtasks: Subtask[];
   gates: Gate[];
   conversationSegments: ConversationSegment[];
+  /** 本模块跨会话的整条时间线（#277）：换 conv 之后历史仍在，只是不在当前会话里 */
+  moduleSegments: ConversationSegment[];
+  /** 门禁范围与最近一次结果（#279）；旧后端可能没有这个字段 */
+  validation?: ValidationInfo;
+  /** 生效推理档与来源（#281）；旧后端可能没有这个字段 */
+  reasoning?: ReasoningInfo;
+  /** 待恢复意图（#283）；null = 没有排队 */
+  unblockRequest?: UnblockRequest | null;
+  /** 可拆回的合并（#289）；null = 不是合并来的，或快照不可用 */
+  mergedFrom?: MergedFromInfo | null;
   workflow: IssueWorkflowSnapshot | null;
   workflowRuntime: IssueWorkflowRuntime | null;
 }
@@ -487,7 +601,11 @@ export interface Subscription {
 
 // ---------- 上传 ----------
 
-/** POST /api/projects/:pid/upload 响应（rel 随 issue images 提交） */
+/**
+ * 上传响应（两个端点同形，故共用一个类型）：
+ * - POST /api/projects/:pid/upload —— 截图（≤5MB、仅图片白名单），rel 随 issue images 提交
+ * - POST /api/projects/:pid/upload/file —— 对话附件（≤20MB、类型不限），rel 随对话 text 帧 files 提交
+ */
 export interface UploadResult {
   ok: boolean;
   path: string;
@@ -716,6 +834,7 @@ export interface ChatMessage {
   role: 'assistant' | 'thinking' | 'tool_use' | 'tool_result' | 'user';
   text?: string;
   tool?: string; // 工具名（tool_result 也带：后端按 tool_use_id 回配）
+  toolCallId?: string; // 源协议调用 ID：并行同名工具乱序返回时用于精确回配
   title?: string; // tool_use 人话标题（如「✏️ 改 Login.tsx」）
   input?: string; // 工具入参（人话正文：路径/±diff/$命令）
   result?: string;
@@ -725,6 +844,8 @@ export interface ChatMessage {
   off?: number;
   /** 用户消息附图的 cwd 相对路径（对话里上传的截图）：后端 ws/chat.ts 发帧前富化，供缩略图/灯箱预览 */
   images?: string[];
+  /** 用户消息附件（非图片）的 cwd 相对路径：同样由后端发帧前富化，供文件 chip 展示/下载 */
+  files?: string[];
 }
 
 /** 菜单选择：sig 是菜单签名，select 帧带回；服务端判过期回 stale */
@@ -748,6 +869,14 @@ export type ChatServerFrame =
   // 向上翻页返回：更早的一页消息（前插）+ 是否还有更早
   | { type: 'history'; msgs: ChatMessage[]; hasMore: boolean }
   /**
+   * 单条消息的完整正文（issue #288「查看完整内容」）：气泡流里的 text/input/result 都是
+   * brief 头尾截断过的，点了才按 off 回源 jsonl 那一行重解析取全文。
+   * truncated=true 表示全文本身也超过服务端上限、只给到前 total 字里的一段（**只截尾**）。
+   */
+  | { type: 'detail'; off: number; content: string; truncated: boolean; total: number }
+  /** 取不到（off 越界 / 源行超上限 / 读盘失败）——前端显示「完整内容加载失败」 */
+  | { type: 'detail'; off: number; error: true }
+  /**
    * 菜单解读（issue #112）：点了「解释一下」才会来。
    * optionsSig = 菜单本体签名（options.join('|')，不含光标）——前端按它匹配当前菜单，
    * 光标挪一格不算换菜单，解读不该因此被丢掉。
@@ -760,13 +889,19 @@ export type ChatServerFrame =
 
 export type ChatClientFrame =
   // id = 本地乐观气泡的一次性标识（issue #116）：服务端把结局（ack/err）原样带回
-  | { type: 'text'; text: string; images?: string[]; id?: string }
+  | { type: 'text'; text: string; images?: string[]; files?: string[]; id?: string }
   | { type: 'key'; key: string }
   | { type: 'select'; index: number; sig: string }
   // 请求更早历史（向上翻页）
   | { type: 'history'; before?: number }
   // 请求解读当前菜单（issue #112「解释一下」，点了才生成）
-  | { type: 'explain'; sig: string };
+  | { type: 'explain'; sig: string }
+  /**
+   * 请求单条消息的完整正文（issue #288）。off = 该消息的稳定标识；
+   * role/tool 是本地已渲染出来的信息，捎给服务端当提示：role='user' 时剥掉附图提示，
+   * tool 给 tool_result 配回工具名（服务端单行解析配不回，配不回就剥不掉 codex exec 外壳）。
+   */
+  | { type: 'detail'; off: number; role?: ChatMessage['role']; tool?: string };
 
 // ---------- 项目工作流模板 ----------
 
@@ -947,6 +1082,7 @@ export const STATUS_LABEL: Record<IssueStatus, string> = {
   merge_review: '合并待确认',
   merging: '合并中',
   done: '完成',
+  paused: '已暂停',
   blocked: '受阻',
   cancelled: '已取消',
 };
@@ -969,7 +1105,7 @@ export const BOARD_COLUMNS: BoardColumn[] = [
   { key: 'doing', label: '进行中', statuses: ['planning', 'implementing', 'testing', 'merging'] },
   // clarifying 在等发起人回答澄清问题——归「待确认」，别装成还没开始
   { key: 'review', label: '待确认', statuses: ['clarifying', 'plan_review', 'merge_review'] },
-  { key: 'finished', label: '完成', statuses: ['done', 'blocked', 'cancelled'] },
+  { key: 'finished', label: '完成', statuses: ['done', 'blocked', 'paused', 'cancelled'] },
 ];
 
 // ---------- 技能 / 技能市场 ----------

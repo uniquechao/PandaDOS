@@ -1,3 +1,4 @@
+import { SkillPolicyEditor } from '../components/SkillPolicyEditor';
 /**
  * 技能页（v1 SkillsTab 平移 + v2 多用户语义）：
  * 子页「已装」：项目技能（可卸载）+ 全局技能（admin 可卸载）→ 点行看 SKILL.md；
@@ -5,7 +6,6 @@
  * 逐条实时上屏）+ 装到项目（属主）/ 装到全局（admin，落所有执行机）；
  * admin 另有「管理市场源」弹窗（增删源 + 单源同步）。
  */
-import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { api } from '../lib/api';
 import { timeAgo } from '../lib/fmt';
@@ -21,95 +21,29 @@ import type {
   SkillsList,
 } from '../lib/types';
 import { Loading } from '../components/Loaders';
+import { Markdown } from '../components/Markdown';
 import { Modal } from '../components/Modal';
 import { toast } from '../lib/toast';
 import { runtimeI18n, tr } from '../i18n/runtime';
 
-// ---------- 极简 markdown 渲染（v1 SkillMD 平移；全部走文本节点，无 innerHTML） ----------
+// ---------- SKILL.md 渲染 ----------
 
-function inline(text: string): (string | JSX.Element)[] {
-  // 切 `code` / **bold** / *italic* / [t](url)
-  const out: (string | JSX.Element)[] = [];
-  const re = /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*]+\*)|(\[[^\]]+\]\((?:https?:\/\/)[^)]+\))/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  let k = 0;
-  while ((m = re.exec(text)) !== null) {
-    if (m.index > last) out.push(text.slice(last, m.index));
-    const s = m[0];
-    if (s.startsWith('`')) out.push(<code key={k++}>{s.slice(1, -1)}</code>);
-    else if (s.startsWith('**')) out.push(<strong key={k++}>{s.slice(2, -2)}</strong>);
-    else if (s.startsWith('*')) out.push(<em key={k++}>{s.slice(1, -1)}</em>);
-    else {
-      const mm = s.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-      if (mm)
-        out.push(
-          <a key={k++} href={mm[2]} target="_blank" rel="noopener noreferrer">
-            {mm[1]}
-          </a>,
-        );
-      else out.push(s);
-    }
-    last = m.index + s.length;
-  }
-  if (last < text.length) out.push(text.slice(last));
-  return out;
+/**
+ * SKILL.md 正文。解析与渲染都复用对话气泡那一套（`lib/markdown` + `components/Markdown`，
+ * issue #298）——原先这里有一份只认标题/列表/代码块的极简实现，不支持表格，
+ * 两份 markdown 渲染器同时在跑迟早会跑偏。
+ * 这里只留技能页独有的两件事：跳过 frontmatter、挂 `.skmd` 皮肤类。
+ */
+export function SkillMD({ text }: { text: string }) {
+  return <Markdown className="skmd" text={stripFrontmatter(text)} />;
 }
 
-export function SkillMD({ text }: { text: string }) {
-  const blocks: JSX.Element[] = [];
+/** 去掉文件开头的 `---` frontmatter 块（技能元数据，不该显示给人看） */
+function stripFrontmatter(text: string): string {
   const lines = text.split(/\r?\n/);
-  let i = 0;
-  let k = 0;
-  // 跳过 frontmatter
-  if (lines[0]?.trim() === '---') {
-    let j = 1;
-    while (j < lines.length && lines[j]!.trim() !== '---') j++;
-    i = j + 1;
-  }
-  while (i < lines.length) {
-    const ln = lines[i]!;
-    if (ln.startsWith('```')) {
-      const buf: string[] = [];
-      i++;
-      while (i < lines.length && !lines[i]!.startsWith('```')) buf.push(lines[i++]!);
-      i++;
-      blocks.push(
-        <pre key={k++}>
-          <code>{buf.join('\n')}</code>
-        </pre>,
-      );
-      continue;
-    }
-    const h = ln.match(/^(#{1,3})\s+(.*)$/);
-    if (h) {
-      const t = inline(h[2]!);
-      blocks.push(h[1]!.length === 1 ? <h1 key={k++}>{t}</h1> : h[1]!.length === 2 ? <h2 key={k++}>{t}</h2> : <h3 key={k++}>{t}</h3>);
-      i++;
-      continue;
-    }
-    if (/^\s*[-*+]\s+/.test(ln)) {
-      const items: JSX.Element[] = [];
-      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i]!)) {
-        items.push(<li key={items.length}>{inline(lines[i]!.replace(/^\s*[-*+]\s+/, ''))}</li>);
-        i++;
-      }
-      blocks.push(<ul key={k++}>{items}</ul>);
-      continue;
-    }
-    if (ln.trim() === '') {
-      i++;
-      continue;
-    }
-    const buf: string[] = [ln];
-    i++;
-    while (i < lines.length && lines[i]!.trim() !== '' && !/^(#{1,3})\s|^```|^\s*[-*+]\s/.test(lines[i]!)) {
-      buf.push(lines[i]!);
-      i++;
-    }
-    blocks.push(<p key={k++}>{inline(buf.join(' '))}</p>);
-  }
-  return <div class="skmd">{blocks}</div>;
+  if (lines[0]?.trim() !== '---') return text;
+  const end = lines.findIndex((l, i) => i > 0 && l.trim() === '---');
+  return end < 0 ? text : lines.slice(end + 1).join('\n');
 }
 
 // ---------- 已装技能行 ----------
@@ -622,6 +556,7 @@ export function SkillsView({ pid, me }: { pid: number; me: Me }) {
         {err && <div class="err">{err}</div>}
       </div>
 
+      <SkillPolicyEditor pid={pid} />
       {sub === 'installed' ? (
         <div class="sklists">
           {list === null && !err && <Loading />}

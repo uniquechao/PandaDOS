@@ -49,6 +49,22 @@ export interface GitResult {
   err: string;
 }
 
+/**
+ * 门禁命令执行结果（#279 ValidationRunner）。
+ *
+ * 与 `GitResult` 一样**不抛错**：超时按 `timedOut: true` + 非零码返回，交调用方判断——
+ * 门禁跑挂是家常便饭，抛错只会让引擎多写一层 catch。
+ */
+export interface CommandResult {
+  code: number;
+  out: string;
+  err: string;
+  /** 到点被杀（out/err 可能只有半截，甚至为空） */
+  timedOut: boolean;
+  /** 实际耗时（ms），用来判断「值不值得定向验证」 */
+  durationMs: number;
+}
+
 /** Git blob 原始字节读取结果；非零退出不抛错，与 git() 契约一致。 */
 export interface GitBlobResult {
   code: number;
@@ -67,6 +83,19 @@ export interface PtyChannel {
 }
 
 export type TmuxScrollDirection = 'up' | 'down';
+
+/**
+ * command/login shell 可能先输出 banner 或提示；只从逐行输出中接受绝对路径，
+ * 避免把 alias、函数说明或相对命令当成可注入 tmux 的 Agent 命令。
+ */
+export function absoluteExecutableFromOutput(output: string): string | null {
+  const lines = output.split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const candidate = lines[index]!.trim();
+    if (candidate.startsWith('/') && !candidate.includes('\0')) return candidate;
+  }
+  return null;
+}
 
 // ---------- 接口 ----------
 
@@ -194,6 +223,9 @@ export interface ExecutorDriver {
 
   // ---- git（issue 分支流：checkout -b / diff / merge，确定性操作不交给 LLM）----
 
+  /** 确保执行机存在 Git；缺失时通过固定白名单包管理器自动安装，失败则抛出明确错误。 */
+  ensureGitAvailable(): Promise<void>;
+
   /** 在 cwd 下执行 git 子命令，返回退出码与输出（不抛错，交调用方判断 code）。 */
   git(cwd: string, args: string[]): Promise<GitResult>;
 
@@ -203,6 +235,20 @@ export interface ExecutorDriver {
    */
   readGitBlob(cwd: string, rev: string, path: string): Promise<GitBlobResult>;
 
+  // ---- 门禁执行（#279）----
+
+  /**
+   * 在 cwd 下执行一条**由控制面拼出**的命令，返回退出码与输出。
+   *
+   * **这不是通用 shell 入口**。它只服务一件事：把类型检查/单测/构建这类门禁从 Agent 会话里
+   * 挪出去跑（在会话里跑等于每轮询一次就是一次 200k 上下文的完整模型请求）。因此：
+   * - 参数是 **argv 数组、不经 shell 解释**：LocalDriver 直接 execFile，SshDriver 逐段 `shq`
+   *   后拼命令行——调用方永远不需要、也不许自己拼引号或塞 `&&` / 管道；
+   * - `argv[0]` 与其余参数必须来自控制面的白名单/项目配置，**不得由 Agent 输出或用户自由文本直接构成**；
+   * - 输出按 `MAX_COMMAND_OUTPUT_CHARS` 截断（保尾——报错都在末尾），超时不抛错、按 `timedOut` 返回。
+   */
+  runCommand(cwd: string, argv: string[], timeoutMs: number): Promise<CommandResult>;
+
   // ---- 终端流 ----
 
   /** 打开一个 PTY 跑 cmd（典型：`tmux attach -t xxx`），代理到网页 xterm。 */
@@ -210,6 +256,18 @@ export interface ExecutorDriver {
 }
 
 // ---------- 共享常量/纯函数（Local/Ssh 两实现共用，v1 injector 规则平移点）----------
+
+/** 门禁输出的单流上限（stdout / stderr 各自 64KB）——注入前还会再裁一次，这里只挡住内存 */
+export const MAX_COMMAND_OUTPUT_CHARS = 64 * 1024;
+
+/**
+ * 输出截断：**保尾不保头**。门禁的有用信息全在末尾（失败清单、错误栈、summary），
+ * 与 prompt 那边的 `midTruncate`（保头保尾）刻意不同口径。
+ */
+export function truncateCommandOutput(s: string, limit = MAX_COMMAND_OUTPUT_CHARS): string {
+  if (s.length <= limit) return s;
+  return `…[前 ${s.length - limit} 字省略]…\n${s.slice(-limit)}`;
+}
 
 /**
  * sendKey 白名单——**单一来源**（I6 收敛）：v1 injector.ts 21 键（评审裁定「别删减」，
@@ -230,6 +288,57 @@ export const KEY_WHITELIST: ReadonlySet<string> = new Set([
  */
 export const DEFAULT_TMUX_TIMEOUT_MS = 10_000;
 export const DEFAULT_GIT_TIMEOUT_MS = 60_000;
+/** 系统包管理器安装 Git 可能需要刷新索引，单独给出比普通 Git 命令更宽的上限。 */
+export const DEFAULT_GIT_INSTALL_TIMEOUT_MS = 5 * 60_000;
+
+/**
+ * 受限的 Git 就绪脚本：只探测 Git 与固定白名单包管理器，不接受调用方参数。
+ * brew 按当前用户安装；系统包管理器仅允许 root 或免密 sudo，绝不触发交互式密码提示。
+ */
+export const ENSURE_GIT_SCRIPT = `set -eu
+if command -v git >/dev/null 2>&1; then exit 0; fi
+if command -v brew >/dev/null 2>&1; then
+  brew install git
+elif command -v apt-get >/dev/null 2>&1; then manager=apt-get
+elif command -v dnf >/dev/null 2>&1; then manager=dnf
+elif command -v yum >/dev/null 2>&1; then manager=yum
+elif command -v apk >/dev/null 2>&1; then manager=apk
+elif command -v pacman >/dev/null 2>&1; then manager=pacman
+else
+  echo PANDA_GIT_NO_MANAGER >&2
+  exit 127
+fi
+if [ "\${manager:-}" ]; then
+  if [ "$(id -u)" = 0 ]; then prefix=
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then prefix='sudo -n'
+  else
+    echo PANDA_GIT_NO_PRIVILEGE >&2
+    exit 126
+  fi
+  case "$manager" in
+    apt-get) $prefix apt-get update && $prefix apt-get install -y git ;;
+    dnf) $prefix dnf install -y git ;;
+    yum) $prefix yum install -y git ;;
+    apk) $prefix apk add --no-cache git ;;
+    pacman) $prefix pacman -Sy --noconfirm git ;;
+  esac
+fi
+command -v git >/dev/null 2>&1 || { echo PANDA_GIT_INSTALL_INCOMPLETE >&2; exit 125; }`;
+
+/** 把脚本的机器标记收敛成可直接呈现的稳定错误。 */
+export function gitAvailabilityError(result: GitResult): Error {
+  const detail = (result.err || result.out).trim().slice(-400);
+  if (detail.includes('PANDA_GIT_NO_MANAGER')) {
+    return new Error('Git 未安装，且未找到受支持的包管理器（brew/apt-get/dnf/yum/apk/pacman）');
+  }
+  if (detail.includes('PANDA_GIT_NO_PRIVILEGE')) {
+    return new Error('Git 未安装，当前执行机用户既不是 root，也没有免密 sudo 安装权限');
+  }
+  if (detail.includes('PANDA_GIT_INSTALL_INCOMPLETE')) {
+    return new Error('Git 安装命令已执行，但安装后仍无法找到 git');
+  }
+  return new Error(`Git 自动安装失败${detail ? `：${detail}` : ''}`);
+}
 
 /** 会话窗口的标称尺寸（I6）：够 CC 把长菜单整块画在一屏里 */
 export const TMUX_WIN_COLS = 220;
@@ -251,11 +360,26 @@ export const MAX_TMUX_SCROLL_LINES = 100;
  * 「整个菜单都看不见」（52×18 实测复现）。
  * 故建会话时把 window-size 锁成 manual 并显式 resize 一次；终端页开/关时再临时交还、
  * 收回（见 ExecutorDriver.resizeWindow 与 web/ws/term）。
+ *
+ * 另外必须 `alternate-screen off`（终端回滚失效的根因）：
+ * claude CLI 的 TUI 跑在**备用屏**里（实测 `#{alternate_on}`=1），而 tmux 对备用屏
+ * **不保留任何 scrollback**（同批实测 `#{history_size}` 恒为 0）。于是 scrollPane 的
+ * `copy-mode -e` + `scroll-up` 执行成功却什么都滚不动——网页端两个上翻按钮、滚轮、
+ * 触屏上滑全部「点了没反应」。codex 不用备用屏（alt=0，history_size 实测 35/1117/1913），
+ * 所以只有 claude 会话中招。
+ *
+ * 关掉备用屏后 tmux 忽略 smcup/rmcup，TUI 直接画在主屏上，顶出去的行照常进历史：
+ * 隔离会话实测 claude 正常启动（alt=0），窗口缩小触发溢出后 history_size 由 1 涨到 32，
+ * `capture-pane -S -30` 能读回启动横幅等真实内容（不是重绘垃圾）。
+ * 对 codex 是 no-op（它本来就 alt=0），故不影响既有行为。
+ * history-limit 保持默认 2000 不动：本改动会让 claude 会话新产生历史，2000 行封顶
+ * 正好把内存增量约束住。
  */
 export function tmuxNewSessionArgs(name: string, cwd: string): string[] {
   return [
     'new-session', '-d', '-s', name, '-c', cwd, '-x', String(TMUX_WIN_COLS), '-y', String(TMUX_WIN_ROWS),
     ';', 'set-window-option', '-t', name, 'window-size', 'manual',
+    ';', 'set-window-option', '-t', name, 'alternate-screen', 'off',
     ';', 'resize-window', '-t', name, '-x', String(TMUX_WIN_COLS), '-y', String(TMUX_WIN_ROWS),
   ];
 }
@@ -309,12 +433,101 @@ export function assertRemovablePath(path: string): string {
   return p;
 }
 
-/**
- * 注入文本与回车之间的间隔毫秒。codex TUI（0.144 实测）有 paste-burst 检测：
- * 紧跟大段注入的 Enter 被并入粘贴当作换行，消息滞留输入框永不提交。停一拍让
- * 突发窗口关闭后再回车；CC 无此问题但延迟无害，两 Driver 统一行为。
- */
+/** 注入后开始观察 pane 稳定前的最短等待；保留原 300ms paste-burst 下限。 */
 export const INJECT_ENTER_DELAY_MS = 300;
+
+/** pane 稳定探测与提交确认的共享时序（Local/Ssh 必须同源）。 */
+export const INJECT_PANE_POLL_MS = 100;
+export const INJECT_STABLE_SAMPLES = 2;
+export const INJECT_STABLE_MAX_POLLS = 20;
+export const INJECT_SUBMIT_MAX_POLLS = 10;
+
+export interface StableSubmitOps {
+  capturePane(): Promise<string>;
+  sendText(): Promise<void>;
+  sendEnter(): Promise<void>;
+  sleep(ms: number): Promise<void>;
+  /** 已净化并实际注入的文本；用于识别 Codex composer 仍持有输入的场景。 */
+  inputText?: string;
+}
+
+/**
+ * capture-pane 不带转义序列；这里只折叠空白，让 codex 把被吞的 Enter 当换行时仍能
+ * 判断为“输入画面没有真正离开 composer”。精确指纹优先；若布局或状态变化，则继续检查最后一个 composer 是否仍持有输入。
+ */
+export function injectionPaneFingerprint(pane: string): string {
+  return pane.replace(/[\x00-\x1f\x7f\s]+/g, ' ').trim();
+}
+/** Codex 最后一个 composer 仍包含注入文本时，说明 Enter 尚未真正提交。 */
+
+export function codexComposerContainsInput(pane: string, inputText: string): boolean {
+  const matches = [...pane.matchAll(/^\s*›(?:\s|$)/gmu)];
+  const lastComposer = matches.at(-1);
+  if (!lastComposer || lastComposer.index === undefined) return false;
+  const compact = (value: string): string => value.replace(/[\x00-\x20\x7f\s]+/g, '');
+  const input = compact(inputText);
+  if (!input) return false;
+  return compact(pane.slice(lastComposer.index)).includes(input.slice(-160));
+}
+
+async function captureForSubmit(capturePane: () => Promise<string>): Promise<string | null> {
+  try {
+    return await capturePane();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 注入文本后等待 TUI 真正消费并稳定，再发 Enter。若提交后的 pane 在完整观察窗内
+ * 始终与提交前等价（包括只多了被吞掉的换行），仅补交一次 Enter；任何可见响应、
+ * 菜单或状态变化都会立即停止，避免重复提交。抓屏不可用时安全退化为 300ms + 单 Enter。
+ */
+export async function sendTextWithStableSubmit(ops: StableSubmitOps): Promise<void> {
+  const initial = await captureForSubmit(ops.capturePane);
+  const initialFingerprint = initial === null ? null : injectionPaneFingerprint(initial);
+  await ops.sendText();
+  await ops.sleep(INJECT_ENTER_DELAY_MS);
+
+  let typedPane: string | null = null;
+  let typedFingerprint: string | null = null;
+  let stableSamples = 0;
+  for (let poll = 0; poll < INJECT_STABLE_MAX_POLLS; poll++) {
+    const current = await captureForSubmit(ops.capturePane);
+    if (current === null) break;
+    const fingerprint = injectionPaneFingerprint(current);
+    if (initialFingerprint !== null && fingerprint === initialFingerprint) {
+      stableSamples = 0; // TUI 还没把注入文本消费到画面上，继续等。
+    } else if (fingerprint === typedFingerprint) {
+      stableSamples++;
+    } else {
+      stableSamples = 0;
+    }
+    typedPane = current;
+    typedFingerprint = fingerprint;
+    if (stableSamples >= INJECT_STABLE_SAMPLES) break;
+    await ops.sleep(INJECT_PANE_POLL_MS);
+  }
+
+  await ops.sendEnter();
+  if (
+    initialFingerprint === null ||
+    typedPane === null ||
+    typedFingerprint === null ||
+    typedFingerprint === initialFingerprint
+  ) return;
+
+  for (let poll = 0; poll < INJECT_SUBMIT_MAX_POLLS; poll++) {
+    await ops.sleep(INJECT_PANE_POLL_MS);
+    const current = await captureForSubmit(ops.capturePane);
+    if (current === null) return;
+    if (
+      injectionPaneFingerprint(current) !== typedFingerprint &&
+      !(ops.inputText && codexComposerContainsInput(current, ops.inputText))
+    ) return;
+  }
+  await ops.sendEnter();
+}
 
 /**
  * 注入净化 = v1 injector.ts:27 逐字语义：`/[\x00-\x1f\x7f]/g → " "` 后截断 2000。

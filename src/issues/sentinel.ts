@@ -7,6 +7,7 @@
  *   TESTS_FAILED:<issueId> 原因       —— testing 阶段测试未通过（回退 implementing）
  *   ISSUE_BLOCKED:<issueId> 原因      —— 卡住，转 blocked
  *   SUBTASKS_BEGIN / SUBTASKS_END     —— planning 阶段子任务块（各自独占一行）
+ *   REPORT_BEGIN / REPORT_END         —— 收尾时随最后一次 STAGE_DONE 一并带出的结构化完成报告
  *
  * 一次还清 v1 三笔债：
  * 1. **整行匹配**（行 trim 后必须整行等于哨兵，子串出现=拒）——v1 子串匹配是事故源；
@@ -15,6 +16,7 @@
  *    tool_result / user 回显（grep 旧 prompt、cat 日志）永远进不来。
  */
 import type { ChatMessage } from '../core/jsonl';
+import { parseCompletionReportJson, type CompletionReport } from './completion-report';
 
 /** 哨兵覆盖的阶段（planning 的产物是 SUBTASKS 块，不用 STAGE_DONE） */
 export type SentinelStage = 'implementing' | 'testing';
@@ -35,6 +37,8 @@ export const MAX_CLARIFY_QUESTIONS = 10;
 const MAX_CLARIFY_QUESTION_CHARS = 1000;
 /** 澄清原文留档上限（extractClarifyText；存进 clarify_questions 事件供 UI 完整展示） */
 export const MAX_CLARIFY_TEXT_CHARS = 4000;
+/** 受阻原因留存上限（三段式「在做什么｜卡在哪｜要我做什么」，见 shared/blocked.ts） */
+export const MAX_BLOCKED_NOTE_CHARS = 400;
 /** 行首编号/列表符（数字点、括号数字、-*• 项）——只把「列成清单的行」当问题，散文不算 */
 const CLARIFY_ITEM_RE = /^(?:[-*•]|\d+[.)、]|\(\d+\))\s*(.+)$/;
 /** 「无/没有/none/n\/a」类占位（代理表示无需澄清时可能留一行）——跳过 */
@@ -79,11 +83,17 @@ export function findTestsFailed(assistantText: string, issueId: number): { note:
   return null;
 }
 
-/** ISSUE_BLOCKED:<id> 原因，id 不符=拒 */
+/**
+ * ISSUE_BLOCKED:<id> 原因，id 不符=拒。
+ *
+ * 上限 400（#301 由 200 提上来）：原因改成「在做什么｜卡在哪｜要我做什么」三段式后，
+ * 200 字会把最要紧的第三段截掉——用户看到的正好是「不知道要我做什么」。
+ * prompt 里仍要求代理写在 200 字内，400 只是留够余量不吞字。
+ */
 export function findBlocked(assistantText: string, issueId: number): { note: string } | null {
   for (const l of lines(assistantText)) {
     const m = l.match(ISSUE_BLOCKED_RE);
-    if (m && Number(m[1]) === issueId) return { note: (m[2] || '').trim().slice(0, 200) };
+    if (m && Number(m[1]) === issueId) return { note: (m[2] || '').trim().slice(0, MAX_BLOCKED_NOTE_CHARS) };
   }
   return null;
 }
@@ -182,6 +192,43 @@ export function parseSubtasksBlock(assistantText: string): string[] | null {
     .slice(0, 40)
     .map((t) => t.slice(0, 500));
   return items.length ? items : null;
+}
+
+/** 完成报告块的体量上限（实测一份报告约 6~8KB；给足余量又不至于把整屏日志当 JSON 解） */
+const MAX_REPORT_CHARS = 32 * 1024;
+
+/**
+ * 解析随最后一次 `STAGE_DONE:<id>:testing` 一并带出的结构化完成报告（#275 / I-05）。
+ *
+ * 为什么要有它：原来这份报告只能靠收尾时**另起一轮满窗注入**让代理写文件才拿得到，
+ * 而那一轮正好落在全程上下文最高点（实测 218k），只为一段摘要加一个 report.json。
+ * 改成让代理在最后一步顺手把 JSON 内联吐出来——零额外工具调用、零额外注入。
+ *
+ * 与 SUBTASKS 块同款纪律：**两个标记各自独占一行**（trim 后整行相等），只认 assistant 文本。
+ * 非法（缺标记 / JSON 坏 / schema 不符 / 超长）一律返回 null 由调用方忽略——报告是锦上添花，
+ * 缺了走确定性拼装即可，绝不能因为它把收尾流程搞失败。
+ */
+export function parseCompletionReportBlock(assistantText: string): CompletionReport | null {
+  const ls = assistantText.split('\n');
+  let begin = -1;
+  for (let i = 0; i < ls.length; i++) {
+    if (ls[i]!.trim() === 'REPORT_BEGIN') {
+      begin = i; // 取第一个 BEGIN
+      break;
+    }
+  }
+  if (begin < 0) return null;
+  let end = -1;
+  for (let i = begin + 1; i < ls.length; i++) {
+    if (ls[i]!.trim() === 'REPORT_END') {
+      end = i;
+      break;
+    }
+  }
+  if (end < 0) return null;
+  const raw = ls.slice(begin + 1, end).join('\n').trim();
+  if (!raw || raw.length > MAX_REPORT_CHARS) return null;
+  return parseCompletionReportJson(raw);
 }
 
 /**

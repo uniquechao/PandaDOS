@@ -9,6 +9,7 @@ import {
   ApprovalRegistry,
   AUTOPILOT_APPROVAL_SYS,
   decideApproval,
+  decideTextApproval,
   EXPLAIN_MENU_WEB_SYS,
   EXPLAIN_SELECTION_SYS,
   explainMenuForHuman,
@@ -18,6 +19,7 @@ import {
   MULTI_SELECT_RE,
   TRUST_RE,
   TRUST_YES_RE,
+  textApprovalCandidate,
 } from './approval';
 import { isDangerousMenu, isNeverPick, pickRecommended, pickSafeAffirmative } from './approval-policy';
 
@@ -36,13 +38,46 @@ class MockLlm implements LlmClient {
 
 const plainMenu = { context: 'Bash command: bun test — Do you want to proceed?', options: ['Yes', 'No'] };
 
+describe('纯文本执行确认分级', () => {
+  const pane = [
+    '请选择执行方式：',
+    '1. 子代理分任务实施',
+    '2. 当前会话直接实施',
+    '回复 `2` 我就立即开始。',
+  ].join('\n');
+
+  test('候选门禁只接明确要求回复的尾部提问', () => {
+    expect(textApprovalCandidate(pane)).toContain('当前会话直接实施');
+    expect(textApprovalCandidate('正在读取代码并运行测试')).toBeNull();
+  });
+
+  test('管家明确判为安全继续时返回短回复', async () => {
+    const llm = new MockLlm(['{"action":"reply","reply":"2","reason":"继续既定计划"}']);
+    await expect(decideTextApproval(llm, { pane, goal: '尽快更新服务' })).resolves.toEqual({
+      action: 'reply', reply: '2', reason: '继续既定计划',
+    });
+  });
+
+  test('业务取舍、模型失败或多行回复一律保留给人工', async () => {
+    const hold = await decideTextApproval(
+      new MockLlm(['{"action":"hold","reason":"属于架构选择"}']),
+      { pane },
+    );
+    expect(hold).toEqual({ action: 'hold', reason: '属于架构选择' });
+    expect((await decideTextApproval(new MockLlm([new Error('down')]), { pane })).action).toBe('hold');
+    expect((await decideTextApproval(
+      new MockLlm(['{"action":"reply","reply":"2\\nrm -rf /","reason":"坏回复"}']),
+      { pane },
+    )).action).toBe('hold');
+  });
+});
+
 describe('审批分级矩阵', () => {
   test('① 多选表单 → 无条件升级人工，LLM 不被调用', async () => {
     const llm = new MockLlm();
     const cases = [
       { context: 'Select files [x] a.ts [ ] b.ts', options: ['a', 'b'] },
       { context: 'Press space to toggle selection', options: ['x', 'y'] },
-      { context: 'Fill the form and Submit', options: ['ok'] },
       { context: 'choose', options: ['[ ] 选项一', '继续'] }, // 选项以 [ 开头
     ];
     for (const menu of cases) {
@@ -451,19 +486,18 @@ describe('自动批准档位（issue #108）', () => {
     expect(llm.calls.length).toBe(0);
   });
 
-  test('全自动档：普通弹窗本地直接放行（选「Yes」而非 don\'t ask again），LLM 不被调用', async () => {
-    const llm = new MockLlm(['{"action":"escalate","reason":"应该转人工"}']);
+  test('全自动档：普通弹窗由管家按语义放行（选「Yes」而非 don\'t ask again）', async () => {
+    const llm = new MockLlm(Array(4).fill('{"action":"approve","option":1,"reason":"安全可推进"}'));
     for (const cmd of ['bun test', 'git commit -m "fix"', 'git push origin feat/x', 'bun add zod']) {
       const r = await decideApproval(llm, bash(cmd), {}, 'auto');
       expect(r.action).toBe('approve');
       expect(r.rule).toBe('auto_affirm');
       expect(r.action === 'approve' && r.optionIndex).toBe(0);
     }
-    expect(llm.calls.length).toBe(0);
+    expect(llm.calls.length).toBe(4);
   });
 
-  test('全自动档红线：危险不可逆仍转人工（rule auto_danger）', async () => {
-    const llm = new MockLlm();
+  test('全自动档：管家识别危险不可逆并转人工（rule auto_danger）', async () => {
     const danger = [
       'rm -rf node_modules',
       'git push --force origin main',
@@ -472,6 +506,7 @@ describe('自动批准档位（issue #108）', () => {
       'systemctl restart panda',
       './deploy.sh prod',
     ];
+    const llm = new MockLlm(Array(danger.length + 1).fill('{"action":"escalate","reason":"不可逆操作"}'));
     for (const cmd of danger) {
       const r = await decideApproval(llm, bash(cmd), {}, 'auto');
       expect(r.action).toBe('escalate');
@@ -485,13 +520,52 @@ describe('自动批准档位（issue #108）', () => {
       'auto',
     );
     expect(env.rule).toBe('auto_danger');
-    expect(llm.calls.length).toBe(0);
+    expect(llm.calls.length).toBe(danger.length + 1);
+  });
+
+  test('全自动档：临时目录清理、production build 与正文 submit 不再被关键词拦截', async () => {
+    const llm = new MockLlm(Array(4).fill('{"action":"approve","option":1,"reason":"安全且在范围内"}'));
+    for (const cmd of [
+      'rm -rf /tmp/panda-build',
+      'rm -f .panda/tmp/result/34/stale',
+      'bun run production build',
+      'bun test submit-handler.test.ts',
+    ]) {
+      const r = await decideApproval(llm, bash(cmd), {}, 'auto');
+      expect(r.action).toBe('approve');
+      expect(r.rule).toBe('auto_affirm');
+    }
+  });
+
+  test('全自动档：管家不可用时只豁免简单临时目录清理，其他删除继续转人工', async () => {
+    const down = () => new MockLlm([new Error('down')]);
+    for (const cmd of ['rm -rf /tmp/panda-build', 'rm -f .panda/tmp/cache/file']) {
+      const r = await decideApproval(down(), bash(cmd), {}, 'auto');
+      expect(r.action).toBe('approve');
+      expect(r.rule).toBe('auto_affirm');
+    }
+    for (const cmd of ['rm -rf src', 'rm -rf /tmp/cache /etc/panda', 'rm -rf /tmp/cache && deploy']) {
+      const r = await decideApproval(down(), bash(cmd), {}, 'auto');
+      expect(r.action).toBe('escalate');
+      expect(r.rule).toBe('auto_danger');
+    }
   });
 
   test('全自动档：无明确同意项（选择题）→ 交人工，绝不退化到第 0 项', async () => {
     const r = await decideApproval(new MockLlm(), { context: '选一个实现方案', options: ['方案 A', '方案 B'] }, {}, 'auto');
     expect(r.action).toBe('escalate');
-    expect(r.rule).toBe('auto_affirm');
+    expect(r.rule).toBe('auto_danger');
+  });
+
+  test('全自动档：即使管家误选永久授权项也拒绝注入', async () => {
+    const r = await decideApproval(
+      new MockLlm(['{"action":"approve","option":2,"reason":"误选"}']),
+      bash('bun test'),
+      {},
+      'auto',
+    );
+    expect(r.action).toBe('escalate');
+    expect(r.rule).toBe('auto_danger');
   });
 
   test('多选表单：三档都在第 1 层转人工（档位不越过铁律）', async () => {
@@ -504,19 +578,19 @@ describe('自动批准档位（issue #108）', () => {
 });
 
 describe('prompt/正则快照（v1 逐字平移，改一个字都要 diff 可见）', () => {
-  test('AUTOPILOT_APPROVAL_SYS 逐字（v2 放宽：普通 git push 自动批；删除/部署/生产配置仍升级）', () => {
+  test('AUTOPILOT_APPROVAL_SYS 明确按完整语义分级及临时目录例外', () => {
     expect(AUTOPILOT_APPROVAL_SYS).toBe(`# 任务：autopilot 智能分级批复
 Claude Code 弹出了一个选择/审批菜单。替主人判断：自动批准并选某项，还是升级给主人人工决定。只输出 JSON：
 {"action":"approve"|"escalate","option":选项编号(从1起,approve时必填),"reason":"≤20字中文理由"}
 
 # 规则（拿不准一律 escalate）
-- approve（安全·可逆·在任务范围内）：读文件/浏览、跑测试或只读命令、普通代码编辑、新建文件/目录、git add/commit/普通 push（非 force、不改历史）、装任务明确需要的依赖、确认计划继续。选最能推进【当前任务】的那项。
-- escalate（危险·不可逆·超范围）：删文件/数据(rm/drop/truncate)、git reset --hard / force push / 改历史、部署/发布/上线、改生产配置或密钥、对外改外部状态（普通 git push 除外）、关机/重启、与当前任务无关的操作、任何看不懂或拿不准的。
+- approve（安全·可逆·在任务范围内）：读文件/浏览、跑测试或 production build、普通代码编辑、新建文件/目录、清理 /tmp 或项目 .panda/tmp 内临时文件、git add/commit/普通 push（非 force、不改历史）、装任务明确需要的依赖、确认计划继续。按完整语义判断，不得因命令正文恰含 submit、production 等单词升级。选最能推进【当前任务】的那项。
+- escalate（危险·不可逆·超范围）：删除非临时文件或数据(drop/truncate)、git reset --hard / force push / 改历史、实际部署/发布/上线、改生产配置或密钥、对外改外部状态（普通 git push 除外）、关机/重启、与当前任务无关的操作、任何看不懂或拿不准的。
 - 宁可 escalate，也别误批。`);
 
-    // 关键词兜底：放宽只涉及普通 push；危险类关键字一个不能少
+    // 管家语义契约：明确临时目录例外，同时保留不可逆操作边界
     expect(AUTOPILOT_APPROVAL_SYS).toContain('git add/commit/普通 push');
-    for (const kw of ['rm/drop/truncate', 'force push', '部署/发布/上线', '改生产配置或密钥']) {
+    for (const kw of ['.panda/tmp', 'force push', '实际部署/发布/上线', '改生产配置或密钥']) {
       expect(AUTOPILOT_APPROVAL_SYS).toContain(kw);
     }
   });
@@ -528,7 +602,7 @@ Claude Code 弹出了一个选择/审批菜单。替主人判断：自动批准�
   });
 
   test('硬性正则逐字（v1 agent.ts:627/632-633）', () => {
-    expect(MULTI_SELECT_RE.source).toBe(/\[[ x✔✓]\]|[☒☐]|\bsubmit\b|space to (toggle|select)/i.source);
+    expect(MULTI_SELECT_RE.source).toBe(/\[[ x✔✓]\]|[☒☐]|space to (toggle|select)/i.source);
     expect(MULTI_SELECT_RE.flags).toBe('i');
     expect(TRUST_RE.source).toBe(/trust|信任/.source);
     expect(TRUST_YES_RE.source).toBe(/yes|trust|信任|是/i.source);
@@ -539,7 +613,7 @@ Claude Code 弹出了一个选择/审批菜单。替主人判断：自动批准�
     expect(isMultiSelectMenu('normal question', ['Yes', 'No'])).toBe(false);
     expect(isMultiSelectMenu('has [x] checkbox', ['a'])).toBe(true);
     expect(isMultiSelectMenu('q', ['[ ] item'])).toBe(true);
-    expect(isMultiSelectMenu('please Submit', ['a'])).toBe(true);
+    expect(isMultiSelectMenu('command: submit release notes', ['Yes', 'No'])).toBe(false);
   });
 
   test('issue #94/#95 回归：AskUserQuestion（☐ 表头）选项变全后仍判为交互表单 → 升级人工', () => {

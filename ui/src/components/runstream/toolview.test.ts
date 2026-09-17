@@ -42,6 +42,10 @@ describe('toolHeadView', () => {
     expect(h.hasBody).toBe(false);
   });
 
+  test('结果为空字符串时仍可展开查看无输出状态', () => {
+    expect(toolHeadView(tool({ input: undefined, result: '' }), false).hasBody).toBe(true);
+  });
+
   test('长结果预览压成单行并截断', () => {
     const long = 'line1\nline2\n' + 'x'.repeat(200);
     const h = toolHeadView(tool({ result: long }), false);

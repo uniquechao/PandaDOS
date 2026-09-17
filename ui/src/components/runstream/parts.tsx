@@ -9,13 +9,15 @@ export function RunStatusBadge({ status }: { status: RunStatus }) {
   if (status === 'running') {
     return (
       <span class="rs-badge run">
-        <span class="tool-spin" />
+        <span class="tool-spin" aria-hidden="true" />
         {tr('ui.runRunning')}
       </span>
     );
   }
-  if (status === 'error') return <span class="rs-badge err">✕ {tr('ui.failed')}</span>;
-  return <span class="rs-badge ok">✓ {tr('ui.succeeded')}</span>;
+  if (status === 'error') {
+    return <span class="rs-badge err"><span aria-hidden="true">✕</span>{tr('ui.failed')}</span>;
+  }
+  return <span class="rs-badge ok"><span aria-hidden="true">✓</span>{tr('ui.succeeded')}</span>;
 }
 
 /** 多行文本按 "- "/"+ " 前缀着色（toolfmt diff 正文）；空行占位保高。 */

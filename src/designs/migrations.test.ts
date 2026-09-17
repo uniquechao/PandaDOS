@@ -59,6 +59,20 @@ function applyDesignMigrationsThrough(db: ReturnType<typeof openDb>, maxId: numb
 }
 
 describe('design workbench migration', () => {
+  test('061：design 具有 UUIDv7 同步身份', () => {
+    const db = openDb(':memory:');
+    migrate(db);
+    migrateIssueEngine(db);
+    migrateDesigns(db);
+    seedProject(db);
+    db.run(`INSERT INTO design_tasks
+      (project_id, title, original_request, agent, created_ts, updated_ts)
+      VALUES (1, '同步设计', '同步', 'codex', 1, 1)`);
+    expect(db.query<{ sync_uid: string }, []>('SELECT sync_uid FROM design_tasks').get()!.sync_uid)
+      .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    db.close();
+  });
+
   test('upgrades a database that already recorded base 050 through additive design migrations with valid foreign keys', () => {
     const db = openDb(':memory:');
     migrate(db);
@@ -146,7 +160,7 @@ describe('design workbench migration', () => {
     db.close();
   });
 
-  test('upgrades a legacy saga-bearing migration 050 without duplicate columns or data rewrites', () => {
+  test('upgrades the legacy saga-bearing migration 050 without duplicate columns or data rewrites', () => {
     const db = openDb(':memory:');
     migrate(db);
     migrateIssueEngine(db);
@@ -159,18 +173,18 @@ describe('design workbench migration', () => {
     db.run(
       `INSERT INTO design_tasks
          (project_id, title, original_request, agent, graph_granularity, created_ts, updated_ts)
-       VALUES (1, 'Dirty legacy', 'Unknown granularity', 'codex', 'custom-legacy', 1, 1)`,
+       VALUES (1, 'e98 dirty legacy', 'Unknown granularity', 'codex', 'custom-e98', 1, 1)`,
     );
     db.query(
       `INSERT INTO design_creation_sagas
          (saga_token, project_id, idempotency_key, request_json, conversation_id, phase,
           conversation_owned, created_ts, updated_ts)
-       VALUES ('legacy-saga', 1, 'legacy-request', '{}', 'legacy-conv', 'intent', 0, 1, 1)`,
+       VALUES ('e98-saga', 1, 'e98-request', '{}', 'e98-conv', 'intent', 0, 1, 1)`,
     ).run();
     db.query(
       `INSERT INTO conversations
          (id, project_id, label, created_ts, agent, kind, design_creation_saga_token)
-       VALUES ('legacy-conv', 1, 'Intermediate', 1, 'codex', 'chat', 'legacy-saga')`,
+       VALUES ('e98-conv', 1, 'Intermediate', 1, 'codex', 'chat', 'e98-saga')`,
     ).run();
     db.query(
       `INSERT INTO conversations
@@ -184,17 +198,17 @@ describe('design workbench migration', () => {
     expect(status.applied).toEqual(expect.arrayContaining([50, 51]));
     expect(tableColumns(db, 'conversations')).toContain('design_creation_saga_token');
     expect(db.query<{ token: string | null }, []>(
-      "SELECT design_creation_saga_token AS token FROM conversations WHERE id = 'legacy-conv'",
-    ).get()).toEqual({ token: 'legacy-saga' });
+      "SELECT design_creation_saga_token AS token FROM conversations WHERE id = 'e98-conv'",
+    ).get()).toEqual({ token: 'e98-saga' });
     expect(db.query<{ n: number }, []>(
       'SELECT COUNT(*) AS n FROM design_saga_conversation_owners',
     ).get()?.n).toBe(1);
     expect(db.query<{ conversationId: string; sagaToken: string }, []>(
       `SELECT conversation_id AS conversationId, saga_token AS sagaToken
        FROM design_saga_conversation_owners`,
-    ).get()).toEqual({ conversationId: 'legacy-conv', sagaToken: 'legacy-saga' });
+    ).get()).toEqual({ conversationId: 'e98-conv', sagaToken: 'e98-saga' });
     expect(new DesignStore(db).listIncompleteCreationSagas().map((saga) => saga.sagaToken))
-      .toEqual(['legacy-saga']);
+      .toEqual(['e98-saga']);
     expect(db.query<{ graph_granularity: string }, []>(
       'SELECT graph_granularity FROM design_tasks WHERE id = 1',
     ).get()).toEqual({ graph_granularity: 'balanced' });
@@ -236,7 +250,7 @@ describe('design workbench migration', () => {
         ).get(table)?.name,
       ).toBe(table);
     }
-    expect(status.applied).toEqual(expect.arrayContaining([50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60]));
+    expect(status.applied).toEqual(expect.arrayContaining([50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 61, 73]));
 
     expect(tableColumns(db, 'issues')).toEqual(
       expect.arrayContaining(['design_task_id', 'design_node_id', 'design_revision']),
@@ -498,7 +512,7 @@ describe('design workbench migration', () => {
     db.close();
   });
 
-  test('060 upgrades a legal 059 run conversation without rewriting its identity', () => {
+  test('073 upgrades a legal 059 run conversation without rewriting its identity', () => {
     const db = openDb(':memory:');
     migrate(db); migrateIssueEngine(db); applyDesignMigrationsThrough(db, 59); seedProject(db);
     db.run(`INSERT INTO design_tasks
@@ -517,7 +531,7 @@ describe('design workbench migration', () => {
       (run_id, project_id, module_key, conversation_id, seed_revision, seed_digest, created_ts, updated_ts)
       VALUES ('legal-run', 1, 'unassigned:codex', 'legal-conv', 1, '${'a'.repeat(64)}', 1, 1)`);
 
-    expect(migrateDesigns(db).applied).toContain(60);
+    expect(migrateDesigns(db).applied).toContain(73);
     expect(db.query('SELECT * FROM design_run_conversations').all()).toHaveLength(1);
     expect(db.query<{ runId: string; projectId: number; conversationId: string }, []>(
       `SELECT run_id AS runId, project_id AS projectId, conversation_id AS conversationId
@@ -527,7 +541,61 @@ describe('design workbench migration', () => {
     db.close();
   });
 
-  test('060 fails transactionally when 059 contains an ambiguous cross-project historical row', () => {
+  test('upgrades a 059 database whose legacy notify migration already owns id 60', () => {
+    const db = openDb(':memory:');
+    migrate(db); migrateIssueEngine(db); applyDesignMigrationsThrough(db, 59);
+    db.run(
+      `INSERT INTO schema_migrations (id, name, applied_ts)
+       VALUES (60, '060_notify_gate_requests.sql', 1)`,
+    );
+
+    const status = migrateDesigns(db);
+
+    expect(status.applied).toContain(73);
+    const foreignKeys = db.query<{ id: number; from: string; to: string; table: string }, []>(
+      "PRAGMA foreign_key_list('design_run_conversations')",
+    ).all();
+    const scopedGroups = new Map<number, string[]>();
+    for (const row of foreignKeys) {
+      scopedGroups.set(row.id, [...(scopedGroups.get(row.id) ?? []), `${row.table}:${row.from}:${row.to}`]);
+    }
+    expect([...scopedGroups.values()]).toEqual(expect.arrayContaining([
+      expect.arrayContaining(['design_execution_runs:run_id:id', 'design_execution_runs:project_id:project_id']),
+      expect.arrayContaining(['project_modules:module_id:id', 'project_modules:project_id:project_id']),
+      expect.arrayContaining(['conversations:conversation_id:id', 'conversations:project_id:project_id']),
+    ]));
+    db.close();
+  });
+
+  test('073 safely replays when the historical design migration already owns id 60', () => {
+    const db = openDb(':memory:');
+    migrate(db); migrateIssueEngine(db); migrateDesigns(db); seedProject(db);
+    db.run(`INSERT INTO design_tasks
+      (project_id, title, original_request, agent, current_revision, graph_granularity, created_ts, updated_ts)
+      VALUES (1, 'replay', 'replay', 'codex', 1, 'balanced', 1, 1)`);
+    db.run(`INSERT INTO design_revisions
+      (design_task_id, revision, document_json, document_markdown, readiness, graph_json, actor, created_ts)
+      VALUES (1, 1, '{}', '', 0, '{"nodes":[],"edges":[]}', 'test', 1)`);
+    db.run(`INSERT INTO design_execution_runs
+      (id, project_id, design_task_id, approved_revision, graph_digest, idempotency_key,
+       execution_mode, lifecycle_state, created_ts, updated_ts)
+      VALUES ('replay-run', 1, 1, 1, '${'a'.repeat(64)}', 'replay-run', 'current', 'ready', 1, 1)`);
+    db.run(`INSERT INTO conversations (id, project_id, label, created_ts, agent, kind)
+      VALUES ('replay-conv', 1, 'replay', 1, 'codex', 'chat')`);
+    db.run(`INSERT INTO design_run_conversations
+      (run_id, project_id, module_key, conversation_id, seed_revision, seed_digest, created_ts, updated_ts)
+      VALUES ('replay-run', 1, 'unassigned:codex', 'replay-conv', 1, '${'a'.repeat(64)}', 1, 1)`);
+    db.run("UPDATE schema_migrations SET id = 60, name = '060_design_run_conversation_scope.sql' WHERE id = 73");
+
+    expect(migrateDesigns(db).applied).toContain(73);
+    expect(db.query<{ runId: string }, []>(
+      'SELECT run_id AS runId FROM design_run_conversations',
+    ).all()).toEqual([{ runId: 'replay-run' }]);
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    db.close();
+  });
+
+  test('073 fails transactionally when 059 contains an ambiguous cross-project historical row', () => {
     const db = openDb(':memory:');
     migrate(db); migrateIssueEngine(db); applyDesignMigrationsThrough(db, 59); seedProject(db);
     db.run(`INSERT INTO projects (name, executor_id, cwd, owner_user_id, created_ts)
@@ -549,7 +617,7 @@ describe('design workbench migration', () => {
       VALUES ('legacy-run', 2, 'unassigned:codex', 'foreign-conv', 1, '${'a'.repeat(64)}', 1, 1)`);
 
     expect(() => migrateDesigns(db)).toThrow();
-    expect(db.query<{ ok: number }, []>('SELECT 1 AS ok FROM schema_migrations WHERE id = 60').get()).toBeNull();
+    expect(db.query<{ ok: number }, []>('SELECT 1 AS ok FROM schema_migrations WHERE id = 73').get()).toBeNull();
     expect(db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM design_run_conversations').get()?.n).toBe(1);
     expect(db.query<{ name: string }, []>(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'design_run_conversations_scope_legacy'",
@@ -557,7 +625,7 @@ describe('design workbench migration', () => {
     db.close();
   });
 
-  test('060 fails transactionally when 059 module id and module key describe different identities', () => {
+  test('073 fails transactionally when 059 module id and module key describe different identities', () => {
     const db = openDb(':memory:');
     migrate(db); migrateIssueEngine(db); applyDesignMigrationsThrough(db, 59); seedProject(db);
     db.run(`INSERT INTO design_tasks
@@ -581,7 +649,7 @@ describe('design workbench migration', () => {
       VALUES ('legacy-run', 1, 1, 'module:2', 'legacy-conv', 1, '${'a'.repeat(64)}', 1, 1)`);
 
     expect(() => migrateDesigns(db)).toThrow();
-    expect(db.query<{ ok: number }, []>('SELECT 1 AS ok FROM schema_migrations WHERE id = 60').get()).toBeNull();
+    expect(db.query<{ ok: number }, []>('SELECT 1 AS ok FROM schema_migrations WHERE id = 73').get()).toBeNull();
     expect(db.query<{ moduleId: number; moduleKey: string }, []>(
       'SELECT module_id AS moduleId, module_key AS moduleKey FROM design_run_conversations',
     ).get()).toEqual({ moduleId: 1, moduleKey: 'module:2' });
