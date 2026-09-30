@@ -1,10 +1,11 @@
 import { BUSY_STATES, orderPending } from '../../../src/issues/queue';
 import type { Issue } from './types';
+import { compareIssueIds, type IssueId } from '../../../shared/issue-id';
 
 export type BoardGroupKey = 'review' | 'doing' | 'todo' | 'blocked' | 'finished' | 'cancelled';
 
 function byCreatedAsc(a: Issue, b: Issue): number {
-  return a.createdTs - b.createdTs || a.id - b.id;
+  return a.createdTs - b.createdTs || compareIssueIds(a.id, b.id);
 }
 
 function byFinishedDesc(a: Issue, b: Issue): number {
@@ -12,8 +13,8 @@ function byFinishedDesc(a: Issue, b: Issue): number {
   const bd = b.doneTs;
   if (ad !== null && bd === null) return -1;
   if (ad === null && bd !== null) return 1;
-  if (ad !== null && bd !== null) return bd - ad || b.id - a.id;
-  return b.createdTs - a.createdTs || b.id - a.id;
+  if (ad !== null && bd !== null) return bd - ad || compareIssueIds(b.id, a.id);
+  return b.createdTs - a.createdTs || compareIssueIds(b.id, a.id);
 }
 
 export function sortBoardGroup(
@@ -34,8 +35,8 @@ export function sortBoardGroup(
  * 宽屏打开项目时默认选中的 issue：等人工选择 > 待确认 > 进行中 > 待办 >
  * 最近完成（与完成组同一倒序口径，#305）> 列表第一条。空列表 → null。
  */
-export function pickDefaultIssueId(list: readonly Issue[]): number | null {
-  const pick = (sts: readonly Issue['status'][]): number | undefined => list.find((i) => sts.includes(i.status))?.id;
+export function pickDefaultIssueId(list: readonly Issue[]): IssueId | null {
+  const pick = (sts: readonly Issue['status'][]): IssueId | undefined => list.find((i) => sts.includes(i.status))?.id;
   return (
     list.find((i) => i.waitingInput)?.id ?? // 弹窗等人工选择的最优先
     pick(['clarifying', 'plan_review', 'merge_review']) ??

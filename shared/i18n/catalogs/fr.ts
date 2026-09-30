@@ -1,3 +1,7 @@
+import { roomMemberMessages } from '../domains/rooms-members';
+import { roomChatMessages } from '../domains/rooms-chat';
+import { roomExtraMessages } from '../domains/rooms-extra';
+import { roomMessages } from '../domains/rooms';
 import { feishuChatMessages } from '../domains/feishu-chat';
 import { feishuLoginMessages } from '../domains/feishu-login';
 import type { MessageCatalog } from '../messages';
@@ -9,6 +13,7 @@ import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
 import { projectSettingsMessages } from '../domains/project-settings';
 import { externalImportMessages } from '../domains/external-import';
+import { workspaceMessages } from '../domains/workspace';
 import { designWorkbenchMessages } from '../domains/design-workbench';
 import { designWorkbenchAdvancedMessages } from '../domains/design-workbench-advanced';
 import { designAssetsUiMessages } from '../domains/design-assets-ui';
@@ -19,12 +24,16 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const frCatalog = {
+  ...roomMemberMessages["fr"],
+  ...roomChatMessages["fr"],
+  ...roomExtraMessages["fr"],
+  ...roomMessages["fr"],
   ...feishuChatMessages["fr"],
   ...feishuLoginMessages["fr"],
   ...shellMessages.fr,
   ...actionMessages.fr,
   ...commonUiMessages.fr,
-  'issue.validation': 'Contrôles', 'issue.validationTargeted': 'ciblés ({files} fichiers)', 'issue.validationFull': 'complets', 'issue.validationPassed': 'réussis', 'issue.validationFailed': 'échoués ({label}, code de sortie {code})', 'issue.validationSkipped': 'ignorés', 'issue.validationPending': 'pas encore exécutés', 'issue.pushFailedTitle':'Terminée, mais les modifications n’ont pas été poussées vers le dépôt distant','issue.pushFailedHint':'Les modifications sont validées en local. Poussez-les manuellement, puis vérifiez.','issue.pushFailedBranch':'Branche {branch}',
+  'issue.validation': 'Contrôles', 'issue.validationTargeted': 'ciblés ({files} fichiers)', 'issue.validationFull': 'complets', 'issue.validationPassed': 'réussis', 'issue.validationFailed': 'échoués ({label}, code de sortie {code})', 'issue.validationSkipped': 'ignorés', 'issue.validationPending': 'pas encore exécutés', 'issue.validationUnavailable': 'contrôles indisponibles', 'issue.validationExempt': 'exemption explicite', 'issue.validationNoCommands': 'aucun contrôle configuré', 'issue.validationDisabled': 'contrôles obligatoires désactivés', 'issue.deliveryLocalComplete': 'Travail local terminé', 'issue.deliveryPushPushed': 'Poussé', 'issue.deliveryPushFailed': 'Échec du push', 'issue.deliveryPushSkipped': 'Push ignoré', 'issue.deliveryPushNotAttempted': 'Push non tenté', 'issue.deliveryMergeUnmanaged': 'Fusion non gérée', 'issue.deliveryDeployUnmanaged': 'Déploiement non géré', 'issue.pushFailedTitle':'Terminée, mais les modifications n’ont pas été poussées vers le dépôt distant','issue.pushFailedHint':'Les modifications sont validées en local. Poussez-les manuellement, puis vérifiez.','issue.pushFailedBranch':'Branche {branch}',
   'issue.completionReport':'Rapport d’achèvement','issue.reportOutcomeComplete':'Objectifs atteints','issue.reportOutcomePartial':'Partiellement terminée','issue.reportOutcomeBlocked':'Bloquée','issue.reportOutcomeUnverified':'Résumé historique non vérifié','issue.reportObjective':'Objectif de mise en œuvre','issue.reportImplementation':'Solution mise en œuvre','issue.reportAdvantages':'Avantages','issue.reportDisadvantages':'Inconvénients et compromis','issue.reportVerification':'Preuves de vérification','issue.reportCompletion':'État d’achèvement','issue.reportUnmetGoals':'Objectifs non atteints','issue.reportRemainingWork':'Actions de suivi nécessaires','issue.reportAttentionTitle':'Cette issue n’est pas entièrement terminée','issue.reportLegacyWarningTitle':'Cette clôture n’a pas été vérifiée de manière structurée','issue.reportLegacyWarning':'L’historique ne contient qu’un résumé libre. PandaDOS ne peut donc pas confirmer que tous les objectifs sont atteints ni qu’aucune action nécessaire ne reste.','issue.continueProcessing':'Poursuivre le traitement','issue.continueProcessingTitle':'Corriger la clôture et poursuivre','issue.continueProcessingWarningTitle':'Cette action rouvrira l’issue','issue.continueProcessingWarning':'Indiquez ce qui reste à faire. L’issue reviendra à la planification et pourra démarrer immédiatement.','issue.continueGuidance':'Objectif non atteint ou consignes de suivi','issue.continueGuidancePlaceholder':'Décrivez l’objectif non atteint et ce qui doit être terminé ensuite…','issue.continueGuidanceRequired':'Indiquez l’objectif non atteint ou l’action nécessaire avant de poursuivre.','issue.confirmContinueProcessing':'Rouvrir et poursuivre',
   'issue.recoveryLength':'{current} / {max} caractères',
   'issue.recoveryTitle':'Résoudre le blocage','issue.recoveryReason':'Raison de l’arrêt de l’exécution','issue.recoveryHelp':'Ajoutez des consignes concrètes ou corrigez l’issue et la sous-tâche bloquée avant de continuer. Enregistrer les modifications ne reprend pas l’exécution.','issue.recoveryGuidance':'Consignes supplémentaires ou méthode de résolution','issue.recoveryGuidancePlaceholder':'Décrivez ce qui doit changer, l’approche à utiliser ou comment lever le blocage…','issue.recoveryGuidanceRequired':'Saisissez des consignes supplémentaires ou une méthode de résolution avant de continuer.','issue.editBlockedIssue':'Modifier l’issue','issue.editBlockedIssueHint':'Modifier le titre, les détails, les réglages ou les images','issue.editBlockedSubtask':'Modifier la sous-tâche bloquée','issue.editBlockedSubtaskHint':'Corriger l’étape bloquée avant de continuer','issue.noEditableBlockedSubtask':'Aucune sous-tâche inachevée ne peut être modifiée','issue.recoveryQueueHint':'Après confirmation, l’issue reprend à l’étape où elle s’est arrêtée. Sans contexte de récupération, elle revient prudemment à la planification.','issue.confirmRecovery':'Envoyer les consignes et continuer','issue.mergedFrom': 'Fusionnée depuis plusieurs issues', 'issue.unmerge': 'Annuler la fusion', 'issue.unmergeLocked': 'Déjà en cours d’exécution : la fusion ne peut plus être annulée.', 'issue.unblockQueued': 'En file d’attente : la reprise démarrera automatiquement à la fin de la tâche en cours.', 'issue.unblockQueuedCancel': 'Annuler la reprise en attente', 'issue.openRecovery':'Résoudre le blocage',
@@ -33,6 +42,7 @@ export const frCatalog = {
   ...notifyMessages.fr,
   ...projectSettingsMessages.fr,
   ...externalImportMessages.fr,
+  ...workspaceMessages.fr,
   ...designWorkbenchMessages.fr,
   ...designWorkbenchAdvancedMessages.fr,
   ...designAssetsUiMessages.fr,

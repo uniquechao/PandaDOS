@@ -17,17 +17,20 @@
  */
 import type { ChatMessage } from '../core/jsonl';
 import { parseCompletionReportJson, type CompletionReport } from './completion-report';
+import { ISSUE_ID_SOURCE, type IssueId } from '../../shared/issue-id';
 
 /** 哨兵覆盖的阶段（planning 的产物是 SUBTASKS 块，不用 STAGE_DONE） */
 export type SentinelStage = 'implementing' | 'testing';
 
-// 整行锚定；id 只认数字（v2 issue id = DB 自增）；分隔符宽容（v1 风格保留）
-const STAGE_DONE_RE = /^STAGE_DONE:\s*(\d+)\s*:\s*([a-z_]+)\s*$/;
-const SUBTASK_DONE_RE = /^SUBTASK_DONE:\s*(\d+)\s*$/;
-const TESTS_FAILED_RE = /^TESTS_FAILED:\s*(\d+)\s*[:：\-]?\s*(.*)$/;
-const ISSUE_BLOCKED_RE = /^ISSUE_BLOCKED:\s*(\d+)\s*[:：\-]?\s*(.*)$/;
+// 整行锚定；id 只认 issue 编号格式（#307：`YYYYMMDD-xxxxxxx` 新编号或存量数字，见 shared/issue-id）；
+// 分隔符宽容（v1 风格保留）。新编号自带 `-`，TESTS_FAILED/ISSUE_BLOCKED 的分隔符 `-` 只在编号之后生效。
+const ID = `(${ISSUE_ID_SOURCE})`;
+const STAGE_DONE_RE = new RegExp(`^STAGE_DONE:\\s*${ID}\\s*:\\s*([a-z_]+)\\s*$`);
+const SUBTASK_DONE_RE = new RegExp(`^SUBTASK_DONE:\\s*${ID}\\s*$`);
+const TESTS_FAILED_RE = new RegExp(`^TESTS_FAILED:\\s*${ID}(?![0-9a-f])\\s*[:：\\-]?\\s*(.*)$`);
+const ISSUE_BLOCKED_RE = new RegExp(`^ISSUE_BLOCKED:\\s*${ID}(?![0-9a-f])\\s*[:：\\-]?\\s*(.*)$`);
 // 执行中澄清：代理在驱动阶段声明「必须先问清才能继续」（配套 prompts.ts 的 NEED_CLARIFY 协议）
-const NEED_CLARIFY_RE = /^NEED_CLARIFY:\s*(\d+)\s*$/;
+const NEED_CLARIFY_RE = new RegExp(`^NEED_CLARIFY:\\s*${ID}\\s*$`);
 
 /**
  * 澄清问题抽取上限（#110 放宽：代理常把选项 A/B/C 写成续行、问题也不止 5 条，
@@ -56,29 +59,29 @@ function lines(text: string): string[] {
 }
 
 /** STAGE_DONE:<id>:<stage>，id 与 stage 都必须与当前一致才算命中 */
-export function findStageDone(assistantText: string, issueId: number, stage: SentinelStage): boolean {
+export function findStageDone(assistantText: string, issueId: IssueId, stage: SentinelStage): boolean {
   for (const l of lines(assistantText)) {
     const m = l.match(STAGE_DONE_RE);
-    if (m && Number(m[1]) === issueId && m[2] === stage) return true;
+    if (m && m[1] === String(issueId) && m[2] === stage) return true;
   }
   return false;
 }
 
 /** SUBTASK_DONE:<id> 计数（v1 hasSubtaskDone 是布尔，同批两个 DONE 丢一个——改计数） */
-export function countSubtaskDone(assistantText: string, issueId: number): number {
+export function countSubtaskDone(assistantText: string, issueId: IssueId): number {
   let n = 0;
   for (const l of lines(assistantText)) {
     const m = l.match(SUBTASK_DONE_RE);
-    if (m && Number(m[1]) === issueId) n++;
+    if (m && m[1] === String(issueId)) n++;
   }
   return n;
 }
 
 /** TESTS_FAILED:<id> 原因（testing 阶段回退信号），id 不符=拒 */
-export function findTestsFailed(assistantText: string, issueId: number): { note: string } | null {
+export function findTestsFailed(assistantText: string, issueId: IssueId): { note: string } | null {
   for (const l of lines(assistantText)) {
     const m = l.match(TESTS_FAILED_RE);
-    if (m && Number(m[1]) === issueId) return { note: (m[2] || '').trim().slice(0, 200) };
+    if (m && m[1] === String(issueId)) return { note: (m[2] || '').trim().slice(0, 200) };
   }
   return null;
 }
@@ -90,10 +93,10 @@ export function findTestsFailed(assistantText: string, issueId: number): { note:
  * 200 字会把最要紧的第三段截掉——用户看到的正好是「不知道要我做什么」。
  * prompt 里仍要求代理写在 200 字内，400 只是留够余量不吞字。
  */
-export function findBlocked(assistantText: string, issueId: number): { note: string } | null {
+export function findBlocked(assistantText: string, issueId: IssueId): { note: string } | null {
   for (const l of lines(assistantText)) {
     const m = l.match(ISSUE_BLOCKED_RE);
-    if (m && Number(m[1]) === issueId) return { note: (m[2] || '').trim().slice(0, MAX_BLOCKED_NOTE_CHARS) };
+    if (m && m[1] === String(issueId)) return { note: (m[2] || '').trim().slice(0, MAX_BLOCKED_NOTE_CHARS) };
   }
   return null;
 }
@@ -102,10 +105,10 @@ export function findBlocked(assistantText: string, issueId: number): { note: str
  * NEED_CLARIFY:<id>：代理在驱动阶段（planning/implementing/testing）声明「必须先问清才能
  * 继续」。整行锚定 + 核 id（子串/错 id/占位符一律拒，与其它哨兵同纪律）。
  */
-export function findNeedClarify(assistantText: string, issueId: number): boolean {
+export function findNeedClarify(assistantText: string, issueId: IssueId): boolean {
   for (const l of lines(assistantText)) {
     const m = l.match(NEED_CLARIFY_RE);
-    if (m && Number(m[1]) === issueId) return true;
+    if (m && m[1] === String(issueId)) return true;
   }
   return false;
 }
@@ -246,3 +249,19 @@ export function looksRateLimited(assistantText: string): boolean {
 
 /** limit 退避时长（v1 agent.ts:564 的 5min 平移；做成常量可配） */
 export const RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000;
+
+/** NEED_PLAN 必须绑定本 issue、本轮；理由可同行或在同一回复的后续段落。 */
+export function parseNeedPlan(text: string, issueId: IssueId, attempt: number):
+  { kind: 'valid'; reason: string } | { kind: 'invalid' } | null {
+  const rows = lines(text);
+  const expected = `NEED_PLAN:${issueId}:${attempt}`;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!;
+    if (!row.startsWith('NEED_PLAN:')) continue;
+    if (row !== expected && !row.startsWith(`${expected} `) && !row.startsWith(`${expected}\t`)) continue;
+    const reason = [row.slice(expected.length).trim(), ...rows.slice(i + 1)].join('\n').trim();
+    if (!reason || /^NEED_PLAN:/.test(reason)) return { kind: 'invalid' };
+    return { kind: 'valid', reason: reason.slice(0, 500) };
+  }
+  return rows.some(row => row.startsWith('NEED_PLAN:')) ? { kind: 'invalid' } : null;
+}

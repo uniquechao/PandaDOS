@@ -22,6 +22,7 @@ import { decideApproval, type ApprovalOutcome } from '../../agents/approval';
 import type { MenuSnapshot } from '../../agents/pm';
 import { ApprovalPipeline, type ApprovalPm } from './approvals';
 import { actOnMenu, optionsSigOf } from './inject';
+import type { IssueId } from '../../../shared/issue-id';
 
 // ---------- 假件 ----------
 
@@ -137,7 +138,7 @@ function setup(
     kind: 'issue',
   };
   const issue: EngineIssue = {
-    id: 7,
+    id: '7',
     projectId: 1,
     title: '装依赖',
     body: null,
@@ -199,13 +200,13 @@ function setup(
   const dispatched: Array<Record<string, unknown>> = [];
   const notify = {
     async dispatch(e: {
-      kind: 'status_change'; projectId: number; issueId: number;
+      kind: 'status_change'; projectId: number; issueId: IssueId;
       summaryCode: 'approval_selection'; summaryParams: Record<string, string | number>;
     }) {
       dispatched.push(e);
     },
   };
-  const logs: Array<{ issueId: number; kind: string; data?: Record<string, unknown> }> = [];
+  const logs: Array<{ issueId: IssueId; kind: string; data?: Record<string, unknown> }> = [];
 
   const pipeline = new ApprovalPipeline({
     db,
@@ -241,7 +242,7 @@ describe('审批管道：approve', () => {
 
     expect(t.driver.keys).toEqual(['Down', 'Enter']); // cursor 0 → 选项 1
     const log = t.logs.find((l) => l.kind === 'menu_auto');
-    expect(log?.issueId).toBe(7);
+    expect(log?.issueId).toBe('7');
     expect(log?.data?.result).toBe('injected');
     expect(log?.data?.rule).toBe('llm');
     expect(t.pipeline.handledSigOf('cc-1')).toBe(optionsSigOf(['Yes', 'No']));

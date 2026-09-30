@@ -5,7 +5,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { Fragment, type VNode } from 'preact';
-import { Markdown } from './Markdown';
+import { LinkedText, Markdown } from './Markdown';
 
 interface El {
   tag: string;
@@ -49,6 +49,15 @@ function flat(v: unknown, out: Node[]): void {
 function render(text: string): Node[] {
   const out: Node[] = [];
   flat(Markdown({ text }), out);
+  return out;
+}
+
+/** issue #310：带项目上下文渲染（cwd 固定成一个项目目录） */
+const PATHS = { pid: 3, cwd: '/home/developer/workspace/proj' };
+
+function renderWithPaths(text: string): Node[] {
+  const out: Node[] = [];
+  flat(Markdown({ text, paths: PATHS }), out);
   return out;
 }
 
@@ -207,5 +216,81 @@ describe('Markdown 安全底线', () => {
     const out = render('<script>alert(1)</script>');
     expect(all(out, 'script').length).toBe(0);
     expect(textOf(out)).toBe('<script>alert(1)</script>');
+  });
+});
+
+describe('文件路径链接（issue #310）', () => {
+  test('不传 paths 时一个路径链接都不产出（技能页等场景保持原样）', () => {
+    const out = render('见 /home/developer/workspace/proj/docs/a.md');
+    expect(all(out, 'a').length).toBe(0);
+    expect(textOf(out)).toBe('见 /home/developer/workspace/proj/docs/a.md');
+  });
+
+  test('正文里的项目内绝对路径 → 文件页深链，可见文字仍是原路径', () => {
+    const out = renderWithPaths('报告在 /home/developer/workspace/proj/docs/a.md 里');
+    const a = all(out, 'a');
+    expect(a.length).toBe(1);
+    expect(a[0].props.class).toBe('md-path');
+    expect(a[0].props.href).toBe('#/p/3/workspace/files/docs%2Fa.md');
+    expect(textOf(out)).toBe('报告在 /home/developer/workspace/proj/docs/a.md 里');
+  });
+
+  test('markdown 链接里的本机绝对路径改指文件页（不再是必然 404 的站内链接）', () => {
+    const out = renderWithPaths('[查看清单](/home/developer/workspace/proj/runs/audit.html)');
+    const a = all(out, 'a');
+    expect(a.length).toBe(1);
+    expect(a[0].props.href).toBe('#/p/3/workspace/files/runs%2Faudit.html');
+    expect(a[0].props.target).toBeUndefined(); // 站内跳转不开新标签页
+    expect(textOf(out)).toBe('查看清单');
+  });
+
+  test('项目外的本机路径摘掉 href，只留文字与说明', () => {
+    const out = renderWithPaths('[别处](/home/developer/other/a.md)');
+    expect(all(out, 'a').length).toBe(0);
+    const span = all(out, 'span').find((el) => String(el.props.class).includes('md-path'));
+    expect(span?.props.class).toBe('md-path off');
+    expect(span?.props.title).toBeString();
+    expect(textOf(out)).toBe('别处');
+  });
+
+  test('http 链接不受影响', () => {
+    const a = all(renderWithPaths('[站外](https://a.com/b)'), 'a');
+    expect(a[0].props.href).toBe('https://a.com/b');
+    expect(a[0].props.target).toBe('_blank');
+  });
+
+  test('整段是路径的行内代码可点，仍渲染成 <code>', () => {
+    const out = renderWithPaths('改的是 `src/web/routes/files.ts`');
+    const a = all(out, 'a');
+    expect(a.length).toBe(1);
+    expect(a[0].props.href).toBe('#/p/3/workspace/files/src%2Fweb%2Froutes%2Ffiles.ts');
+    expect(all(out, 'code').length).toBe(1);
+    expect(textOf(out)).toBe('改的是 src/web/routes/files.ts');
+  });
+
+  test('不是路径的行内代码照旧（不套链接）', () => {
+    const out = renderWithPaths('常量 `MAX_AUTO_MODULES`');
+    expect(all(out, 'a').length).toBe(0);
+    expect(all(out, 'code').length).toBe(1);
+  });
+
+  test('表格单元格里的路径同样可点', () => {
+    const out = renderWithPaths('| 文件 | 说明 |\n|---|---|\n| docs/a.md | 报告 |');
+    const a = all(out, 'a');
+    expect(a.length).toBe(1);
+    expect(a[0].props.href).toBe('#/p/3/workspace/files/docs%2Fa.md');
+  });
+
+  test('比值与日期不会被认成路径', () => {
+    const out = renderWithPaths('命中 62/121，日期 2026/07/23');
+    expect(all(out, 'a').length).toBe(0);
+    expect(textOf(out)).toBe('命中 62/121，日期 2026/07/23');
+  });
+
+  test('LinkedText（用户气泡原文）：只多出跳转入口，字符一个不改', () => {
+    const out: Node[] = [];
+    flat(LinkedText({ text: '看下 docs/a.md 这个', paths: PATHS }), out);
+    expect(all(out, 'a').length).toBe(1);
+    expect(textOf(out)).toBe('看下 docs/a.md 这个');
   });
 });

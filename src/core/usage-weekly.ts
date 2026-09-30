@@ -41,6 +41,7 @@ import { localDayStartMs } from './activity';
 import { DEFAULT_TZ, localDay } from './daily-greeting';
 import { costOf, emptyUsage, mergeUsage, type UsagePricing, type UsageTotals } from './usage';
 import { MODULE_NONE, MODULE_UNATTRIBUTED, UsageStore } from './usage-store';
+import type { IssueId } from '../../shared/issue-id';
 
 const DAY_MS = 86_400_000;
 
@@ -126,7 +127,7 @@ export function emptyOutcomes(): ModuleOutcomeStats {
 }
 
 interface TransitionRow {
-  issue_id: number;
+  issue_id: IssueId;
   project_id: number;
   module_id: number | null;
   data_json: string | null;
@@ -178,10 +179,10 @@ export function moduleOutcomes(db: Database, q: OutcomeQuery): Map<string, Modul
     .all(...params);
 
   /** 每个桶里各状态命中的 issue 集合（去重靠 Set，同一条 issue 一周内反复进出只算一次） */
-  const buckets = new Map<string, { done: Set<number>; blocked: Set<number>; cancelled: Set<number> }>();
+  const buckets = new Map<string, { done: Set<IssueId>; blocked: Set<IssueId>; cancelled: Set<IssueId> }>();
   /** issue → 本周第一次 blocked 的事件 id；恢复只认「那次之后」的 done */
-  const firstBlockedEvent = new Map<number, number>();
-  const issueBucket = new Map<number, string>();
+  const firstBlockedEvent = new Map<IssueId, number>();
+  const issueBucket = new Map<IssueId, string>();
 
   for (const r of rows) {
     const key = bucketKey(r.project_id, r.module_id ?? MODULE_NONE);
@@ -200,12 +201,12 @@ export function moduleOutcomes(db: Database, q: OutcomeQuery): Map<string, Modul
   }
 
   // 恢复率：本周进过 blocked 的 issue，在那次 blocked 之后是否又 done（done 不限本周）
-  const recovered = new Set<number>();
+  const recovered = new Set<IssueId>();
   if (firstBlockedEvent.size > 0) {
     const ids = [...firstBlockedEvent.keys()];
     const placeholders = ids.map(() => '?').join(', ');
     for (const r of db
-      .query<{ issue_id: number; id: number; data_json: string | null }, number[]>(
+      .query<{ issue_id: IssueId; id: number; data_json: string | null }, IssueId[]>(
         `SELECT id, issue_id, data_json FROM issue_events
           WHERE kind = 'transition' AND issue_id IN (${placeholders})
           ORDER BY id`,
@@ -219,8 +220,8 @@ export function moduleOutcomes(db: Database, q: OutcomeQuery): Map<string, Modul
 
   const out = new Map<string, ModuleOutcomeStats>();
   for (const [key, b] of buckets) {
-    const failed = new Set<number>([...b.blocked, ...b.cancelled]);
-    const outcome = new Set<number>([...b.done, ...failed]);
+    const failed = new Set<IssueId>([...b.blocked, ...b.cancelled]);
+    const outcome = new Set<IssueId>([...b.done, ...failed]);
     if (outcome.size === 0) continue; // 本周只有中间状态流转的桶：没有结局，不出现在结局表里
     const recoveredHere = [...b.blocked].filter((id) => recovered.has(id)).length;
     out.set(key, {

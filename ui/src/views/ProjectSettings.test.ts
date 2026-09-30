@@ -32,17 +32,18 @@ describe('项目配置页外部 issue 来源请求', () => {
       host: 'github.com', suggestedProvider: 'github', suggestedInstanceUrl: 'https://github.com',
     })).toEqual({ provider: 'github', instanceUrl: '' });
     expect(externalIssueSourceDefaults({
-      host: 'gitlab.sunseed.tech',
-    })).toEqual({ provider: 'gitlab', instanceUrl: 'https://gitlab.sunseed.tech' });
+      host: 'gitlab.example.com',
+    })).toEqual({ provider: 'gitlab', instanceUrl: 'https://gitlab.example.com' });
   });
 });
 
 describe('项目设置控制台', () => {
   test('项目字段通过规范化快照派生未保存状态', () => {
-    const saved = { name: 'PandaDOS', goal: 'Ship', validationCommands: '' };
+    const saved = { name: 'PandaDOS', goal: 'Ship', validationCommands: '', validationPolicy: 'optional' as const };
     expect(projectSettingsDirty(saved, saved)).toBeFalse();
     expect(projectSettingsDirty(saved, { ...saved, name: ' PandaDOS ' })).toBeFalse();
     expect(projectSettingsDirty(saved, { ...saved, goal: 'New goal' })).toBeTrue();
+    expect(projectSettingsDirty(saved, { ...saved, validationPolicy: 'required' })).toBeTrue();
   });
 
   test('设置控制台移除自动化，并将执行机归入仓库章节，issue 订阅、成员和模块保持独立', () => {

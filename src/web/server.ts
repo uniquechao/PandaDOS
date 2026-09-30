@@ -3,7 +3,7 @@
  *
  * 装配顺序：
  *   1. DB 打开 + 迁移链 migrate → migrateIssueEngine → migratePmAgent → migrateDesigns → migrateNotify
- *   2. UserStore + ensureAdminUser（明文 token 一次性 stdout + 0600 文件，严禁进日志）
+ *   2. UserStore + ensureAdminUser（明文 token 只存 0600 文件）
  *   3. executors 表 → Driver 池（127.0.0.1/localhost 且无 keyRef = LocalDriver，否则 SshDriver 懒连接）
  *   4. 单例 KeyedMutex / JsonlLocator / ConversationManager（PM 与引擎共用，锁才有互斥意义）
  *   5. createLlmClient + createPmPool
@@ -22,11 +22,24 @@ import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { explainMenuForHuman } from '../agents/approval';
-import { createLlmClient } from '../agents/llm';
+import { createLlmClient, loadLlmConfig } from '../agents/llm';
+import { RoomEngine } from '../rooms/engine';
+import { RoomStore } from '../rooms/store';
+import { migrateRooms } from '../rooms/migrations';
+import { RoomCoordinator } from '../rooms/coordinator';
+import { RoomModelRuntime } from '../rooms/model-runtime';
+import { RoomLocalCliRuntime } from '../rooms/local-cli';
+import { RoomMemberRuntime } from '../rooms/member-runtime';
+import { RoomMemberDesigner } from '../rooms/member-designer';
+import type { RoomRuntime } from '../rooms/runtime';
+import { RoomPublicationService } from './room-publication';
+import { ResourceDrain } from '../rooms/lifecycle';
+import { RoomIssueFeedbackService } from './room-issue-feedback';
+import { roomRuntimeAccess } from './room-runtime-access';
 import { createPmPool, migratePmAgent } from '../agents/pm';
 import { userPromptLocale } from '../agents/prompts/language';
 import { MessageCounter } from '../core/activity';
-import { ensureArtifactSkill, ensurePandaIssueSkill } from '../core/agent-compat';
+import { ensureArtifactSkill, ensurePandaIssueInboxSkill, ensurePandaIssueSkill } from '../core/agent-compat';
 import { PRODUCT_NAME, PRODUCT_SLUG, RUNTIME_DATA_DIR_NAME } from '../core/branding';
 import { ConversationManager } from '../core/conversations';
 import { defaultDbPath, openDb } from '../core/db';
@@ -76,6 +89,7 @@ import { FeishuChannel, type FeishuConfig } from '../notify/feishu';
 import { migrateNotify, NotifyRouter, userByFeishuOpenid } from '../notify/router';
 import { RegressionGuard, DEFAULT_REGRESSION_GUARD_CONFIG } from '../issues/validation-guard';
 import { UsageCollector, DEFAULT_USAGE_COLLECTOR_CONFIG } from '../core/usage-collector';
+import { dedicatedIsolationViolation } from '../issues/execution-isolation';
 import { isBusy } from '../issues/queue';
 import type { Project } from '../core/types';
 import { FeishuLoginConfigStore } from './feishu-login-config';
@@ -89,6 +103,7 @@ import { decidePoll, ProjectDataSyncCoordinator } from './project-data-sync';
 import { ApprovalPipeline } from './ws/approvals';
 import { ChatApprovalWatcher } from './ws/chat-approvals';
 import { ProgressBridge } from './ws/progress';
+import { createPreviewService } from './preview';
 import { createWsHandlers, handleWsUpgrade, type WsData, type WsDeps } from './ws';
 
 // ---------- 选项 / 返回 ----------
@@ -165,6 +180,10 @@ export interface ServerOptions {
   designWorktreeRecoveryLimit?: number;
   /** Overall startup deadline for authoritative worktree recovery. */
   designWorktreeRecoveryTimeoutMs?: number;
+  /** Test injection retains the durable Room engine while avoiding external model calls. */
+  roomRuntime?: RoomRuntime;
+  /** Stop accepting requests promptly; retain DB/driver resources until publication drains. */
+  roomStopTimeoutMs?: number;
 }
 
 export interface DesignImageRuntime {
@@ -295,7 +314,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   migrateIssueEngine(db);
   migratePmAgent(db);
   migrateDesigns(db);
-  const migrations = migrateNotify(db); // 链尾返回全量迁移状态
+  migrateNotify(db);
+  const migrations = migrateRooms(db); // 链尾返回全量迁移状态
   ensureSystemLocalExecutor(
     db,
     opts.localExecutorDefaults ?? discoverLocalExecutorDefaults(),
@@ -313,12 +333,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     mkdirSync(dirname(f), { recursive: true });
     writeFileSync(f, `${boot.token}\n`, { mode: 0o600 });
     chmodSync(f, 0o600); // 文件已存在时 writeFileSync 的 mode 不生效，补一刀
-    // 明文 token 仅此一次输出 stdout + 0600 文件；严禁进任何日志（v1 前科）。
-    // 测试环境不打：单测里每起一个服务器就打一行，全量跑下来 stdout 全是这些 token 行，
-    // 把门禁失败回灌的尾部挤得一条 `(fail)` 都不剩（#279 的 failureTail 因此改成先保 stderr）。
+    // 服务日志会被 systemd/journald 持久化；只报告路径，绝不输出凭据本身。
     if (process.env.NODE_ENV !== 'test') {
       process.stdout.write(
-        `[${PRODUCT_NAME}] 首启已创建 admin 用户（username=admin）。token 仅显示这一次（已写入 ${f}，0600）：\n${boot.token}\n`,
+        `[${PRODUCT_NAME}] 首启 admin 凭据已写入 ${f}（0600）。\n`,
       );
     }
   }
@@ -361,7 +379,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     );
   };
 
-  // 本期单执行机：最小 id 为主执行机，引擎/对话/上传全走它（多机调度 = 后续 wave）
+  // 最小 id 为兼容旧项目的主执行机；项目操作始终按 executor_id 路由。
   const bootExecutors = listExecutors(db);
   const primary = bootExecutors[0];
   if (primary) driverForExecutor(primary); // 启动即入池（懒连接），healthz/状态同步立即可见
@@ -441,10 +459,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   const claudeProjectsDir = primary?.claudeDir ?? join(homedir(), '.claude', 'projects');
   const trustFile = trustFileOf(claudeProjectsDir);
 
-  // 项目 → 其 executor 的 Driver（WS 终端/act/审批注入用；executor 缺失回退主 Driver）
+  // 项目 → 其 executor 的 Driver。绑定失效时必须失败，绝不把操作送到主执行机。
   const driverForProject = (p: Project): ExecutorDriver => {
     const ex = listExecutors(db).find((e) => e.id === p.executorId);
-    return ex ? driverForExecutor(ex) : primaryDriver;
+    if (!ex) throw new Error(`项目 ${p.id} 的执行机 ${p.executorId} 不存在`);
+    const isolationViolation = dedicatedIsolationViolation(db, p, ex);
+    if (isolationViolation) throw new Error(`项目 ${p.id} 的 OS 隔离无效：${isolationViolation}`);
+    return driverForExecutor(ex);
   };
   // project-data 原子替换与所有 Git 写共用同一 mutex；必须在两套服务装配前创建。
   const mutex = new KeyedMutex();
@@ -553,9 +574,56 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   const claudeLocator = new JsonlLocator(primaryDriver, claudeProjectsDir);
   // 双代理定位器：claude 透传，codex 按 launch_ts+cwd 从 rollout 发现（consumer 全走结构化 {locate}）
   const locator = new AgentJsonlLocator(db, primaryDriver, claudeLocator, `${homes.codexHome}/sessions`);
+  const historyForProject = (project: Project): { reader: ExecutorDriver; locator: AgentJsonlLocator } => {
+    if (project.executorId === primary?.id) {
+      driverForProject(project); // Dedicated-mode policy must not bypass the primary fast path.
+      return { reader: primaryDriver, locator };
+    }
+    const executor = listExecutors(db).find((candidate) => candidate.id === project.executorId);
+    if (!executor) throw new Error(`项目 ${project.id} 的执行机 ${project.executorId} 不存在`);
+    const executorHomes = agentHomesOf(executor.claudeDir);
+    if (!executorHomes) throw new Error(`执行机 ${executor.id} 的 Agent 家目录无法确定`);
+    const reader = driverForProject(project);
+    const claude = new JsonlLocator(reader, executor.claudeDir);
+    return {
+      reader,
+      locator: new AgentJsonlLocator(db, reader, claude, `${executorHomes.codexHome}/sessions`),
+    };
+  };
+  // 创建、调度、恢复及聊天入口共用这一条 fail-closed 预检。远端项目必须同时能解析
+  // 项目 Driver 和该执行机的 Agent 家目录；绝不把定位失败的项目交给主执行机。
+  const executionUnavailable = (project: Project): string | null => {
+    try {
+      historyForProject(project);
+      return null;
+    } catch (error) {
+      return `项目 ${project.id} 的执行机 ${project.executorId} 不可用：${String(error)}`;
+    }
+  };
+  const conversationExecutionForProject = (projectId: number) => {
+    const project = getProject(db, projectId);
+    if (!project) throw new Error(`项目 ${projectId} 不存在`);
+    const executor = listExecutors(db).find((candidate) => candidate.id === project.executorId);
+    if (!executor) throw new Error(`项目 ${projectId} 的执行机 ${project.executorId} 不存在`);
+    const context = historyForProject(project);
+    const agentHomes = project.executorId === primary?.id
+      ? homes
+      : agentHomesOf(executor.claudeDir);
+    if (!agentHomes) throw new Error(`执行机 ${executor.id} 的 Agent 家目录无法确定`);
+    const trust = trustFileOf(executor.claudeDir);
+    return {
+      driver: context.reader,
+      locator: context.locator,
+      claudeHome: agentHomes.claudeHome,
+      codexHome: agentHomes.codexHome,
+      codexConfigFile: `${agentHomes.codexHome}/config.toml`,
+      ...(trust ? { trustFile: trust } : {}),
+    };
+  };
   // 「这条对话现在用哪个模型」（issue #109）：读会话 jsonl 尾窗，与引擎/WS 同源同定位器
   const modelProbe = new ModelProbe(primaryDriver, locator);
   const convs = new ConversationManager(db, primaryDriver, locator, {
+    executionForProject: conversationExecutionForProject,
     ...(trustFile ? { trustFile } : {}),
     codexConfigFile: `${homes.codexHome}/config.toml`,
     claudeHome: homes.claudeHome,
@@ -571,11 +639,20 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     void ensurePandaIssueSkill(primaryDriver, derivedHomes).catch((e) =>
       console.error(`[${PRODUCT_NAME}] 内置技能 panda-issue 安装失败（best-effort）:`, e),
     );
+    void ensurePandaIssueInboxSkill(primaryDriver, derivedHomes).catch((e) =>
+      console.error(`[${PRODUCT_NAME}] 内置技能 panda-issue-inbox 安装失败（best-effort）:`, e),
+    );
   }
 
   // ---- 5. LLM + PM 管家池 ----
   const llm = createLlmClient(db);
-  const pmFor = createPmPool({ driver: primaryDriver, llm, users, convs, locator, mutex, db });
+  const pmFor = createPmPool({
+    driver: primaryDriver, llm, users, convs, locator, mutex, db,
+    executionForProject: (project) => {
+      const context = historyForProject(project);
+      return { driver: context.reader, locator: context.locator };
+    },
+  });
   const moduleStore = new ModuleStore(db);
   const designStore = new DesignStore(db);
   const designScope = {
@@ -667,12 +744,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   });
   const executionWorkspaces = createDesignExecutionWorkspaceAdapter({ db, conversations: convs });
 
-  // 「Agent 认知总结」后台编排：digest 走共享 locator + 主 Driver 读 jsonl（与引擎/WS 同源）；
-  // runner 在项目所在执行机的 sum-<id> 会话里跑（driverForProject）。启动即清「卡在 running」的僵尸态。
+  // 「Agent 认知总结」的历史读取和 runner 均绑定项目执行机；相同 cwd 不等于同一执行位置。
   const summaryOrchestrator = new SummaryOrchestrator({
     db,
     buildDigest: (project) =>
-      buildHistoryDigest({ db, reader: primaryDriver, locator }, project.id),
+      buildHistoryDigest({ db, ...historyForProject(project) }, project.id),
     runSummary: (project, agent, historyDigest, target) =>
       new AgentSummaryRunner({ driver: driverForProject(project) }).run({
         projectId: project.id,
@@ -701,7 +777,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   const channelOn = opts.feishuChannel ?? process.env.PANDA_FEISHU_CHANNEL !== 'off';
   const feishuMessaging: FeishuMessaging = new FeishuMessaging({
     db, config: feishuLoginConfig, notify,
-    // Preserve deployment defaults; saving login credentials alone never enables messaging.
+    // Deployment-level off is a hard boundary even when DB preferences predate it.
+    deploymentAllowed: channelOn,
+    // Saving login credentials alone never enables messaging.
     defaultEnabled: !!feishuCfg && channelOn,
     create: (config) => {
       const chat: PrivateChat = new PrivateChat({
@@ -735,7 +813,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     driver: primaryDriver,
     convs,
     locator,
+    executionForProject: (project) => {
+      const context = historyForProject(project);
+      return { driver: context.reader, locator: context.locator };
+    },
     pmFor,
+    executionUnavailable,
     notify,
     mutex,
     flushProjectData,
@@ -768,6 +851,17 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
       : { postCommitTimeoutMs: opts.publicationRecoveryTimeoutMs }),
   });
   const designSync = new DesignSyncCoordinator({ store: designStore, issues: engine });
+  const roomEngine = new RoomEngine({ store: new RoomStore(db) });
+  const roomSessionRoot = join(dbPath === ':memory:' ? dirname(assetStorageRoot) : dirname(resolve(dbPath)), 'room-sessions');
+  const roomRuntime = opts.roomRuntime ?? new RoomMemberRuntime({
+    stateDir: roomSessionRoot,
+    api: new RoomModelRuntime({ config: () => loadLlmConfig(db), acquire: signal => llm.acquireSlot(signal) }),
+    local: new RoomLocalCliRuntime({ stateDir: roomSessionRoot, acquire: signal => llm.acquireSlot(signal) }),
+  });
+  const roomMemberDesigner = new RoomMemberDesigner(roomRuntime);
+  const roomFeedback = new RoomIssueFeedbackService(db, engine);
+  const roomCoordinator = new RoomCoordinator({ service: roomRuntimeAccess(db,roomEngine,attempt => { const scope={projectId:attempt.projectId,roomId:attempt.roomId};roomFeedback.sync(scope);return roomFeedback.list(scope).filter(item=>item.missionId===attempt.missionId); }), runtime: roomRuntime, maxConcurrent: 2 });
+  const roomPublication = new RoomPublicationService({ db, rooms: roomEngine, issues: engine });
   const designEngine = new DesignEngine({
     store: designStore,
     scope: designScope,
@@ -1010,6 +1104,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   const regressionGuard = new RegressionGuard(
     {
       driver: primaryDriver,
+      driverForProject,
       listProjects: () =>
         db.query<{ id: number }, []>("SELECT id FROM projects WHERE status = 'active' ORDER BY id")
           .all()
@@ -1043,6 +1138,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
       db,
       driver: primaryDriver,
       locate: (convId) => locator.locate(convId),
+      executionForProject: (projectId) => {
+        const project = getProject(db, projectId);
+        if (!project) throw new Error(`用量采集的项目 ${projectId} 不存在`);
+        const context = historyForProject(project);
+        return { driver: context.reader, locate: (convId: string) => context.locator.locate(convId) };
+      },
       onError: (convId, error) => console.error(`[${PRODUCT_NAME}] 用量采集失败（${convId}）:`, error),
     },
     { intervalMs: opts.usageCollectIntervalMs ?? DEFAULT_USAGE_COLLECTOR_CONFIG.intervalMs },
@@ -1056,8 +1157,26 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   );
 
   // ---- 8. 路由聚合 + 静态 + healthz ----
+  // 完整网页预览隔离服务（#388）：令牌制、不读登录态；可选独立端口/来源（PANDA_PREVIEW_PORT/ORIGIN）
+  const preview = createPreviewService({
+    db,
+    driverForProject,
+    ...(process.env.PANDA_PREVIEW_ORIGIN ? { origin: process.env.PANDA_PREVIEW_ORIGIN } : {}),
+  });
+  const previewPort = Number(process.env.PANDA_PREVIEW_PORT ?? 0);
+  const previewServer = previewPort > 0
+    ? Bun.serve({
+        hostname: opts.bind ?? process.env.PANDA_BIND ?? '127.0.0.1',
+        port: previewPort,
+        async fetch(req) {
+          return (await preview.handle(req)) ?? new Response('not found', { status: 404 });
+        },
+      })
+    : null;
+
   const dispatch = createApiDispatcher({
     db,
+    preview,
     users,
     engine,
     designs: {
@@ -1075,12 +1194,18 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     driverFor: (ex) => driverForExecutor(ex),
     previewDriverFor: (ex) => buildDriver(ex),
     driverForProject, // files/git 浏览、技能安装按项目所在执行机取 Driver
+    executionUnavailable,
     projectDataSync,
     llm, // 技能市场 驱动大模型 富化（与 PM 池共享并发闸）
+    rooms: { service: roomEngine, runtime: roomRuntime, memberDesigner: roomMemberDesigner, coordinator: roomCoordinator, publication: roomPublication, feedback: roomFeedback },
     onExecutorChanged: invalidateDriver, // M5：admin 改/删执行机后热失效 Driver 池
     convs,
     mutex, // 对话模式 conversations 路由 activate/archive 用（与引擎/PM/act/WS 同一把锁）
     models: modelProbe, // 对话/issue 详情页显示「正在用哪个模型」
+    modelsForProject: (project) => {
+      const context = historyForProject(project);
+      return new ModelProbe(context.reader, context.locator);
+    },
     subs: notify.subscriptions,
     get feishu() { return feishuMessaging.current; },
     sessions,
@@ -1117,7 +1242,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     locator,
     mutex,
     reader: primaryDriver, // jsonl 读取与引擎/locator 同源
+    historyForProject: (project) => historyForProject(project),
     driverForProject,
+    executionUnavailable,
     approvals,
     messages, // chat 文本帧计入用户消息数
     judgeAgentFailure: async (projectId, agent, pane) => {
@@ -1213,6 +1340,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
 
       if (url.pathname === '/healthz') return healthz();
 
+      // 预览服务不走登录态与 dispatcher：只认短时令牌，响应强制 CSP sandbox（opaque origin）
+      if (url.pathname.startsWith('/preview/')) return (await preview.handle(req))!;
+
       // WS 挂载（Wave3）：upgrade 前 resolveUser + 项目属主/admin 鉴权（ws/index.ts）
       if (url.pathname.startsWith('/ws/')) {
         const w = await handleWsUpgrade(req, url, srv, wsDeps);
@@ -1237,6 +1367,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   });
 
   const designCreationRecoveryAbort = new AbortController();
+  roomCoordinator.start();
+  roomPublication.start();
   const designCreationRecovery = designEngine.recoverIncompleteCreations({
     maxSagas: 25,
     attemptBudget: 25,
@@ -1247,9 +1379,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   });
 
   // ---- 9. 优雅停机（M1：先停引擎并等在途 tick 归还，driver/db 最后关）----
-  const stop = async (): Promise<void> => {
+  let stopPromise: Promise<void> | undefined;
+  const performStop = async (): Promise<void> => {
     if (stopped) return;
     stopped = true;
+    server.stop(true);
+    previewServer?.stop(true);
     clearInterval(statusTimer);
     clearInterval(revisionSyncTimer);
     clearInterval(executionEffectTimer);
@@ -1265,7 +1400,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     for (const controller of executionEffectControllers) {
       controller.abort(new DOMException('shutdown', 'AbortError'));
     }
-    await Promise.all([
+    const clarificationFlights = new ResourceDrain();
+    clarificationFlights.track(engine.closeClarifications());
+    clarificationFlights.track(roomMemberDesigner.stop());
+    const [coordinatorDrain, publicationDrain, clarificationDrain] = await Promise.all([
+      roomCoordinator.stop(opts.roomStopTimeoutMs),
+      roomPublication.stop(opts.roomStopTimeoutMs),
+      clarificationFlights.close(opts.roomStopTimeoutMs),
       designRuns.stop(opts.designRunStopTimeoutMs),
       designAssetsRuntime.service.shutdown(opts.designAssetShutdownTimeoutMs),
     ]);
@@ -1282,19 +1423,30 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
       if (timer) clearTimeout(timer);
     }
     // Recovery owns Issue/Design DB work; never close the DB underneath it.
-    await engine.stop(); // M1：await 在途 tick 归还——之后不再有引擎侧执行机/db 调用
+    await engine.stop({ deferClarificationDrain: true }); // Tick owners drain here; clarification owners retain the barrier below.
     await chatApprovals.stop(); // 同理：等在途巡检归还，之后不再有它侧的执行机/db 调用
     engineRunning = false;
     progress.stopAll(); // 进度 reporter 挂引擎生命周期（引擎停了再清定时器）
     await notify.flushAll(); // 引擎已停，冲掉聚合缓冲里最后一批通知
     notify.stop();
     await feishuMessaging.stop();
-    for (const d of drivers.values()) {
-      await (d as { close?: () => Promise<void> | void }).close?.(); // SshDriver 终态；LocalDriver 无需
+    const finalizeResources = async (): Promise<void> => {
+      for (const d of drivers.values()) {
+        await (d as { close?: () => Promise<void> | void }).close?.();
+      }
+      db.close();
+    };
+    const resourceDrains = [coordinatorDrain, publicationDrain, clarificationDrain];
+    if (resourceDrains.every(drain => drain.settled)) await finalizeResources();
+    else {
+      // A scheduler may be inside an uncancellable external call. The server is
+      // closed, but its resources remain valid until that call returns. Main-mode
+      // process exit also releases them; never close SQLite beneath a live owner.
+      console.warn('[rooms] shutdown deferred resource release', { pending: resourceDrains.reduce((sum, drain) => sum + drain.pending, 0) });
+      void Promise.all(resourceDrains.map(drain => drain.done)).then(finalizeResources).catch(() => console.error('[rooms] deferred resource release failed'));
     }
-    server.stop(true);
-    db.close();
   };
+  const stop = (): Promise<void> => stopPromise ??= performStop();
 
   return {
     port: server.port ?? 0,

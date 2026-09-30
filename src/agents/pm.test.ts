@@ -113,7 +113,7 @@ function project(over: Partial<Project> = {}): Project {
 
 function issue(over: Partial<Issue> = {}): Issue {
   return {
-    id: 42,
+    id: '42',
     projectId: 7,
     title: '加导出功能',
     body: '支持 CSV',
@@ -307,7 +307,7 @@ describe('generateClarifyingQuestions', () => {
 // ---------- 同模块智能合并 ----------
 
 describe('mergeModuleTasks（同模块 pending 交 LLM 归并）', () => {
-  const cand = (id: number, title: string, body: string | null = null) => ({ id, title, body });
+  const cand = (id: number, title: string, body: string | null = null) => ({ id: String(id), title, body });
 
   test('候选 <2 → 不问 LLM，返回 []', async () => {
     const llm = new MockLlm();
@@ -327,7 +327,7 @@ describe('mergeModuleTasks（同模块 pending 交 LLM 归并）', () => {
     ]);
     const pm = new PmAgent(project(), makeDeps(llm));
     const got = await pm.mergeModuleTasks('web', [cand(1, 'A', 'aa'), cand(2, 'B'), cand(3, 'C')]);
-    expect(got).toEqual([{ members: [1, 2], title: '合并A+B', body: '1) A\n2) B' }]);
+    expect(got).toEqual([{ members: ['1', '2'], title: '合并A+B', body: '1) A\n2) B' }]);
     expect(llm.calls[0]!.messages[0]!.content).toStartWith(MERGE_SYS);
     expect(llm.calls[0]!.opts?.jsonMode).toBe(true);
     expect(llm.calls[0]!.messages[1]!.content).toContain('模块「web」');
@@ -370,9 +370,9 @@ describe('mergeModuleTasks（同模块 pending 交 LLM 归并）', () => {
   });
 
   test('formatMergeCandidate / mergeCandidateFileHints：拼装与边界', () => {
-    expect(formatMergeCandidate({ id: 7, title: 'T', body: null }))
+    expect(formatMergeCandidate({ id: '7', title: 'T', body: null }))
       .toBe('#7 T\n需求：（无正文，仅标题）');
-    const short = formatMergeCandidate({ id: 8, title: 'T', body: '一句话' });
+    const short = formatMergeCandidate({ id: '8', title: 'T', body: '一句话' });
     expect(short).toContain('需求：一句话');
     expect(short).not.toContain('（后略）'); // 没超预算就不该出现省略提示
     expect(short).not.toContain('涉及：');
@@ -387,14 +387,14 @@ describe('mergeModuleTasks（同模块 pending 交 LLM 归并）', () => {
     const llm = new MockLlm([
       JSON.stringify({
         groups: [
-          { members: [1, 2], title: 'g1', body: 'b1' },
+          { members: ['1', '2'], title: 'g1', body: 'b1' },
           { members: [2, 3], title: 'g2', body: 'b2' }, // 2 已被 g1 用掉 → 整组丢
         ],
       }),
     ]);
     const pm = new PmAgent(project(), makeDeps(llm));
     const got = await pm.mergeModuleTasks('web', [cand(1, 'A'), cand(2, 'B'), cand(3, 'C')]);
-    expect(got).toEqual([{ members: [1, 2], title: 'g1', body: 'b1' }]);
+    expect(got).toEqual([{ members: ['1', '2'], title: 'g1', body: 'b1' }]);
   });
 
   test('缺 title/body、非法 JSON、空 groups → []（保守，不卡调度）', async () => {
@@ -563,8 +563,8 @@ describe('buildStagePrompt（issues/prompts 模板编排）', () => {
 
 describe('summarizeProgress（issue_events 批次 → 值不值得推）', () => {
   const events: IssueEvent[] = [
-    { id: 1, issueId: 42, kind: 'injected', dataJson: '{"stage":"implementing"}', ts: 1 },
-    { id: 2, issueId: 42, kind: 'done', dataJson: '{"note":"子任务 1 完成"}', ts: 2 },
+    { id: 1, issueId: '42', kind: 'injected', dataJson: '{"stage":"implementing"}', ts: 1 },
+    { id: 2, issueId: '42', kind: 'done', dataJson: '{"note":"子任务 1 完成"}', ts: 2 },
   ];
 
   test('push=true → headline；带 PM systemPrompt 前缀；滚动摘要进下一轮 prev', async () => {
@@ -650,6 +650,33 @@ describe('answerQuestion（v1 chatWithTools 平移，项目作用域）', () => 
 // ---------- 管家池 / 迁移 / 引擎兼容 ----------
 
 describe('管家池与集成契约', () => {
+  test('第二执行机 PM 工具只观察项目自己的 Driver，绑定变更会换实例', async () => {
+    const llm = new MockLlm([
+      { content: '', toolCalls: [{ id: 'remote-tool', type: 'function', function: { name: 'list_sessions', arguments: '{}' } }] },
+      '完成',
+    ]);
+    const remote = { ...noopDriver, listSessions: async () => [{ name: 'cc-8', createdTs: 0, attached: false }] };
+    let activeRemote = remote;
+    const pmFor = createPmPool(makeDeps(llm, {
+      executionForProject: (p) => ({
+        driver: p.executorId === 2 ? activeRemote : noopDriver,
+        locator: { locate: async () => null },
+      }),
+    }));
+    const p = project({ id: 8, executorId: 2, cwd: '/repo/export' });
+    const remotePm = pmFor(p);
+    expect(await remotePm.answerQuestion(3, '列会话')).toBe('完成');
+    const tool = llm.calls[1]!.messages.find((m) => m.role === 'tool')?.content ?? '';
+    expect(tool).toContain('@cc-8：运行中');
+    expect(tool).not.toContain('cc-7');
+    expect(pmFor(p)).toBe(remotePm);
+    activeRemote = { ...noopDriver, listSessions: async () => [{ name: 'cc-9', createdTs: 0, attached: false }] };
+    const refreshed = pmFor(p);
+    expect(refreshed).not.toBe(remotePm);
+    expect(pmFor(p)).toBe(refreshed);
+    expect(pmFor(project({ id: 8, executorId: 1 }))).not.toBe(remotePm);
+  });
+
   test('createPmPool：同项目复用实例，取用时刷新 project 快照', () => {
     const pmFor = createPmPool(makeDeps(new MockLlm()));
     const a = pmFor(project());

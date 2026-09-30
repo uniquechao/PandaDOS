@@ -895,8 +895,8 @@ describe('design workbench migration', () => {
        VALUES (1, 1, '{}', '# Revision', 100, '{"nodes":[],"edges":[]}', 'owner', 1)`,
     );
     db.run(
-      `INSERT INTO issues (project_id, title, category, status, impl_mode, created_ts)
-       VALUES (1, 'Published node', 'task', 'pending', 'team', 1)`,
+      `INSERT INTO issues (id, project_id, title, category, status, impl_mode, created_ts)
+       VALUES ('1', 1, 'Published node', 'task', 'pending', 'team', 1)`,
     );
 
     const tokenHash = 'a'.repeat(64);
@@ -979,10 +979,10 @@ describe('design workbench migration', () => {
        VALUES (2, 2, '{}', '# Second revision', 100, '{"nodes":[],"edges":[]}', 'owner', 3)`,
     );
     db.run(
-      `INSERT INTO issues (project_id, title, category, status, impl_mode, created_ts)
-       VALUES (1, 'Second link', 'task', 'pending', 'seq', 2),
-              (1, 'Supplement', 'task', 'pending', 'seq', 3),
-              (2, 'Foreign parent', 'task', 'pending', 'seq', 4)`,
+      `INSERT INTO issues (id, project_id, title, category, status, impl_mode, created_ts)
+       VALUES ('2', 1, 'Second link', 'task', 'pending', 'seq', 2),
+              ('3', 1, 'Supplement', 'task', 'pending', 'seq', 3),
+              ('4', 2, 'Foreign parent', 'task', 'pending', 'seq', 4)`,
     );
     db.query(
       `INSERT INTO design_publications

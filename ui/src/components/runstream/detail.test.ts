@@ -90,3 +90,16 @@ describe('四类事件都接上展开区', () => {
     expect(index).toContain('off={ev.off}');
   });
 });
+
+describe('消息里的文件路径链接（issue #310）', () => {
+  test('cwd 走进程内缓存取一次，凑齐 pid+cwd 才透给消息气泡', () => {
+    expect(index).toContain("useProjectCwd(pid)");
+    expect(index).toContain("pid !== undefined && cwd ? { pid, cwd } : null");
+    expect(index).toContain('paths={paths}');
+  });
+
+  test('AI 正文按 markdown 渲染时带上 paths；用户原文只包一层 LinkedText（不当 markdown 解析）', () => {
+    expect(message).toContain('<Markdown text={localizeUtcTimes(t, ts)} paths={paths} />');
+    expect(message).toContain('<LinkedText text={t} paths={paths} />');
+  });
+});

@@ -75,12 +75,12 @@ function seed() {
     )
     .get(alice.id, Date.now())!.id;
   const iid = db
-    .query<{ id: number }, [number, number]>(
+    .query<{ id: string }, [number, number]>(
       `INSERT INTO issues (project_id, title, created_ts) VALUES (?, '加登录', ?) RETURNING id`,
     )
     .get(pid, Date.now())!.id;
   const gid = db
-    .query<{ id: number }, [number, string]>(
+    .query<{ id: number }, [string, string]>(
       `INSERT INTO gates (issue_id, kind, payload_json) VALUES (?, 'plan', ?) RETURNING id`,
     )
     .get(iid, JSON.stringify({ subtasks: ['写表', '写接口'], implMode: 'seq' }))!.id;

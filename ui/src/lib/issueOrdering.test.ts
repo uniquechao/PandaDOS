@@ -4,7 +4,7 @@ import { filterIssueList, pageSlice, pickDefaultIssueId, sortBoardGroup } from '
 
 function issue(id: number, patch: Partial<Issue> = {}): Issue {
   return {
-    id,
+    id: String(id),
     projectId: 1,
     title: `issue-${id}`,
     body: null,
@@ -37,9 +37,9 @@ function issue(id: number, patch: Partial<Issue> = {}): Issue {
 describe('sortBoardGroup', () => {
   test('待确认和进行中按创建时间正序，且不修改输入', () => {
     const items = [issue(3, { createdTs: 30 }), issue(1, { createdTs: 10 }), issue(2, { createdTs: 10 })];
-    expect(sortBoardGroup('doing', items, items).map((i) => i.id)).toEqual([1, 2, 3]);
-    expect(sortBoardGroup('review', items, items).map((i) => i.id)).toEqual([1, 2, 3]);
-    expect(items.map((i) => i.id)).toEqual([3, 1, 2]);
+    expect(sortBoardGroup('doing', items, items).map((i) => i.id)).toEqual(['1', '2', '3']);
+    expect(sortBoardGroup('review', items, items).map((i) => i.id)).toEqual(['1', '2', '3']);
+    expect(items.map((i) => i.id)).toEqual(['3', '1', '2']);
   });
 
   test('完成按 doneTs 倒序；缺失结束时间的排后并按创建时间倒序', () => {
@@ -49,7 +49,7 @@ describe('sortBoardGroup', () => {
       issue(3, { status: 'cancelled', createdTs: 200, doneTs: 500 }),
       issue(4, { status: 'cancelled', createdTs: 450, doneTs: null }),
     ];
-    expect(sortBoardGroup('finished', items, items).map((i) => i.id)).toEqual([3, 1, 4, 2]);
+    expect(sortBoardGroup('finished', items, items).map((i) => i.id)).toEqual(['3', '1', '4', '2']);
   });
 
   test('待办复用真实队列：置顶优先，随后延续当前执行模块', () => {
@@ -60,7 +60,7 @@ describe('sortBoardGroup', () => {
       issue(3, { module: 'ops', createdTs: 30, pinnedTs: 100 }),
       issue(4, { module: 'ops', createdTs: 40 }),
     ];
-    expect(sortBoardGroup('todo', pending, [active, ...pending]).map((i) => i.id)).toEqual([3, 4, 1, 2]);
+    expect(sortBoardGroup('todo', pending, [active, ...pending]).map((i) => i.id)).toEqual(['3', '4', '1', '2']);
   });
 
   test('受阻/已取消组（#105 拆桶）与完成组同一套倒序', () => {
@@ -69,8 +69,8 @@ describe('sortBoardGroup', () => {
       issue(2, { status: 'blocked', createdTs: 300, doneTs: null }),
       issue(3, { status: 'blocked', createdTs: 200, doneTs: 900 }),
     ];
-    expect(sortBoardGroup('blocked', items, items).map((i) => i.id)).toEqual([3, 2, 1]);
-    expect(sortBoardGroup('cancelled', items, items).map((i) => i.id)).toEqual([3, 2, 1]);
+    expect(sortBoardGroup('blocked', items, items).map((i) => i.id)).toEqual(['3', '2', '1']);
+    expect(sortBoardGroup('cancelled', items, items).map((i) => i.id)).toEqual(['3', '2', '1']);
   });
 });
 
@@ -84,11 +84,11 @@ describe('filterIssueList（完成组搜索）', () => {
   test('空查询原样返回；标题/模块不分大小写包含；#编号可带可不带 #', () => {
     expect(filterIssueList(list, '')).toHaveLength(3);
     expect(filterIssueList(list, '  ')).toHaveLength(3);
-    expect(filterIssueList(list, '弹窗').map((i) => i.id)).toEqual([103]);
-    expect(filterIssueList(list, 'TERMINAL').map((i) => i.id)).toEqual([12]);
-    expect(filterIssueList(list, 'workbench').map((i) => i.id)).toEqual([103]);
-    expect(filterIssueList(list, '#89').map((i) => i.id)).toEqual([89]);
-    expect(filterIssueList(list, '89').map((i) => i.id)).toEqual([89]);
+    expect(filterIssueList(list, '弹窗').map((i) => i.id)).toEqual(['103']);
+    expect(filterIssueList(list, 'TERMINAL').map((i) => i.id)).toEqual(['12']);
+    expect(filterIssueList(list, 'workbench').map((i) => i.id)).toEqual(['103']);
+    expect(filterIssueList(list, '#89').map((i) => i.id)).toEqual(['89']);
+    expect(filterIssueList(list, '89').map((i) => i.id)).toEqual(['89']);
     expect(filterIssueList(list, '没有的')).toEqual([]);
     // 单独一个 # 不当成「所有编号都命中」
     expect(filterIssueList(list, '#')).toEqual([]);
@@ -118,8 +118,8 @@ describe('pickDefaultIssueId', () => {
       issue(2, { status: 'pending' }),
       issue(3, { status: 'implementing' }),
     ];
-    expect(pickDefaultIssueId(list)).toBe(3);
-    expect(pickDefaultIssueId([list[0], list[1]])).toBe(2);
+    expect(pickDefaultIssueId(list)).toBe('3');
+    expect(pickDefaultIssueId([list[0], list[1]])).toBe('2');
   });
 
   test('只剩已完成等收尾 issue 时选完成时间最新的那条', () => {
@@ -130,11 +130,11 @@ describe('pickDefaultIssueId', () => {
       issue(4, { status: 'done', doneTs: 400 }),
       issue(5, { status: 'blocked' }),
     ];
-    expect(pickDefaultIssueId(list)).toBe(3);
+    expect(pickDefaultIssueId(list)).toBe('3');
   });
 
   test('没有已完成 issue 时退回列表第一条，空列表为 null', () => {
-    expect(pickDefaultIssueId([issue(7, { status: 'cancelled' }), issue(8, { status: 'blocked' })])).toBe(7);
+    expect(pickDefaultIssueId([issue(7, { status: 'cancelled' }), issue(8, { status: 'blocked' })])).toBe('7');
     expect(pickDefaultIssueId([])).toBeNull();
   });
 });

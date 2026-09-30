@@ -106,15 +106,15 @@ const FAST = { pollIntervalMs: 10, readyDelayMs: 20, timeoutMs: 400 };
 
 describe('纯函数', () => {
   test('clarifySessionName / clarifyPaths：clr- 前缀 + 按 issue 隔离的 scratch 子目录', () => {
-    expect(clarifySessionName(42)).toBe('clr-42');
-    const p = clarifyPaths('/repo/proj/', 42);
+    expect(clarifySessionName('42')).toBe('clr-42');
+    const p = clarifyPaths('/repo/proj/', '42');
     expect(p.scratch).toBe(`/repo/proj/${CLARIFY_SCRATCH_BASE}/42`);
     expect(p.task).toBe(`/repo/proj/${CLARIFY_SCRATCH_BASE}/42/task.md`);
     expect(p.feedback).toBe(`/repo/proj/${CLARIFY_SCRATCH_BASE}/42/feedback.md`);
     expect(p.questions).toBe(`/repo/proj/${CLARIFY_SCRATCH_BASE}/42/questions.md`);
     expect(p.done).toBe(`/repo/proj/${CLARIFY_SCRATCH_BASE}/42/done`);
     // 兄弟 issue 子目录互不重叠
-    expect(clarifyPaths('/repo/proj', 7).scratch).not.toBe(p.scratch);
+    expect(clarifyPaths('/repo/proj', '7').scratch).not.toBe(p.scratch);
   });
 
   test('buildClarifyTaskMd：标题/类型/目标/正文齐全；无正文有占位', () => {
@@ -134,14 +134,14 @@ describe('纯函数', () => {
   });
 
   test('buildClarifyPrompt：单段无换行，覆盖 task/feedback/questions/done 与只读约束', () => {
-    const p = buildClarifyPrompt('claude', 42);
+    const p = buildClarifyPrompt('claude', '42');
     expect(p).not.toContain('\n');
     expect(p).toContain(`${CLARIFY_SCRATCH_BASE}/42/task.md`);
     expect(p).toContain(`${CLARIFY_SCRATCH_BASE}/42/feedback.md`);
     expect(p).toContain(`${CLARIFY_SCRATCH_BASE}/42/questions.md`);
     expect(p).toContain(`${CLARIFY_SCRATCH_BASE}/42/done`);
     expect(p).toContain('不要改动任何文件');
-    expect(buildClarifyPrompt('codex', 1)).toContain('无需请求审批');
+    expect(buildClarifyPrompt('codex', '1')).toContain('无需请求审批');
   });
 
   test('buildClarifyTaskMd：历轮问答成对渲染（问题编号 + 答复/未答占位）；无历史无该节', () => {
@@ -166,9 +166,9 @@ describe('纯函数', () => {
   });
 
   test('buildClarifyPrompt：默认明示已答过的不重复问；allowQuestions=false 时不许创建 questions.md', () => {
-    const p = buildClarifyPrompt('claude', 42);
+    const p = buildClarifyPrompt('claude', '42');
     expect(p).toContain('不要重复问');
-    const noQ = buildClarifyPrompt('claude', 42, { allowQuestions: false });
+    const noQ = buildClarifyPrompt('claude', '42', { allowQuestions: false });
     expect(noQ).not.toContain('\n');
     expect(noQ).toContain('不要创建');
     expect(noQ).toContain('questions.md');
@@ -198,7 +198,7 @@ describe('ClarifyRunner.run', () => {
   test('成功：起 clr-<id> 会话、写 task.md、注入提示、读回反馈+问题、清理', async () => {
     const driver = new FakeDriver();
     const cwd = '/repo/proj';
-    const p = clarifyPaths(cwd, 42);
+    const p = clarifyPaths(cwd, '42');
     driver.onCapture = (n, files) => {
       if (n >= 5) {
         files.set(p.feedback, '理解：加 CSV 导出；思路：改 export.ts；风险：大数据量内存。');
@@ -208,7 +208,7 @@ describe('ClarifyRunner.run', () => {
     };
     const r = await runClarify(
       { driver, ...mkClock() },
-      { issueId: 42, cwd, agent: 'claude', title: '加导出', body: '支持 CSV', goal: 'G', projectName: 'Demo' },
+      { issueId: '42', cwd, agent: 'claude', title: '加导出', body: '支持 CSV', goal: 'G', projectName: 'Demo' },
       FAST,
     );
 
@@ -232,10 +232,10 @@ describe('ClarifyRunner.run', () => {
     expect(driver.files.has(p.feedback)).toBe(false);
   });
 
-  test('codex：起 codex bypass 参数；questions.md 缺失 → 视为需求清晰（questions=[]）', async () => {
+  test('codex：起工作区沙箱参数；questions.md 缺失 → 视为需求清晰（questions=[]）', async () => {
     const driver = new FakeDriver();
     const cwd = '/repo/proj';
-    const p = clarifyPaths(cwd, 7);
+    const p = clarifyPaths(cwd, '7');
     driver.onCapture = (n, files) => {
       if (n >= 5) {
         files.set(p.feedback, '需求清晰，直接做。');
@@ -244,7 +244,7 @@ describe('ClarifyRunner.run', () => {
     };
     const r = await runClarify(
       { driver, ...mkClock() },
-      { issueId: 7, cwd, agent: 'codex', title: 't' },
+      { issueId: '7', cwd, agent: 'codex', title: 't' },
       FAST,
     );
     expect(r.ok).toBe(true);
@@ -253,20 +253,20 @@ describe('ClarifyRunner.run', () => {
       expect(r.questions).toEqual([]);
     }
     expect(driver.sent[0]!.text).toContain('codex');
-    expect(driver.sent[0]!.text).toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(driver.sent[0]!.text).toContain('--approve-for-me');
   });
 
   test('只有问题没有反馈 → 仍算成功（feedback 为空串）', async () => {
     const driver = new FakeDriver();
     const cwd = '/repo/proj';
-    const p = clarifyPaths(cwd, 8);
+    const p = clarifyPaths(cwd, '8');
     driver.onCapture = (n, files) => {
       if (n >= 3) {
         files.set(p.questions, '目标环境是什么？');
         files.set(p.done, 'ok');
       }
     };
-    const r = await runClarify({ driver, ...mkClock() }, { issueId: 8, cwd, agent: 'claude', title: 't' }, FAST);
+    const r = await runClarify({ driver, ...mkClock() }, { issueId: '8', cwd, agent: 'claude', title: 't' }, FAST);
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.feedback).toBe('');
@@ -277,8 +277,8 @@ describe('ClarifyRunner.run', () => {
   test('超时：done 标记始终不出现 → reason=timeout，仍清理', async () => {
     const driver = new FakeDriver();
     const cwd = '/repo/proj';
-    const p = clarifyPaths(cwd, 3);
-    const r = await runClarify({ driver, ...mkClock() }, { issueId: 3, cwd, agent: 'claude', title: 't' }, FAST);
+    const p = clarifyPaths(cwd, '3');
+    const r = await runClarify({ driver, ...mkClock() }, { issueId: '3', cwd, agent: 'claude', title: 't' }, FAST);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('timeout');
     expect(driver.killed).toContain('clr-3');
@@ -290,7 +290,7 @@ describe('ClarifyRunner.run', () => {
   test('抢救：done 没写出来但 feedback 已落盘 → 按成功用并标 salvaged', async () => {
     const driver = new FakeDriver();
     const cwd = '/repo/proj';
-    const p = clarifyPaths(cwd, 11);
+    const p = clarifyPaths(cwd, '11');
     driver.paneAt = () => '正在分析…';
     driver.onCapture = (n, files) => {
       if (n >= 5) {
@@ -298,7 +298,7 @@ describe('ClarifyRunner.run', () => {
         files.set(p.questions, '1. 超时调到多少？');
       } // 就是不写 done
     };
-    const r = await runClarify({ driver, ...mkClock() }, { issueId: 11, cwd, agent: 'claude', title: 't' }, FAST);
+    const r = await runClarify({ driver, ...mkClock() }, { issueId: '11', cwd, agent: 'claude', title: 't' }, FAST);
 
     expect(r.ok).toBe(true);
     if (r.ok) {
@@ -316,7 +316,7 @@ describe('ClarifyRunner.run', () => {
     const driver = new FakeDriver();
     const cwd = '/repo/proj';
     driver.paneAt = () => '❯ 等待权限确认';
-    const r = await runClarify({ driver, ...mkClock() }, { issueId: 12, cwd, agent: 'claude', title: 't' }, FAST);
+    const r = await runClarify({ driver, ...mkClock() }, { issueId: '12', cwd, agent: 'claude', title: 't' }, FAST);
 
     expect(r.ok).toBe(false);
     if (!r.ok) {
@@ -330,11 +330,11 @@ describe('ClarifyRunner.run', () => {
   test('done 出现但反馈/问题都空 → reason=no-output', async () => {
     const driver = new FakeDriver();
     const cwd = '/repo/proj';
-    const p = clarifyPaths(cwd, 4);
+    const p = clarifyPaths(cwd, '4');
     driver.onCapture = (n, files) => {
       if (n >= 3) files.set(p.done, 'ok'); // 只有 done
     };
-    const r = await runClarify({ driver, ...mkClock() }, { issueId: 4, cwd, agent: 'claude', title: 't' }, FAST);
+    const r = await runClarify({ driver, ...mkClock() }, { issueId: '4', cwd, agent: 'claude', title: 't' }, FAST);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('no-output');
   });
@@ -343,8 +343,8 @@ describe('ClarifyRunner.run', () => {
     const driver = new FakeDriver();
     driver.failCreate = true;
     const cwd = '/repo/proj';
-    const p = clarifyPaths(cwd, 6);
-    const r = await runClarify({ driver, ...mkClock() }, { issueId: 6, cwd, agent: 'claude', title: 't' }, FAST);
+    const p = clarifyPaths(cwd, '6');
+    const r = await runClarify({ driver, ...mkClock() }, { issueId: '6', cwd, agent: 'claude', title: 't' }, FAST);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('error');
     expect(driver.removed).toContain(p.scratch);
@@ -361,7 +361,7 @@ describe('ClarifyRunner.run', () => {
           : '';
     await runClarify(
       { driver, ...mkClock() },
-      { issueId: 5, cwd, agent: 'claude', title: 't' },
+      { issueId: '5', cwd, agent: 'claude', title: 't' },
       { pollIntervalMs: 10, readyDelayMs: 20, timeoutMs: 30 },
     );
     expect(driver.keys).toEqual([
@@ -374,8 +374,8 @@ describe('ClarifyRunner.run', () => {
   test('并发隔离：清理只删本 issue 子目录，不动同项目兄弟 scratch', async () => {
     const driver = new FakeDriver();
     const cwd = '/repo/proj';
-    const mine = clarifyPaths(cwd, 10);
-    const sibling = clarifyPaths(cwd, 11);
+    const mine = clarifyPaths(cwd, '10');
+    const sibling = clarifyPaths(cwd, '11');
     driver.files.set(sibling.task, '兄弟 issue 的任务文件');
     driver.onCapture = (n, files) => {
       if (n >= 3) {
@@ -383,7 +383,7 @@ describe('ClarifyRunner.run', () => {
         files.set(mine.done, 'ok');
       }
     };
-    const r = await runClarify({ driver, ...mkClock() }, { issueId: 10, cwd, agent: 'claude', title: 't' }, FAST);
+    const r = await runClarify({ driver, ...mkClock() }, { issueId: '10', cwd, agent: 'claude', title: 't' }, FAST);
     expect(r.ok).toBe(true);
     expect(driver.removed).toContain(mine.scratch);
     expect(driver.removed).not.toContain(sibling.scratch);
@@ -393,7 +393,7 @@ describe('ClarifyRunner.run', () => {
   test('残留会话/旧 scratch：起步先清（kill 失败静默），不影响本轮', async () => {
     const driver = new FakeDriver();
     const cwd = '/repo/proj';
-    const p = clarifyPaths(cwd, 12);
+    const p = clarifyPaths(cwd, '12');
     driver.sessions.add('clr-12'); // 上轮残留
     driver.files.set(p.feedback, '旧反馈（应被清掉重来）');
     driver.onCapture = (n, files) => {
@@ -402,7 +402,7 @@ describe('ClarifyRunner.run', () => {
         files.set(p.done, 'ok');
       }
     };
-    const r = await runClarify({ driver, ...mkClock() }, { issueId: 12, cwd, agent: 'claude', title: 't' }, FAST);
+    const r = await runClarify({ driver, ...mkClock() }, { issueId: '12', cwd, agent: 'claude', title: 't' }, FAST);
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.feedback).toBe('新反馈');
     // 残留会话先被杀，收尾又杀一次（第二次静默失败不炸）

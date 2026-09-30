@@ -14,7 +14,7 @@ import { feishuLoginConfigRoutes } from './routes/feishu-login-config';
 const dbs: Database[] = [];
 afterEach(() => { for (const db of dbs.splice(0)) db.close(); });
 const path = '/api/admin/feishu-messaging';
-function setup() {
+function setup(deploymentAllowed = true) {
   const db = openDb(':memory:'); dbs.push(db); migrate(db);
   const users = new UserStore(db);
   const admin = users.create('admin', 'admin');
@@ -25,7 +25,7 @@ function setup() {
   let release: Promise<void> | undefined;
   const channels: Array<MessagingChannel & { stopped: boolean; appId: string }> = [];
   const sent: Array<{ openid: string; userId: number }> = [];
-  const messaging = new FeishuMessaging({ db, config, notify, defaultEnabled: false, create: (cfg) => {
+  const messaging = new FeishuMessaging({ db, config, notify, defaultEnabled: false, deploymentAllowed, create: (cfg) => {
     const channel = {
       name: 'feishu' as const, appId: cfg.appId, stopped: false,
       start: async () => { await release; if (fail) throw new Error('secret'); },
@@ -49,6 +49,18 @@ function setup() {
   return { db, users, admin, member, config, notify, messaging, channels, sent, call, credentials,
     fail: () => { fail = true; }, block: (p: Promise<void>) => { release = p; } };
 }
+
+test('deployment-level off overrides a previously persisted enabled preference', async () => {
+  const s = setup(false);
+  s.credentials();
+  s.db.run('INSERT INTO feishu_messaging_config (id, enabled) VALUES (1, 1)');
+  await s.messaging.refresh();
+  expect(s.messaging.status(s.admin.user.id)).toMatchObject({ enabled: false, state: 'disabled' });
+  expect(s.channels).toHaveLength(0);
+  expect((await s.call('PUT', '', { enabled: true })).status).toBe(409);
+  expect(s.db.query<{ enabled: number }, []>('SELECT enabled FROM feishu_messaging_config WHERE id = 1').get()?.enabled).toBe(1);
+  await s.messaging.stop();
+});
 
 test('all management operations require admin; responses never include secrets', async () => {
   const s = setup();

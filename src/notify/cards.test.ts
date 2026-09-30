@@ -61,7 +61,7 @@ describe('三卡平移（v1 结构保持）', () => {
 
 describe('卡点确认卡（新增）', () => {
   test('approve/reject 双按钮共用同一 requestId，forge=gate', () => {
-    const c = buildGateCard({ requestId: 'gX', kind: 'plan', issueId: 7, summary: 'S' }, en) as Card;
+    const c = buildGateCard({ requestId: 'gX', kind: 'plan', issueId: '7', summary: 'S' }, en) as Card;
     expect(c.header.title.content).toContain('Plan awaiting confirmation');
     expect(c.header.title.content).toContain('#7');
     const btns = actions(c);
@@ -73,7 +73,7 @@ describe('卡点确认卡（新增）', () => {
   });
 
   test('merge_review 标题', () => {
-    const c = buildGateCard({ requestId: 'g', kind: 'merge_review', issueId: 3, summary: 'S' }, en) as Card;
+    const c = buildGateCard({ requestId: 'g', kind: 'merge_review', issueId: '3', summary: 'S' }, en) as Card;
     expect(c.header.title.content).toContain('Pre-merge review');
   });
 });

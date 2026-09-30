@@ -119,8 +119,8 @@ describe('纯函数', () => {
         { id: 2, slug: 'exec', displayName: '执行', agent: 'codex', source: 'auto', issueCount: 0 },
       ],
       issues: [
-        { id: 11, title: '修分支列表', body: '下拉里看不到远程分支\n补上', status: 'done', agent: 'claude', moduleId: 1 },
-        { id: 12, title: '无主任务', body: null, status: 'pending', agent: 'claude', moduleId: null },
+        { id: '11', title: '修分支列表', body: '下拉里看不到远程分支\n补上', status: 'done', agent: 'claude', moduleId: 1 },
+        { id: '12', title: '无主任务', body: null, status: 'pending', agent: 'claude', moduleId: null },
       ],
     });
     expect(md).toContain('项目：Demo');
@@ -157,10 +157,10 @@ describe('parseOrganizePlan', () => {
       { id: 9, slug: 'old-archived', agent: 'claude', active: false },
     ],
     issues: [
-      { id: 11, status: 'pending', moduleId: 1 },
-      { id: 12, status: 'done', moduleId: 2 },
-      { id: 13, status: 'implementing', moduleId: 2 },
-      { id: 14, status: 'blocked', moduleId: 3 },
+      { id: '11', status: 'pending', moduleId: 1 },
+      { id: '12', status: 'done', moduleId: 2 },
+      { id: '13', status: 'implementing', moduleId: 2 },
+      { id: '14', status: 'blocked', moduleId: 3 },
     ],
   };
   const plan = (actions: unknown[]): string => JSON.stringify({ actions });
@@ -235,8 +235,8 @@ describe('parseOrganizePlan', () => {
     );
     expect(got).toEqual([
       { kind: 'create', slug: 'file-preview', displayName: '文件预览', agent: 'claude', reason: 'r' },
-      { kind: 'move', issueIds: [11, 12], to: { slug: 'file-preview' }, reason: 'mv1' },
-      { kind: 'move', issueIds: [12], to: { moduleId: 3 }, reason: 'mv2' },
+      { kind: 'move', issueIds: ['11', '12'], to: { slug: 'file-preview' }, reason: 'mv1' },
+      { kind: 'move', issueIds: ['12'], to: { moduleId: 3 }, reason: 'mv2' },
     ]);
   });
 
@@ -264,7 +264,7 @@ describe('OrganizeRunner.run', () => {
       { id: 1, slug: 'legacy-module-01', displayName: 'Git 页面', agent: 'claude' as const, source: 'legacy', issueCount: 1 },
     ],
     issues: [
-      { id: 11, title: '修分支列表', body: null, status: 'done', agent: 'claude' as const, moduleId: 1 },
+      { id: '11', title: '修分支列表', body: null, status: 'done', agent: 'claude' as const, moduleId: 1 },
     ],
   };
 
@@ -300,7 +300,7 @@ describe('OrganizeRunner.run', () => {
     const r = await runOrganize({ driver, ...mkClock() }, { ...input, agent: 'codex' }, FAST);
     expect(r.ok).toBe(true);
     expect(driver.sent[0]!.text).toContain('codex');
-    expect(driver.sent[0]!.text).toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(driver.sent[0]!.text).toContain('--approve-for-me');
   });
 
   test('超时 → timeout；done 出现但 plan.json 缺失/为空 → no-output；createSession 抛错 → error', async () => {

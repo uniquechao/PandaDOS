@@ -4,7 +4,7 @@
  * 复制全文、必要时「查看完整内容」按 off 回源。
  */
 import { ImgThumb } from '../ImgThumb';
-import { Markdown } from '../Markdown';
+import { LinkedText, Markdown, type ProjectPaths } from '../Markdown';
 import { localizeUtcTimes } from '../../lib/utctime';
 import { tr } from '../../i18n/runtime';
 import { DetailBody } from './detail';
@@ -17,6 +17,7 @@ export function MessageEvent({
   ts,
   off,
   pid,
+  paths,
   onOpenImage,
 }: {
   role: 'user' | 'assistant';
@@ -30,6 +31,8 @@ export function MessageEvent({
   /** 该消息的稳定标识（issue #288「查看完整内容」用） */
   off?: number;
   pid?: number;
+  /** 项目 id + cwd：正文里落在项目内的文件路径做成文件页深链（issue #310）；缺省不做链接 */
+  paths?: ProjectPaths | null;
   onOpenImage?: (path: string) => void;
 }) {
   const imgs = pid != null && images && images.length ? images : [];
@@ -47,9 +50,14 @@ export function MessageEvent({
           role={role}
           // AI 正文：先就地补本地时间（`6:50am (UTC)`，原文保留），再按 markdown 渲染
           // （issue #298 —— 表格是重点，容错见 lib/markdown）。
-          // 用户自己打的字一个都不动：不换算时间，也不当 markdown 解析。
+          // 用户自己打的字一个都不动：不换算时间，也不当 markdown 解析，只把其中的文件路径
+          // 变成可点链接（issue #310：字符一个不改，只是多了个跳转入口）。
           render={(t) =>
-            role === 'assistant' ? <Markdown text={localizeUtcTimes(t, ts)} /> : <>{t}</>
+            role === 'assistant' ? (
+              <Markdown text={localizeUtcTimes(t, ts)} paths={paths} />
+            ) : (
+              <LinkedText text={t} paths={paths} />
+            )
           }
         />
       ) : null}

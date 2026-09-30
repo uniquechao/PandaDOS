@@ -19,6 +19,7 @@ import type {
   DesignGraphNodeDraft,
   DesignIssueBaselineContract,
 } from './types';
+import { compareIssueIds } from '../../shared/issue-id';
 
 const owner: Actor = { id: 'user:1', role: 'owner' };
 const otherOwner: Actor = { id: 'user:2', role: 'owner' };
@@ -167,7 +168,7 @@ function setup(opts: {
         }];
       });
       operations.push({
-        key: `issue-publication:${projectId}:scheduler:${[...issueIds].sort((a, b) => a - b).join(',')}`,
+        key: `issue-publication:${projectId}:scheduler:${[...issueIds].sort(compareIssueIds).join(',')}`,
         kind: 'scheduler',
         projectId,
         issueId: null,

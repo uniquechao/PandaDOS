@@ -25,6 +25,7 @@ import {
 } from '../../issues/engine';
 import { KeyedMutex } from '../../issues/mutex';
 import { ProgressBridge, progressToEvent } from './progress';
+import type { IssueId } from '../../../shared/issue-id';
 
 // ---------- ProgressBridge（reporter/notify 全 mock） ----------
 
@@ -68,7 +69,7 @@ const project = (id: number): Project => ({
 });
 
 const issue = (id: number, projectId: number): EngineIssue => ({
-  id,
+  id: String(id),
   projectId,
   title: 't',
   body: null,
@@ -146,7 +147,7 @@ describe('ProgressBridge', () => {
     await r.onPush!({ push: true, status: 'error', needsReply: true, headline: '测试炸了' });
     expect(t.dispatched).toEqual([
       {
-        kind: 'status_change', projectId: 10, issueId: 42,
+        kind: 'status_change', projectId: 10, issueId: '42',
         summaryCode: 'progress_needs_reply', summaryParams: { emoji: '❗', headline: '测试炸了' },
       },
     ]);
@@ -157,13 +158,13 @@ describe('ProgressBridge', () => {
   });
 
   test('progressToEvent 帧形状（确定性翻译）', () => {
-    expect(progressToEvent(1, 2, { push: true, status: 'done', needsReply: false, headline: 'ok' }))
+    expect(progressToEvent(1, '2', { push: true, status: 'done', needsReply: false, headline: 'ok' }))
       .toEqual({
-        kind: 'status_change', projectId: 1, issueId: 2,
+        kind: 'status_change', projectId: 1, issueId: '2',
         summaryCode: 'progress', summaryParams: { emoji: '✅', headline: 'ok' },
       });
     expect(
-      progressToEvent(1, 2, { push: true, status: 'waiting', needsReply: true, headline: '等确认' })
+      progressToEvent(1, '2', { push: true, status: 'waiting', needsReply: true, headline: '等确认' })
         .summaryCode,
     ).toBe('progress_needs_reply');
   });
@@ -246,7 +247,7 @@ describe('引擎 Wave3 钩子', () => {
     const convs = new ConversationManager(db, driver, locator);
     const menuCalls: EngineMenuCtx[] = [];
     const menuGone: string[] = [];
-    const msgCalls: Array<{ issueId: number; msgs: ChatMessage[] }> = [];
+    const msgCalls: Array<{ issueId: IssueId; msgs: ChatMessage[] }> = [];
     let menuThrow = false;
 
     const engine = new IssueEngine({

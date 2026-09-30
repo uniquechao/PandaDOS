@@ -50,23 +50,23 @@ describe('conversation 累计：覆盖写 + 游标', () => {
 describe('issue 归因：增量累加', () => {
   test('多次追加相加，不同 issue 互不影响', () => {
     const { store } = setup();
-    store.addIssue(10, 1, totals({ requests: 1, inputTokens: 100, outputTokens: 10 }));
-    store.addIssue(10, 1, totals({ requests: 2, inputTokens: 50, toolCalls: 4 }));
-    store.addIssue(11, 1, totals({ requests: 1, outputTokens: 7 }));
+    store.addIssue('10', 1, totals({ requests: 1, inputTokens: 100, outputTokens: 10 }));
+    store.addIssue('10', 1, totals({ requests: 2, inputTokens: 50, toolCalls: 4 }));
+    store.addIssue('11', 1, totals({ requests: 1, outputTokens: 7 }));
 
-    expect(store.getIssue(10)).toMatchObject({ requests: 3, inputTokens: 150, outputTokens: 10, toolCalls: 4 });
-    expect(store.getIssue(11)).toMatchObject({ requests: 1, outputTokens: 7 });
-    expect(store.getIssue(999)).toEqual(emptyUsage()); // 没有记录 = 全零，不是 undefined
+    expect(store.getIssue('10')).toMatchObject({ requests: 3, inputTokens: 150, outputTokens: 10, toolCalls: 4 });
+    expect(store.getIssue('11')).toMatchObject({ requests: 1, outputTokens: 7 });
+    expect(store.getIssue('999')).toEqual(emptyUsage()); // 没有记录 = 全零，不是 undefined
   });
 
   test('按项目列出，按 output 降序（成本视图默认想先看最贵的）', () => {
     const { store } = setup();
-    store.addIssue(10, 1, totals({ outputTokens: 5 }));
-    store.addIssue(11, 1, totals({ outputTokens: 50 }));
-    store.addIssue(20, 2, totals({ outputTokens: 500 }));
+    store.addIssue('10', 1, totals({ outputTokens: 5 }));
+    store.addIssue('11', 1, totals({ outputTokens: 50 }));
+    store.addIssue('20', 2, totals({ outputTokens: 500 }));
 
-    expect(store.listIssueUsage(1).map((b) => b.issueId)).toEqual([11, 10]);
-    expect(store.listIssueUsage().map((b) => b.issueId)).toEqual([20, 11, 10]);
+    expect(store.listIssueUsage(1).map((b) => b.issueId)).toEqual(['11', '10']);
+    expect(store.listIssueUsage().map((b) => b.issueId)).toEqual(['20', '11', '10']);
   });
 });
 
@@ -94,14 +94,14 @@ describe('聚合：项目 / 非 Issue 会话 / 归不到 issue 的余量 / 全�
   test('归不到 issue 的余量 = 会话总量 − 已归因；不为负', () => {
     const { store } = setup();
     store.upsertConversation({ convId: 'c1', projectId: 1, kind: 'issue', scannedBytes: 1, ...totals({ outputTokens: 100, requests: 4 }) });
-    store.addIssue(10, 1, totals({ outputTokens: 70, requests: 3 }));
+    store.addIssue('10', 1, totals({ outputTokens: 70, requests: 3 }));
 
     expect(store.unattributedByProject()).toEqual([
       expect.objectContaining({ projectId: 1, outputTokens: 30, requests: 1 }),
     ]);
 
     // 归因反而更多（口径出问题）时不出负数，但也不会被悄悄抹平成「正常」
-    store.addIssue(11, 1, totals({ outputTokens: 999 }));
+    store.addIssue('11', 1, totals({ outputTokens: 999 }));
     expect(store.unattributedByProject()[0]!.outputTokens).toBe(0);
   });
 
@@ -117,10 +117,10 @@ describe('聚合：项目 / 非 Issue 会话 / 归不到 issue 的余量 / 全�
 describe('按天分桶（065 / #295）', () => {
   test('同一天同一条 issue 多次追加相加；不同天/不同 issue 各自成桶', () => {
     const { store } = setup();
-    store.addDaily('2026-09-07', 1, 10, totals({ requests: 1, outputTokens: 10 }));
-    store.addDaily('2026-09-07', 1, 10, totals({ requests: 2, outputTokens: 5, toolCalls: 3 }));
-    store.addDaily('2026-09-07', 1, 11, totals({ outputTokens: 7 }));
-    store.addDaily('2026-09-08', 1, 10, totals({ outputTokens: 100 }));
+    store.addDaily('2026-09-07', 1, '10', totals({ requests: 1, outputTokens: 10 }));
+    store.addDaily('2026-09-07', 1, '10', totals({ requests: 2, outputTokens: 5, toolCalls: 3 }));
+    store.addDaily('2026-09-07', 1, '11', totals({ outputTokens: 7 }));
+    store.addDaily('2026-09-08', 1, '10', totals({ outputTokens: 100 }));
 
     expect(store.listDaily()).toEqual([
       expect.objectContaining({ day: '2026-09-07', projectId: 1, requests: 3, outputTokens: 22, toolCalls: 3 }),
@@ -130,10 +130,10 @@ describe('按天分桶（065 / #295）', () => {
 
   test('日期闭区间与项目筛选；按 day 升序（趋势要按时间读）', () => {
     const { store } = setup();
-    store.addDaily('2026-09-06', 1, 10, totals({ outputTokens: 1 }));
-    store.addDaily('2026-09-07', 1, 10, totals({ outputTokens: 2 }));
-    store.addDaily('2026-09-08', 1, 10, totals({ outputTokens: 4 }));
-    store.addDaily('2026-09-07', 2, 20, totals({ outputTokens: 8 }));
+    store.addDaily('2026-09-06', 1, '10', totals({ outputTokens: 1 }));
+    store.addDaily('2026-09-07', 1, '10', totals({ outputTokens: 2 }));
+    store.addDaily('2026-09-08', 1, '10', totals({ outputTokens: 4 }));
+    store.addDaily('2026-09-07', 2, '20', totals({ outputTokens: 8 }));
 
     expect(store.listDaily({ from: '2026-09-07', to: '2026-09-08' }).map((r) => [r.day, r.projectId, r.outputTokens]))
       .toEqual([['2026-09-07', 1, 2], ['2026-09-07', 2, 8], ['2026-09-08', 1, 4]]);
@@ -149,7 +149,7 @@ describe('按天分桶（065 / #295）', () => {
       VALUES (5, 1, 'issue-engine', 'issue 引擎与调度', 'claude', 'manual', 1),
              (6, 1, 'web-ui', '前端', 'codex', 'manual', 1)`);
     db.run('UPDATE issues SET module_id = 5 WHERE id = 10');
-    store.addDaily('2026-09-07', 1, 10, totals({ outputTokens: 30 }));
+    store.addDaily('2026-09-07', 1, '10', totals({ outputTokens: 30 }));
 
     expect(store.listDailyByModule()).toEqual([
       expect.objectContaining({
@@ -169,9 +169,9 @@ describe('按天分桶（065 / #295）', () => {
     db.run(`INSERT INTO project_modules (id, project_id, slug, display_name, agent, source, created_ts)
       VALUES (5, 1, 'issue-engine', 'issue 引擎与调度', 'claude', 'manual', 1)`);
     db.run('UPDATE issues SET module_id = 5 WHERE id = 10');
-    store.addDaily('2026-09-07', 1, 10, totals({ outputTokens: 30 }));
-    store.addDaily('2026-09-07', 1, 11, totals({ outputTokens: 7 }));  // issue 没有模块
-    store.addDaily('2026-09-07', 1, 0, totals({ outputTokens: 5 }));   // 未归因
+    store.addDaily('2026-09-07', 1, '10', totals({ outputTokens: 30 }));
+    store.addDaily('2026-09-07', 1, '11', totals({ outputTokens: 7 }));  // issue 没有模块
+    store.addDaily('2026-09-07', 1, '0', totals({ outputTokens: 5 }));   // 未归因
 
     expect(store.listDailyByModule({ projectId: 1 }).map((r) => [r.moduleId, r.outputTokens])).toEqual([
       [MODULE_UNATTRIBUTED, 5],
@@ -184,7 +184,7 @@ describe('按天分桶（065 / #295）', () => {
 
   test('issue 被删：分桶行留着（未归因/未归模块可见），不因外键消失', () => {
     const { db, store } = setup();
-    store.addDaily('2026-09-07', 1, 10, totals({ outputTokens: 30 }));
+    store.addDaily('2026-09-07', 1, '10', totals({ outputTokens: 30 }));
     db.run('DELETE FROM issues WHERE id = 10');
     expect(store.listDaily()).toEqual([expect.objectContaining({ outputTokens: 30 })]);
     expect(store.listDailyByModule()).toEqual([expect.objectContaining({ moduleId: MODULE_NONE, outputTokens: 30 })]);
@@ -219,23 +219,23 @@ describe('单价表与回扫（#282 / Q2、Q3）', () => {
     const { store } = setup();
     store.upsertConversation({ convId: 'c1', projectId: 1, kind: 'issue', scannedBytes: 900, ...totals({ outputTokens: 50 }) });
     store.upsertConversation({ convId: 'c3', projectId: 2, kind: 'issue', scannedBytes: 900, ...totals({ outputTokens: 7 }) });
-    store.addIssue(10, 1, totals({ outputTokens: 40 }));
-    store.addIssue(20, 2, totals({ outputTokens: 7 }));
-    store.addDaily('2026-09-07', 1, 10, totals({ outputTokens: 40 }));
-    store.addDaily('2026-09-07', 2, 20, totals({ outputTokens: 7 }));
+    store.addIssue('10', 1, totals({ outputTokens: 40 }));
+    store.addIssue('20', 2, totals({ outputTokens: 7 }));
+    store.addDaily('2026-09-07', 1, '10', totals({ outputTokens: 40 }));
+    store.addDaily('2026-09-07', 2, '20', totals({ outputTokens: 7 }));
 
     expect(store.resetScan(1)).toBe(1); // 只重置项目 1
     expect(store.getConversation('c1')).toMatchObject({ scannedBytes: 0, outputTokens: 0 });
-    expect(store.getIssue(10)).toEqual(emptyUsage());
+    expect(store.getIssue('10')).toEqual(emptyUsage());
     // 按天分桶也是累加表，同样必须被清掉（不清就会在回扫后翻倍）
     expect(store.listDaily({ projectId: 1 })).toEqual([]);
     // 别的项目不受影响
     expect(store.getConversation('c3')).toMatchObject({ scannedBytes: 900, outputTokens: 7 });
-    expect(store.getIssue(20).outputTokens).toBe(7);
+    expect(store.getIssue('20').outputTokens).toBe(7);
     expect(store.listDaily({ projectId: 2 })).toEqual([expect.objectContaining({ outputTokens: 7 })]);
 
     expect(store.resetScan()).toBe(2); // 全量重置
-    expect(store.getIssue(20)).toEqual(emptyUsage());
+    expect(store.getIssue('20')).toEqual(emptyUsage());
     expect(store.grandTotal()).toEqual(emptyUsage());
     expect(store.listDaily()).toEqual([]);
   });

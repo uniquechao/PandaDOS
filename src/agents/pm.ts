@@ -57,6 +57,7 @@ import {
 import { executeTool, TOOL_SCHEMAS, type PmToolsDeps, type ToolConvOps, type ToolLocator } from './tools';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
 import { outputLanguageInstruction, promptLanguage } from './prompts/language';
+import { parseIssueId, type IssueId } from '../../shared/issue-id';
 
 // ---------- 模块自带迁移（040 编号空间） ----------
 
@@ -139,7 +140,7 @@ export const MERGE_SYS = `# 任务：判断同一模块下的多条待办能否�
 你是项目 PM，在调度前对同一模块（子系统/目录）的若干待办任务做智能归并，目的是让高度相关、
 能在同一次实施里顺手一起完成的任务合并成一条，减少反复起会话、重复读代码的开销。
 
-只输出 JSON：{"groups": [{"members": [id, id, ...], "title": "合并后标题", "body": "合并后正文"}]}
+只输出 JSON：{"groups": [{"members": ["id", "id", ...], "title": "合并后标题", "body": "合并后正文"}]}
 
 规则（宁可不合并，也别把不相关的硬凑一起）：
 - 只合并**高度相关、边界重叠、能一起做且不互相冲突**的任务（如：改同一处逻辑的多个小修、
@@ -152,7 +153,7 @@ export const MERGE_SYS = `# 任务：判断同一模块下的多条待办能否�
   这是发起人对该条的明确要求，比「看起来很像」重要得多。（引擎侧另有确定性过滤，这里是双保险。）
 - 没有任何可合并的组时，groups 给空数组。`;
 export const MERGE_SYS_EN = `# Task: decide whether pending issues in one module should be merged
-Return JSON only: {"groups":[{"members":[1,2],"title":"merged title","body":"complete merged requirements"}]}.
+Return JSON only: {"groups":[{"members":["id","id"],"title":"merged title","body":"complete merged requirements"}]}.
 Merge only highly related work with overlapping boundaries that can safely be implemented together. Keep independent or risky work separate. Every group needs at least two supplied IDs. Preserve every requirement in the merged body. **Never put an issue in a group when its body declares that it must not be merged (noMerge / "do not merge" / scope declaration)** — the engine filters those too, this is a second line of defence. Return an empty groups array when nothing should merge.`;
 
 /** clarifying 判定 system（v2 新增，风格沿用四段调优 prompt 的保守哲学） */
@@ -255,14 +256,14 @@ export function formatMergeCandidate(candidate: MergeCandidate): string {
 }
 
 export interface MergeCandidate {
-  id: number;
+  id: IssueId;
   title: string;
   body: string | null;
 }
 
 /** LLM 给出的一个合并组：members 合成一条，title/body 为合并后内容 */
 export interface MergeGroup {
-  members: number[];
+  members: IssueId[];
   title: string;
   body: string;
 }
@@ -283,6 +284,8 @@ export interface PmUserStore {
 
 export interface PmAgentDeps {
   driver: ExecutorDriver;
+  /** Resolve the paired Driver and JSONL locator when a project lives on another executor. */
+  executionForProject?(project: Project): { driver: ExecutorDriver; locator: ToolLocator };
   llm: LlmClient;
   /** core/users UserStore 结构兼容（getSettings/byId 子集） */
   users: PmUserStore;
@@ -551,8 +554,8 @@ export class PmAgent {
         if (!g || typeof g !== 'object') continue;
         const gg = g as { members?: unknown; title?: unknown; body?: unknown };
         const members = (Array.isArray(gg.members) ? gg.members : [])
-          .map((m) => Number(m))
-          .filter((m) => Number.isInteger(m) && ids.has(m));
+          .map((m) => parseIssueId(m))
+          .filter((m): m is IssueId => m !== null && ids.has(m));
         const uniq = [...new Set(members)];
         if (uniq.length < 2) continue; // 少于 2 条不成合并
         const title = typeof gg.title === 'string' && gg.title.trim() ? gg.title.trim().slice(0, 200) : '';
@@ -561,7 +564,7 @@ export class PmAgent {
         out.push({ members: uniq, title, body });
       }
       // 防 LLM 把同一 id 划进多个组：一个 id 只归第一个用到它的组
-      const used = new Set<number>();
+      const used = new Set<IssueId>();
       return out.filter((g) => {
         if (g.members.some((m) => used.has(m))) return false;
         g.members.forEach((m) => used.add(m));
@@ -777,15 +780,18 @@ export class PmAgent {
  * 返回值签名与 EngineDeps.pmFor 一致，可直接接线。
  */
 export function createPmPool(deps: PmAgentDeps): (project: Project) => PmAgent {
-  const pool = new Map<number, PmAgent>();
+  const pool = new Map<number, { executorId: number; driver: ExecutorDriver; pm: PmAgent }>();
   return (project: Project) => {
-    let pm = pool.get(project.id);
-    if (!pm) {
-      pm = new PmAgent(project, deps);
-      pool.set(project.id, pm);
+    let entry = pool.get(project.id);
+    const execution = deps.executionForProject?.(project);
+    const driver = execution?.driver ?? deps.driver;
+    if (!entry || entry.executorId !== project.executorId || entry.driver !== driver) {
+      const pm = new PmAgent(project, execution ? { ...deps, ...execution } : deps);
+      entry = { executorId: project.executorId, driver, pm };
+      pool.set(project.id, entry);
     } else {
-      pm.project = project;
+      entry.pm.project = project;
     }
-    return pm;
+    return entry.pm;
   };
 }

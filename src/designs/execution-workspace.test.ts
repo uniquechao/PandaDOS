@@ -5,7 +5,7 @@ import type { EngineIssue } from '../issues/engine';
 import { DesignExecutionWorkspaceAdapter, ExecutionWorkspaceError } from './execution-workspace';
 
 const project = { id: 4, cwd: '/repo' } as Project;
-const issue = (id: number) => ({ id, projectId: 4, moduleId: null, agent: 'codex' }) as EngineIssue;
+const issue = (id: number) => ({ id: String(id), projectId: 4, moduleId: null, agent: 'codex' }) as EngineIssue;
 
 function dbReturning(row: Record<string, unknown> | null): Database {
   return {

@@ -1,3 +1,7 @@
+import { roomMemberMessages } from '../domains/rooms-members';
+import { roomChatMessages } from '../domains/rooms-chat';
+import { roomExtraMessages } from '../domains/rooms-extra';
+import { roomMessages } from '../domains/rooms';
 import { feishuChatMessages } from '../domains/feishu-chat';
 import { feishuLoginMessages } from '../domains/feishu-login';
 import { shellMessages } from '../domains/shell';
@@ -8,6 +12,7 @@ import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
 import { projectSettingsMessages } from '../domains/project-settings';
 import { externalImportMessages } from '../domains/external-import';
+import { workspaceMessages } from '../domains/workspace';
 import { designWorkbenchMessages } from '../domains/design-workbench';
 import { designWorkbenchAdvancedMessages } from '../domains/design-workbench-advanced';
 import { designAssetsUiMessages } from '../domains/design-assets-ui';
@@ -18,6 +23,10 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const enCatalog = {
+  ...roomMemberMessages["en"],
+  ...roomChatMessages["en"],
+  ...roomExtraMessages["en"],
+  ...roomMessages["en"],
   ...feishuChatMessages["en"],
   ...feishuLoginMessages["en"],
   ...shellMessages.en,
@@ -28,6 +37,7 @@ export const enCatalog = {
   ...notifyMessages.en,
   ...projectSettingsMessages.en,
   ...externalImportMessages.en,
+  ...workspaceMessages.en,
   ...designWorkbenchMessages.en,
   ...designWorkbenchAdvancedMessages.en,
   ...designAssetsUiMessages.en,

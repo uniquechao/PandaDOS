@@ -1,3 +1,5 @@
+import { langOfPath } from './highlight';
+
 /**
  * 文件预览类型判定（对话模式文件侧栏用）。按扩展名分：图片内联 / 网页沙箱 iframe /
  * PDF 下载 / 文本代码 / 其它下载。与后端 core/files.contentTypeForExt 口径大体对齐。
@@ -16,6 +18,7 @@ const TEXT = new Set([
   'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'css', 'scss', 'less',
   'py', 'go', 'rs', 'java', 'kt', 'c', 'h', 'cc', 'cpp', 'hpp', 'sh', 'bash',
   'toml', 'ini', 'conf', 'sql', 'rb', 'php', 'swift', 'vue', 'svelte',
+  'tsv', 'rst', 'adoc', 'tex', 'txt', 'text', 'out', 'err', 'diff', 'patch', 'srt', 'vtt',
 ]);
 
 export function isImageExt(ext: string): boolean {
@@ -34,6 +37,7 @@ export function previewKind(path: string): PreviewKind {
   if (IMG.has(e)) return 'image';
   if (e === 'html' || e === 'htm') return 'html';
   if (e === 'pdf') return 'pdf';
-  if (TEXT.has(e)) return 'text';
+  // 源码 / 脚本 / 配置 / 数据文件（含 Dockerfile、Makefile、.env 这类无扩展名文件）按 highlight 的语言表识别
+  if (TEXT.has(e) || langOfPath(path) !== null) return 'text';
   return 'download';
 }

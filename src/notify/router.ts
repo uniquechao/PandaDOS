@@ -27,11 +27,12 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import type { Database } from 'bun:sqlite';
 import { migrate, type MigrationStatus } from '../core/migrate';
-import type { Gate, IssueState, Subscription, SubscriptionScope } from '../core/types';
+import type { Gate, IssueState, Subscription, SubscriptionScope, SubscriptionTargetId } from '../core/types';
 import { createI18n, type I18nApi } from '../../shared/i18n/formatter';
 import { catalogs } from '../../shared/i18n/catalogs';
 import { isSupportedLocale, isValidTimeZone } from '../../shared/i18n/locales';
 import type { MessageKey } from '../../shared/i18n/messages';
+import type { IssueId } from '../../shared/issue-id';
 
 // ---------- 模块自带迁移（编号取全局唯一的 063，同 issues/030 模式） ----------
 
@@ -72,7 +73,7 @@ export type NotifySummaryCode =
 export interface NotifyEvent {
   kind: 'status_change' | 'gate_waiting' | 'issue_done' | 'issue_blocked' | 'choice_waiting';
   projectId: number;
-  issueId: number;
+  issueId: IssueId;
   /** status_change 专用 */
   from?: IssueState;
   to?: IssueState;
@@ -315,7 +316,8 @@ interface SubRow {
   id: number;
   user_id: number;
   scope: string;
-  target_id: number;
+  /** #307 起为 TEXT：project 订阅存项目 id 文本，issue 订阅存 issue 编号 */
+  target_id: string | number;
   created_ts: number;
 }
 
@@ -324,7 +326,7 @@ function mapSub(r: SubRow): Subscription {
     id: r.id,
     userId: r.user_id,
     scope: r.scope as SubscriptionScope,
-    targetId: r.target_id,
+    targetId: r.scope === 'project' ? Number(r.target_id) : String(r.target_id),
     createdTs: r.created_ts,
   };
 }
@@ -333,29 +335,29 @@ export class SubscriptionStore {
   constructor(private readonly db: Database) {}
 
   /** 幂等订阅：已存在返回现有行（UNIQUE(user_id,scope,target_id) 兜底） */
-  add(userId: number, scope: SubscriptionScope, targetId: number): Subscription {
+  add(userId: number, scope: SubscriptionScope, targetId: SubscriptionTargetId): Subscription {
     this.db
       .query(
         `INSERT INTO subscriptions (user_id, scope, target_id, created_ts) VALUES (?, ?, ?, ?)
          ON CONFLICT(user_id, scope, target_id) DO NOTHING`,
       )
-      .run(userId, scope, targetId, Date.now());
+      .run(userId, scope, String(targetId), Date.now());
     const r = this.db
-      .query<SubRow, [number, string, number]>(
+      .query<SubRow, [number, string, string]>(
         'SELECT * FROM subscriptions WHERE user_id = ? AND scope = ? AND target_id = ?',
       )
-      .get(userId, scope, targetId);
+      .get(userId, scope, String(targetId));
     if (!r) throw new Error('insert subscription failed');
     return mapSub(r);
   }
 
   /** 退订；不存在返回 false */
-  remove(userId: number, scope: SubscriptionScope, targetId: number): boolean {
+  remove(userId: number, scope: SubscriptionScope, targetId: SubscriptionTargetId): boolean {
     const r = this.db
-      .query<{ id: number }, [number, string, number]>(
+      .query<{ id: number }, [number, string, string]>(
         'DELETE FROM subscriptions WHERE user_id = ? AND scope = ? AND target_id = ? RETURNING id',
       )
-      .get(userId, scope, targetId);
+      .get(userId, scope, String(targetId));
     return r !== null;
   }
 
@@ -367,9 +369,9 @@ export class SubscriptionStore {
   }
 
   /** 事件的订阅者收敛：project 订阅 ∪ issue 订阅，按 user 去重 */
-  subscriberIds(projectId: number, issueId: number): number[] {
+  subscriberIds(projectId: number, issueId: IssueId): number[] {
     return this.db
-      .query<{ user_id: number }, [number, number]>(
+      .query<{ user_id: number }, [number, IssueId]>(
         `SELECT DISTINCT user_id FROM subscriptions
          WHERE (scope = 'project' AND target_id = ?) OR (scope = 'issue' AND target_id = ?)
          ORDER BY user_id`,

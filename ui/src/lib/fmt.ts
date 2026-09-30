@@ -27,3 +27,12 @@ export function tryJson<T>(s: string | null | undefined): T | null {
     return null;
   }
 }
+
+/** 文件大小（B/K/M/G，技术单位不随语言变化） */
+export function fmtSize(n: number | null | undefined): string {
+  if (n === null || n === undefined) return '';
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}K`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)}M`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(1)}G`;
+}

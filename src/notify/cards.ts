@@ -15,6 +15,7 @@
  */
 import type { GateKind } from '../core/types';
 import type { I18nApi } from '../../shared/i18n/formatter';
+import type { IssueId } from '../../shared/issue-id';
 
 // ---------- 事件状态（v1 cards.ts:3-18 原样） ----------
 
@@ -168,7 +169,7 @@ export interface GateCardArgs {
   /** 一次性 requestId（GateRequestStore.create 产出，消费即失效） */
   requestId: string;
   kind: GateKind;
-  issueId: number;
+  issueId: IssueId;
   /** 计划摘要或 diff 摘要（gateSummary 产出，可加抬头） */
   summary: string;
 }

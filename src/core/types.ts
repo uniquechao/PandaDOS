@@ -1,4 +1,6 @@
 import type { SupportedLocale } from '../../shared/i18n/locales';
+import type { IssueId } from '../../shared/issue-id';
+export type { IssueId } from '../../shared/issue-id';
 
 /**
  * core/types —— 领域类型（对应 SQLite 数据模型，spec §4）。
@@ -85,6 +87,7 @@ export function parseAutoApproveLevel(v: unknown): AutoApproveLevel | null {
 // ---------- 项目 / 对话 ----------
 
 export type ProjectStatus = 'active' | 'archived';
+export type ValidationPolicy = 'required' | 'optional' | 'none';
 
 /** 对话类型：issue 引擎执行会话或项目级独立聊天会话。 */
 export type ConversationKind = 'issue' | 'chat';
@@ -108,6 +111,8 @@ export interface Project {
   createdTs: number;
   /** 项目归属的执行机 Linux 用户名（003 迁移；'' = 跟随执行机连接用户） */
   runUser: string;
+  /** Dedicated mode runs the entire project through one verified, unprivileged SSH OS account. */
+  executionIsolation?: 'shared' | 'dedicated-ssh';
   /** README 自动简介（005 迁移；core/readme-summary.ts 按天生成，null = 尚未生成） */
   readmeSummary: string | null;
   /**
@@ -135,6 +140,8 @@ export interface Project {
    * 空数组 = 显式「不跑门禁」。两者不是一回事，别在读取侧混成一个。
    */
   validationCommands: ValidationCommand[] | null;
+  /** required 阻止无命令的自动完成；optional 保留既有行为；none 明确豁免。 */
+  validationPolicy?: ValidationPolicy;
   /** 项目统一使用 Issue 看板；字段保留用于兼容既有持久化与接口。 */
   kind: 'issue';
 }
@@ -183,7 +190,7 @@ export interface ExternalIssueRecord {
   externalNumber: string;
   externalUrl: string;
   disposition: ExternalIssueDisposition;
-  localIssueId: number | null;
+  localIssueId: IssueId | null;
   createdBy: number | null;
   createdTs: number;
   updatedTs: number;
@@ -304,7 +311,7 @@ export interface ValidationScope {
 }
 
 export interface Issue {
-  id: number;
+  id: IssueId;
   syncUid?: string;
   projectId: number;
   title: string;
@@ -390,7 +397,7 @@ export interface WorkflowGraphSnapshot {
 export interface IssueWorkflowSharedContext {
   schemaVersion: 1;
   issue: {
-    id: number;
+    id: IssueId;
     title: string;
     body: string | null;
     category: IssueCategory;
@@ -454,7 +461,7 @@ export type IssueWorkflowStatus =
 /** issue 创建时复制 graph；template 引用仅用于溯源，不参与后续执行。 */
 export interface IssueWorkflowSnapshot {
   id: number;
-  issueId: number;
+  issueId: IssueId;
   templateId: number | null;
   templateVersionId: number | null;
   templateName: string;
@@ -560,7 +567,7 @@ export interface IssueWorkflowRuntime {
 
 export interface IssueEvent {
   id: number;
-  issueId: number;
+  issueId: IssueId;
   kind: string;
   dataJson: string | null;
   ts: number;
@@ -573,7 +580,7 @@ export type GateStatus = 'waiting' | 'approved' | 'rejected';
 
 export interface Gate {
   id: number;
-  issueId: number;
+  issueId: IssueId;
   kind: GateKind;
   status: GateStatus;
   payloadJson: string | null;
@@ -585,11 +592,15 @@ export interface Gate {
 
 export type SubscriptionScope = 'project' | 'issue';
 
+/** 订阅目标：project 订阅 = 项目数字 id；issue 订阅 = issue 编号 */
+export type SubscriptionTargetId = number | IssueId;
+
 export interface Subscription {
   id: number;
   userId: number;
   scope: SubscriptionScope;
-  targetId: number;
+  /** project 订阅 = 项目 id；issue 订阅 = issue 编号（#307） */
+  targetId: SubscriptionTargetId;
   createdTs: number;
 }
 

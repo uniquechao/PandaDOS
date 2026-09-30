@@ -8,6 +8,7 @@ import type { Database } from 'bun:sqlite';
 import type { AgentKind, ProjectModule, ReasoningEffort } from '../core/types';
 import { parseReasoningEffort, REASONING_EFFORTS } from '../core/types';
 import { moduleIssueRelPath } from './module-docs';
+import type { IssueId } from '../../shared/issue-id';
 
 export type ModuleSource = ProjectModule['source'];
 
@@ -41,7 +42,7 @@ export interface ModuleDocsPort {
   /** slug 改名时把 .panda/modules/<旧slug>/ 目录整体迁到新 slug 并改写 meta；缺省 = 不支持改 slug。 */
   renameDir?(module: ProjectModule, newSlug: string): Promise<void>;
   createIssuePage?(module: ProjectModule, issue: {
-    id: number;
+    id: IssueId;
     title: string;
     body: string | null;
     status: string;
@@ -49,20 +50,20 @@ export interface ModuleDocsPort {
     createdTs: number;
   }): Promise<string>;
   refreshIssueIndex?(module: ProjectModule, issues: Array<{
-    id: number;
+    id: IssueId;
     title: string;
     status: string;
     docPath: string;
   }>): Promise<void>;
   recordResultSummary?(
     module: ProjectModule,
-    issue: { id: number; title: string; body: string | null; status: string; agent: AgentKind; createdTs: number },
+    issue: { id: IssueId; title: string; body: string | null; status: string; agent: AgentKind; createdTs: number },
     summary: string,
   ): Promise<void>;
   /** 模块知识增量（#277 / I-01）：写进 MODULE.md 的 module-knowledge 区块 */
   recordModuleKnowledge?(
     module: ProjectModule,
-    entry: { issueId: number; status: string; title: string; note?: string },
+    entry: { issueId: IssueId; status: string; title: string; note?: string },
   ): Promise<void>;
 }
 
@@ -441,8 +442,8 @@ export class ModuleManager {
 
   async recordIssue(
     module: ProjectModule,
-    issue: { id: number; title: string; body: string | null; status: string; agent: AgentKind; createdTs: number },
-    projectIssues: Array<{ id: number; title: string; status: string; moduleId: number | null }>,
+    issue: { id: IssueId; title: string; body: string | null; status: string; agent: AgentKind; createdTs: number },
+    projectIssues: Array<{ id: IssueId; title: string; status: string; moduleId: number | null }>,
     signal?: AbortSignal,
   ): Promise<void> {
     if (!this.deps.docs.createIssuePage || !this.deps.docs.refreshIssueIndex) return;
@@ -464,7 +465,7 @@ export class ModuleManager {
 
   async recordResultSummary(
     module: ProjectModule,
-    issue: { id: number; title: string; body: string | null; status: string; agent: AgentKind; createdTs: number },
+    issue: { id: IssueId; title: string; body: string | null; status: string; agent: AgentKind; createdTs: number },
     summary: string,
   ): Promise<void> {
     if (!this.deps.docs.recordResultSummary) return;
@@ -478,7 +479,7 @@ export class ModuleManager {
    */
   async recordModuleKnowledge(
     module: ProjectModule,
-    entry: { issueId: number; status: string; title: string; note?: string },
+    entry: { issueId: IssueId; status: string; title: string; note?: string },
   ): Promise<void> {
     if (!this.deps.docs.recordModuleKnowledge) return;
     await this.deps.docs.recordModuleKnowledge(module, entry);
@@ -575,7 +576,7 @@ export class ModuleManager {
   /** 刷新某模块的 ISSUES.md 索引（issue 被挪走后来源模块要除名；目标模块由 recordIssue 顺带刷） */
   async syncIssueIndex(
     module: ProjectModule,
-    projectIssues: Array<{ id: number; title: string; status: string; moduleId: number | null }>,
+    projectIssues: Array<{ id: IssueId; title: string; status: string; moduleId: number | null }>,
   ): Promise<void> {
     if (!this.deps.docs.refreshIssueIndex) return;
     const items = projectIssues

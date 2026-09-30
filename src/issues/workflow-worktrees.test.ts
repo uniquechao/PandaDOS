@@ -124,12 +124,12 @@ async function setup() {
   });
   const context: IssueWorkflowSharedContext = {
     schemaVersion: 1,
-    issue: { id: 33, title: '并行修改', body: '测试 worktree', category: 'task', createdTs: 2 },
+    issue: { id: '33', title: '并行修改', body: '测试 worktree', category: 'task', createdTs: 2 },
     project: { id: 1, name: 'demo', goal: null, readmeSummary: null, understanding: null, understandingAgent: null, understandingTs: null },
     module: null,
     documents: { module: null, issueProcess: null },
   };
-  const workflow = templates.attachIssue(33, template, context);
+  const workflow = templates.attachIssue('33', template, context);
   const group = JSON.stringify({ forkRunId: 1, parentGroup: null, parentToken: 'root' });
   const insertRun = (nodeKey: string, finishedTs: number) => db.query<{ id: number }, [number, string, string, string, number, number, number]>(
     `INSERT INTO issue_workflow_node_runs
@@ -170,6 +170,26 @@ async function prepareChange(
 }
 
 describe('并行写节点 worktree', () => {
+  test('同 cwd 的工作流 Git 操作只发给项目 Driver', async () => {
+    const s = await setup();
+    const wrong = new GitTestDriver();
+    wrong.git = async () => { throw new Error('主执行机不得收到工作流 Git 操作'); };
+    const manager = new WorkflowWorktreeManager({
+      db: s.db,
+      driver: wrong,
+      driverForProjectId: (projectId) => {
+        expect(projectId).toBe(1);
+        return s.driver;
+      },
+      conversations: s.conversations,
+      mutex: new KeyedMutex(),
+      logEvent: () => {},
+    });
+    const cwd = await manager.prepare(s.insertRun('a', 10));
+    expect(cwd).toContain('.worktrees');
+    expect((await s.driver.git(cwd!, ['rev-parse', '--is-inside-work-tree'])).out.trim()).toBe('true');
+  });
+
   test('服务在 preparing 阶段重启后可重建缺失 worktree', async () => {
     const s = await setup();
     const runId = s.insertRun('a', 10);

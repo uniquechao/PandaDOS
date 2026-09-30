@@ -1,0 +1,6 @@
+-- panda:issue-text-id
+-- 074（#307）：issue 主键改文本编号 `YYYYMMDD-` + 4 位随机十六进制 + 本机 MAC 后 3 位。
+-- 运行期重建（core/migrate.convertIssueIdsToText）：issues.id → TEXT PRIMARY KEY，所有外键指向
+-- issues(id) 的列及 subscriptions.target_id / usage_daily.issue_id / skill_policies.issue_id → TEXT。
+-- 存量数字编号原样转成文本（'307'），不回填新格式。幂等：已是 TEXT 的表跳过。
+-- designs 目录在 issues 之后执行，全新库上它的表晚于本迁移才建出来，由 075 再跑一遍补齐。

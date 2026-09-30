@@ -42,6 +42,7 @@ import {
   type ChatWsDeps,
 } from './chat';
 import { clampInt, termClose, termMessage, termOpen, type TermWsData } from './term';
+import { parseIssueId, type IssueId } from '../../../shared/issue-id';
 
 export type WsData = TermWsData | ChatWsData;
 
@@ -62,10 +63,14 @@ export interface WsDeps {
     reclaim?(convId: string): Promise<string | null>;
   };
   mutex: KeyedMutex;
-  /** jsonl 读取面（与引擎/locator 同源 = 主执行机 Driver） */
+  /** Legacy default JSONL reader; project-scoped historyForProject takes precedence. */
   reader: JsonlReader;
+  /** Resolve JSONL locator and reader together for the project's executor. */
+  historyForProject?(project: Project): Pick<ChatWsDeps, 'reader' | 'locator'>;
   /** tmux/PTY 操作面：项目 → 其 executor 的 Driver */
   driverForProject(project: Project): ExecutorDriver;
+  /** Legacy fail-closed guard when no project-scoped history resolver is installed. */
+  executionUnavailable?(project: Project): string | null;
   approvals?: ChatApprovals;
   /** 菜单解读（issue #112「解释一下」）；缺省不接 = 前端点了收 explain_failed */
   explain?: ChatWsDeps['explain'];
@@ -98,12 +103,6 @@ function designConversationDeny(conversationId: string): Response {
     409,
     { conversationId },
   ), 409);
-}
-
-function parseIssueId(raw: string): number | null {
-  if (!/^[1-9]\d*$/.test(raw)) return null;
-  const id = Number(raw);
-  return Number.isSafeInteger(id) ? id : null;
 }
 
 /** Design conversations share the chat storage shape but remain outside ordinary chat/terminal entry points. */
@@ -178,11 +177,11 @@ function resolveTermTarget(deps: WsDeps, projectId: number, url: URL, ded: strin
     const raw = url.searchParams.get('issue') ?? '';
     const issueId = parseIssueId(raw);
     if (issueId === null) return targetDeny('非法 issue id', 400);
-    const scope = deps.db.query<{ project_id: number }, [number]>('SELECT project_id FROM issues WHERE id = ?').get(issueId);
+    const scope = deps.db.query<{ project_id: number }, [IssueId]>('SELECT project_id FROM issues WHERE id = ?').get(issueId);
     if (!scope) return targetDeny('issue 不存在', 404);
     if (scope.project_id !== projectId) return targetDeny('issue 不属于该项目', 403);
     const issue = deps.db
-      .query<{ conv_id: string }, [number, number]>(
+      .query<{ conv_id: string }, [IssueId, number]>(
         `SELECT i.conv_id
          FROM issues i
          JOIN conversations c ON c.id = i.conv_id AND c.project_id = i.project_id AND c.kind = 'issue'
@@ -299,6 +298,17 @@ export async function handleWsUpgrade(
     return server.upgrade(req, { data }) ? undefined : json({ ok: false, error: 'upgrade failed' }, 400);
   }
 
+  let history: Pick<ChatWsDeps, 'reader' | 'locator'> | undefined;
+  try {
+    history = deps.historyForProject?.(project);
+  } catch (e) {
+    return json(apiError('executor.chat_unavailable', String(e), 409), 409);
+  }
+  if (!history) {
+    const unavailable = deps.executionUnavailable?.(project);
+    if (unavailable) return json(apiError('executor.chat_unavailable', unavailable, 409), 409);
+  }
+
   // ?conv= 钉住对话：必须属于该项目——防跨项目读任意对话历史。
   // 不存在与不属于同视为 403（不泄露 conv 存在性，与项目 404/403 语义一致）。
   // kind='chat'（对话模式独立对话）→ 注入/抓屏目标 = 它自己的会话 chat-<convId>，恒可注入；
@@ -333,6 +343,7 @@ export async function handleWsUpgrade(
     session,
     cwd: project.cwd,
     driver,
+    ...(history ? { history } : {}),
     ...(pinnedAgent ? { agent: pinnedAgent } : {}),
     pinnedConv,
     chatMode,
@@ -350,7 +361,7 @@ export async function handleWsUpgrade(
 
 /** Bun.serve 的 websocket 处理器（按 ws.data.kind 分发） */
 export function createWsHandlers(deps: WsDeps): WebSocketHandler<WsData> {
-  const chatDeps = {
+  const sharedChatDeps = {
     reader: deps.reader,
     locator: deps.locator,
     convs: deps.convs,
@@ -362,17 +373,21 @@ export function createWsHandlers(deps: WsDeps): WebSocketHandler<WsData> {
     ...(deps.retryDelayMs !== undefined ? { retryDelayMs: deps.retryDelayMs } : {}),
     ...(deps.messages ? { messages: deps.messages } : {}),
   };
+  const chatDeps = (data: ChatWsData): ChatWsDeps => ({
+    ...sharedChatDeps,
+    ...(data.history ?? {}),
+  });
   return {
     open(ws) {
       if (ws.data.kind === 'term') void termOpen(ws as ServerWebSocket<TermWsData>);
-      else void chatOpen(ws as ServerWebSocket<ChatWsData>, chatDeps);
+      else void chatOpen(ws as ServerWebSocket<ChatWsData>, chatDeps(ws.data as ChatWsData));
     },
     message(ws, msg) {
       // Bun 的 binary 帧是 Buffer（Uint8Array 子类），零拷贝转视图
       const payload: string | Uint8Array =
         typeof msg === 'string' ? msg : new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength);
       if (ws.data.kind === 'term') termMessage(ws as ServerWebSocket<TermWsData>, payload);
-      else chatMessage(ws as ServerWebSocket<ChatWsData>, payload, chatDeps);
+      else chatMessage(ws as ServerWebSocket<ChatWsData>, payload, chatDeps(ws.data as ChatWsData));
     },
     close(ws) {
       if (ws.data.kind === 'term') termClose(ws as ServerWebSocket<TermWsData>);

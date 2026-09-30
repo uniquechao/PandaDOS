@@ -16,7 +16,7 @@ issue -> optional module -> persistent conversation/session id
 | --- | --- | --- |
 | Project | working directory + executor | Filesystem access crosses `ExecutorDriver` |
 | Issue | database row + event state machine | Holds a conversation id, not a process |
-| Module | project module id | Uses one agent and reuses one conversation sequentially |
+| Module | project module id | Uses one agent; normally rotates issue conversations and preserves shared knowledge in `MODULE.md` |
 | Conversation | CLI session id | Survives service and tmux restarts |
 | tmux session | computed session name | Replaceable runtime container |
 
@@ -36,9 +36,9 @@ Names are computed by the control plane and must never be guessed. New sessions 
 
 ## Issue lifecycle and scheduling
 
-The normal state path is `pending -> planning -> implementing -> testing -> done`; any phase may become blocked. Transitions are pure, validated, persisted as events, and applied through one engine boundary. A project runs one issue at a time. Queue priority is manual pinning, then same-module grouping, then FIFO.
+Ordinary issues normally run `pending -> implementing -> testing -> done`; explicit planning, workflow templates, and manual review add their respective stages. Execution failures pause with a resumable context; external blockers use `blocked`. Transitions are validated and recorded through one engine boundary. A project runs one ordinary issue at a time. Queue priority is manual pinning, then same-module grouping, then FIFO.
 
-An issue reuses its existing conversation, otherwise its module conversation, otherwise an available debug conversation when eligible, and finally a new conversation. Module identity is the module id; display slugs are never scheduling keys.
+An issue resumes its own conversation when recovering. New module issues normally receive a new conversation; module documentation carries durable context. Module identity is the module id; display slugs are never scheduling keys. `done` means the accepted objective and required verification are complete. Commit, push, merge, and deployment are separate delivery facts; ordinary completion does not imply a local merge or production deployment.
 
 ## Engine heartbeat
 

@@ -27,6 +27,7 @@ import type {
   DesignRevision,
   DesignTask,
 } from './types';
+import { parseIssueId, type IssueId } from '../../shared/issue-id';
 
 const CONFIRMATION_TTL_MS = 5 * 60_000;
 const MAX_ISSUE_BODY = 8_000;
@@ -447,15 +448,15 @@ export class DesignPublisher implements DesignPublisherPort {
             agent?: unknown;
           };
           if (payload.projectId !== publication.projectId || !Array.isArray(payload.issueIds)
-            || !payload.issueIds.every((id) => Number.isSafeInteger(id))) {
+            || !payload.issueIds.every((id) => parseIssueId(id) !== null)) {
             throw new Error(`publication outbox payload invalid: ${item.targetKey}`);
           }
           return {
             key: item.targetKey,
             kind: item.kind === 'module_index' ? 'module-doc' as const : 'scheduler' as const,
             projectId: publication.projectId,
-            issueId: Number.isSafeInteger(payload.issueId) ? payload.issueId as number : null,
-            issueIds: payload.issueIds as number[],
+            issueId: parseIssueId(payload.issueId),
+            issueIds: payload.issueIds.map((id) => parseIssueId(id)!),
             ...(item.kind === 'module_index'
               ? {
                 moduleId: Number.isSafeInteger(payload.moduleId) ? payload.moduleId as number : null,

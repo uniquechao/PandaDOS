@@ -7,6 +7,7 @@ const login = readFileSync(new URL('./views/Login.tsx', import.meta.url), 'utf8'
 const provider = readFileSync(new URL('./i18n/provider.tsx', import.meta.url), 'utf8');
 const enCatalog = readFileSync(new URL('../../shared/i18n/catalogs/en.ts', import.meta.url), 'utf8');
 const index = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+const viteConfig = readFileSync(new URL('../vite.config.ts', import.meta.url), 'utf8');
 
 describe('PandaDOS 品牌视觉系统', () => {
   test('可见品牌只保留 PandaDOS 名称与标识，不展示内部定位口号', () => {
@@ -86,12 +87,16 @@ describe('PandaDOS 品牌位图', () => {
     ['apple-touch-icon.png', 180],
   ] as const;
 
-  test.each(sizes)('%s 在 ui/public 与 public 同步且尺寸正确', (name, size) => {
+  test.each(sizes)('%s 源资产尺寸正确', (name, size) => {
     const uiAsset = readFileSync(new URL(`../public/${name}`, import.meta.url));
-    const builtAsset = readFileSync(new URL(`../../public/${name}`, import.meta.url));
-    expect(uiAsset.equals(builtAsset)).toBe(true);
     expect(uiAsset.subarray(1, 4).toString()).toBe('PNG');
     expect(uiAsset.readUInt32BE(16)).toBe(size);
     expect(uiAsset.readUInt32BE(20)).toBe(size);
+  });
+
+  test('Vite 使用 ui/public 作为源并将产物输出到根目录 public', () => {
+    // Vite 默认从 <root>/public 复制静态资产；没有显式 publicDir 覆盖才能守住这条约定。
+    expect(viteConfig).not.toMatch(/\bpublicDir\s*:/);
+    expect(viteConfig).toContain("outDir: '../public'");
   });
 });

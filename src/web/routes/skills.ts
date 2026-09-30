@@ -56,6 +56,7 @@ import type { Executor, Project } from '../../core/types';
 import { getProject } from '../../issues/engine';
 import { json, type RouteDef } from '../middleware';
 import { getExecutorById } from './executors';
+import { parseIssueId, type IssueId } from '../../../shared/issue-id';
 
 export interface SkillsRoutesDeps {
   db: Database;
@@ -125,10 +126,10 @@ export function skillsRoutes(deps: SkillsRoutesDeps): RouteDef[] {
     method, path:'/api/projects/:projectId/skill-policy', auth:'project-access',
     handler: async ({req,params}) => {
       const pid=Number(params.projectId), query=new URL(req.url).searchParams;
-      const mid=Number(query.get('moduleId') ?? 0), iid=Number(query.get('issueId') ?? 0);
-      if (![pid,mid,iid].every(Number.isSafeInteger) || pid<=0 || mid<0 || iid<0 || (mid && iid)) return json({ok:false,error:'Invalid policy scope'},400);
+      const mid=Number(query.get('moduleId') ?? 0), rawIid=query.get('issueId'), iid=rawIid && rawIid !== '0' ? parseIssueId(rawIid) : '';
+      if (![pid,mid].every(Number.isSafeInteger) || pid<=0 || mid<0 || iid===null || (mid && iid)) return json({ok:false,error:'Invalid policy scope'},400);
       if (mid && !db.query('SELECT id FROM project_modules WHERE id=? AND project_id=?').get(mid,pid)) return json({ok:false,error:'Module not found'},404);
-      const issue=iid ? db.query<{module_id:number|null},[number,number]>('SELECT module_id FROM issues WHERE id=? AND project_id=?').get(iid,pid) : null;
+      const issue=iid ? db.query<{module_id:number|null},[IssueId,number]>('SELECT module_id FROM issues WHERE id=? AND project_id=?').get(iid,pid) : null;
       if (iid && !issue) return json({ok:false,error:'Issue not found'},404);
       const scope={projectId:pid,moduleId:mid || undefined,issueId:iid || undefined};
       try {

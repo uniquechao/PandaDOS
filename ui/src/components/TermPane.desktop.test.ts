@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import type { IssueId } from '../../../shared/issue-id';
 
 const termPaneUrl = new URL('./TermPane.tsx', import.meta.url);
 
@@ -7,7 +8,7 @@ describe('TermPane PC 端回归', () => {
     const { buildTermWsPath } = await import('./TermPane');
 
     expect(buildTermWsPath(42, { kind: 'bash' }, 80, 24)).toBe('/ws/term/42?cols=80&rows=24');
-    expect(buildTermWsPath(42, { kind: 'issue', issueId: 7 }, 80, 24)).toBe(
+    expect(buildTermWsPath(42, { kind: 'issue', issueId: '7' }, 80, 24)).toBe(
       '/ws/term/42?issue=7&cols=80&rows=24',
     );
     expect(buildTermWsPath(42, { kind: 'conversation', convId: 'chat-7' }, 80, 24)).toBe(
@@ -18,7 +19,7 @@ describe('TermPane PC 端回归', () => {
   test('公开的终端目标与面板 props 都要求调用方选择目标', async () => {
     const source = await Bun.file(termPaneUrl).text();
 
-    expect(source).toContain("export type NativeTarget = { kind: 'bash' } | { kind: 'issue'; issueId: number } | { kind: 'conversation'; convId: string };");
+    expect(source).toContain("export type NativeTarget = { kind: 'bash' } | { kind: 'issue'; issueId: IssueId } | { kind: 'conversation'; convId: string };");
     expect(source).toContain('export function TermPane({ pid, target, onStatus, closedMessage }');
   });
 

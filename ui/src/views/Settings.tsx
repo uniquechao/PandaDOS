@@ -275,7 +275,7 @@ function SubscriptionsSect() {
             {s.scope === 'project' ? t('view.project') : 'issue'}
           </span>
           <span class="grow">
-            {s.scope === 'project' ? (projects.get(s.targetId) ?? `#${s.targetId}`) : `issue #${s.targetId}`}
+            {s.scope === 'project' ? (projects.get(Number(s.targetId)) ?? `#${s.targetId}`) : `issue #${s.targetId}`}
           </span>
           <span class="mut small">{fmtTime(s.createdTs)}</span>
           <button class="btn sm ghost danger" onClick={() => void unsub(s)}>

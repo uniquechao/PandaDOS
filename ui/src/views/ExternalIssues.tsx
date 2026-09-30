@@ -19,6 +19,7 @@ import type {
   ProjectModule,
 } from '../lib/types';
 import { reconcileAgent } from '../components/AgentPicker';
+import type { IssueId } from '../../../shared/issue-id';
 
 const PROVIDER_LABEL = { github: 'GitHub', gitlab: 'GitLab' } as const;
 
@@ -77,7 +78,7 @@ function ImportModal({
   modules: ProjectModule[];
   supportedAgents: AgentKind[];
   onClose: () => void;
-  onImported: (candidate: ExternalIssueCandidate, localIssueId: number) => void;
+  onImported: (candidate: ExternalIssueCandidate, localIssueId: IssueId) => void;
 }) {
   const { t } = useI18n();
   const initialAgent = supportedAgents[0] ?? 'claude';
@@ -109,7 +110,7 @@ function ImportModal({
     setBusy(true);
     setError('');
     try {
-      const result = await api<{ issue: { id: number } }>(
+      const result = await api<{ issue: { id: IssueId } }>(
         `/api/projects/${pid}/external-issues/import`,
         'POST',
         externalIssueImportPayload(candidate, form, modules),

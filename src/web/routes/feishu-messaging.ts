@@ -14,6 +14,9 @@ export function feishuMessagingRoutes(db: Database, messaging: FeishuMessaging):
         if (!body || typeof body.enabled !== 'boolean') {
           return json(apiError('feishu.messaging_invalid', 'Choose whether to enable messaging.', 400), 400);
         }
+        if (body.enabled && !messaging.deploymentAllowed) {
+          return json(apiError('feishu.messaging_unavailable', 'Messaging is disabled by server configuration.', 409), 409);
+        }
         if (body.enabled && !messaging.status(user!.id).configured) {
           return json(apiError('feishu.messaging_unconfigured', 'Save an App ID and secret first.', 400), 400);
         }

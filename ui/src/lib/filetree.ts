@@ -1,7 +1,7 @@
 /**
  * ui/lib/filetree —— 文件页左侧可展开文件树的纯逻辑（脱离 DOM，可单测）。
  *
- * 只放「拼子路径」「按条目选图标」两个无副作用小函数；懒加载/展开态等有状态逻辑留在
+ * 只放「拼子路径」「按条目选图标」「算祖先目录」几个无副作用小函数；懒加载/展开态等有状态逻辑留在
  * components/FileTree.tsx。图标口径与 Chat 文件侧栏一致（复用 lib/preview 的图片判定）。
  */
 import type { FsEntry } from './types';
@@ -28,4 +28,20 @@ export function treeIcon(entry: FsEntry): string {
   if (entry.type === 'symlink') return '🔗';
   if (entry.type === 'other') return '❓';
   return isImageExt(extOf(entry.name)) ? '🖼' : '📄';
+}
+
+/**
+ * 深链目标 → 需要展开的各级目录（由外到内）。
+ * 目标带尾斜杠 = 目录，自己也要展开；否则末段是文件名，只展开到它的父目录。
+ * 根目录恒展开、不入展开集，所以结果里不含 ''。
+ */
+export function ancestorDirsOf(target: string | null | undefined): string[] {
+  if (!target) return [];
+  const isDir = target.endsWith('/');
+  const segs = target.split('/').filter((s) => s.length > 0 && s !== '.');
+  if (segs.some((s) => s === '..')) return [];
+  const depth = isDir ? segs.length : segs.length - 1;
+  const dirs: string[] = [];
+  for (let i = 1; i <= depth; i++) dirs.push(segs.slice(0, i).join('/'));
+  return dirs;
 }

@@ -3,6 +3,7 @@
  * v2 最重要的边界：控制面对执行机的一切操作（tmux / 受限文件 / git / 终端流）只走这里。
  * 实现：SshDriver（生产，ssh2 单持久连接多路复用）、LocalDriver（本机直跑，测试替身）。
  */
+import { randomUUID } from 'node:crypto';
 import type { AgentKind } from '../core/types';
 
 // ---------- 载荷类型 ----------
@@ -441,6 +442,20 @@ export const INJECT_PANE_POLL_MS = 100;
 export const INJECT_STABLE_SAMPLES = 2;
 export const INJECT_STABLE_MAX_POLLS = 20;
 export const INJECT_SUBMIT_MAX_POLLS = 10;
+/**
+ * 首轮观察证据不足（unknown）后的只读延长观察上限。shell 里敲的启动命令要等代理冷启动
+ * 画出输入框才有提交证据（Claude Code 2.1.x 实测约 1.6s，重项目/带 --settings 更久），
+ * 远超首轮 ~1s 窗口。延长期只看不按键，拿到证据即返回。
+ */
+export const INJECT_SETTLE_MAX_POLLS = 100;
+
+/** 输入已注入，但仍滞留或无法确认提交；调用方应保留现场，不能重灌整段 prompt。 */
+export class InputSubmitUnconfirmedError extends Error {
+  constructor(reason = '无法确认输入已提交；已保留终端现场') {
+    super(`PANDA_INPUT_SUBMIT_UNCONFIRMED: ${reason}`);
+    this.name = 'InputSubmitUnconfirmedError';
+  }
+}
 
 export interface StableSubmitOps {
   capturePane(): Promise<string>;
@@ -451,6 +466,25 @@ export interface StableSubmitOps {
   inputText?: string;
 }
 
+/** 显式 bracketed paste：支持的终端收到完整粘贴事件，shell 则收到普通文本。
+ * 每次独立命名，避免并发会话串文本；成功由 -d 删除，失败也清理缓存。
+ */
+export async function pasteTextWithTmux(
+  run: (args: string[]) => Promise<Pick<CommandResult, 'code' | 'out' | 'err'>>, session: string, text: string,
+): Promise<void> {
+  const buffer = `panda-input-${randomUUID()}`;
+  const loaded = await run(['set-buffer', '-b', buffer, '--', text]);
+  if (loaded.code !== 0) throw new Error(`tmux set-buffer failed: ${loaded.err || loaded.out}`);
+  let pasted = false;
+  try {
+    const result = await run(['paste-buffer', '-b', buffer, '-d', '-p', '-t', session]);
+    if (result.code !== 0) throw new Error(`tmux paste-buffer failed: ${result.err || result.out}`);
+    pasted = true;
+  } finally {
+    if (!pasted) await run(['delete-buffer', '-b', buffer]).catch(() => {});
+  }
+}
+
 /**
  * capture-pane 不带转义序列；这里只折叠空白，让 codex 把被吞的 Enter 当换行时仍能
  * 判断为“输入画面没有真正离开 composer”。精确指纹优先；若布局或状态变化，则继续检查最后一个 composer 是否仍持有输入。
@@ -458,16 +492,43 @@ export interface StableSubmitOps {
 export function injectionPaneFingerprint(pane: string): string {
   return pane.replace(/[\x00-\x1f\x7f\s]+/g, ' ').trim();
 }
-/** Codex 最后一个 composer 仍包含注入文本时，说明 Enter 尚未真正提交。 */
 
+/** Codex 不同版本会用实心点或空心点显示运行态；出现这些行后，前面的 › 已进入历史。 */
+const AGENT_OUTPUT_LINE_RE = /^\s*[•●◦]\s+\S/u;
+
+/** 只检查最后一个输入区；其后的代理输出说明该行已经进入历史。 */
+function codexComposer(pane: string): string | null {
+  const last = [...pane.matchAll(/^\s*[›❯](?:\s|$)/gmu)].at(-1);
+  if (!last || last.index === undefined) return null;
+  const composer = pane.slice(last.index);
+  // Codex 历史消息也使用 ›，不能把后面的 Working/回复当作输入区。
+  if (composer.split('\n').some(line => AGENT_OUTPUT_LINE_RE.test(line))) return null;
+  return composer.trimStart();
+}
+
+/** Codex 最后一个 composer 仍包含注入文本时，说明 Enter 尚未真正提交。 */
 export function codexComposerContainsInput(pane: string, inputText: string): boolean {
-  const matches = [...pane.matchAll(/^\s*›(?:\s|$)/gmu)];
-  const lastComposer = matches.at(-1);
-  if (!lastComposer || lastComposer.index === undefined) return false;
+  const composer = codexComposer(pane);
+  if (composer === null) return false;
   const compact = (value: string): string => value.replace(/[\x00-\x20\x7f\s]+/g, '');
   const input = compact(inputText);
   if (!input) return false;
-  return compact(pane.slice(lastComposer.index)).includes(input.slice(-160));
+  const visible = compact(composer);
+  // 长输入可能只显示开头，或滚动后仅显示结尾。
+  if (visible.includes(input.slice(-160)) || visible.includes(input.slice(0, 160))) return true;
+  // 超窄屏 composer 可能只保留中段，每个换行片段也不到 24 字符。这里只在最后一个
+  // 输入区逐行匹配本次原文：单段仍要求 24 字符；短段至少两行且累计 24 字符，避免把
+  // context/model 状态栏里偶然与 prompt 相同的一小段当作待提交证据。
+  const fragments = [...new Set(composer.split('\n').map(line =>
+    compact(line.replace(/^\s*[›❯]\s*/u, '')),
+  ).filter(fragment => fragment.length >= 8 && input.includes(fragment)))];
+  return fragments.some(fragment => fragment.length >= 24) ||
+    (fragments.length >= 2 && fragments.reduce((sum, fragment) => sum + fragment.length, 0) >= 24);
+}
+
+function codexComposerHasPaste(pane: string): boolean {
+  const composer = codexComposer(pane);
+  return composer !== null && /\[Pasted (?:text|content)[^\]\n]*\]/iu.test(composer);
 }
 
 async function captureForSubmit(capturePane: () => Promise<string>): Promise<string | null> {
@@ -479,9 +540,9 @@ async function captureForSubmit(capturePane: () => Promise<string>): Promise<str
 }
 
 /**
- * 注入文本后等待 TUI 真正消费并稳定，再发 Enter。若提交后的 pane 在完整观察窗内
- * 始终与提交前等价（包括只多了被吞掉的换行），仅补交一次 Enter；任何可见响应、
- * 菜单或状态变化都会立即停止，避免重复提交。抓屏不可用时安全退化为 300ms + 单 Enter。
+ * 注入后等画面稳定再提交，完整观察提交结果，避免把短暂重绘当成响应。
+ * 只有持续看到待提交输入才补交一次；补交后再次检查，仍滞留则上抛诊断。
+ * 抓屏不可用或画面含义不明确时不盲目补交，避免在菜单或已运行任务上重复 Enter。
  */
 export async function sendTextWithStableSubmit(ops: StableSubmitOps): Promise<void> {
   const initial = await captureForSubmit(ops.capturePane);
@@ -510,23 +571,71 @@ export async function sendTextWithStableSubmit(ops: StableSubmitOps): Promise<vo
   }
 
   await ops.sendEnter();
-  if (
-    initialFingerprint === null ||
-    typedPane === null ||
-    typedFingerprint === null ||
-    typedFingerprint === initialFingerprint
-  ) return;
+  const pending = (pane: string): boolean => {
+    if (ops.inputText) {
+      if (codexComposerContainsInput(pane, ops.inputText)) {
+        return initialFingerprint === null || injectionPaneFingerprint(pane) !== initialFingerprint;
+      }
+      // 折叠粘贴没有原文可匹配；必须确认该占位是在本次注入后出现的。
+      if (initial !== null && !codexComposerHasPaste(initial) && codexComposerHasPaste(pane)) return true;
+      // 已有 Codex 输入区时以输入内容为准，不能将空输入区或历史视为滞留。
+      return false;
+    }
+    return typedPane !== null && typedFingerprint !== initialFingerprint &&
+      injectionPaneFingerprint(pane) === typedFingerprint;
+  };
+  const submitted = (pane: string): 'running' | 'cleared' | null => {
+    if (pending(pane)) return null;
+    // 必须有新输出或 composer 清空的正证据；画面变化本身不是提交证据。
+    const outputLines = (value: string) => value.split('\n').filter(line =>
+      AGENT_OUTPUT_LINE_RE.test(line) || /esc to (?:interrupt|cancel)/i.test(line));
+    const previous = new Set(outputLines(initial ?? ''));
+    if (outputLines(pane).some(line => !previous.has(line))) return 'running';
+    const composer = codexComposer(pane);
+    if (composer !== null && initial !== null && codexComposer(initial) === null &&
+      typedPane !== null && codexComposer(typedPane) === null) return 'cleared';
+    if (composer !== null && /^\s*[›❯]\s*$/u.test(composer.split('\n')[0]!)) {
+      return (typedPane !== null && (codexComposerContainsInput(typedPane, ops.inputText ?? '') ||
+        (initial !== null && !codexComposerHasPaste(initial) && codexComposerHasPaste(typedPane)))) ||
+        (initial !== null && codexComposer(initial) === null) ? 'cleared' : null;
+    }
+    // sendKeys 也用于 shell 命令：新出现的 shell 提示符表示命令已返回。
+    const shellPrompt = (value: string) => /^.*[$#]\s*$/u.test(value.trimEnd().split('\n').at(-1) ?? '');
+    return typedPane !== null && !shellPrompt(typedPane) && shellPrompt(pane) ? 'cleared' : null;
+  };
+  const observe = async (
+    maxPolls = INJECT_SUBMIT_MAX_POLLS, stopOnEvidence = false,
+  ): Promise<'pending' | 'submitted' | 'unknown'> => {
+    let consecutive = 0;
+    let confirmed = false;
+    let cleared = 0;
+    for (let poll = 0; poll < maxPolls; poll++) {
+      await ops.sleep(INJECT_PANE_POLL_MS);
+      const current = await captureForSubmit(ops.capturePane);
+      consecutive = current !== null && pending(current) ? consecutive + 1 : 0;
+      const evidence = current === null ? null : submitted(current);
+      if (evidence === 'running') confirmed = true;
+      cleared = evidence === 'cleared' ? cleared + 1 : 0;
+      if (stopOnEvidence && (confirmed || cleared >= INJECT_STABLE_SAMPLES)) return 'submitted';
+    }
+    // 已观察到运行时绝不再补 Enter，即使后续抓屏失败或显示历史输入。
+    return confirmed || cleared >= INJECT_STABLE_SAMPLES ? 'submitted' : consecutive >= INJECT_STABLE_SAMPLES ? 'pending' : 'unknown';
+  };
 
-  for (let poll = 0; poll < INJECT_SUBMIT_MAX_POLLS; poll++) {
-    await ops.sleep(INJECT_PANE_POLL_MS);
-    const current = await captureForSubmit(ops.capturePane);
-    if (current === null) return;
-    if (
-      injectionPaneFingerprint(current) !== typedFingerprint &&
-      !(ops.inputText && codexComposerContainsInput(current, ops.inputText))
-    ) return;
+  let first = await observe();
+  if (first === 'submitted') return;
+  // 证据不足时绝不补 Enter，只继续观察：典型是 shell 里刚敲下启动命令、代理仍在冷启动。
+  if (first === 'unknown') {
+    first = await observe(INJECT_SETTLE_MAX_POLLS, true);
+    if (first === 'submitted') return;
   }
-  await ops.sendEnter();
+  if (first === 'pending') {
+    await ops.sendEnter();
+    if (await observe() === 'submitted') return;
+  }
+  throw new InputSubmitUnconfirmedError(first === 'pending'
+    ? '有限补交后仍未确认提交；请检查保留的输入现场'
+    : '抓屏不可用或提交证据不足；未盲目补交');
 }
 
 /**

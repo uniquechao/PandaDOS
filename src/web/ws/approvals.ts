@@ -45,6 +45,7 @@ import {
   type MenuDriver,
 } from './inject';
 import { userPromptLocale } from '../../agents/prompts/language';
+import type { IssueId } from '../../../shared/issue-id';
 
 // ---------- 依赖最小面（结构化依赖，PM/通知全可 mock） ----------
 
@@ -64,7 +65,7 @@ export interface ApprovalNotifier {
   dispatch(e: {
     kind: 'status_change';
     projectId: number;
-    issueId: number;
+    issueId: IssueId;
     summaryCode: 'approval_selection';
     summaryParams: { context: string };
   }): Promise<void>;
@@ -72,7 +73,7 @@ export interface ApprovalNotifier {
 
 /** SubscriptionStore 结构子集（升级卡收件人收敛） */
 export interface ApprovalSubs {
-  subscriberIds(projectId: number, issueId: number): number[];
+  subscriberIds(projectId: number, issueId: IssueId): number[];
 }
 
 /** FeishuChannel 结构子集（升级卡直发；未配置传 null → 文本兜底） */
@@ -90,7 +91,7 @@ export interface ApprovalPipelineDeps {
   notify: ApprovalNotifier;
   feishu: ApprovalCardChannel | null;
   /** 审计出口（接 engine.store.logEvent；缺省丢弃） */
-  log?(issueId: number, kind: string, data?: Record<string, unknown>): void;
+  log?(issueId: IssueId, kind: string, data?: Record<string, unknown>): void;
   registry?: ApprovalRegistry;
   /** actOnMenu 抓空重试间隔（测试调小） */
   retryDelayMs?: number;
@@ -109,7 +110,7 @@ interface SessionState {
 
 interface PendingMeta {
   projectId: number;
-  issueId: number;
+  issueId: IssueId;
   createdTs: number;
 }
 
@@ -154,8 +155,8 @@ export class ApprovalPipeline {
   }
 
   /** 仍在等人工处理（已升级、未消费未过期）的 issue id 集合——waiting_input 派生标记数据源 */
-  waitingIssueIds(): Set<number> {
-    const out = new Set<number>();
+  waitingIssueIds(): Set<IssueId> {
+    const out = new Set<IssueId>();
     for (const [rid, m] of this.meta) {
       if (this.registry.has(rid)) out.add(m.issueId);
     }
@@ -380,7 +381,7 @@ export class ApprovalPipeline {
     );
   }
 
-  private log(issueId: number, kind: string, data?: Record<string, unknown>): void {
+  private log(issueId: IssueId, kind: string, data?: Record<string, unknown>): void {
     try {
       this.deps.log?.(issueId, kind, data);
     } catch {

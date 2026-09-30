@@ -15,6 +15,7 @@ import { authDepsFromDb, createDispatcher } from '../middleware';
 import { adminRoutes } from './admin';
 import { dayStartMs, weekWindowOf } from '../../core/usage-weekly';
 import type { Executor } from '../../core/types';
+import type { IssueId } from '../../../shared/issue-id';
 
 function makeApp(driver: ExecutorDriver = new LocalDriver()) {
   const db = openDb(':memory:');
@@ -571,6 +572,22 @@ describe('执行机 CRUD', () => {
     expect((await call(dispatch, 'DELETE', '/api/admin/executors/1', admin.token))!.status).toBe(409);
   });
 
+  test('已有项目绑定的执行机身份不可重指向另一台主机', async () => {
+    const { dispatch, admin, db } = makeApp();
+    const created = await call(dispatch, 'POST', '/api/admin/executors', admin.token, EXEC_BODY);
+    const { executor } = await created!.json() as { executor: { id: number; host: string } };
+    db.query(
+      'INSERT INTO projects (name, executor_id, cwd, owner_user_id, created_ts) VALUES (?, ?, ?, ?, ?)',
+    ).run('bound', executor.id, '/workspace/app', admin.user.id, Date.now());
+    const moved = await call(dispatch, 'PATCH', `/api/admin/executors/${executor.id}`, admin.token, { host: '10.0.0.99' });
+    expect(moved!.status).toBe(409);
+    expect((await moved!.json() as { error: { code: string } }).error.code).toBe('executor.location_immutable');
+    const renamed = await call(dispatch, 'PATCH', `/api/admin/executors/${executor.id}`, admin.token, { name: 'renamed' });
+    expect(renamed!.status).toBe(200);
+    expect(db.query<{ host: string }, [number]>('SELECT host FROM executors WHERE id = ?').get(executor.id)?.host)
+      .toBe(executor.host);
+  });
+
   test('POST/GET/PATCH/DELETE 全链；PATCH/DELETE 触发 onExecutorChanged（M5 热失效）', async () => {
     const { dispatch, admin, executorChanges } = makeApp();
     const c = await call(dispatch, 'POST', '/api/admin/executors', admin.token, EXEC_BODY);
@@ -733,25 +750,25 @@ describe('用量周度视图（#295）', () => {
       VALUES (10, 1, '引擎甲', 5, 'done', 1), (11, 1, '引擎乙', 5, 'blocked', 1),
              (12, 1, '前端甲', 6, 'done', 1), (13, 1, '没归模块', NULL, 'done', 1),
              (20, 2, '别的项目', NULL, 'done', 1)`);
-    const daily = (day: string, projectId: number, issueId: number, out: number, input = 0) =>
+    const daily = (day: string, projectId: number, issueId: IssueId, out: number, input = 0) =>
       db.run(`INSERT INTO usage_daily (day, project_id, issue_id, output_tokens, input_tokens, updated_ts)
         VALUES (?, ?, ?, ?, ?, 1)`, [day, projectId, issueId, out, input]);
-    daily(MON, 1, 10, 1_000_000);            // 引擎模块：$10
-    daily('2026-09-09', 1, 11, 0, 2_000_000); // 引擎模块：$2.5
-    daily('2026-09-09', 1, 12, 100_000);      // 前端模块：$1
-    daily('2026-09-09', 1, 13, 50_000);       // 未归模块：$0.5
-    daily('2026-09-09', 1, 0, 20_000);        // 未归因：$0.2
-    daily('2026-09-09', 2, 20, 10_000);       // 别的项目：$0.1
-    daily('2026-09-21', 1, 10, 9_000_000);    // 下下周，不该进本周
-    const trans = (issueId: number, to: string, ts: number) =>
+    daily(MON, 1, '10', 1_000_000);            // 引擎模块：$10
+    daily('2026-09-09', 1, '11', 0, 2_000_000); // 引擎模块：$2.5
+    daily('2026-09-09', 1, '12', 100_000);      // 前端模块：$1
+    daily('2026-09-09', 1, '13', 50_000);       // 未归模块：$0.5
+    daily('2026-09-09', 1, '0', 20_000);        // 未归因：$0.2
+    daily('2026-09-09', 2, '20', 10_000);       // 别的项目：$0.1
+    daily('2026-09-21', 1, '10', 9_000_000);    // 下下周，不该进本周
+    const trans = (issueId: IssueId, to: string, ts: number) =>
       db.run(`INSERT INTO issue_events (issue_id, kind, data_json, ts) VALUES (?, 'transition', ?, ?)`,
         [issueId, JSON.stringify({ event: 'x', from: 'implementing', to }), ts]);
-    trans(10, 'done', at(MON));                 // 引擎：完成 1
-    trans(11, 'blocked', at('2026-09-09'));     // 引擎：受阻 1，没救回来
-    trans(12, 'blocked', at('2026-09-08'));     // 前端：受阻后本周救回
-    trans(12, 'done', at('2026-09-10'));
-    trans(13, 'cancelled', at('2026-09-09'));   // 未归模块：取消
-    trans(20, 'done', at('2026-09-09'));        // 别的项目
+    trans('10', 'done', at(MON));                 // 引擎：完成 1
+    trans('11', 'blocked', at('2026-09-09'));     // 引擎：受阻 1，没救回来
+    trans('12', 'blocked', at('2026-09-08'));     // 前端：受阻后本周救回
+    trans('12', 'done', at('2026-09-10'));
+    trans('13', 'cancelled', at('2026-09-09'));   // 未归模块：取消
+    trans('20', 'done', at('2026-09-09'));        // 别的项目
   }
 
   interface WeeklyBody {
@@ -898,7 +915,7 @@ describe('成本视图（#282 / I-08、I-09）', () => {
       projects: Array<{ projectId: number; projectName: string; outputTokens: number }>;
       chat: Array<{ projectId: number; outputTokens: number }>;
       unattributed: Array<{ projectId: number; outputTokens: number }>;
-      issues: Array<{ issueId: number; title: string; usage: { outputTokens: number }; testRetries: number;
+      issues: Array<{ issueId: IssueId; title: string; usage: { outputTokens: number }; testRetries: number;
         nudges: number; judged: number; validationMs: number; validationRuns: number }>;
     };
 
@@ -911,7 +928,7 @@ describe('成本视图（#282 / I-08、I-09）', () => {
     expect(body.unattributed.find((u) => u.projectId === 1)).toMatchObject({ outputTokens: 13000 });
     expect(body.unattributed.find((u) => u.projectId === 2)).toMatchObject({ outputTokens: 0 });
     // issue 档带上引擎侧的非 token 指标
-    const issue10 = body.issues.find((i) => i.issueId === 10)!;
+    const issue10 = body.issues.find((i) => i.issueId === '10')!;
     expect(issue10).toMatchObject({
       title: '贵的那条', testRetries: 1, nudges: 1, judged: 1, validationMs: 70000, validationRuns: 1,
     });
@@ -923,16 +940,16 @@ describe('成本视图（#282 / I-08、I-09）', () => {
     seed(db);
 
     const byProject = await (await call(dispatch, 'GET', '/api/admin/usage?projectId=2', admin.token))!.json() as {
-      projects: Array<{ projectId: number }>; issues: Array<{ issueId: number }>;
+      projects: Array<{ projectId: number }>; issues: Array<{ issueId: IssueId }>;
     };
     expect(byProject.projects.map((p) => p.projectId)).toEqual([2]);
-    expect(byProject.issues.map((i) => i.issueId)).toEqual([11]);
+    expect(byProject.issues.map((i) => i.issueId)).toEqual(['11']);
 
     const windowed = await (await call(dispatch, 'GET', '/api/admin/usage?from=5000', admin.token))!.json() as {
-      window: { from: number; windowAppliesTo: string }; issues: Array<{ issueId: number }>;
+      window: { from: number; windowAppliesTo: string }; issues: Array<{ issueId: IssueId }>;
       projects: Array<{ projectId: number }>;
     };
-    expect(windowed.issues.map((i) => i.issueId)).toEqual([11]); // issue 10 建于 1000，被窗口挡掉
+    expect(windowed.issues.map((i) => i.issueId)).toEqual(['11']); // issue 10 建于 1000，被窗口挡掉
     expect(windowed.window).toEqual({ from: 5000, windowAppliesTo: 'issues' });
     expect(windowed.projects.length).toBeGreaterThan(0); // 项目档是累计值，不随窗口变
   });
@@ -947,11 +964,11 @@ describe('成本视图（#282 / I-08、I-09）', () => {
     expect(got.pricing).toMatchObject({ inputPerMTok: 1.25, cachedInputPerMTok: 0.125, outputPerMTok: 10 });
 
     const before = await (await call(dispatch, 'GET', '/api/admin/usage', admin.token))!.json() as {
-      grandCostUsd: number; issues: Array<{ issueId: number; costUsd: number }>;
+      grandCostUsd: number; issues: Array<{ issueId: IssueId; costUsd: number }>;
     };
     // 项目甲会话：input 50w + cached 40w + output 2w  →  0.625 + 0.05 + 0.2 ≈ 0.875（另加项目乙那条）
     expect(before.grandCostUsd).toBeGreaterThan(0.8);
-    expect(before.issues.find((i) => i.issueId === 10)!.costUsd).toBeGreaterThan(0);
+    expect(before.issues.find((i) => i.issueId === '10')!.costUsd).toBeGreaterThan(0);
 
     const put = await call(dispatch, 'PUT', '/api/admin/usage/pricing', admin.token, { outputPerMTok: 20 });
     expect(put!.status).toBe(200);

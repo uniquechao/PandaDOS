@@ -1,0 +1,3 @@
+-- panda:issue-text-id
+-- 075（#307）：与 issues/074 同一重建（幂等）。designs 目录晚于 issues 目录执行，全新库上
+-- design_graph_nodes / design_issue_links 在 074 之后才建出、仍是 INTEGER 的 issue 列，在这里补转 TEXT。

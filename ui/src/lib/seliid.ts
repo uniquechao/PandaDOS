@@ -1,3 +1,4 @@
+import type { IssueId } from '../../../shared/issue-id';
 /**
  * ui/lib/seliid —— 看板深链选中 issue 的校验（纯函数，便于单测）。
  *
@@ -8,7 +9,7 @@
 
 export interface ResolvedSel {
   /** 有效选中的 issue id；未命中 / 无 selIid → undefined（调用方回退 defaultIid / null） */
-  effectiveIid: number | undefined;
+  effectiveIid: IssueId | undefined;
   /** selIid 明确不属于本项目（已加载且列表里没有）→ 需回退并清 URL */
   stale: boolean;
 }
@@ -20,8 +21,8 @@ export interface ResolvedSel {
  * - 已加载：命中列表 → 保留；未命中 → { undefined, true }（失效深链，需回退 + 清 URL）。
  */
 export function resolveSelIid(
-  selIid: number | undefined,
-  issues: { id: number }[] | null,
+  selIid: IssueId | undefined,
+  issues: { id: IssueId }[] | null,
   loaded: boolean,
 ): ResolvedSel {
   if (selIid == null) return { effectiveIid: undefined, stale: false };

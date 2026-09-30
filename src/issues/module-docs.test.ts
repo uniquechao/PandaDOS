@@ -71,7 +71,7 @@ describe('ModuleDocs', () => {
     const { cwd, docs, module } = await setup();
     await docs.ensureModule(module);
     const rel = await docs.createIssuePage(module, {
-      id: 72,
+      id: '72',
       title: 'Terminal Process Isolation',
       body: '对话和 issue 互不影响',
       status: 'pending',
@@ -81,8 +81,8 @@ describe('ModuleDocs', () => {
     expect(rel).toBe('.panda/modules/terminal-runtime/issues/72-terminal-process-isolation.md');
 
     await docs.refreshIssueIndex(module, [
-      { id: 72, title: 'Terminal Process Isolation', status: 'pending', docPath: rel },
-      { id: 70, title: 'Old work', status: 'done', docPath: moduleIssueRelPath(module.slug, 70, 'Old work') },
+      { id: '72', title: 'Terminal Process Isolation', status: 'pending', docPath: rel },
+      { id: '70', title: 'Old work', status: 'done', docPath: moduleIssueRelPath(module.slug, '70', 'Old work') },
     ]);
     const page = await fsp.readFile(path.join(cwd, rel), 'utf8');
     expect(page).toContain('issue_id: 72');
@@ -90,7 +90,7 @@ describe('ModuleDocs', () => {
     expect(page).toContain('## 设计与实施');
     await fsp.appendFile(path.join(cwd, rel), '\n人工过程记录：保留我。\n');
     const updatedRel = await docs.createIssuePage(module, {
-      id: 72,
+      id: '72',
       title: 'Terminal Process Isolation Updated',
       body: '更新后的当前需求',
       status: 'implementing',
@@ -117,7 +117,7 @@ describe('ModuleDocs', () => {
   test('执行总结写入过程页受管区块且幂等更新', async () => {
     const { cwd, docs, module } = await setup();
     const issue = {
-      id: 72,
+      id: '72',
       title: 'Terminal Process Isolation',
       body: '对话和 issue 互不影响',
       status: 'done',
@@ -154,7 +154,7 @@ describe('ModuleDocs', () => {
     const { cwd, docs, module } = await setup();
     await docs.ensureModule(module);
     const rel = await docs.createIssuePage(module, {
-      id: 72,
+      id: '72',
       title: 'Terminal Process Isolation',
       body: 'b',
       status: 'done',
@@ -226,7 +226,7 @@ describe('模块知识区 module-knowledge（纯函数）', () => {
   ].join('\n');
   const add = (text: string, id: number, extra: Partial<{ status: string; title: string; note: string }> = {}) =>
     appendModuleKnowledge(text, {
-      issueId: id, status: extra.status ?? 'done', title: extra.title ?? `任务 ${id}`,
+      issueId: String(id), status: extra.status ?? 'done', title: extra.title ?? `任务 ${id}`,
       ...(extra.note !== undefined ? { note: extra.note } : {}),
     });
 
@@ -261,7 +261,7 @@ describe('模块知识区 module-knowledge（纯函数）', () => {
   test('只留最近 N 条：更早的按顺序丢掉', () => {
     let out = doc;
     for (let i = 1; i <= 6; i++) out = add(out, i);
-    out = appendModuleKnowledge(out, { issueId: 7, status: 'done', title: '任务 7' }, { maxEntries: 3 });
+    out = appendModuleKnowledge(out, { issueId: '7', status: 'done', title: '任务 7' }, { maxEntries: 3 });
     const lines = parseModuleKnowledge(out);
     expect(lines).toHaveLength(3);
     expect(lines.map((l) => l.split(' ')[1])).toEqual(['#5', '#6', '#7']);
@@ -269,7 +269,7 @@ describe('模块知识区 module-knowledge（纯函数）', () => {
 
   test('单条超长按字符截断，但不把这条丢掉', () => {
     const line = formatModuleKnowledgeEntry({
-      issueId: 9, status: 'done', title: 'T'.repeat(1000), note: 'N'.repeat(1000),
+      issueId: '9', status: 'done', title: 'T'.repeat(1000), note: 'N'.repeat(1000),
     });
     expect(line.length).toBe(MAX_KNOWLEDGE_ENTRY_CHARS);
     expect(line).toStartWith('- #9 done · ');
@@ -279,7 +279,7 @@ describe('模块知识区 module-knowledge（纯函数）', () => {
   test('总量超限从最旧的开始丢，至少留住刚写进去的那条', () => {
     let out = doc;
     for (let i = 1; i <= 5; i++) out = add(out, i, { note: 'x'.repeat(200) });
-    out = appendModuleKnowledge(out, { issueId: 99, status: 'done', title: '最新' }, { maxChars: 400 });
+    out = appendModuleKnowledge(out, { issueId: '99', status: 'done', title: '最新' }, { maxChars: 400 });
     const lines = parseModuleKnowledge(out);
     expect(lines.at(-1)).toContain('#99');
     expect(lines.join('\n').length).toBeLessThanOrEqual(400);

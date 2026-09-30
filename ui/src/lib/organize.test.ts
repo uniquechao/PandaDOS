@@ -66,7 +66,7 @@ describe('organize 本地化消息描述', () => {
       values: { sources: '“执行页面” “控制台”', target: '执行' },
     });
     expect(
-      actionMessage(act({ kind: 'move', issueIds: [3, 7], toName: '文件预览' })),
+      actionMessage(act({ kind: 'move', issueIds: ['3', '7'], toName: '文件预览' })),
     ).toEqual({ key: 'ui.organizeDescriptionMove', values: { issues: '#3 #7', target: '文件预览' } });
   });
 

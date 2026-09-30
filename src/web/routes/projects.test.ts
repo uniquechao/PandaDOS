@@ -10,7 +10,10 @@ import { LocalDriver } from '../../executor/local';
 import { authDepsFromDb, createDispatcher } from '../middleware';
 import { projectsRoutes, projectSlug } from './projects';
 
-function setup(projectDataSync?: Parameters<typeof projectsRoutes>[0]['projectDataSync']) {
+function setup(
+  projectDataSync?: Parameters<typeof projectsRoutes>[0]['projectDataSync'],
+  driverForOverride?: Parameters<typeof projectsRoutes>[0]['driverFor'],
+) {
   const db = openDb(':memory:');
   migrate(db);
   migrateIssueEngine(db); // 门禁命令列（047）在 issues 迁移链里；生产两条链都跑
@@ -37,7 +40,7 @@ function setup(projectDataSync?: Parameters<typeof projectsRoutes>[0]['projectDa
     }),
   };
   // waiting_input 数据源：测试用集合模拟（生产 = 审批管道登记 ∪ 菜单滞留）
-  const waitingSet = new Set<number>();
+  const waitingSet = new Set<string>();
   const gitCalls: Array<{ cwd: string; args: string[] }> = [];
   const mkdirCalls: string[] = [];
   const dispatch = createDispatcher(
@@ -46,7 +49,7 @@ function setup(projectDataSync?: Parameters<typeof projectsRoutes>[0]['projectDa
       convs,
       waitingIssueIds: () => waitingSet,
       projectDataSync,
-      driverFor: () => ({
+      driverFor: driverForOverride ?? (() => ({
         listSessions: async () => [],
         readFileRange: async () => ({ data: new Uint8Array(), size: 0 }),
         statPath: async () => null,
@@ -58,7 +61,7 @@ function setup(projectDataSync?: Parameters<typeof projectsRoutes>[0]['projectDa
           gitCalls.push({ cwd, args });
           return { code: 0, out: '', err: '' };
         },
-      }),
+      })),
     }),
     authDepsFromDb(db, users),
   );
@@ -96,6 +99,29 @@ function projectCreationDriver() {
 }
 
 describe('projects 路由', () => {
+  test('专用 SSH 隔离项目创建时验证 OS 身份与独占账号', async () => {
+    const root = '/home/panda_iso_test/work';
+    const driver = {
+      ...projectCreationDriver(),
+      statPath: async () => ({ size: 0, mtimeMs: 1, isDirectory: true, isFile: false, mode: 0o700 }),
+      runCommand: async (_cwd: string, argv: string[]) => ({
+        code: argv[0] === 'sudo' ? 1 : 0,
+        out: argv[1] === '-u' ? '1003\n' : argv[1] === '-un' ? 'panda_iso_test\n' : '',
+        err: '',
+      }),
+    };
+    const s = setup(undefined, () => driver);
+    s.db.run("INSERT INTO executors (id, name, host, port, ssh_user, key_ref, workspace_root, claude_dir) VALUES (2, 'isolated', '127.0.0.1', 22, 'panda_iso_test', 'key', '/home/panda_iso_test/work', '/home/panda_iso_test/.claude/projects')");
+    const body = { name: 'isolated', executorId: 2, cwd: `${root}/app`, executionIsolation: 'dedicated-ssh' };
+    expect((await j(s.dispatch(req('POST', '/api/projects', s.alice.token, body)))).status).toBe(403);
+    const created = await j(s.dispatch(req('POST', '/api/projects', s.admin.token, body)));
+    expect(created.status).toBe(200);
+    expect(created.body.project.executionIsolation).toBe('dedicated-ssh');
+    expect((await j(s.dispatch(req('POST', '/api/projects', s.admin.token, { ...body, name: 'second', cwd: `${root}/other` })))).status).toBe(409);
+    expect((await j(s.dispatch(req('POST', '/api/projects', s.admin.token, { ...body, name: 'escape', cwd: '/tmp/escape' })))).status).toBe(409);
+    s.db.close();
+  });
+
   test('同步状态接口遵循项目权限，手动同步后返回最新摘要', async () => {
     let calls = 0;
     const status = { state: 'success' as const, lastAttemptTs: 10, lastSuccessTs: 10,
@@ -198,6 +224,10 @@ describe('projects 路由', () => {
 
     // 门禁命令（#279 / I-03）：默认未配置；数组落库；null 清回未配置；坏输入 400
     expect(patched.body.project.validationCommands).toBeNull();
+    expect(patched.body.project.validationPolicy).toBe('optional');
+    const required = await j(s.dispatch(req('PATCH', `/api/projects/${pid}`, s.alice.token, { validationPolicy: 'required' })));
+    expect(required.body.project.validationPolicy).toBe('required');
+    expect((await j(s.dispatch(req('PATCH', `/api/projects/${pid}`, s.alice.token, { validationPolicy: 'typo' })))).status).toBe(400);
     const vc = await j(s.dispatch(req('PATCH', `/api/projects/${pid}`, s.alice.token, {
       validationCommands: [
         { label: 'typecheck', argv: ['bun', 'run', 'typecheck'] },
@@ -808,7 +838,7 @@ describe('POST /api/projects/import', () => {
     const ins = s.db.prepare(
       `INSERT INTO issues (project_id, title, status, created_ts) VALUES (?, ?, ?, ?)`,
     );
-    for (const st of ['pending', 'clarifying', 'implementing', 'testing', 'plan_review', 'blocked', 'done', 'cancelled']) {
+    for (const st of ['pending', 'clarifying', 'implementing', 'testing', 'plan_review', 'blocked', 'paused', 'done', 'cancelled']) {
       ins.run(pa.id, `i-${st}`, st, Date.now());
     }
     ins.run(pb.id, 'b-doing', 'merging', Date.now());
@@ -819,7 +849,7 @@ describe('POST /api/projects/import', () => {
     // alice：只见自己项目；done/cancelled 不计；clarifying 计入待确认（在等发起人回答）
     const a = await j(s.dispatch(req('GET', '/api/projects/summary', s.alice.token)));
     expect(a.status).toBe(200);
-    expect(a.body.projects[pa.id]).toEqual({ todo: 1, doing: 2, review: 2, blocked: 1 });
+    expect(a.body.projects[pa.id]).toEqual({ todo: 1, doing: 2, review: 2, blocked: 2 });
     expect(a.body.projects[pb.id]).toBeUndefined();
 
     // admin 全量可见
@@ -835,8 +865,8 @@ describe('POST /api/projects/import', () => {
     expect(a2.body.projects[pc.id]).toBeUndefined();
 
     // waiting_input（弹窗等人工）补进待确认角标：只认驱动中的 issue，pending 的残留不计
-    const implId = (s.db.query(`SELECT id FROM issues WHERE title = 'i-implementing'`).get() as { id: number }).id;
-    const pendId = (s.db.query(`SELECT id FROM issues WHERE title = 'i-pending'`).get() as { id: number }).id;
+    const implId = (s.db.query(`SELECT id FROM issues WHERE title = 'i-implementing'`).get() as { id: string }).id;
+    const pendId = (s.db.query(`SELECT id FROM issues WHERE title = 'i-pending'`).get() as { id: string }).id;
     s.waitingSet.add(implId);
     s.waitingSet.add(pendId);
     const a3 = await j(s.dispatch(req('GET', '/api/projects/summary', s.alice.token)));
@@ -896,10 +926,10 @@ describe('POST /api/projects/import', () => {
     // bob：pending 澄清待答（alice 不可见、admin 可见）。
     ins.run(pb.id, 'b-pend-clarify', 'pending', Date.now());
 
-    const idOf = (t: string): number =>
-      (s.db.query(`SELECT id FROM issues WHERE title = ?`).get(t) as { id: number }).id;
+    const idOf = (t: string): string =>
+      (s.db.query(`SELECT id FROM issues WHERE title = ?`).get(t) as { id: string }).id;
     const ev = s.db.prepare(`INSERT INTO issue_events (issue_id, kind, data_json, ts) VALUES (?, ?, ?, ?)`);
-    const ask = (id: number): void => {
+    const ask = (id: string): void => {
       ev.run(id, 'clarify_questions', JSON.stringify({ questions: ['q?'], source: 'exec' }), Date.now());
     };
     for (const t of ['a-pend-clarify', 'a-impl-both', 'a-planrev-clarify', 'a-done-clarify', 'b-pend-clarify']) {

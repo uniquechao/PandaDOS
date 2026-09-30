@@ -6,6 +6,7 @@
  * 模块名、slug、issue 标识与 AI reason 始终作为原始参数展示。
  */
 import type { MessageKey, MessageValues } from '../../../shared/i18n/messages';
+import type { IssueId } from '../../../shared/issue-id';
 
 export type OrganizeActionKind = 'create' | 'rename' | 'merge' | 'move';
 
@@ -27,7 +28,7 @@ export interface OrganizeActionView {
   targetName?: string;
   sourceNames?: string[];
   // move
-  issueIds?: number[];
+  issueIds?: IssueId[];
   to?: { moduleId: number } | { slug: string };
   toName?: string;
 }

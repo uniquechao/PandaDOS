@@ -56,3 +56,21 @@ describe('FileTree 结构约束', () => {
     expect(source).toContain('latestRequest.current[path]');
   });
 });
+
+describe('深链展开（issue #310）', () => {
+  test('按 revealPath 展开各级祖先目录并补拉子项', () => {
+    expect(source).toContain('revealPath');
+    expect(source).toContain('ancestorDirsOf(revealPath)');
+    expect(source).toContain('}, [pid, revealPath]);');
+  });
+
+  test('只补拉未加载过、且不在加载中的目录', () => {
+    expect(source).toContain("if (children[d] === undefined && status[d] !== 'loading') loadDir(d);");
+  });
+
+  test('目标行挂载即滚进可视区，且只滚一次（之后用户自己点别的不会被拽回来）', () => {
+    expect(source).toContain('ref={(el) => revealRow(el, full)}');
+    expect(source).toContain('pendingReveal.current = null;');
+    expect(source).toContain("el.scrollIntoView({ block: 'nearest' });");
+  });
+});

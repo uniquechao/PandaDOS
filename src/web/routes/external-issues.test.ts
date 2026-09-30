@@ -14,6 +14,7 @@ import { KeyedMutex } from '../../issues/mutex';
 import { validateWorkflowGraph, WorkflowTemplateStore } from '../../issues/workflows';
 import { authDepsFromDb, createDispatcher } from '../middleware';
 import { externalIssuesRoutes } from './external-issues';
+import type { IssueId } from '../../../shared/issue-id';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -160,7 +161,7 @@ function createWorkflow(db: ReturnType<typeof openDb>) {
 describe('外部 issue 路由', () => {
   test('来源配置限属主，读取只返回脱敏 token；成员可列 remote', async () => {
     const s = await setup();
-    await s.driver.git(s.repo, ['remote', 'add', 'internal', 'ssh://git@gitlab.sunseed.tech:2222/team/repo.git']);
+    await s.driver.git(s.repo, ['remote', 'add', 'internal', 'ssh://git@gitlab.example.com:2222/team/repo.git']);
     expect((await call(s.dispatch, 'GET', '/api/projects/1/external-issues/remotes')).status).toBe(401);
     expect((await call(
       s.dispatch,
@@ -177,8 +178,8 @@ describe('外部 issue 路由', () => {
     );
     expect(remotes.body.remotes).toEqual([
       {
-        name: 'internal', url: 'ssh://git@gitlab.sunseed.tech:2222/team/repo.git', host: 'gitlab.sunseed.tech',
-        suggestedProvider: 'gitlab', suggestedInstanceUrl: 'https://gitlab.sunseed.tech',
+        name: 'internal', url: 'ssh://git@gitlab.example.com:2222/team/repo.git', host: 'gitlab.example.com',
+        suggestedProvider: 'gitlab', suggestedInstanceUrl: 'https://gitlab.example.com',
       },
       {
         name: 'origin', url: 'git@github.com:octo/repo.git', host: 'github.com',
@@ -280,7 +281,7 @@ describe('外部 issue 路由', () => {
     expect(records).toHaveLength(1);
     expect(records[0]).toMatchObject({ disposition: 'imported', localIssueId: rows[0]!.id });
     const snapshots = s.db.query<
-      { issue_id: number; template_version_id: number; context_json: string },
+      { issue_id: IssueId; template_version_id: number; context_json: string },
       []
     >('SELECT issue_id, template_version_id, context_json FROM issue_workflows').all();
     expect(snapshots).toHaveLength(1);

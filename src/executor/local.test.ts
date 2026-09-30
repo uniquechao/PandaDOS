@@ -30,7 +30,7 @@ import {
 import { LocalDriver, ptySpawnEnv, ptySpawnSpec, runCommand, sttyResizeArgs } from './local';
 
 describe('Local/SSH 共用稳定提交时序', () => {
-  test('长 prompt 等待输入画面稳定后只提交一次，响应出现即停止观察', async () => {
+  test('长 prompt 等待输入画面稳定后只提交一次，响应出现后不补交', async () => {
     let phase: 'idle' | 'typing' | 'working' = 'idle';
     let typingCaptures = 0;
     let enters = 0;
@@ -92,6 +92,187 @@ describe('Local/SSH 共用稳定提交时序', () => {
     expect(enters).toBe(2);
   });
 
+  for (const scenario of ['折叠粘贴', '延迟显示', '短暂重绘', '短暂清空', '前缀可见', '持续滞留', '历史消息', '抓屏失败'] as const) {
+    test(`提交检查与有限兜底：${scenario}`, async () => {
+      const prompt = '检查输入并启动执行'.repeat(60) + '唯一尾部';
+      let typed = false;
+      let enters = 0;
+      let observations = 0;
+      const run = sendTextWithStableSubmit({
+        inputText: prompt,
+        capturePane: async () => {
+          if (scenario === '抓屏失败') throw new Error('capture unavailable');
+          if (!typed) return '› ';
+          if (enters >= 2 && scenario !== '持续滞留') return `› ${prompt}\n• Working`;
+          if (enters > 0) observations++;
+          if (scenario === '历史消息' && enters > 0) return `› ${prompt}\n• 已经开始执行`;
+          if (scenario === '延迟显示' && enters === 0) return '› ';
+          if (scenario === '短暂重绘' && observations === 1) return '重绘中';
+          if (scenario === '短暂清空' && observations === 1) return '› ';
+          const content = scenario === '折叠粘贴' ? '[Pasted text #1 +20 lines]'
+            : scenario === '前缀可见' ? prompt.slice(0, 200) : prompt;
+          return `› ${content}\n${enters ? '99%' : '100%'} context left`;
+        },
+        sendText: async () => { typed = true; },
+        sendEnter: async () => { enters++; },
+        sleep: async () => {},
+      });
+      if (scenario === '持续滞留' || scenario === '抓屏失败') await expect(run).rejects.toThrow('PANDA_INPUT_SUBMIT_UNCONFIRMED');
+      else await run;
+      expect(enters).toBe(scenario === '历史消息' || scenario === '抓屏失败' ? 1 : 2);
+    });
+  }
+
+  test('初次回车后延迟进入运行态，不补交回车', async () => {
+    let typed = false;
+    let enters = 0;
+    let observations = 0;
+    await sendTextWithStableSubmit({
+      inputText: '延迟运行',
+      capturePane: async () => {
+        if (!typed) return '› ';
+        if (enters && ++observations >= 6) return '› 延迟运行\n• Working';
+        return '› 延迟运行';
+      },
+      sendText: async () => { typed = true; },
+      sendEnter: async () => { enters++; },
+      sleep: async () => {},
+    });
+    expect(enters).toBe(1);
+  });
+
+  test('shell 启动命令等代理冷启动画出输入框后确认提交，不补交回车', async () => {
+    // 实测 Claude Code 2.1.284 冷启动约 1.6s 才出输入框，且空输入框带占位文案。
+    const cmd = 'claude --session-id abc';
+    let typed = false;
+    let enters = 0;
+    let polls = 0;
+    await sendTextWithStableSubmit({
+      inputText: cmd,
+      capturePane: async () => {
+        if (!typed) return '';
+        if (!enters || ++polls < 16) return `panda@host:~/proj$ ${cmd}`;
+        return ' ▐▛███▛█   Claude Code v2.1.284\n' +
+          '────────\n❯ Try "create a util logging.py that..."\n────────\n  ⏵⏵ auto mode on (shift+tab to cycle)';
+      },
+      sendText: async () => { typed = true; },
+      sendEnter: async () => { enters++; },
+      sleep: async () => {},
+    });
+    expect(enters).toBe(1);
+  });
+
+  test('已有粘贴占位或菜单变化不触发盲目补交', async () => {
+    for (const initial of ['› [Pasted text #1 +20 lines]', '› ']) {
+      let enters = 0;
+      await expect(sendTextWithStableSubmit({
+        inputText: '新输入',
+        capturePane: async () => enters && initial === '› ' ? '› 1. Confirm\n2. Cancel' : initial,
+        sendText: async () => {},
+        sendEnter: async () => { enters++; },
+        sleep: async () => {},
+      })).rejects.toThrow('PANDA_INPUT_SUBMIT_UNCONFIRMED');
+      expect(enters).toBe(1);
+    }
+  });
+
+  for (const result of ['运行', '仍滞留', '未知', '抓屏失败'] as const) {
+    test(`58×38 只显示长输入中段，补交结果：${result}`, async () => {
+      const prompt = Array.from({ length: 80 }, (_, i) => `第${i}项需要检查输入提交状态。`).join('');
+      const middle = prompt.slice(220, 700).match(/.{1,28}/g)!.join('\n  ');
+      let typed = false;
+      let enters = 0;
+      let texts = 0;
+      await (async () => {
+        const run = sendTextWithStableSubmit({
+          inputText: prompt,
+          capturePane: async () => {
+            if (!typed) return '历史输出\n› ';
+            if (enters >= 2) {
+              if (result === '运行') return `› ${prompt}\n• Working (1s)`;
+              if (result === '未知') return '重绘中';
+              if (result === '抓屏失败') throw new Error('抓屏失败');
+            }
+            return `› ${middle}\n${enters ? '99%' : '100%'} context left`;
+          },
+          sendText: async () => { typed = true; texts++; },
+          sendEnter: async () => { enters++; },
+          sleep: async () => {},
+        });
+        if (result === '运行') await run;
+        else await expect(run).rejects.toThrow('PANDA_INPUT_SUBMIT_UNCONFIRMED');
+      })();
+      expect(enters).toBe(2);
+      expect(texts).toBe(1);
+    });
+  }
+
+  test('历史输出未变化和无输入锚点的未知画面不盲目补交', async () => {
+    for (const pane of ['› 历史提示词\n• Working', '无法识别的菜单']) {
+      let enters = 0;
+      await expect(sendTextWithStableSubmit({
+        inputText: '本轮提示词', capturePane: async () => pane,
+        sendText: async () => {}, sendEnter: async () => { enters++; }, sleep: async () => {},
+      })).rejects.toThrow('PANDA_INPUT_SUBMIT_UNCONFIRMED');
+      expect(enters).toBe(1);
+    }
+  });
+
+  test('观察到运行后抓屏失败不重复回车，旧提示词不作为新输入证据', async () => {
+    for (const running of [true, false]) {
+      let enters = 0;
+      let observations = 0;
+      const run = sendTextWithStableSubmit({
+        inputText: '旧提示词',
+        capturePane: async () => {
+          if (!enters) return '› 旧提示词';
+          if (running && ++observations === 1) return '• Working';
+          if (running) throw new Error('抓屏失败');
+          return '› 旧提示词';
+        },
+        sendText: async () => {}, sendEnter: async () => { enters++; }, sleep: async () => {},
+      });
+      if (running) await run;
+      else await expect(run).rejects.toThrow('PANDA_INPUT_SUBMIT_UNCONFIRMED');
+      expect(enters).toBe(1);
+    }
+  });
+
+  test('Codex 空心运行标记后的历史提示词不触发补交', async () => {
+    const prompt = '检查这条 issue 并完成实现';
+    let typed = false;
+    let enters = 0;
+    await sendTextWithStableSubmit({
+      inputText: prompt,
+      capturePane: async () => typed && enters
+        ? `› ${prompt}\n\n◦ Working (2s)`
+        : typed ? `› ${prompt}` : '› ',
+      sendText: async () => { typed = true; },
+      sendEnter: async () => { enters++; },
+      sleep: async () => {},
+    });
+    expect(enters).toBe(1);
+  });
+
+  test('超窄终端只显示长输入的短中段时仍能确认滞留并补交', async () => {
+    const prompt = Array.from({ length: 80 }, (_, i) => `第${i}项检查自动提交。`).join('');
+    const middle = `${prompt.slice(260, 274)}\n  ${prompt.slice(274, 288)}`;
+    let typed = false;
+    let enters = 0;
+    await sendTextWithStableSubmit({
+      inputText: prompt,
+      capturePane: async () => {
+        if (!typed) return '› ';
+        if (enters >= 2) return `› ${prompt}\n◦ Working (1s • esc to interrupt)`;
+        return `› ${middle}\n${enters ? '99%' : '100%'} context left`;
+      },
+      sendText: async () => { typed = true; },
+      sendEnter: async () => { enters++; },
+      sleep: async () => {},
+    });
+    expect(enters).toBe(2);
+  });
+
   test('输入进入历史区且底部出现新 composer 时不视为待提交', () => {
     const prompt = '不要重复提交这条消息';
     expect(codexComposerContainsInput(
@@ -99,6 +280,36 @@ describe('Local/SSH 共用稳定提交时序', () => {
       prompt,
     )).toBe(false);
   });
+});
+
+describe('LocalDriver 提交接线', () => {
+  for (const outcome of ['运行', '未知', '抓屏失败', '滞留'] as const) {
+    test(`长输入中段与补交结果：${outcome}`, async () => {
+      const prompt = Array.from({ length: 80 }, (_, i) => `第${i}项检查提交状态。`).join('');
+      let pane = '› ';
+      let enters = 0;
+      let texts = 0;
+      const driver = new LocalDriver({ injectSleep: async () => {} });
+      Object.defineProperty(driver, 'tmux', { value: async (args: string[]) => {
+        if (args[0] === 'capture-pane') {
+          if (outcome === '抓屏失败') throw new Error('抓屏失败');
+          return { code: 0, out: pane, err: '' };
+        }
+        if (args[0] === 'paste-buffer') { texts++; pane = `› ${prompt.slice(250, 264)}\n  ${prompt.slice(264, 278)}`; }
+        else if (args.at(-1) === 'Enter') {
+          enters++;
+          if (enters === 2 && outcome === '运行') pane = '◦ Working (1s • esc to interrupt)';
+          if (outcome === '未知') pane = '重绘中';
+        }
+        return { code: 0, out: '', err: '' };
+      } });
+      const run = driver.sendKeys('测试', prompt);
+      if (outcome === '运行') await run;
+      else await expect(run).rejects.toThrow('PANDA_INPUT_SUBMIT_UNCONFIRMED');
+      expect(texts).toBe(1);
+      expect(enters).toBe(outcome === '未知' || outcome === '抓屏失败' ? 1 : 2);
+    });
+  }
 });
 
 describe('Git 自动就绪', () => {

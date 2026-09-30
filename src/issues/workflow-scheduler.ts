@@ -14,10 +14,11 @@ import type {
 import type { SupportedLocale } from '../../shared/i18n/locales';
 import { WorkflowNodeRunner } from './workflow-node-runner';
 import type { WorkflowWorktreeCoordinator } from './workflow-worktrees';
+import type { IssueId } from '../../shared/issue-id';
 
 interface WorkflowRow {
   id: number;
-  issue_id: number;
+  issue_id: IssueId;
   status: string;
   pause_reason: string | null;
   graph_json: string;
@@ -43,7 +44,7 @@ export interface WorkflowSchedulerDeps {
   nodes: WorkflowNodeRunner;
   worktrees?: WorkflowWorktreeCoordinator;
   now?: () => number;
-  logEvent(issueId: number, kind: string, data?: unknown): void;
+  logEvent(issueId: IssueId, kind: string, data?: unknown): void;
 }
 
 function parseGroup(value: string | null): ParallelGroup | null {
@@ -74,9 +75,9 @@ export class WorkflowScheduler {
     this.now = deps.now ?? Date.now;
   }
 
-  private workflowByIssue(issueId: number): WorkflowRow | null {
+  private workflowByIssue(issueId: IssueId): WorkflowRow | null {
     return this.deps.db
-      .query<WorkflowRow, [number]>('SELECT * FROM issue_workflows WHERE issue_id = ?')
+      .query<WorkflowRow, [IssueId]>('SELECT * FROM issue_workflows WHERE issue_id = ?')
       .get(issueId) ?? null;
   }
 
@@ -495,7 +496,7 @@ export class WorkflowScheduler {
     return { state: 'running' };
   }
 
-  async begin(issueId: number, locale?: SupportedLocale): Promise<WorkflowTickResult | null> {
+  async begin(issueId: IssueId, locale?: SupportedLocale): Promise<WorkflowTickResult | null> {
     const workflow = this.workflowByIssue(issueId);
     if (!workflow) return null;
     const graph = this.graph(workflow);
@@ -620,7 +621,7 @@ export class WorkflowScheduler {
     return { state: 'running' };
   }
 
-  async tick(issueId: number, locale?: SupportedLocale): Promise<WorkflowTickResult | null> {
+  async tick(issueId: IssueId, locale?: SupportedLocale): Promise<WorkflowTickResult | null> {
     let workflow = this.workflowByIssue(issueId);
     if (!workflow) return null;
     if (workflow.status === 'pending' || workflow.status === 'paused') return this.begin(issueId, locale);
@@ -693,7 +694,7 @@ export class WorkflowScheduler {
         : { state: 'running' };
   }
 
-  pause(issueId: number, reason: string): void {
+  pause(issueId: IssueId, reason: string): void {
     const workflow = this.workflowByIssue(issueId);
     if (!workflow || workflow.status !== 'running') return;
     const ts = this.now();
@@ -711,7 +712,7 @@ export class WorkflowScheduler {
     this.deps.logEvent(issueId, 'workflow_paused', { workflowId: workflow.id, reason });
   }
 
-  cancel(issueId: number): void {
+  cancel(issueId: IssueId): void {
     const workflow = this.workflowByIssue(issueId);
     if (!workflow || workflow.status === 'completed' || workflow.status === 'cancelled') return;
     const ts = this.now();

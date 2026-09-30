@@ -154,7 +154,7 @@ function setup() {
     graphDigest: 'digest-safe',
     status: 'recoverable_error' as const,
     error: 'SQLITE_ERROR at /private/secret.db token_hash=abc',
-    issues: [{ nodeId: 'api', issueId: 91, title: 'Expose API', implMode: 'direct' as const, moduleId: 11, agent: 'codex' as const }],
+    issues: [{ nodeId: 'api', issueId: '91', title: 'Expose API', implMode: 'direct' as const, moduleId: 11, agent: 'codex' as const }],
   };
   const publisher: DesignPublisherPort = {
     issuePublishConfirmation(designId, expectedRevision, actor) {
@@ -557,7 +557,7 @@ describe('design routes', () => {
       designId: id,
       revision: 3,
       status: 'recoverable_error',
-      issues: [{ issueId: 91 }],
+      issues: [{ issueId: '91' }],
     });
     expect(published.body.publication.error).toBeUndefined();
     expect(JSON.stringify(published.body)).not.toContain('secret.db');
@@ -855,7 +855,7 @@ describe('design routes', () => {
     const created = await createDesign(s);
     const id = created.body.design.id as number;
     for (const node of [
-      { nodeId: 'bad-issue', title: 'Bad issue', issueId: '12' },
+      { nodeId: 'bad-issue', title: 'Bad issue', issueId: 12 },
       { nodeId: 'bad-sync', title: 'Bad sync', lastSyncedRevision: true },
     ]) {
       const response = await s.call('PUT', `/api/projects/1/designs/${id}/graph`, s.alice.token, {

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
+import { STATUS_LABEL } from '../lib/types';
 
 const source = readFileSync(new URL('./Board.tsx', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
@@ -65,7 +66,10 @@ describe('项目配置入口（Issue #10）', () => {
     const start = source.indexOf('<div class="bacts">');
     const end = source.indexOf('{project?.goal', start);
     const headerActions = source.slice(start, end);
-    const routes = ['/designs', '/chat', '/files', '/skills', '/term', '/git', '/settings'];
+    const routes = ['/designs', '/chat', '/rooms', '/workspace', '/skills', '/term', '/settings'];
+    // #388：文件与 Git 合并为单一「工作区」入口
+    expect(headerActions).not.toContain('/files`');
+    expect(headerActions).not.toContain('/git`');
     expect(start).toBeGreaterThan(0);
     expect(end).toBeGreaterThan(start);
     expect(headerActions.match(/<button class="btn sm"/g)).toHaveLength(8);
@@ -108,4 +112,14 @@ describe('新建 issue：高级工作流（Issue #33）', () => {
     expect(css).toContain('background: var(--accent-weak)');
     expect(css).toContain('@media (max-width: 720px)');
   });
+});
+
+
+test('实际看板分组覆盖每个 issue 状态一次，暂停任务不能被过滤掉', () => {
+  const statuses = [...source.matchAll(/statuses: \[([^\]]*)\]/g)]
+    .flatMap(match => [...match[1]!.matchAll(/'([^']+)'/g)].map(value => value[1]!));
+  expect([...statuses].sort()).toEqual(Object.keys(STATUS_LABEL).sort());
+  const pausedGroup = [...source.matchAll(/key: '([^']+)'[^\n]*statuses: \[([^\]]*)\]/g)]
+    .find(match => match[2]!.includes("'paused'"));
+  expect(pausedGroup?.[1]).toBe('blocked');
 });

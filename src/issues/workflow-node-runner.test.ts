@@ -132,7 +132,7 @@ function setup(workflowGraph: WorkflowGraphSnapshot = graph()) {
   });
   const context: IssueWorkflowSharedContext = {
     schemaVersion: 1,
-    issue: { id: 33, title: '用户原始标题', body: '用户原始正文', category: 'task', createdTs: 2 },
+    issue: { id: '33', title: '用户原始标题', body: '用户原始正文', category: 'task', createdTs: 2 },
     project: {
       id: 1,
       name: 'demo',
@@ -148,7 +148,7 @@ function setup(workflowGraph: WorkflowGraphSnapshot = graph()) {
       issueProcess: '.panda/modules/demo-module/issues/33-issue.md',
     },
   };
-  const workflow = store.attachIssue(33, template, context);
+  const workflow = store.attachIssue('33', template, context);
   const driver = new MemoryDriver();
   const conversations = new FakeConversations(db);
   let now = 10;
@@ -180,6 +180,30 @@ function schedulerFor(
 }
 
 describe('工作流节点独立会话与结果协议', () => {
+  test('同一路径的第二执行机节点只读写所属执行机', async () => {
+    const s = setup();
+    const remote = new MemoryDriver();
+    const runner = new WorkflowNodeRunner({
+      db: s.db,
+      driver: s.driver,
+      driverForProjectId: (projectId) => {
+        expect(projectId).toBe(1);
+        return remote;
+      },
+      conversations: s.conversations,
+      mutex: new KeyedMutex(),
+    });
+    const started = await runner.start({ issueWorkflowId: s.workflow.id, nodeKey: 'code', tokenKey: 'remote', locale: 'zh-Hans' });
+    expect(remote.files.has(started.contextPath)).toBe(true);
+    expect(remote.prompts).toHaveLength(1);
+    expect(s.driver.files.size).toBe(0);
+    expect(s.driver.prompts).toHaveLength(0);
+    await remote.writeFile(started.resultPath, JSON.stringify({ schemaVersion: 1, output: '完成', selectedEdgeKey: 'code-review', routeReason: '可以评审' }));
+    await remote.writeFile(started.donePath, 'ok');
+    expect(await runner.collect(started.run.id)).toMatchObject({ state: 'completed' });
+    expect(s.driver.files.size).toBe(0);
+  });
+
   test('Codex 写节点读取完整共享上下文，并持久化自然语言成果和 Agent 路由', async () => {
     const s = setup();
     const started = await s.runner.start({
@@ -325,7 +349,7 @@ describe('可恢复工作流调度', () => {
     const s = setup();
     const events: string[] = [];
     const first = schedulerFor(s, events);
-    expect(await first.begin(33, 'zh-Hans')).toEqual({ state: 'running' });
+    expect(await first.begin('33', 'zh-Hans')).toEqual({ state: 'running' });
     const code1 = s.db.query<{ id: number }, []>(
       "SELECT id FROM issue_workflow_node_runs WHERE node_key = 'code' ORDER BY id DESC LIMIT 1",
     ).get()!;
@@ -339,7 +363,7 @@ describe('可恢复工作流调度', () => {
     await s.driver.writeFile(code1Paths.done, 'ok');
 
     const restarted = schedulerFor(s, events);
-    expect(await restarted.tick(33, 'zh-Hans')).toEqual({ state: 'running' });
+    expect(await restarted.tick('33', 'zh-Hans')).toEqual({ state: 'running' });
     const codeRuns = s.db.query<{ id: number; attempt: number; status: string }, []>(
       "SELECT id, attempt, status FROM issue_workflow_node_runs WHERE node_key = 'code' ORDER BY id",
     ).all();
@@ -356,7 +380,7 @@ describe('可恢复工作流调度', () => {
       routeReason: '进入评审',
     }));
     await s.driver.writeFile(code2Paths.done, 'ok');
-    await restarted.tick(33, 'zh-Hans');
+    await restarted.tick('33', 'zh-Hans');
     const review = s.db.query<{ id: number; predecessor_run_ids_json: string }, []>(
       "SELECT id, predecessor_run_ids_json FROM issue_workflow_node_runs WHERE node_key = 'review' ORDER BY id DESC LIMIT 1",
     ).get()!;
@@ -369,7 +393,7 @@ describe('可恢复工作流调度', () => {
       routeReason: '可以结束',
     }));
     await s.driver.writeFile(reviewPaths.done, 'ok');
-    expect(await restarted.tick(33, 'zh-Hans')).toEqual({ state: 'completed' });
+    expect(await restarted.tick('33', 'zh-Hans')).toEqual({ state: 'completed' });
   });
 
   test('并行分支全部到达后只汇合一次，先到分支保持等待', async () => {
@@ -411,7 +435,7 @@ describe('可恢复工作流调度', () => {
       },
     };
     const scheduler = schedulerFor(s, [], worktrees);
-    await scheduler.begin(33);
+    await scheduler.begin('33');
     const runs = s.db.query<{ id: number; node_key: string }, []>(
       "SELECT id, node_key FROM issue_workflow_node_runs WHERE node_key IN ('a', 'b') ORDER BY id",
     ).all();
@@ -422,14 +446,14 @@ describe('可恢复工作流调度', () => {
       await s.driver.writeFile(paths.result, JSON.stringify({ schemaVersion: 1, output: 'A 完成', selectedEdgeKey: 'a-join', routeReason: 'A 完成' }));
       await s.driver.writeFile(paths.done, 'ok');
     }
-    expect(await scheduler.tick(33)).toEqual({ state: 'running' });
+    expect(await scheduler.tick('33')).toEqual({ state: 'running' });
     expect(s.db.query<{ status: string }, []>("SELECT status FROM issue_workflow_node_runs WHERE node_key = 'join'").get()).toEqual({ status: 'waiting_join' });
 
     const b = runs.find((run) => run.node_key === 'b')!;
     const bPaths = workflowNodePaths('/workspace/demo', s.workflow.id, b.id);
     await s.driver.writeFile(bPaths.result, JSON.stringify({ schemaVersion: 1, output: 'B 完成', selectedEdgeKey: 'b-join', routeReason: 'B 完成' }));
     await s.driver.writeFile(bPaths.done, 'ok');
-    expect(await scheduler.tick(33)).toEqual({ state: 'completed' });
+    expect(await scheduler.tick('33')).toEqual({ state: 'completed' });
     expect([...new Set(worktreeCalls.finalized)].sort((a, b) => a - b)).toEqual(runs.map((run) => run.id).sort((a, b) => a - b));
     expect(worktreeCalls.merged.at(-1)!.sort((a, b) => a - b)).toEqual(runs.map((run) => run.id).sort((a, b) => a - b));
     expect(s.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM issue_workflow_node_runs WHERE node_key = 'join'").get()!.n).toBe(1);
@@ -453,7 +477,7 @@ describe('可恢复工作流调度', () => {
     };
     const s = setup(loop);
     const scheduler = schedulerFor(s);
-    await scheduler.begin(33);
+    await scheduler.begin('33');
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       const run = s.db.query<{ id: number }, [number]>(
         "SELECT id FROM issue_workflow_node_runs WHERE node_key = 'review' AND iteration = ? ORDER BY id DESC LIMIT 1",
@@ -466,7 +490,7 @@ describe('可恢复工作流调度', () => {
         routeReason: '需要返工',
       }));
       await s.driver.writeFile(paths.done, 'ok');
-      const result = await scheduler.tick(33);
+      const result = await scheduler.tick('33');
       if (attempt === 1) expect(result).toEqual({ state: 'running' });
       else expect(result).toEqual({ state: 'failed', reason: 'workflow.node_visit_limit:review' });
     }

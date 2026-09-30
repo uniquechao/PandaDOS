@@ -15,6 +15,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { openDb } from '../../core/db';
 import { migrate } from '../../core/migrate';
+import { chatTmux } from '../../core/conversations';
+import { saveLlmConfig } from '../../agents/llm';
+import { migratePmAgent } from '../../agents/pm';
 import { fileReadHint, imageReadHint } from '../../core/uploads';
 import { LocalDriver } from '../../executor/local';
 import { KEY_WHITELIST, type PtyChannel } from '../../executor/driver';
@@ -62,6 +65,7 @@ class FakeDriver extends LocalDriver {
   scrollDelayMs = 0;
   scrollInFlight = 0;
   maxScrollInFlight = 0;
+  readPaths: string[] = [];
   override async findExecutable(agent: 'claude' | 'codex') {
     return `/test/bin/${agent}`;
   }
@@ -83,6 +87,10 @@ class FakeDriver extends LocalDriver {
   }
   override async capturePane() {
     return this.pane;
+  }
+  override async readFileRange(filePath: string, offset: number, limit: number) {
+    this.readPaths.push(filePath);
+    return super.readFileRange(filePath, offset, limit);
   }
   override async openPty(cmd: string, cols: number, rows: number): Promise<PtyChannel> {
     const pty = new FakePty();
@@ -118,13 +126,14 @@ interface Ctx {
   dir: string;
   claudeDir: string;
   driver: FakeDriver;
+  remoteDriver?: FakeDriver;
   adminToken: string;
   aliceToken: string;
   bobToken: string;
   pid: number;
 }
 
-async function boot(): Promise<Ctx> {
+async function boot(withSecondExecutor = false): Promise<Ctx> {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-ws-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
   const dbPath = path.join(dir, 'panda.db');
@@ -133,18 +142,27 @@ async function boot(): Promise<Ctx> {
 
   const db0 = openDb(dbPath);
   migrate(db0);
+  migratePmAgent(db0);
+  // 线上服务启动门禁时会把 PANDA_LLM_* 传给测试进程。显式空配置可让
+  // agent failure 判定保持本地、即时，避免测试误发真实请求并拖过 waitFor。
+  saveLlmConfig(db0, { baseUrl: '', model: '', apiKey: '' });
   db0.query(
     `INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir)
      VALUES ('local', '127.0.0.1', 22, 'root', '', ?, ?)`,
   ).run(path.join(dir, 'ws'), claudeDir);
+  if (withSecondExecutor) db0.query(
+    `INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir, supports_claude)
+     VALUES ('remote', 'remote', 22, 'root', 'k', ?, ?, 1)`,
+  ).run(path.join(dir, 'ws'), path.join(dir, 'remote-home', '.claude', 'projects'));
   db0.close();
 
   const driver = new FakeDriver();
+  const remoteDriver = withSecondExecutor ? new FakeDriver() : undefined;
   const server = await startServer({
     port: 0,
     dbPath,
     adminTokenFile: path.join(dir, 'admin-token'),
-    driverFactory: () => driver,
+    driverFactory: (executor) => executor.id === 2 && remoteDriver ? remoteDriver : driver,
     feishu: null,
     engineConfig: { tickMs: 3_600_000 },
     statusIntervalMs: 3_600_000,
@@ -176,6 +194,7 @@ async function boot(): Promise<Ctx> {
     dir,
     claudeDir,
     driver,
+    ...(remoteDriver ? { remoteDriver } : {}),
     adminToken,
     aliceToken: alice.body.token as string,
     bobToken: bob.body.token as string,
@@ -290,6 +309,65 @@ const ASK_MENU = [
 // ---------- 鉴权矩阵（upgrade 前置；非 upgrade 请求直接看状态码） ----------
 
 describe('WS 鉴权矩阵（/ws/term /ws/chat 同一套 upgrade 前鉴权）', () => {
+  test('同 cwd 双执行机 chat 的启动、历史和注入只落第二执行机', async () => {
+    const t = await boot(true);
+    const remote = t.remoteDriver!;
+    const first = t.server.db.query<{ cwd: string; owner_user_id: number }, [number]>(
+      'SELECT cwd, owner_user_id FROM projects WHERE id = ?',
+    ).get(t.pid)!;
+    const second = t.server.db.query<{ id: number }, [string, string, number, number]>(
+      `INSERT INTO projects (name, executor_id, cwd, owner_user_id, created_ts)
+       VALUES (?, 2, ?, ?, ?) RETURNING id`,
+    ).get('same-cwd-remote', first.cwd, first.owner_user_id, Date.now())!.id;
+    const headers = { authorization: `Bearer ${t.aliceToken}`, 'content-type': 'application/json' };
+    const created = await fetch(`${t.base}/api/projects/${second}/conversations`, {
+      method: 'POST', headers, body: JSON.stringify({ label: 'remote chat', agent: 'claude' }),
+    });
+    expect(created.status).toBe(200);
+    const convId = ((await created.json()) as { conversation: { id: string } }).conversation.id;
+    const activated = await fetch(`${t.base}/api/projects/${second}/conversations/${convId}/activate`, {
+      method: 'POST', headers,
+    });
+    expect(activated.status).toBe(200);
+    expect(remote.sessions.has(chatTmux(convId))).toBe(true);
+    expect(t.driver.sessions.has(chatTmux(convId))).toBe(false);
+    const jsonl = path.join(t.dir, 'remote-transcript.jsonl');
+    await fsp.writeFile(jsonl, JSON.stringify({
+      type: 'assistant', message: {
+        model: 'claude-remote', content: [{ type: 'text', text: 'second executor history' }],
+      },
+    }) + '\n');
+    t.server.db.run('UPDATE conversations SET agent_jsonl_path = ? WHERE id = ?', [jsonl, convId]);
+    const model = await fetch(`${t.base}/api/projects/${second}/conversations/${convId}/model`, { headers });
+    expect(model.status).toBe(200);
+    expect(((await model.json()) as { model: string }).model).toBe('claude-remote');
+    const client = await connect(`${t.wsBase}/ws/chat/${second}?conv=${convId}`, t.aliceToken);
+    const firstFrame = await client.next();
+    const baseline = firstFrame.type === 'mode' ? await client.next() : firstFrame;
+    expect(baseline.type).toBe('baseline');
+    expect(baseline.msgs.some((m: { text: string }) => m.text.includes('second executor history'))).toBe(true);
+    expect(remote.readPaths).toContain(jsonl);
+    expect(t.driver.readPaths).not.toContain(jsonl);
+    client.send({ type: 'text', text: 'remote input' });
+    await Bun.sleep(80);
+    expect(remote.sent.some((item) => item.text === 'remote input')).toBe(true);
+    expect(t.driver.sent.some((item) => item.text === 'remote input')).toBe(false);
+    client.close();
+  }, 10_000);
+
+  test('第二执行机聊天在升级前拒绝，原始终端继续走项目 Driver', async () => {
+    const t = await boot();
+    t.server.db.run("INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir) VALUES ('other', '127.0.0.2', 22, 'root', '', '/same', '/same/.claude')");
+    // Model a legacy/corrupted binding; normal writes are blocked by migration 078.
+    t.server.db.run('DROP TRIGGER projects_executor_identity_immutable');
+    t.server.db.query('UPDATE projects SET executor_id = 2 WHERE id = ?').run(t.pid);
+    const headers = { authorization: `Bearer ${t.aliceToken}` };
+    const chat = await fetch(`${t.base}/ws/chat/${t.pid}`, { headers });
+    expect(chat.status).toBe(409);
+    expect((await chat.json() as { error: { code: string } }).error.code).toBe('executor.chat_unavailable');
+    expect((await fetch(`${t.base}/ws/term/${t.pid}`, { headers })).status).toBe(400);
+  });
+
   test('401/403/404 全矩阵 + 正常路径可升级', async () => {
     const t = await boot();
     const get = async (p: string, token?: string) =>

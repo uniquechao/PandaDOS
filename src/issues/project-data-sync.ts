@@ -5,6 +5,9 @@ import { MAX_ISSUE_BODY_CHARS } from './limits';
 import { issueOriginalRequestEnd } from './module-docs';
 import { legacySyncUid, PANDA_PROJECT_DATA, PANDA_PROJECT_DATA_VERSION } from '../core/project-data';
 import type { PandaSyncAdapter, VersionedPandaRecord } from '../core/project-sync';
+import { parseIssueId, type IssueId } from '../../shared/issue-id';
+import { withNewIssueId } from '../core/issue-id';
+import { renumberIssue, wasRenumberedFrom } from './issue-renumber';
 
 type Meta = Record<string, string>;
 
@@ -82,11 +85,14 @@ function issueRecord(data: Uint8Array, path: string): VersionedPandaRecord {
   const meta = managedMeta(text, 'issue-meta', path);
   const createdTs = intValue(meta.created_ts, 0);
   const uid = textValue(meta.sync_uid) ?? legacySyncUid(createdTs, `issue:${path}`);
+  // #307：编号跨实例沿用。优先 meta 的 issue_id，旧文件退回标题行 `# #<id> 标题`
+  const issueId = parseIssueId(textValue(meta.issue_id)) ?? parseIssueId(/^#\s+#(\S+)\s/m.exec(text)?.[1]);
   return {
     schema: PANDA_PROJECT_DATA.schema,
     version: PANDA_PROJECT_DATA_VERSION,
     kind: 'issue',
     uid,
+    issueId,
     updatedTs: intValue(meta.updated_ts, createdTs),
     title: titleFrom(text, true, path),
     body: originalRequest(text),
@@ -104,6 +110,15 @@ const ISSUE_STATES = new Set([
   'pending', 'clarifying', 'planning', 'plan_review', 'implementing', 'testing',
   'merge_review', 'merging', 'done', 'blocked', 'cancelled',
 ]);
+
+/**
+ * 腾出编号给同步导入的远端 issue：本地已有同号（sync_uid 必然不同）→ 本地这条换新号（#307）。
+ * 本地那条执行中则抛错，本次导入记错误、下次拉取重试。
+ */
+function claimIssueId(db: Database, id: IssueId): void {
+  if (!db.query('SELECT 1 FROM issues WHERE id = ?').get(id)) return;
+  renumberIssue(db, id, { reason: 'sync_collision' });
+}
 
 export function createIssueProjectDataAdapters(db: Database): PandaSyncAdapter[] {
   const project: PandaSyncAdapter = {
@@ -183,7 +198,8 @@ export function createIssueProjectDataAdapters(db: Database): PandaSyncAdapter[]
           'SELECT id, slug FROM project_modules WHERE project_id = ? AND slug = ?',
         ).get(projectId, String(value.moduleSlug ?? ''));
       if (!moduleRow) throw new Error('Issue 引用的模块不存在');
-      const existing = db.query<{ id: number; status: string }, [number, string]>(
+      const fileIssueId = parseIssueId(value.issueId);
+      const existing = db.query<{ id: IssueId; status: string }, [number, string]>(
         'SELECT id, status FROM issues WHERE project_id = ? AND sync_uid = ?',
       ).get(projectId, item.uid);
       const fileStatus = typeof value.status === 'string' && ISSUE_STATES.has(value.status)
@@ -198,24 +214,40 @@ export function createIssueProjectDataAdapters(db: Database): PandaSyncAdapter[]
       const implMode = value.implMode === 'team' ? 'team' : 'seq';
       const agent = value.agent === 'codex' ? 'codex' : 'claude';
       const createdTs = Number(value.createdTs) || 0;
-      if (existing) {
-        db.query(`UPDATE issues SET title = ?, body = ?, category = ?, module = ?, module_id = ?,
-          impl_mode = ?, agent = ?, doc_path = ? WHERE id = ?`)
-          .run(title, body, category, moduleRow.slug, moduleRow.id, implMode, agent,
-            item.path, existing.id);
-      } else {
-        db.query(`INSERT INTO issues
-          (project_id, sync_uid, title, body, category, status, module, module_id, impl_mode, agent,
+      const insert = (id: IssueId) => db.query(`INSERT INTO issues
+          (id, project_id, sync_uid, title, body, category, status, module, module_id, impl_mode, agent,
            doc_path, created_ts)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-          .run(projectId, item.uid, title, body, category, status, moduleRow.slug, moduleRow.id,
-            implMode, agent, item.path, createdTs);
-      }
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(id, projectId, item.uid, title, body, category, status, moduleRow.slug, moduleRow.id,
+          implMode, agent, item.path, createdTs);
+      db.transaction(() => {
+        let localId = existing?.id ?? null;
+        if (localId !== null && fileIssueId !== null && fileIssueId !== localId) {
+          // 本地换号后、旧过程页还没被持久化搬走：这份文件已过时，忽略
+          if (wasRenumberedFrom(db, localId, fileIssueId)) return;
+          // 远端给这条换过号：沿用远端编号（本地同号的另一条先让位）
+          claimIssueId(db, fileIssueId);
+          localId = renumberIssue(db, localId, { to: fileIssueId, reason: 'sync_adopt' });
+        }
+        if (localId !== null) {
+          db.query(`UPDATE issues SET title = ?, body = ?, category = ?, module = ?, module_id = ?,
+            impl_mode = ?, agent = ?, doc_path = ? WHERE id = ?`)
+            .run(title, body, category, moduleRow.slug, moduleRow.id, implMode, agent,
+              item.path, localId);
+        } else if (fileIssueId !== null) {
+          claimIssueId(db, fileIssueId);
+          insert(fileIssueId);
+        } else {
+          withNewIssueId(insert);
+        }
+      })();
     },
     archive(projectId, item) {
-      const existing = db.query<{ status: string }, [number, string]>(
-        'SELECT status FROM issues WHERE project_id = ? AND sync_uid = ?',
+      const existing = db.query<{ status: string; doc_path: string | null }, [number, string]>(
+        'SELECT status, doc_path FROM issues WHERE project_id = ? AND sync_uid = ?',
       ).get(projectId, item.uid);
+      // 换号后过程页搬到了新路径：旧路径消失不代表 issue 被删
+      if (existing?.doc_path && existing.doc_path !== item.path) return;
       if (existing && !BUSY_STATES.includes(existing.status as never)) {
         db.query(`UPDATE issues SET status = 'cancelled'
           WHERE project_id = ? AND sync_uid = ?`).run(projectId, item.uid);
@@ -254,8 +286,8 @@ export function moduleMetaProjection(db: Database, moduleId: number): string {
   ].join('\n');
 }
 
-export function issueMetaProjection(db: Database, issueId: number): string {
-  const row = db.query<Record<string, unknown>, [number]>('SELECT * FROM issues WHERE id = ?').get(issueId);
+export function issueMetaProjection(db: Database, issueId: IssueId): string {
+  const row = db.query<Record<string, unknown>, [IssueId]>('SELECT * FROM issues WHERE id = ?').get(issueId);
   if (!row || typeof row.sync_uid !== 'string') throw new Error('Issue 不存在或缺少 sync_uid');
   const module = row.module_id === null ? null : db.query<{ sync_uid: string }, [number]>(
     'SELECT sync_uid FROM project_modules WHERE id = ?',

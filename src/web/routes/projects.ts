@@ -43,6 +43,8 @@ import {
   PASSWD_READ_LIMIT,
   type ExecutorProbe,
 } from './executors';
+import { isIssueId, type IssueId } from '../../../shared/issue-id';
+import { dedicatedIsolationViolation, probeDedicatedOsBoundary } from '../../issues/execution-isolation';
 
 export interface ProjectsRoutesDeps {
   db: Database;
@@ -78,7 +80,7 @@ export interface ProjectsRoutesDeps {
    * summary 聚合把它们补进「待确认」角标（状态本身还在 doing，等人工这件事必须可见）。
    * 缺省 = 不补（测试/离线装配）。
    */
-  waitingIssueIds?(): Set<number>;
+  waitingIssueIds?(): Set<IssueId>;
   summaryOrchestrator?: {
     start(
       project: Project,
@@ -118,6 +120,7 @@ interface ProjectRowRaw {
   status: string;
   created_ts: number;
   run_user: string;
+  execution_isolation?: string;
   work_branch: string | null;
   kind: string;
 }
@@ -241,6 +244,7 @@ const SUMMARY_COLUMN: Record<string, 'todo' | 'doing' | 'review' | 'blocked'> = 
   plan_review: 'review',
   merge_review: 'review',
   blocked: 'blocked',
+  paused: 'blocked',
 };
 
 export interface ProjectIssueSummary {
@@ -464,12 +468,12 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
             ? ''
             : ' AND (p.owner_user_id = ? OR p.id IN (SELECT project_id FROM project_members WHERE user_id = ?))';
         const ownerArgs: number[] = u.role === 'admin' ? [] : [u.id, u.id];
-        const attention = new Map<number, number>(); // issueId → projectId（天然去重）
+        const attention = new Map<IssueId, number>(); // issueId → projectId（天然去重）
 
-        const waiting = [...(deps.waitingIssueIds?.() ?? [])].filter((n) => Number.isInteger(n));
+        const waiting = [...(deps.waitingIssueIds?.() ?? [])].filter(isIssueId);
         if (waiting.length) {
           const rows = db
-            .query<{ id: number; project_id: number }, number[]>(
+            .query<{ id: IssueId; project_id: number }, Array<IssueId | number>>(
               `SELECT i.id, i.project_id FROM issues i
                JOIN projects p ON p.id = i.project_id
                WHERE i.id IN (${waiting.map(() => '?').join(',')})
@@ -481,7 +485,7 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
         }
 
         const clarifyRows = db
-          .query<{ id: number; project_id: number }, number[]>(
+          .query<{ id: IssueId; project_id: number }, number[]>(
             `SELECT i.id, i.project_id FROM issues i
              JOIN projects p ON p.id = i.project_id
              WHERE i.status NOT IN ('done', 'cancelled', 'clarifying', 'plan_review', 'merge_review')
@@ -543,6 +547,18 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
         // Linux 用户（可选，admin-only）：本期 = 归属标记 + 默认 cwd 锚点（/home/<user>/…）
         const ru = parseRunUser(b, u);
         if (ru.error) return ru.error;
+        const isolationMode = b.executionIsolation ?? 'shared';
+        if (isolationMode !== 'shared' && isolationMode !== 'dedicated-ssh') {
+          return json({ ok: false, error: 'executionIsolation 必须为 shared 或 dedicated-ssh' }, 400);
+        }
+        if (isolationMode === 'dedicated-ssh' && u.role !== 'admin') {
+          return json({ ok: false, error: '仅管理员可创建专用 SSH 隔离项目' }, 403);
+        }
+        const hasIsolationColumn = db.query<{ name: string }, []>('PRAGMA table_info(projects)')
+          .all().some((column) => column.name === 'execution_isolation');
+        if (isolationMode === 'dedicated-ssh' && !hasIsolationColumn) {
+          return json({ ok: false, error: '数据库尚未安装专用隔离迁移' }, 503);
+        }
         const wb = parseWorkBranch(b);
         if (wb.error) return wb.error;
         const pk = parseProjectKind(b);
@@ -570,6 +586,16 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
             else warnings.push(`未能解析用户 ${ru.value} 的家目录，cwd 落 workspace`);
           }
           cwd = `${anchor === '/' ? '' : anchor}/${projectSlug(name)}`;
+        }
+
+        if (isolationMode === 'dedicated-ssh') {
+          const violation = dedicatedIsolationViolation(db, {
+            id: 0, cwd, runUser: ru.value ?? '', executionIsolation: isolationMode,
+          }, ex);
+          if (violation) return json({ ok: false, error: violation }, 409);
+          if (!driver?.runCommand) return json({ ok: false, error: '执行机未提供 OS 身份探查能力' }, 503);
+          const osViolation = await probeDedicatedOsBoundary({ statPath: driver.statPath.bind(driver), runCommand: driver.runCommand.bind(driver) }, ex);
+          if (osViolation) return json({ ok: false, error: osViolation }, 409);
         }
 
         // Git 准备先行：成功才落项目行（失败不留半截项目；目录残留由错误信息指认）。
@@ -604,15 +630,7 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
         );
         if (gitFailure) return gitFailure;
 
-        const row = db
-          .query<
-            ProjectRowRaw,
-            [string, number, string, number, string | null, string | null, number, string, string | null, string]
-          >(
-            `INSERT INTO projects (name, executor_id, cwd, owner_user_id, pm_persona, goal, created_ts, run_user, work_branch, kind)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
-          )
-          .get(
+        const projectValues = [
             name.slice(0, 100),
             executorId,
             cwd,
@@ -623,7 +641,16 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
             ru.value ?? '',
             workBranch,
             'issue',
-          );
+          ] as const;
+        const row = hasIsolationColumn
+          ? db.query<ProjectRowRaw, [...typeof projectValues, string]>(
+            `INSERT INTO projects (name, executor_id, cwd, owner_user_id, pm_persona, goal, created_ts, run_user, work_branch, kind, execution_isolation)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+          ).get(...projectValues, isolationMode)
+          : db.query<ProjectRowRaw, [...typeof projectValues]>(
+            `INSERT INTO projects (name, executor_id, cwd, owner_user_id, pm_persona, goal, created_ts, run_user, work_branch, kind)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+          ).get(...projectValues);
         if (!row) return json({ ok: false, error: '创建失败' }, 500);
         const project = mapProject(row);
 
@@ -1221,6 +1248,11 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
         const norm = (p: string): string => path.posix.normalize(p).replace(/\/+$/, '') || '/';
         const dest = norm(destRaw);
         const cur = norm(project.cwd);
+        if (project.executionIsolation === 'dedicated-ssh') {
+          const executor = getExecutorById(db, project.executorId);
+          const violation = executor && dedicatedIsolationViolation(db, { ...project, cwd: dest }, executor);
+          if (!executor || violation) return json({ ok: false, error: violation ?? '执行机不存在' }, 409);
+        }
         if (dest === '/') return json({ ok: false, error: '不能迁移到根目录' }, 400);
         if (dest === cur) return json({ ok: false, error: '目标与当前目录相同' }, 400);
         if (dest.startsWith(`${cur}/`) || cur.startsWith(`${dest}/`)) {
@@ -1431,6 +1463,13 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
           } else {
             return json({ ok: false, error: 'validationCommands 必须是数组或 null' }, 400);
           }
+        }
+        if ('validationPolicy' in b) {
+          if (b.validationPolicy !== 'required' && b.validationPolicy !== 'optional' && b.validationPolicy !== 'none') {
+            return json({ ok: false, error: 'validationPolicy 必须为 required、optional 或 none' }, 400);
+          }
+          sets.push('validation_policy = ?');
+          vals.push(b.validationPolicy);
         }
         // 项目类型固定为 issue；仅保留显式 issue 供旧客户端兼容。
         const pk = parseProjectKind(b);

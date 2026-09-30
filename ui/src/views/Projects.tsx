@@ -376,6 +376,7 @@ export function ProjectsView({ me }: { me: Me }) {
               {!!s && s.todo > 0 && <span class="badge b-gray">{tr('project.statusTodo')} {s.todo}</span>}
               {!!s && s.blocked > 0 && <span class="badge b-red">{tr('project.statusBlocked')} {s.blocked}</span>}
               {p.runUser && <span class="badge b-blue">@{p.runUser}</span>}
+              {p.executionIsolation === 'dedicated-ssh' && <span class="badge b-blue">{tr('projectSettings.isolationDedicated')}</span>}
             </div>
           </div>
           <span
@@ -429,19 +430,10 @@ export function ProjectsView({ me }: { me: Me }) {
               class="pcard-act"
               onClick={(e) => {
                 e.stopPropagation();
-                nav(`/p/${p.id}/files`);
+                nav(`/p/${p.id}/workspace`);
               }}
             >
-              {tr('view.files')}
-            </button>
-            <button
-              class="pcard-act"
-              onClick={(e) => {
-                e.stopPropagation();
-                nav(`/p/${p.id}/git`);
-              }}
-            >
-              Git
+              {tr('ws.title')}
             </button>
             {canManage(p) && (
               <button
@@ -629,6 +621,7 @@ function CreateProjectModal({
   const executors = useExecutors();
   const [executorId, setExecutorId] = useState('');
   const [runUser, setRunUser] = useState('');
+  const [executionIsolation, setExecutionIsolation] = useState<'shared' | 'dedicated-ssh'>('shared');
   const [withConv, setWithConv] = useState(true);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
@@ -673,6 +666,7 @@ function CreateProjectModal({
           ...(goal.trim() ? { goal: goal.trim() } : {}),
           ...(cwd.trim() ? { cwd: cwd.trim() } : anchoredCwd ? { cwd: anchoredCwd } : {}),
           ...(runUser ? { runUser } : {}),
+          ...(executionIsolation === 'dedicated-ssh' ? { executionIsolation } : {}),
           ...(workBranch.trim() ? { workBranch: workBranch.trim() } : {}),
           withConversation: withConv,
         },
@@ -729,6 +723,16 @@ function CreateProjectModal({
           <ExecutorSelect executors={executors} value={executorId} onChange={setExecutorId} />
         </label>
         {isAdmin && <RunUserSelect osUsers={osUsers} value={runUser} onChange={setRunUser} />}
+        {isAdmin && (
+          <label class="field">
+            {tr('projectSettings.isolationMode')}
+            <select value={executionIsolation} onChange={(e) => setExecutionIsolation(e.currentTarget.value as 'shared' | 'dedicated-ssh')}>
+              <option value="shared">{tr('projectSettings.isolationShared')}</option>
+              <option value="dedicated-ssh">{tr('projectSettings.isolationDedicated')}</option>
+            </select>
+            <small>{tr('projectSettings.isolationHelp')}</small>
+          </label>
+        )}
         <label class="field">
           {tr('project.goalOptional')}
           <textarea rows={2} value={goal} onInput={(e) => setGoal(e.currentTarget.value)} />

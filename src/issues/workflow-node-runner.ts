@@ -21,6 +21,7 @@ import type { ExecutorDriver } from '../executor/driver';
 import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/language';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
 import { KeyedMutex, tmuxLockKey } from './mutex';
+import type { IssueId } from '../../shared/issue-id';
 
 export const WORKFLOW_RUN_SCRATCH_BASE = '.panda/tmp/workflows';
 export const MAX_WORKFLOW_NODE_OUTPUT_CHARS = 64_000;
@@ -45,7 +46,7 @@ export interface WorkflowNodeConversationOps {
 
 interface WorkflowLookupRow {
   id: number;
-  issue_id: number;
+  issue_id: IssueId;
   project_id: number;
   cwd: string;
   template_name: string;
@@ -90,7 +91,7 @@ export interface WorkflowNodeContextFile {
   schemaVersion: 1;
   workflow: {
     id: number;
-    issueId: number;
+    issueId: IssueId;
     templateName: string;
   };
   sharedContext: IssueWorkflowSharedContext;
@@ -141,6 +142,7 @@ export type CollectWorkflowNodeResult =
 export interface WorkflowNodeRunnerDeps {
   db: Database;
   driver: WorkflowNodeDriver;
+  driverForProjectId?: (projectId: number) => WorkflowNodeDriver;
   conversations: WorkflowNodeConversationOps;
   mutex: KeyedMutex;
   now?: () => number;
@@ -319,6 +321,9 @@ export function parseWorkflowNodeResult(
 }
 
 export class WorkflowNodeRunner {
+  private driver(projectId: number): WorkflowNodeDriver {
+    return this.deps.driverForProjectId?.(projectId) ?? this.deps.driver;
+  }
   private readonly now: () => number;
 
   constructor(private readonly deps: WorkflowNodeRunnerDeps) {
@@ -473,11 +478,11 @@ export class WorkflowNodeRunner {
     };
     const session = chatTmux(conversation.id);
     try {
-      await this.deps.driver.writeFile(paths.context, JSON.stringify(context, null, 2));
+      await this.driver(row.project_id).writeFile(paths.context, JSON.stringify(context, null, 2));
       await this.deps.mutex.runExclusive(tmuxLockKey(session), async () => {
         const active = await this.deps.conversations.activate(conversation.id, executionCwd);
         if (!active) throw new Error('节点对话不存在');
-        await this.deps.driver.sendKeys(
+        await this.driver(row.project_id).sendKeys(
           session,
           buildWorkflowNodePrompt(agent, paths, node.executionMode, input.locale),
         );
@@ -515,7 +520,7 @@ export class WorkflowNodeRunner {
     if (!node) throw new Error('节点定义不存在');
     const candidateEdges = graph.edges.filter((edge) => edge.fromNodeKey === node.key);
     const paths = workflowNodePaths(row.cwd, run.issueWorkflowId, run.id);
-    const done = await this.deps.driver.statPath(paths.done).catch(() => null);
+    const done = await this.driver(row.project_id).statPath(paths.done).catch(() => null);
     if (!done?.isFile) return { state: 'pending', run };
     const routingTs = this.now();
     this.deps.db
@@ -524,7 +529,7 @@ export class WorkflowNodeRunner {
          WHERE id = ? AND status IN ('queued', 'running')`,
       )
       .run(routingTs, run.id);
-    const raw = await readDriverText(this.deps.driver, paths.result, MAX_RESULT_BYTES);
+    const raw = await readDriverText(this.driver(row.project_id), paths.result, MAX_RESULT_BYTES);
     const parsed = raw === null
       ? { ok: false as const, code: 'workflow.result_missing', details: paths.resultRel }
       : parseWorkflowNodeResult(raw, candidateEdges);
@@ -571,7 +576,7 @@ export class WorkflowNodeRunner {
     await this.deps.mutex.runExclusive(tmuxLockKey(session), async () => {
       const active = await this.deps.conversations.activate(run.conversationId!, executionCwd);
       if (!active) throw new Error('节点对话不存在');
-      await this.deps.driver.sendKeys(
+      await this.driver(row.project_id).sendKeys(
         session,
         buildWorkflowNodeResumePrompt(run.agent!, paths, locale),
       );

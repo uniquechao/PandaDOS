@@ -17,6 +17,7 @@ import {
   weeklyReport,
   weekWindowOf,
 } from './usage-weekly';
+import type { IssueId } from '../../shared/issue-id';
 
 const totals = (over: Partial<UsageTotals> = {}): UsageTotals => ({ ...emptyUsage(), ...over });
 
@@ -45,7 +46,7 @@ function issue(db: ReturnType<typeof openDb>, id: number, moduleId: number | nul
 }
 
 /** 落一条 transition 事件（只有 to 参与统计） */
-function trans(db: ReturnType<typeof openDb>, issueId: number, to: string, ts: number): void {
+function trans(db: ReturnType<typeof openDb>, issueId: IssueId, to: string, ts: number): void {
   db.run(`INSERT INTO issue_events (issue_id, kind, data_json, ts) VALUES (?, 'transition', ?, ?)`,
     [issueId, JSON.stringify({ event: 'x', from: 'implementing', to }), ts]);
 }
@@ -88,12 +89,12 @@ describe('结局指标口径', () => {
     issue(db, 11, 5);
     issue(db, 12, 5);
     issue(db, 13, 5);
-    trans(db, 10, 'done', at(MON));
-    trans(db, 11, 'done', at('2026-09-08'));
-    trans(db, 11, 'done', at('2026-09-08', 12)); // 同一条重复进 done：去重后仍是一条
-    trans(db, 12, 'blocked', at('2026-09-09'));
-    trans(db, 13, 'cancelled', at('2026-09-10'));
-    trans(db, 13, 'implementing', at('2026-09-10', 12)); // 中间状态不算结局
+    trans(db, '10', 'done', at(MON));
+    trans(db, '11', 'done', at('2026-09-08'));
+    trans(db, '11', 'done', at('2026-09-08', 12)); // 同一条重复进 done：去重后仍是一条
+    trans(db, '12', 'blocked', at('2026-09-09'));
+    trans(db, '13', 'cancelled', at('2026-09-10'));
+    trans(db, '13', 'implementing', at('2026-09-10', 12)); // 中间状态不算结局
     const w = weekWindowOf(MON);
 
     const stats = moduleOutcomes(db, { fromMs: w.fromMs, toMs: w.toMs }).get('1:5')!;
@@ -106,8 +107,8 @@ describe('结局指标口径', () => {
   test('同一条 issue 本周先 blocked 后 done：分子分母各只算一条，且算恢复', () => {
     const { db } = setup();
     issue(db, 10, 5);
-    trans(db, 10, 'blocked', at(MON));
-    trans(db, 10, 'done', at('2026-09-09'));
+    trans(db, '10', 'blocked', at(MON));
+    trans(db, '10', 'done', at('2026-09-09'));
     const w = weekWindowOf(MON);
 
     const s = moduleOutcomes(db, { fromMs: w.fromMs, toMs: w.toMs }).get('1:5')!;
@@ -120,10 +121,10 @@ describe('结局指标口径', () => {
     const { db } = setup();
     issue(db, 10, 5);
     issue(db, 11, 5);
-    trans(db, 10, 'blocked', at('2026-09-11'));
-    trans(db, 10, 'done', at('2026-09-15')); // 下一周才 done
-    trans(db, 11, 'blocked', at('2026-09-11'));
-    trans(db, 11, 'cancelled', at('2026-09-16')); // 没救回来
+    trans(db, '10', 'blocked', at('2026-09-11'));
+    trans(db, '10', 'done', at('2026-09-15')); // 下一周才 done
+    trans(db, '11', 'blocked', at('2026-09-11'));
+    trans(db, '11', 'cancelled', at('2026-09-16')); // 没救回来
     const w = weekWindowOf(MON);
 
     const s = moduleOutcomes(db, { fromMs: w.fromMs, toMs: w.toMs }).get('1:5')!;
@@ -137,8 +138,8 @@ describe('结局指标口径', () => {
   test('blocked 之前的 done 不算恢复（顺序按事件 id 判）', () => {
     const { db } = setup();
     issue(db, 10, 5);
-    trans(db, 10, 'done', at(MON));
-    trans(db, 10, 'blocked', at('2026-09-09')); // 之后再没 done
+    trans(db, '10', 'done', at(MON));
+    trans(db, '10', 'blocked', at('2026-09-09')); // 之后再没 done
     const w = weekWindowOf(MON);
     expect(moduleOutcomes(db, { fromMs: w.fromMs, toMs: w.toMs }).get('1:5')).toMatchObject({
       recoveredCount: 0, recoveryRate: 0,
@@ -151,11 +152,11 @@ describe('结局指标口径', () => {
     issue(db, 11, 6);
     issue(db, 12, null);       // 未归模块
     issue(db, 20, null, 2);    // 别的项目
-    trans(db, 10, 'done', at(MON));
-    trans(db, 11, 'blocked', at(MON));
-    trans(db, 12, 'done', at(MON));
-    trans(db, 20, 'done', at(MON));
-    trans(db, 10, 'done', at('2026-09-06')); // 上一周，不该进来
+    trans(db, '10', 'done', at(MON));
+    trans(db, '11', 'blocked', at(MON));
+    trans(db, '12', 'done', at(MON));
+    trans(db, '20', 'done', at(MON));
+    trans(db, '10', 'done', at('2026-09-06')); // 上一周，不该进来
     const w = weekWindowOf(MON);
 
     const all = moduleOutcomes(db, { fromMs: w.fromMs, toMs: w.toMs });
@@ -170,7 +171,7 @@ describe('结局指标口径', () => {
     const { db } = setup();
     issue(db, 10, 5);
     db.run(`INSERT INTO issue_events (issue_id, kind, data_json, ts) VALUES (10, 'transition', '{坏 json', ?)`, [at(MON)]);
-    trans(db, 10, 'implementing', at('2026-09-08'));
+    trans(db, '10', 'implementing', at('2026-09-08'));
     const w = weekWindowOf(MON);
     expect(moduleOutcomes(db, { fromMs: w.fromMs, toMs: w.toMs }).size).toBe(0);
   });
@@ -181,12 +182,12 @@ describe('周报合成', () => {
     const { db, store } = setup();
     issue(db, 10, 5);
     issue(db, 11, 6);
-    store.addDaily(MON, 1, 10, totals({ outputTokens: 1_000_000, requests: 3 }));       // $10
-    store.addDaily('2026-09-09', 1, 11, totals({ inputTokens: 2_000_000 }));            // $2.5
-    store.addDaily('2026-09-09', 1, 0, totals({ outputTokens: 100_000 }));              // $1，未归因
-    store.addDaily('2026-09-20', 1, 10, totals({ outputTokens: 9_000_000 }));           // 下下周，不该进来
-    trans(db, 10, 'done', at(MON));
-    trans(db, 11, 'blocked', at('2026-09-09'));
+    store.addDaily(MON, 1, '10', totals({ outputTokens: 1_000_000, requests: 3 }));       // $10
+    store.addDaily('2026-09-09', 1, '11', totals({ inputTokens: 2_000_000 }));            // $2.5
+    store.addDaily('2026-09-09', 1, '0', totals({ outputTokens: 100_000 }));              // $1，未归因
+    store.addDaily('2026-09-20', 1, '10', totals({ outputTokens: 9_000_000 }));           // 下下周，不该进来
+    trans(db, '10', 'done', at(MON));
+    trans(db, '11', 'blocked', at('2026-09-09'));
 
     const r = weeklyReport(db, { week: '2026-09-10' });
     expect(r.week.start).toBe(MON);
@@ -212,7 +213,7 @@ describe('周报合成', () => {
   test('只有结局没有用量的模块也要出现（否则「白干一周」的模块会凭空消失）', () => {
     const { db } = setup();
     issue(db, 10, 5);
-    trans(db, 10, 'done', at(MON));
+    trans(db, '10', 'done', at(MON));
 
     const r = weeklyReport(db, { week: MON });
     expect(r.modules).toEqual([
@@ -225,8 +226,8 @@ describe('周报合成', () => {
     const { db } = setup();
     issue(db, 10, 5);
     // 只有中间状态流转：没有结局，也没有任何分桶用量
-    trans(db, 10, 'implementing', at(MON));
-    trans(db, 10, 'testing', at('2026-09-09'));
+    trans(db, '10', 'implementing', at(MON));
+    trans(db, '10', 'testing', at('2026-09-09'));
 
     expect([...activeModuleBuckets(db, {
       fromMs: weekWindowOf(MON).fromMs, toMs: weekWindowOf(MON).toMs,
@@ -242,7 +243,7 @@ describe('周报合成', () => {
   test('只有用量没有结局的模块给空结局（还在跑，不是零失败）', () => {
     const { db, store } = setup();
     issue(db, 10, 5);
-    store.addDaily(MON, 1, 10, totals({ outputTokens: 100 }));
+    store.addDaily(MON, 1, '10', totals({ outputTokens: 100 }));
     const r = weeklyReport(db, { week: MON });
     expect(r.modules[0]).toMatchObject({ moduleId: 5 });
     expect(r.modules[0]!.outcomes).toMatchObject({ outcomeCount: 0, failureRate: 0, recoveryRate: 0 });
@@ -252,8 +253,8 @@ describe('周报合成', () => {
     const { db, store } = setup();
     issue(db, 10, 5);
     issue(db, 20, null, 2);
-    store.addDaily(MON, 1, 10, totals({ outputTokens: 100 }));
-    store.addDaily(MON, 2, 20, totals({ outputTokens: 900 }));
+    store.addDaily(MON, 1, '10', totals({ outputTokens: 100 }));
+    store.addDaily(MON, 2, '20', totals({ outputTokens: 900 }));
 
     const p1 = weeklyReport(db, { week: MON, projectId: 1 });
     expect(p1.modules.map((m) => [m.projectId, m.moduleId])).toEqual([[1, 5]]);

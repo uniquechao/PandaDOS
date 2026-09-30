@@ -1,9 +1,14 @@
 {
-  "version": "2.3.2-2026.0917",
+  "version": "2.4.1-2026.0929",
   "notes": [
-    "issue-direct-execution",
-    "issue-pause-resume",
-    "skill-policies",
-    "project-sync-reliability"
+    "unified-workspace",
+    "issue-injection-recovery",
+    "validation-delivery-evidence",
+    "dedicated-ssh-isolation",
+    "agent-chatroom-workspace",
+    "local-session-member-models",
+    "agent-roster-editing",
+    "compact-member-contact-list",
+    "conversation-segment-resume"
   ]
 }

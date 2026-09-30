@@ -50,6 +50,7 @@ import { getProject, type ImplCommitsSnapshot } from '../../issues/engine';
 import { gitLockKey, KeyedMutex } from '../../issues/mutex';
 import { json, type RouteCtx, type RouteDef } from '../middleware';
 import { llmErrorResponse } from '../llm-error';
+import { parseIssueId, type IssueId } from '../../../shared/issue-id';
 
 /** 本模块需要的 Driver 子集（结构兼容 ExecutorDriver，测试可传替身） */
 export type GitDriver = Pick<
@@ -103,7 +104,7 @@ export interface GitRoutesDeps {
    * issue 不属于该项目或不存在 → null。不传（旧调用点）则 per-issue 端点回 404，
    * 项目级 git 端点不受影响。
    */
-  issueGitRef?(projectId: number, issueId: number): IssueGitRef | null;
+  issueGitRef?(projectId: number, issueId: IssueId): IssueGitRef | null;
 }
 
 /** 提交图条数上限（v1 同值；配合 Driver 层 60s git 限时防大仓库拖挂） */
@@ -119,7 +120,7 @@ const WRITE_PATHS_MAX = 500;
 const SEP = '\x1f';
 
 /** 读 JSON body → 对象（解析失败/非对象回 {}，同其它 routes） */
-async function readBody(req: Request): Promise<Record<string, unknown>> {
+export async function readBody(req: Request): Promise<Record<string, unknown>> {
   const b = await req.json().catch(() => null);
   return typeof b === 'object' && b !== null ? (b as Record<string, unknown>) : {};
 }
@@ -157,7 +158,7 @@ function parseWriteSelection(body: Record<string, unknown>): WriteSelection | st
   return { all: false, paths };
 }
 
-function gitFailure(
+export function gitFailure(
   action: string,
   result: { out: string; err: string },
   status = 409,
@@ -274,7 +275,7 @@ function unquotePath(p: string): string {
 }
 
 /** 解析 `status --porcelain=v1 -b` 的 '## …' 头行 → 上游与领先/落后 */
-function parseStatusHead(line: string): { upstream: string; ahead: number; behind: number } {
+export function parseStatusHead(line: string): { upstream: string; ahead: number; behind: number } {
   const up = line.match(/\.\.\.(\S+)/);
   const a = line.match(/ahead (\d+)/);
   const b = line.match(/behind (\d+)/);
@@ -282,7 +283,7 @@ function parseStatusHead(line: string): { upstream: string; ahead: number; behin
 }
 
 /** 解析 porcelain v1 改动行（不含 '##' 头） */
-function parseChanges(out: string): GitChangeRec[] {
+export function parseChanges(out: string): GitChangeRec[] {
   const changes: GitChangeRec[] = [];
   for (const line of out.split('\n')) {
     if (!line || line.startsWith('##') || line.length < 4) continue;
@@ -359,7 +360,7 @@ function parseFiles(nameStatus: string, numstat: string): GitFileRec[] {
   return files;
 }
 
-function sliceDiff(out: string): { diff: string; truncated: boolean } {
+export function sliceDiff(out: string): { diff: string; truncated: boolean } {
   if (out.length <= DIFF_MAX) return { diff: out, truncated: false };
   return { diff: out.slice(0, DIFF_MAX), truncated: true };
 }
@@ -374,7 +375,7 @@ function parseBlobSide(url: URL): BlobSide | null {
 }
 
 /** blob spec 不能使用 pathspec 的 `--` 防护，因此先严格限定为仓库内相对路径。 */
-function safeRepoPath(raw: string): string | null {
+export function safeRepoPath(raw: string): string | null {
   if (!raw || raw.length > 4_000 || raw.startsWith('/') || raw.includes('\0')) return null;
   const parts = raw.replace(/\\/g, '/').split('/');
   if (parts.some((part) => !part || part === '.' || part === '..')) return null;
@@ -504,6 +505,48 @@ async function pushState(
   const remotes = await driver.git(cwd, ['remote']);
   const hasOrigin = remotes.code === 0 && remotes.out.split('\n').some((l) => l.trim() === 'origin');
   return hasOrigin ? { state: 'unpushed' } : { state: 'none' };
+}
+
+/** 进行中的多步 Git 操作（冲突处理的「继续/中止」入口据此显示） */
+export type GitOperationState = 'merge' | 'rebase' | 'cherry-pick' | 'revert' | null;
+
+/** `git rev-parse --git-path <name>` 解析到绝对路径（相对输出按 cwd 解析；worktree 下自动落 common dir） */
+export async function gitPath(driver: Pick<GitDriver, 'git'>, cwd: string, name: string): Promise<string | null> {
+  const r = await driver.git(cwd, ['rev-parse', '--git-path', name]);
+  if (r.code !== 0 || !r.out.trim()) return null;
+  const p = r.out.trim();
+  return p.startsWith('/') ? p : `${cwd.replace(/\/+$/, '')}/${p}`;
+}
+
+export async function operationState(driver: Pick<GitDriver, 'git' | 'statPath'>, cwd: string): Promise<GitOperationState> {
+  const probes: Array<[string, Exclude<GitOperationState, null>]> = [
+    ['rebase-merge', 'rebase'], ['rebase-apply', 'rebase'], ['MERGE_HEAD', 'merge'],
+    ['CHERRY_PICK_HEAD', 'cherry-pick'], ['REVERT_HEAD', 'revert'],
+  ];
+  for (const [name, op] of probes) {
+    const p = await gitPath(driver, cwd, name);
+    if (p && (await driver.statPath(p).catch(() => null))) return op;
+  }
+  return null;
+}
+
+/** GET /git 附加字段：仓库前缀、上次 fetch 时间（FETCH_HEAD mtime）、进行中的操作、是否配置远程 */
+async function repoExtras(driver: GitDriver, cwd: string): Promise<{
+  prefix: string; lastFetchTs: number | null; operation: GitOperationState; remotes: string[];
+}> {
+  const [pre, fetchHead, operation, remotes] = await Promise.all([
+    driver.git(cwd, ['rev-parse', '--show-prefix']),
+    gitPath(driver, cwd, 'FETCH_HEAD'),
+    operationState(driver, cwd),
+    driver.git(cwd, ['remote']),
+  ]);
+  const st = fetchHead ? await driver.statPath(fetchHead).catch(() => null) : null;
+  return {
+    prefix: pre.code === 0 ? pre.out.trim() : '',
+    lastFetchTs: st ? st.mtimeMs : null,
+    operation,
+    remotes: remotes.code === 0 ? remotes.out.split('\n').map((l) => l.trim()).filter(Boolean) : [],
+  };
 }
 
 // ---------- AI 助读（驱动大模型） ----------
@@ -673,7 +716,8 @@ export function gitRoutes(deps: GitRoutesDeps): RouteDef[] {
   /** per-issue 端点前置：解析 issue 分支/基线。未装配 issueGitRef 或非本项目 issue → 404。 */
   function resolveIssueRef(ctx: RouteCtx): IssueGitRef | Response {
     if (!deps.issueGitRef) return json({ ok: false, error: 'per-issue git 未启用' }, 404);
-    const ref = deps.issueGitRef(Number(ctx.params.projectId), Number(ctx.params.issueId));
+    const issueId = parseIssueId(ctx.params.issueId);
+    const ref = issueId === null ? null : deps.issueGitRef(Number(ctx.params.projectId), issueId);
     if (!ref) return json({ ok: false, error: '无此 issue' }, 404);
     return ref;
   }
@@ -699,7 +743,10 @@ export function gitRoutes(deps: GitRoutesDeps): RouteDef[] {
             ? parseStatusHead(statusR.out.split('\n')[0] ?? '')
             : { upstream: '', ahead: 0, behind: 0 };
           const changes = statusR.code === 0 ? parseChanges(statusR.out) : [];
+          const extra = await repoExtras(driver, cwd);
           return json({
+            ...extra,
+            upstreamGone: /\[gone\]/.test(statusR.out.split('\n')[0] ?? ''),
             ok: true,
             cwd,
             branch: branchRaw === 'HEAD' ? '' : branchRaw, // detached 时 rev-parse 回 'HEAD'
@@ -995,6 +1042,15 @@ export function gitRoutes(deps: GitRoutesDeps): RouteDef[] {
             return json({ ok: true, ...sliceDiff(dr.out) });
           }
           const paths = old && old !== path ? [path, old] : [path];
+          // 工作区（#388）：分开看暂存区（index 对 HEAD）与未暂存（工作树对 index），避免把暂存误认成全部改动
+          const side = ctx.url.searchParams.get('side');
+          if (side === 'staged' || side === 'unstaged') {
+            const sr = await driver.git(cwd, side === 'staged'
+              ? ['diff', '--cached', '-M', '--', ...paths]
+              : ['diff', '-M', '--', ...paths]);
+            if (sr.code !== 0) return json({ ok: false, error: sr.err.slice(0, 200) || 'diff 失败' }, 500);
+            return json({ ok: true, ...sliceDiff(sr.out) });
+          }
           // 对 HEAD diff = 暂存+未暂存合并视角；空仓库无 HEAD → 退化为未暂存 diff
           let dr = await driver.git(cwd, ['diff', '-M', 'HEAD', '--', ...paths]);
           if (dr.code !== 0) dr = await driver.git(cwd, ['diff', '-M', '--', ...paths]);

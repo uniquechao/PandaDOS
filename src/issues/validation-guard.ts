@@ -18,12 +18,13 @@ import {
   VALIDATION_TIMEOUT_MS,
   type ValidationExecutor,
 } from './validation';
+import type { IssueId } from '../../shared/issue-id';
 
 /** 守护自己的通知事件（与 EngineNotifyEvent 结构兼容，issues 层不 import notify） */
 export interface GuardNotifyEvent {
   kind: 'issue_blocked';
   projectId: number;
-  issueId: number;
+  issueId: IssueId;
   summaryCode: 'regression_failed';
   summaryParams: Record<string, string | number>;
 }
@@ -34,13 +35,15 @@ export interface RegressionGuardDeps {
     statPath(path: string): Promise<{ size: number; isFile: boolean } | null>;
     readFileRange(path: string, offset: number, limit: number): Promise<{ data: Uint8Array }>;
   };
+  /** Bind package discovery and validation to the project's executor, even when cwd matches. */
+  driverForProject?(project: Project): RegressionGuardDeps['driver'];
   /** 参与守护的项目（调用方决定范围：通常是 active 项目） */
   listProjects(): Project[];
   /** 项目是否正忙（有 issue 在驱动中）——忙就跳过本轮 */
   isBusy(projectId: number): boolean;
   /** 事件挂靠的锚点 issue（项目级事件按既有惯例挂在项目最后一条 issue 上）；没有 issue 返回 null */
-  anchorIssueId(projectId: number): number | null;
-  logEvent(issueId: number, kind: string, data: Record<string, unknown>): void;
+  anchorIssueId(projectId: number): IssueId | null;
+  logEvent(issueId: IssueId, kind: string, data: Record<string, unknown>): void;
   /** 该项目最近一次回归跑完的时刻（读事件），null = 从没跑过 */
   lastRunTs(projectId: number): number | null;
   notify(event: GuardNotifyEvent): void | Promise<void>;
@@ -61,7 +64,7 @@ export const DEFAULT_REGRESSION_GUARD_CONFIG: RegressionGuardConfig = {
 
 /** 一轮守护对单个项目的结论（返回给调用方/测试看，不落库） */
 export type GuardOutcome =
-  | { kind: 'skipped'; reason: 'disabled' | 'busy' | 'too-soon' | 'no-commands' | 'no-anchor' }
+  | { kind: 'skipped'; reason: 'disabled' | 'busy' | 'too-soon' | 'no-commands' | 'no-anchor' | 'executor-unavailable' }
   | { kind: 'passed'; durationMs: number }
   | { kind: 'failed'; label: string; code: number };
 
@@ -115,9 +118,16 @@ export class RegressionGuard {
     const anchor = this.deps.anchorIssueId(project.id);
     if (anchor === null) return { kind: 'skipped', reason: 'no-anchor' }; // 没有 issue 的项目没什么可回归的
 
+    let driver: RegressionGuardDeps['driver'];
+    try { driver = this.deps.driverForProject?.(project) ?? this.deps.driver; }
+    catch (e) {
+      this.deps.logEvent(anchor, 'error', { where: 'regression-executor', error: String(e).slice(0, 300) });
+      return { kind: 'skipped', reason: 'executor-unavailable' };
+    }
+
     const commands = resolveValidationCommands(
       project.validationCommands,
-      await this.readPackageJson(project.cwd),
+      await this.readPackageJson(driver, project.cwd),
     );
     if (commands.length === 0) return { kind: 'skipped', reason: 'no-commands' };
 
@@ -128,7 +138,7 @@ export class RegressionGuard {
     let run;
     try {
       run = await runValidation(
-        this.deps.driver,
+        driver,
         project.cwd,
         commands,
         { kind: 'full', files: [], reason: '批次全量回归' },
@@ -165,12 +175,12 @@ export class RegressionGuard {
     return { kind: 'failed', label: failed.label, code: failed.code };
   }
 
-  private async readPackageJson(cwd: string): Promise<string | null> {
+  private async readPackageJson(driver: RegressionGuardDeps['driver'], cwd: string): Promise<string | null> {
     try {
       const path = `${cwd.replace(/\/+$/, '')}/package.json`;
-      const stat = await this.deps.driver.statPath(path);
+      const stat = await driver.statPath(path);
       if (!stat?.isFile || stat.size === 0) return null;
-      const r = await this.deps.driver.readFileRange(path, 0, Math.min(stat.size, 256 * 1024));
+      const r = await driver.readFileRange(path, 0, Math.min(stat.size, 256 * 1024));
       return new TextDecoder().decode(r.data);
     } catch {
       return null;

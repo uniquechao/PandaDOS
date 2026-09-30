@@ -4,6 +4,7 @@ import {
   isAgentCommand,
   isShellCommand,
   judgeAgentLiveness,
+  paneHasAgentInput,
   paneHasAgentUi,
   shellPromptTail,
   shouldProbeLiveness,
@@ -95,6 +96,20 @@ describe('paneHasAgentUi', () => {
     expect(paneHasAgentUi('claude', CLAUDE_EXITED)).toBe(false);
     expect(paneHasAgentUi('codex', CODEX_LIVE)).toBe(true);
     expect(paneHasAgentUi('codex', BASH_IDLE)).toBe(false);
+  });
+});
+
+describe('paneHasAgentInput', () => {
+  test('只认真实输入行，不把启动横幅或旧 UI 边框当成可输入', () => {
+    expect(paneHasAgentInput('codex', 'OpenAI Codex\nLoading session…')).toBe(false);
+    expect(paneHasAgentInput('codex', '› 修复登录问题')).toBe(true);
+    expect(paneHasAgentInput('claude', '╭───────────────╮\n│ 正在启动… │')).toBe(false);
+    expect(paneHasAgentInput('claude', '│ ❯ 试试 "fix lint errors" │')).toBe(true);
+    expect(paneHasAgentInput('claude', '~/repo ❯')).toBe(false);
+    expect(paneHasAgentInput('codex', '›\n[root@VM repo]#')).toBe(false);
+    expect(paneHasAgentInput('codex', '› 旧问题\n• Working')).toBe(false);
+    expect(paneHasAgentInput('codex', '› 旧问题\nStarting Codex…')).toBe(false);
+    expect(paneHasAgentInput('codex', '› 1. Update now\n  2. Skip')).toBe(false);
   });
 });
 

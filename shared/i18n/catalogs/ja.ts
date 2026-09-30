@@ -1,3 +1,7 @@
+import { roomMemberMessages } from '../domains/rooms-members';
+import { roomChatMessages } from '../domains/rooms-chat';
+import { roomExtraMessages } from '../domains/rooms-extra';
+import { roomMessages } from '../domains/rooms';
 import { feishuChatMessages } from '../domains/feishu-chat';
 import { feishuLoginMessages } from '../domains/feishu-login';
 import type { MessageCatalog } from '../messages';
@@ -9,6 +13,7 @@ import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
 import { projectSettingsMessages } from '../domains/project-settings';
 import { externalImportMessages } from '../domains/external-import';
+import { workspaceMessages } from '../domains/workspace';
 import { designWorkbenchMessages } from '../domains/design-workbench';
 import { designWorkbenchAdvancedMessages } from '../domains/design-workbench-advanced';
 import { designAssetsUiMessages } from '../domains/design-assets-ui';
@@ -19,12 +24,16 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const jaCatalog = {
+  ...roomMemberMessages["ja"],
+  ...roomChatMessages["ja"],
+  ...roomExtraMessages["ja"],
+  ...roomMessages["ja"],
   ...feishuChatMessages["ja"],
   ...feishuLoginMessages["ja"],
   ...shellMessages.ja,
   ...actionMessages.ja,
   ...commonUiMessages.ja,
-  'issue.validation': 'ゲート', 'issue.validationTargeted': '限定（{files} ファイル）', 'issue.validationFull': '全量', 'issue.validationPassed': '合格', 'issue.validationFailed': '不合格（{label}、終了コード {code}）', 'issue.validationSkipped': 'スキップ', 'issue.validationPending': '未実行', 'issue.pushFailedTitle':'完了しましたが、変更はリモートにプッシュされていません','issue.pushFailedHint':'変更はローカルにコミット済みです。手動でプッシュしてから確認してください。','issue.pushFailedBranch':'ブランチ {branch}',
+  'issue.validation': 'ゲート', 'issue.validationTargeted': '限定（{files} ファイル）', 'issue.validationFull': '全量', 'issue.validationPassed': '合格', 'issue.validationFailed': '不合格（{label}、終了コード {code}）', 'issue.validationSkipped': 'スキップ', 'issue.validationPending': '未実行', 'issue.validationUnavailable': '検証を利用できません', 'issue.validationExempt': '明示的に免除', 'issue.validationNoCommands': '検証コマンド未設定', 'issue.validationDisabled': '必須検証が無効', 'issue.deliveryLocalComplete': 'ローカル作業完了', 'issue.deliveryPushPushed': 'プッシュ済み', 'issue.deliveryPushFailed': 'プッシュ失敗', 'issue.deliveryPushSkipped': 'プッシュをスキップ', 'issue.deliveryPushNotAttempted': '未プッシュ', 'issue.deliveryMergeUnmanaged': 'マージは管理対象外', 'issue.deliveryDeployUnmanaged': 'デプロイは管理対象外', 'issue.pushFailedTitle':'完了しましたが、変更はリモートにプッシュされていません','issue.pushFailedHint':'変更はローカルにコミット済みです。手動でプッシュしてから確認してください。','issue.pushFailedBranch':'ブランチ {branch}',
   'issue.completionReport':'完了レポート','issue.reportOutcomeComplete':'目標達成','issue.reportOutcomePartial':'一部完了','issue.reportOutcomeBlocked':'ブロック中','issue.reportOutcomeUnverified':'未検証の履歴要約','issue.reportObjective':'実装目標','issue.reportImplementation':'実装方法','issue.reportAdvantages':'利点','issue.reportDisadvantages':'欠点とトレードオフ','issue.reportVerification':'検証結果','issue.reportCompletion':'完了状況','issue.reportUnmetGoals':'未達成の目標','issue.reportRemainingWork':'必要な後続作業','issue.reportAttentionTitle':'このissueはまだ完全には完了していません','issue.reportLegacyWarningTitle':'この完了記録は構造化検証されていません','issue.reportLegacyWarning':'履歴には自由記述の要約しかないため、PandaDOSはすべての目標達成や必要な後続作業の有無を確認できません。','issue.continueProcessing':'処理を続ける','issue.continueProcessingTitle':'完了状態を修正して続行','issue.continueProcessingWarningTitle':'issueを再度開きます','issue.continueProcessingWarning':'未完了の内容を入力してください。issueは計画段階に戻り、すぐに実行される場合があります。','issue.continueGuidance':'未達成の目標または後続作業の指示','issue.continueGuidancePlaceholder':'未達成の目標と次に完了すべき内容を入力…','issue.continueGuidanceRequired':'続行する前に未達成の目標または必要な後続作業を入力してください。','issue.confirmContinueProcessing':'再度開いて続行',
   'issue.recoveryLength':'{current} / {max} 文字',
   'issue.recoveryTitle':'ブロックを解消','issue.recoveryReason':'実行が停止した理由','issue.recoveryHelp':'具体的な対応方法を追加するか、issueとブロック中のサブタスクを修正してください。編集を保存しただけでは実行は再開されません。','issue.recoveryGuidance':'追加の指示または解消方法','issue.recoveryGuidancePlaceholder':'変更点、採用する方法、またはブロックの解消方法を入力…','issue.recoveryGuidanceRequired':'続行する前に追加の指示または解消方法を入力してください。','issue.editBlockedIssue':'issueを編集','issue.editBlockedIssueHint':'タイトル、詳細、設定、画像を修正','issue.editBlockedSubtask':'ブロック中のサブタスクを編集','issue.editBlockedSubtaskHint':'続行前に現在のブロック中の手順を修正','issue.noEditableBlockedSubtask':'編集できる未完了サブタスクはありません','issue.recoveryQueueHint':'確認後、issueは停止した段階から続行します。復旧情報を利用できない場合のみ、安全に計画段階へ戻ります。','issue.confirmRecovery':'指示を送信して続行','issue.mergedFrom': '複数の issue を統合したもの', 'issue.unmerge': '統合を戻す', 'issue.unmergeLocked': '実行が始まっているため、統合は元に戻せません。', 'issue.unblockQueued': '順番待ちです。現在のタスクが終わり次第、自動で再開します。', 'issue.unblockQueuedCancel': '順番待ちを取り消す', 'issue.openRecovery':'ブロックを解消',
@@ -33,6 +42,7 @@ export const jaCatalog = {
   ...notifyMessages.ja,
   ...projectSettingsMessages.ja,
   ...externalImportMessages.ja,
+  ...workspaceMessages.ja,
   ...designWorkbenchMessages.ja,
   ...designWorkbenchAdvancedMessages.ja,
   ...designAssetsUiMessages.ja,

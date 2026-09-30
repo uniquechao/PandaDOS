@@ -152,6 +152,8 @@ export interface ChatWsData {
   cwd: string;
   /** 该项目 executor 的 Driver（tmux 操作面 + 判活） */
   driver: ChatDriver;
+  /** Reader and locator captured with the same executor identity at upgrade time. */
+  history?: Pick<ChatWsDeps, 'reader' | 'locator'>;
   /** 钉住对话的 agent（codex/claude）——就绪门禁提示文案用；未知时按通用「AI」措辞 */
   agent?: 'claude' | 'codex';
   /** 钉住的对话 id（?conv=；null=跟随项目当前激活对话，v2 首发行为） */

@@ -6,6 +6,7 @@ export type ProjectDataAction = 'upsert' | 'archive';
 
 export interface ProjectDataOutboxJob {
   id: number;
+  generation: number;
   projectId: number;
   entityKind: string;
   entityId: string;
@@ -17,6 +18,7 @@ export interface ProjectDataOutboxJob {
 
 interface JobRow {
   id: number;
+  generation: number;
   project_id: number;
   entity_kind: string;
   entity_id: string;
@@ -76,32 +78,39 @@ export function ensureProjectDataOutboxTriggers(
     "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'project_data_outbox'",
   ).get()!.n > 0;
   if (!exists) return;
-  for (const spec of specs) {
-    const id = spec.idColumn ?? 'id';
-    const project = spec.projectColumn ?? 'project_id';
-    if (![spec.table, id, project].every((value) => IDENTIFIER.test(value)) || !IDENTIFIER.test(spec.kind)) {
-      throw new Error('非法协作持久化触发器配置');
-    }
-    const action = spec.archivedWhen ? `CASE WHEN ${spec.archivedWhen} THEN 'archive' ELSE 'upsert' END` : "'upsert'";
-    for (const event of ['INSERT', 'UPDATE'] as const) {
-      const name = `trg_${spec.table}_project_data_${event.toLowerCase()}`;
-      db.run(`CREATE TRIGGER IF NOT EXISTS ${name} AFTER ${event} ON ${spec.table} BEGIN
+  db.transaction(() => {
+    for (const spec of specs) {
+      const id = spec.idColumn ?? 'id';
+      const project = spec.projectColumn ?? 'project_id';
+      if (![spec.table, id, project].every((value) => IDENTIFIER.test(value)) || !IDENTIFIER.test(spec.kind)) {
+        throw new Error('非法协作持久化触发器配置');
+      }
+      const action = spec.archivedWhen ? `CASE WHEN ${spec.archivedWhen} THEN 'archive' ELSE 'upsert' END` : "'upsert'";
+      for (const event of ['INSERT', 'UPDATE'] as const) {
+        const name = `trg_${spec.table}_project_data_${event.toLowerCase()}`;
+        // Rebuild the generated trigger after schema upgrades. IF NOT EXISTS would preserve
+        // the pre-generation body forever on an existing installation.
+        db.run(`DROP TRIGGER IF EXISTS ${name}`);
+        db.run(`CREATE TRIGGER ${name} AFTER ${event} ON ${spec.table} BEGIN
         INSERT INTO project_data_outbox
           (project_id, entity_kind, entity_id, action, attempt_count, next_attempt_ts,
            last_error, created_ts, updated_ts)
         VALUES (NEW.${project}, '${spec.kind}', CAST(NEW.${id} AS TEXT), ${action}, 0, 0,
                 NULL, unixepoch('subsec') * 1000, unixepoch('subsec') * 1000)
         ON CONFLICT(project_id, entity_kind, entity_id) DO UPDATE SET
-          action = excluded.action, attempt_count = 0, next_attempt_ts = 0,
+          action = excluded.action, generation = project_data_outbox.generation + 1,
+          attempt_count = 0, next_attempt_ts = 0,
           last_error = NULL, updated_ts = excluded.updated_ts;
       END`);
+      }
     }
-  }
+  })();
 }
 
 function mapJob(row: JobRow): ProjectDataOutboxJob {
   return {
     id: row.id,
+    generation: row.generation,
     projectId: row.project_id,
     entityKind: row.entity_kind,
     entityId: row.entity_id,
@@ -125,7 +134,8 @@ export class ProjectDataPersistenceOutbox {
       (project_id, entity_kind, entity_id, action, created_ts, updated_ts)
       VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(project_id, entity_kind, entity_id) DO UPDATE SET
-        action = excluded.action, attempt_count = 0, next_attempt_ts = 0,
+        action = excluded.action, generation = project_data_outbox.generation + 1,
+        attempt_count = 0, next_attempt_ts = 0,
         last_error = NULL, updated_ts = excluded.updated_ts`)
       .run(projectId, entityKind, String(entityId), action, now, now);
   }
@@ -150,15 +160,17 @@ export class ProjectDataPersistenceOutbox {
       try {
         if (!handler) throw new Error(`未注册协作持久化处理器：${job.entityKind}`);
         await handler.persist(job);
-        this.db.query('DELETE FROM project_data_outbox WHERE id = ?').run(job.id);
-        persisted += 1;
+        const acknowledged = this.db.query('DELETE FROM project_data_outbox WHERE id = ? AND generation = ?')
+          .run(job.id, job.generation);
+        persisted += acknowledged.changes;
       } catch (error) {
         const attempts = job.attemptCount + 1;
         const delay = Math.min(60 * 60_000, 1_000 * 2 ** Math.min(attempts - 1, 12));
-        this.db.query(`UPDATE project_data_outbox
-          SET attempt_count = ?, next_attempt_ts = ?, last_error = ?, updated_ts = ? WHERE id = ?`)
-          .run(attempts, now + delay, String(error).slice(0, 1000), now, job.id);
-        failed += 1;
+        const retried = this.db.query(`UPDATE project_data_outbox
+          SET attempt_count = ?, next_attempt_ts = ?, last_error = ?, updated_ts = ?
+          WHERE id = ? AND generation = ?`)
+          .run(attempts, now + delay, String(error).slice(0, 1000), now, job.id, job.generation);
+        failed += retried.changes;
       }
     }
     const remaining = this.db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM project_data_outbox').get()!.n;

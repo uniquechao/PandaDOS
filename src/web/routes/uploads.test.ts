@@ -66,6 +66,31 @@ async function j(r: Response | Promise<Response> | null): Promise<{ status: numb
 }
 
 describe('POST /api/projects/:projectId/upload', () => {
+  test('相同 cwd 的第二执行机上传只使用项目绑定的 Driver', async () => {
+    const s = await setup();
+    s.db.run("INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir) VALUES ('second', '127.0.0.2', 22, 'root', 'k', '/same', '/same/.claude')");
+    s.db.query('UPDATE projects SET executor_id = 2 WHERE id = ?').run(1);
+    let primaryTouched = false;
+    class WrongDriver extends LocalDriver {
+      override async writeFile(filePath: string, data: Uint8Array | string, mode?: number) {
+        primaryTouched = true;
+        return super.writeFile(filePath, data, mode);
+      }
+    }
+    const dispatch = createDispatcher(uploadsRoutes({
+      db: s.db,
+      driver: new WrongDriver(),
+      driverForProject: (project) => {
+        expect(project.executorId).toBe(2);
+        return new LocalDriver();
+      },
+    }), authDepsFromDb(s.db, new UserStore(s.db)));
+    const result = await j(dispatch(upload('/api/projects/1/upload', s.alice.token, new File([PNG], 'route.png'))));
+    expect(result.status).toBe(200);
+    expect(primaryTouched).toBe(false);
+    expect(new Uint8Array(await fsp.readFile(result.body.abs))).toEqual(PNG);
+  });
+
   test('鉴权矩阵：未登录 401 / 非属主 403 / 属主与 admin 过 / 不存在项目 admin 404·普通 403', async () => {
     const s = await setup();
     const f = () => new File([PNG], 'shot.png', { type: 'image/png' });

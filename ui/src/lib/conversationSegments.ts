@@ -1,4 +1,5 @@
 import type { ChatMessage, ConversationSegment } from './types';
+import { compareIssueIds, type IssueId } from '../../../shared/issue-id';
 
 export interface ConversationMessageGroup {
   key: string;
@@ -14,7 +15,7 @@ export function groupConversationMessages(
   msgs: ChatMessage[],
   inputSegments: ConversationSegment[],
 ): ConversationMessageGroup[] {
-  const segments = [...inputSegments].sort((a, b) => a.startTs - b.startTs || a.issueId - b.issueId);
+  const segments = [...inputSegments].sort((a, b) => a.startTs - b.startTs || compareIssueIds(a.issueId, b.issueId));
   const groups: ConversationMessageGroup[] = [];
   let current = -1;
   const before: ChatMessage[] = [];
@@ -40,9 +41,9 @@ export function groupConversationMessages(
 export function messagesForIssue(
   msgs: ChatMessage[],
   inputSegments: ConversationSegment[],
-  issueId: number,
+  issueId: IssueId,
 ): ChatMessage[] {
-  const segments = [...inputSegments].sort((a, b) => a.startTs - b.startTs || a.issueId - b.issueId);
+  const segments = [...inputSegments].sort((a, b) => a.startTs - b.startTs || compareIssueIds(a.issueId, b.issueId));
   const out: ChatMessage[] = [];
   let owner: ConversationSegment | undefined;
 
@@ -60,7 +61,7 @@ export function messagesForIssue(
   return out;
 }
 
-export function issueStartTs(segments: ConversationSegment[], issueId: number): number | undefined {
+export function issueStartTs(segments: ConversationSegment[], issueId: IssueId): number | undefined {
   const starts = segments.filter((s) => s.issueId === issueId).map((s) => s.startTs);
   return starts.length ? Math.min(...starts) : undefined;
 }
@@ -87,14 +88,14 @@ export function groupModuleSegments(
   msgs: ChatMessage[],
   segments: ConversationSegment[],
   convId: string | undefined,
-  excludeIssueId?: number,
+  excludeIssueId?: IssueId,
 ): ModuleSegmentRow[] {
   const mine = segments.filter((s) => convId !== undefined && s.convId === convId);
   const byKey = new Map(
     groupConversationMessages(msgs, mine).map((g) => [g.key, g.msgs] as const),
   );
   return [...segments]
-    .sort((a, b) => a.startTs - b.startTs || a.issueId - b.issueId)
+    .sort((a, b) => a.startTs - b.startTs || compareIssueIds(a.issueId, b.issueId))
     .filter((s) => s.issueId !== excludeIssueId)
     .map((segment) => {
       const inCurrentConv = convId !== undefined && segment.convId === convId;

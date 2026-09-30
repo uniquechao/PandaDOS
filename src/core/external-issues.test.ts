@@ -128,12 +128,12 @@ describe('ExternalIssueStore', () => {
       externalNumber: '12',
       externalUrl: 'https://gitlab.example/group/repo/-/issues/12',
       disposition: 'imported',
-      localIssueId: 9,
+      localIssueId: '9',
       createdBy: 1,
     });
     expect(imported.id).toBe(ignored.id);
     expect(imported.disposition).toBe('imported');
-    expect(imported.localIssueId).toBe(9);
+    expect(String(imported.localIssueId)).toBe('9'); // core-only 库 issues 未经 074，仍是数字
     expect(store.listRecords(1, 'gitlab', 'gitlab.example/group/repo')).toEqual([imported]);
     db.close();
   });
@@ -159,10 +159,10 @@ describe('ExternalIssueStore', () => {
       externalUrl: 'https://github.com/o/r/issues/12',
       createdBy: 1,
     };
-    expect(store.recordImportedOnce(identity, 9)?.localIssueId).toBe(9);
-    expect(store.recordImportedOnce(identity, 10)).toBeNull();
+    expect(String(store.recordImportedOnce(identity, '9')?.localIssueId)).toBe('9');
+    expect(store.recordImportedOnce(identity, '10')).toBeNull();
     expect(store.recordIgnored(identity)).toBeNull();
-    expect(store.listRecords(1, 'github', identity.sourceKey)[0]?.localIssueId).toBe(9);
+    expect(String(store.listRecords(1, 'github', identity.sourceKey)[0]?.localIssueId)).toBe('9');
     db.close();
   });
 });

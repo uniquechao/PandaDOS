@@ -27,8 +27,8 @@ describe('agent prompt language routing', () => {
   test('non-Chinese prompts use English instructions while preserving raw input and protocols', () => {
     const raw = '修复 `git push` 后的错误';
     for (const locale of ['en', 'ja', 'fr'] as const) {
-      const planning = buildPlanningPrompt({ issue: { id: 42, title: raw, body: null }, locale });
-      const testing = buildTestingPrompt({ issue: { id: 42, title: raw, body: null }, branch: 'feat/x', locale });
+      const planning = buildPlanningPrompt({ issue: { id: '42', title: raw, body: null }, locale });
+      const testing = buildTestingPrompt({ issue: { id: '42', title: raw, body: null }, branch: 'feat/x', locale });
       expect(planning).toContain('[Task planning]');
       expect(planning).toContain(raw);
       expect(planning).toContain('SUBTASKS_BEGIN');
@@ -39,7 +39,7 @@ describe('agent prompt language routing', () => {
   });
 
   test('Chinese internal prompts stay Chinese and selected output locale is explicit', () => {
-    const zh = buildPlanningPrompt({ issue: { id: 7, title: '导出', body: null }, locale: 'zh-Hant' });
+    const zh = buildPlanningPrompt({ issue: { id: '7', title: '导出', body: null }, locale: 'zh-Hant' });
     expect(zh).toContain('【任务规划】');
     expect(zh).toContain('Traditional Chinese (zh-Hant)');
     const ja = buildReadmeSummaryPrompt('demo', '# Raw README 日本語', 'ja');

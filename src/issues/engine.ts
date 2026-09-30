@@ -1,4 +1,6 @@
 import { effectiveSkillPolicy, skillSessionSettings, saveSkillPolicy, type SkillPolicy } from '../core/skill-policy';
+import { ClarificationDelivery, ClarificationNotDeliveredError, type ClarificationDeliveryInput } from './clarification-delivery';
+import { createHash } from 'node:crypto';
 import { agentHomesFromClaudeDir, listGlobalSkills, listProjectSkills } from '../core/skills';
 import { validationIdentity, validationCheckKey } from './validation-identity';
 /**
@@ -23,7 +25,6 @@ import { validationIdentity, validationCheckKey } from './validation-identity';
  * 不 import 它们的实现；对执行机只走 ExecutorDriver。
  */
 import type { Database } from 'bun:sqlite';
-import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { ensureSyncUids } from '../core/project-data';
 import { ensureProjectDataOutboxTriggers } from '../core/project-data-outbox';
@@ -49,7 +50,6 @@ import {
 } from './validation';
 import {
   parseCompletionReportJson,
-  serializeCompletionReport,
   type CompletionReport,
 } from './completion-report';
 import type {
@@ -58,7 +58,6 @@ import type {
   Conversation,
   Gate,
   GateKind,
-  GateStatus,
   Issue,
   IssueCategory,
   IssueEvent,
@@ -74,16 +73,28 @@ import type {
   ValidationCommand,
   ValidationScope,
 } from '../core/types';
-import type { ExecutorDriver, GitResult } from '../executor/driver';
+import { InputSubmitUnconfirmedError, type ExecutorDriver } from '../executor/driver';
+import { IssueEffectJournal } from './effect-journal';
+import { GitDeliveryService } from './git-delivery-service';
+import { ExecutionSyncRepository } from './execution-sync-repository';
+import { isDeclaredAsyncFunction, isThenable, type SynchronousCallbackResult } from './synchronous-callback';
+import type {
+  IssueExecutionSync, IssueExecutionSyncDecision, IssueExecutionSyncEffectContext,
+  IssueExecutionSyncEffectReceipt, IssueExecutionSyncRequest,
+} from './execution-sync-types';
+import {
+  ExecutionSyncEffectRepository,
+  type IssueExecutionSyncEffectOutboxItem,
+} from './execution-sync-effect-repository';
 import {
   readRecentMessages,
   tailConversation,
   type ChatMessage,
-  type JsonlReader,
 } from '../core/jsonl';
 import { detectSelection, type SelectionPayload } from '../core/screen';
 import {
   judgeAgentLiveness,
+  paneHasAgentInput,
   paneHasAgentUi,
   shouldProbeLiveness,
   type AgentLiveness,
@@ -106,6 +117,7 @@ import {
   parseCompletionReportBlock,
   parseSubtasksBlock,
   RATE_LIMIT_BACKOFF_MS,
+  parseNeedPlan,
 } from './sentinel';
 import {
   buildClarifyContinue,
@@ -121,14 +133,13 @@ import {
   imageReadHint,
 } from './prompts';
 import { attentionKindOf, type AttentionKind } from './attention';
-import { clarifyPaths, clarifySessionName } from './clarify-runner';
 import {
   buildBlockedSummary,
   buildDoneSummary,
   MAX_SUMMARY_CHARS,
 } from './result-summary';
 import { parseOrganizePlan, type OrganizeAction } from './organize-runner';
-import { BUSY_STATES, isBusy, moduleKeyOf, pickNext } from './queue';
+import { BUSY_STATES, isBusy, moduleKeyOf } from './queue';
 import { gitLockKey, KeyedMutex, projectLockKey, tmuxLockKey } from './mutex';
 import { outputLanguageInstruction, promptLanguage, userPromptLocale } from '../agents/prompts/language';
 import { moduleIssueRelPath } from './module-docs';
@@ -141,8 +152,26 @@ import {
 } from './workflows';
 import { WorkflowNodeRunner } from './workflow-node-runner';
 import { WorkflowScheduler } from './workflow-scheduler';
+import { IssueTransitionCoordinator } from './transition-coordinator';
+import { IssueTransitionRepository, type TransitionOptions } from './transition-repository';
+import { IssueSchedulingPolicy } from './scheduling-policy';
+import { decideCompletionReport, decideValidationGate } from './completion-policy';
+import { ClarifyRecoveryCoordinator } from './clarify-recovery-coordinator';
+import { IssueStateEventRepository } from './issue-state-event-repository';
+import { IssueGateRepository } from './issue-gate-repository';
+import { IssueScheduler } from './issue-scheduler';
 import { WorkflowWorktreeManager } from './workflow-worktrees';
+import { workflowCompletionReport } from './workflow-completion';
 import type { SupportedLocale } from '../../shared/i18n/locales';
+import { compareIssueIds, parseIssueId, type IssueId } from '../../shared/issue-id';
+import { withNewIssueId } from '../core/issue-id';
+
+export type { IssueExecutionSyncEffectOutboxItem } from './execution-sync-effect-repository';
+export type {
+  IssueExecutionSync, IssueExecutionSyncDecision, IssueExecutionSyncEffectContext,
+  IssueExecutionSyncEffectReceipt, IssueExecutionSyncRequest, IssueExecutionSyncState,
+} from './execution-sync-types';
+export type { SynchronousCallbackResult } from './synchronous-callback';
 
 /** pending 元数据编辑与自动合并落地共用的项目锁，避免 LLM 返回后的 Git 意图被并发改写。 */
 function issueMetaLockKey(projectId: number): string {
@@ -273,8 +302,6 @@ export interface PreparedDesignBatch {
   readonly drafts: readonly PreparedDesignIssue[];
 }
 
-export type SynchronousCallbackResult<Result> = Result extends PromiseLike<unknown> ? never : Result;
-
 /** Narrow port consumed by a later cross-domain publisher; commit is intentionally synchronous. */
 export interface IssuePublicationBatchPort {
   prepareDesignBatch(projectId: number, drafts: readonly DesignIssueDraft[]): Promise<PreparedDesignBatch>;
@@ -287,7 +314,7 @@ export interface IssuePublicationBatchPort {
   ): readonly EngineIssue[];
   completeDesignBatch(
     projectId: number,
-    issueIds: readonly number[],
+    issueIds: readonly IssueId[],
     outbox?: IssuePublicationPostCommitOutboxPort,
     signal?: AbortSignal,
   ): Promise<void>;
@@ -297,8 +324,8 @@ export interface IssuePublicationPostCommitOperation {
   key: string;
   kind: 'module-doc' | 'scheduler';
   projectId: number;
-  issueId: number | null;
-  issueIds: readonly number[];
+  issueId: IssueId | null;
+  issueIds: readonly IssueId[];
   /** Immutable module target captured by the caller-owned publication outbox. */
   moduleId?: number | null;
   agent?: AgentKind;
@@ -322,63 +349,8 @@ export class IssuePublicationPostCommitError extends Error {
   }
 }
 
-export type IssueExecutionSyncState =
-  | 'requested'
-  | 'boundary_waiting'
-  | 'applied'
-  | 'ignored'
-  | 'supplemented'
-  | 'stale';
-
-export type IssueExecutionSyncDecision = 'apply' | 'ignore' | 'supplement';
-
-export interface IssueExecutionSyncRequest {
-  sourceKind: string;
-  sourceKey: string;
-  sourceRevision: string;
-  sourceDigest: string;
-  diff: unknown;
-  requestedBy?: number | null;
-}
-
-export interface IssueExecutionSync {
-  id: number;
-  issueId: number;
-  sourceKind: string;
-  sourceKey: string;
-  sourceRevision: string;
-  sourceDigest: string;
-  diffJson: string;
-  state: IssueExecutionSyncState;
-  boundaryKind: string | null;
-  deferredActionJson: string | null;
-  requestedBy: number | null;
-  requestedTs: number;
-  acknowledgedTs: number | null;
-  decidedBy: number | null;
-  decidedTs: number | null;
-  resumeState: 'idle' | 'pending' | 'running' | 'complete';
-  /** Stable across claims/restarts; deferred DB/event consumers must CAS/idempotently key on it. */
-  resumeKey: string | null;
-  resumeToken: string | null;
-  resumeClaimedTs: number | null;
-  resumedTs: number | null;
-}
-
-export interface IssueExecutionSyncEffectContext {
-  /** External I/O is represented by a stable intent committed with the database effect receipt. */
-  enqueueExternalEffect(intentKey: string, kind: string, payload: unknown): void;
-}
-
-export interface IssueExecutionSyncEffectReceipt {
-  syncId: number;
-  resumeKey: string;
-  result: unknown;
-  completedTs: number;
-}
-
 export interface IssueDesignSyncSnapshot {
-  issueId: number;
+  issueId: IssueId;
   projectId: number;
   status: IssueState;
   title: string;
@@ -386,13 +358,13 @@ export interface IssueDesignSyncSnapshot {
   moduleId: number | null;
   agent: AgentKind;
   implMode: DesignPublicationMode;
-  dependencyIssueIds: number[];
+  dependencyIssueIds: IssueId[];
   hasConversation: boolean;
   manualReview: boolean;
 }
 
 export interface IssueDesignSyncUpdate {
-  issueId: number;
+  issueId: IssueId;
   expectedStatus: 'pending' | 'blocked' | 'clarifying' | 'planning' | 'plan_review'
     | 'implementing' | 'testing' | 'merge_review';
   expected: Omit<IssueDesignSyncSnapshot, 'status' | 'hasConversation' | 'manualReview'>;
@@ -400,49 +372,12 @@ export interface IssueDesignSyncUpdate {
   sourceRevision: string;
 }
 
-export interface IssueExecutionSyncEffectOutboxItem {
-  resumeKey: string;
-  syncId: number;
-  intentKey: string;
-  kind: string;
-  payload: unknown;
-  createdTs: number;
-  deliveredTs: number | null;
-  deliveryState: 'pending' | 'dispatching' | 'delivered' | 'uncertain';
-  deliveryToken: string | null;
-  dispatchStartedTs: number | null;
-}
-
 export interface IssueDependencyBlocker {
-  issueId: number;
+  issueId: IssueId;
   status: IssueState;
 }
 
 const MAX_PUBLICATION_BATCH = 200;
-const MAX_EXECUTION_SYNC_JSON = 200_000;
-
-function isThenable(value: unknown): value is PromiseLike<unknown> {
-  return (
-    (typeof value === 'object' && value !== null) || typeof value === 'function'
-  ) && typeof (value as { then?: unknown }).then === 'function';
-}
-
-function isDeclaredAsyncFunction(value: Function): boolean {
-  return Object.prototype.toString.call(value) === '[object AsyncFunction]';
-}
-
-function encodeExecutionSyncEffectResult(value: unknown): string {
-  const encoded = JSON.stringify({ value });
-  if (encoded === undefined || encoded.length > MAX_EXECUTION_SYNC_JSON) {
-    throw new Error('execution sync effect result must be bounded JSON');
-  }
-  return encoded;
-}
-
-function decodeExecutionSyncEffectResult(encoded: string): unknown {
-  const wrapper = JSON.parse(encoded) as { value?: unknown };
-  return wrapper.value;
-}
 
 function validatePreparedDependencies(
   prepared: PreparedDesignBatch,
@@ -511,7 +446,7 @@ export interface ConversationSegment {
   id: string;
   /** 这段挂在哪条会话上（#277 轮换后模块会有多条 conv，前端据此区分「不在当前会话里」） */
   convId: string;
-  issueId: number;
+  issueId: IssueId;
   title: string;
   status: IssueState;
   startTs: number;
@@ -564,12 +499,12 @@ export type EngineDoneJudgement = 'done' | 'not_done' | 'clarify';
 
 /** 同模块智能合并的候选/结果形状（agents/pm.ts MergeCandidate/MergeGroup 结构一致） */
 export interface EngineMergeCandidate {
-  id: number;
+  id: IssueId;
   title: string;
   body: string | null;
 }
 export interface EngineMergeGroup {
-  members: number[];
+  members: IssueId[];
   title: string;
   body: string;
 }
@@ -612,7 +547,7 @@ export interface EngineOrganizeInput {
     issueCount: number;
   }>;
   issues: Array<{
-    id: number;
+    id: IssueId;
     title: string;
     body: string | null;
     status: string;
@@ -629,7 +564,7 @@ export type EngineOrganizeResult =
 
 /** 创建时澄清分析入参（issues/clarify-runner RunClarifyInput 结构一致） */
 export interface EngineClarifyInput {
-  issueId: number;
+  issueId: IssueId;
   cwd: string;
   agent: AgentKind;
   title: string;
@@ -658,7 +593,7 @@ export interface EngineClarifyInput {
  * 再存一份只会多一个会对不上的真相。
  */
 export interface IssueCostStats {
-  issueId: number;
+  issueId: IssueId;
   usage: UsageTotals;
   /** 测试返工次数（tests_failed） */
   testRetries: number;
@@ -714,7 +649,7 @@ function bodyExcerpt(body: string | null | undefined, n = 120): string {
 export interface EngineNotifyEvent {
   kind: 'status_change' | 'gate_waiting' | 'issue_done' | 'issue_blocked' | 'choice_waiting';
   projectId: number;
-  issueId: number;
+  issueId: IssueId;
   from?: IssueState;
   to?: IssueState;
   gate?: Gate;
@@ -789,7 +724,7 @@ export interface EngineExecutionWorkspaceOps {
 // ---------- 行映射 ----------
 
 interface IssueRow {
-  id: number;
+  id: IssueId;
   sync_uid?: string | null;
   project_id: number;
   title: string;
@@ -919,115 +854,22 @@ function mapIssue(r: IssueRow): EngineIssue {
   };
 }
 
-interface ExecutionSyncRow {
-  id: number;
-  issue_id: number;
-  source_kind: string;
-  source_key: string;
-  source_revision: string;
-  source_digest: string;
-  diff_json: string;
-  state: string;
-  boundary_kind: string | null;
-  deferred_action_json: string | null;
-  requested_by: number | null;
-  requested_ts: number;
-  acknowledged_ts: number | null;
-  decided_by: number | null;
-  decided_ts: number | null;
-  resume_state: string;
-  resume_key: string | null;
-  resume_token: string | null;
-  resume_claimed_ts: number | null;
-  resumed_ts: number | null;
-}
-
-interface ExecutionSyncEffectReceiptRow {
-  resume_key: string;
-  sync_id: number;
-  result_json: string;
-  completed_ts: number;
-}
-
-interface ExecutionSyncEffectOutboxRow {
-  resume_key: string;
-  sync_id: number;
-  intent_key: string;
-  kind: string;
-  payload_json: string;
-  created_ts: number;
-  delivered_ts: number | null;
-  delivery_state: string;
-  delivery_token: string | null;
-  dispatch_started_ts: number | null;
-}
-
-function mapExecutionSync(row: ExecutionSyncRow): IssueExecutionSync {
-  return {
-    id: row.id,
-    issueId: row.issue_id,
-    sourceKind: row.source_kind,
-    sourceKey: row.source_key,
-    sourceRevision: row.source_revision,
-    sourceDigest: row.source_digest,
-    diffJson: row.diff_json,
-    state: row.state as IssueExecutionSyncState,
-    boundaryKind: row.boundary_kind,
-    deferredActionJson: row.deferred_action_json,
-    requestedBy: row.requested_by,
-    requestedTs: row.requested_ts,
-    acknowledgedTs: row.acknowledged_ts,
-    decidedBy: row.decided_by,
-    decidedTs: row.decided_ts,
-    resumeState: row.resume_state as IssueExecutionSync['resumeState'],
-    resumeKey: row.resume_key,
-    resumeToken: row.resume_token,
-    resumeClaimedTs: row.resume_claimed_ts,
-    resumedTs: row.resumed_ts,
-  };
-}
-
-function mapExecutionSyncEffectReceipt(row: ExecutionSyncEffectReceiptRow): IssueExecutionSyncEffectReceipt {
-  return {
-    syncId: row.sync_id,
-    resumeKey: row.resume_key,
-    result: decodeExecutionSyncEffectResult(row.result_json),
-    completedTs: row.completed_ts,
-  };
-}
-
 interface EventRow {
   id: number;
-  issue_id: number;
+  issue_id: IssueId;
   kind: string;
   data_json: string | null;
   ts: number;
 }
 
-function mapEvent(r: EventRow): IssueEvent {
-  return { id: r.id, issueId: r.issue_id, kind: r.kind, dataJson: r.data_json, ts: r.ts };
-}
-
 interface GateRow {
   id: number;
-  issue_id: number;
+  issue_id: IssueId;
   kind: string;
   status: string;
   payload_json: string | null;
   decided_by: number | null;
   decided_ts: number | null;
-}
-
-function mapGate(r: GateRow): Gate {
-  return {
-    id: r.id,
-    issueId: r.issue_id,
-    kind: r.kind as GateKind,
-    status: r.status as GateStatus,
-    payloadJson: r.payload_json,
-    decidedBy: r.decided_by,
-    decidedTs: r.decided_ts,
-  };
 }
 
 interface ProjectRow {
@@ -1043,6 +885,7 @@ interface ProjectRow {
   created_ts: number;
   /** 003 迁移；SELECT * 在旧库上可能拿不到该列，映射时兜底 '' */
   run_user?: string | null;
+  execution_isolation?: string | null;
   /** 005 迁移；同上，旧库兜底 null */
   readme_summary?: string | null;
   /** 006 迁移；同上，旧库兜底 null */
@@ -1059,6 +902,7 @@ interface ProjectRow {
   kind?: string | null;
   /** 047 迁移；旧库/未配置均为 null（= 按 package.json 探测，不等于「不跑门禁」） */
   validation_commands_json?: string | null;
+  validation_policy?: string | null;
 }
 
 export function mapProject(r: ProjectRow): Project {
@@ -1074,6 +918,7 @@ export function mapProject(r: ProjectRow): Project {
     status: r.status as ProjectStatus,
     createdTs: r.created_ts,
     runUser: r.run_user ?? '',
+    ...(r.execution_isolation === 'dedicated-ssh' ? { executionIsolation: 'dedicated-ssh' as const } : {}),
     readmeSummary: r.readme_summary ?? null,
     workBranch: r.work_branch ?? null,
     understanding: r.understanding ?? null,
@@ -1086,6 +931,8 @@ export function mapProject(r: ProjectRow): Project {
     summaryError: r.summary_error ?? null,
     manualReview: (r.manual_review ?? 0) !== 0,
     validationCommands: parseValidationCommands(r.validation_commands_json ?? null),
+    validationPolicy: r.validation_policy === 'required' || r.validation_policy === 'none'
+      ? r.validation_policy : 'optional',
     kind: 'issue',
   };
 }
@@ -1133,12 +980,6 @@ function getPublicationModule(db: Database, id: number): ProjectModule | undefin
 
 /** git log 字段分隔符（提交信息里不会出现的控制符；与 web/routes/git.ts 同构） */
 const GIT_FIELD_SEP = '\x1f';
-
-/**
- * 「远端有我没有的提交」这一类 push 失败的判据（#272 / B-02）：fetch + rebase 后重试一次通常就过。
- * 认得宽一点是刻意的——多试一次 fetch/rebase 的代价，远小于「done 了但代码没进远端」。
- */
-const PUSH_REJECTED_RE = /\[rejected\]|fetch first|non-fast-forward|updates were rejected/i;
 
 /** numstat 的重命名路径归一：'dir/{old => new}/f'、'old => new' → 新路径 */
 function normNumstatPath(p: string): string {
@@ -1286,21 +1127,43 @@ function parseTransData(dataJson: string | null): {
   }
 }
 
+/**
+ * #307：编号的随机段不再体现先后，同一毫秒建出的多条 issue（批量发布、合并测试）只能靠 created_ts 排序。
+ * 进程内单调递增（至少 +1ms），保证 `ORDER BY created_ts, id` 与队列 FIFO 仍等于创建顺序。
+ */
+let lastIssueCreatedTs = 0;
+function nextIssueCreatedTs(): number {
+  lastIssueCreatedTs = Math.max(Date.now(), lastIssueCreatedTs + 1);
+  return lastIssueCreatedTs;
+}
+
 export class IssueStore {
-  constructor(private readonly db: Database) {}
+  private readonly stateEvents: IssueStateEventRepository;
+  private readonly gates: IssueGateRepository;
+  private readonly syncEffects: ExecutionSyncEffectRepository;
+  private readonly sync: ExecutionSyncRepository;
+
+  constructor(private readonly db: Database) {
+    this.stateEvents = new IssueStateEventRepository(db);
+    this.gates = new IssueGateRepository(db);
+    this.syncEffects = new ExecutionSyncEffectRepository(db);
+    this.sync = new ExecutionSyncRepository(db);
+  }
 
   create(projectId: number, input: IssueInput): EngineIssue {
-    const row = this.db
+    // #307：编号由 core/issue-id 生成（日期 + 随机段 + 本机 MAC 段），本机撞号重新生成
+    const row = withNewIssueId((id) => this.db
       .query<IssueRow, [
-        number, string, string | null, string, string, number | null, string, string,
+        IssueId, number, string, string | null, string, string, number | null, string, string,
         string | null, string | null, string | null, number | null, string, number,
       ]>(
         `INSERT INTO issues
-           (project_id, title, body, category, module, module_id, impl_mode, agent,
+           (id, project_id, title, body, category, module, module_id, impl_mode, agent,
             target_branch, source_ref, images_json, created_by, auto_approve, created_ts)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       )
       .get(
+        id,
         projectId,
         input.title.slice(0, 200),
         input.body ? input.body.slice(0, MAX_ISSUE_BODY_CHARS) : null,
@@ -1315,8 +1178,8 @@ export class IssueStore {
         input.createdBy ?? null,
         // 归一到三档：038 的列带 CHECK 约束，脏值直接插会抛 SQLITE_CONSTRAINT 把建 issue 整条打挂
         parseAutoApproveLevel(input.autoApprove) ?? 'medium',
-        Date.now(),
-      );
+        nextIssueCreatedTs(),
+      ));
     if (!row) throw new Error('insert issue failed');
     this.db.run('UPDATE issues SET execution_mode = ? WHERE id = ?', [input.executionMode ?? 'planned', row.id]);
     this.logEvent(row.id, 'created', { title: row.title });
@@ -1325,18 +1188,19 @@ export class IssueStore {
 
   /** 039 publication-only insert: validated exact bytes, pending, locked, and no async side effects. */
   createPublished(projectId: number, input: PreparedDesignIssue): EngineIssue {
-    const row = this.db
+    const row = withNewIssueId((id) => this.db
       .query<IssueRow, [
-        number, string, string, string, string, number | null, string, string,
+        IssueId, number, string, string, string, string, number | null, string, string,
         string | null, string | null, number | null, number,
       ]>(
         `INSERT INTO issues
-           (project_id, title, body, category, module, module_id, impl_mode, agent,
+           (id, project_id, title, body, category, module, module_id, impl_mode, agent,
             target_branch, source_ref, created_by, created_ts, publication_locked)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
          RETURNING *`,
       )
       .get(
+        id,
         projectId,
         input.title,
         input.body,
@@ -1348,15 +1212,15 @@ export class IssueStore {
         input.targetBranch ?? null,
         input.sourceRef ?? null,
         input.createdBy ?? null,
-        Date.now(),
-      );
+        nextIssueCreatedTs(),
+      ));
     if (!row) throw new Error('insert published issue failed');
     this.logEvent(row.id, 'created', { title: row.title, publication: true, nodeId: input.nodeId });
     return this.get(row.id)!;
   }
 
-  get(id: number): EngineIssue | undefined {
-    const r = this.db.query<IssueRow, [number]>('SELECT * FROM issues WHERE id = ?').get(id);
+  get(id: IssueId): EngineIssue | undefined {
+    const r = this.db.query<IssueRow, [IssueId]>('SELECT * FROM issues WHERE id = ?').get(id);
     return r ? mapIssue(r) : undefined;
   }
 
@@ -1390,10 +1254,10 @@ export class IssueStore {
       .map(mapIssue);
   }
 
-  addDependency(issueId: number, dependsOnIssueId: number, kind = 'blocks'): void {
+  addDependency(issueId: IssueId, dependsOnIssueId: IssueId, kind = 'blocks'): void {
     if (kind !== 'blocks') throw new Error(`unsupported dependency kind: ${kind}`);
     const scope = this.db
-      .query<{ issue_project: number; predecessor_project: number }, [number, number]>(
+      .query<{ issue_project: number; predecessor_project: number }, [IssueId, IssueId]>(
         `SELECT dependent.project_id AS issue_project,
                 predecessor.project_id AS predecessor_project
          FROM issues dependent, issues predecessor
@@ -1410,9 +1274,9 @@ export class IssueStore {
     ).run(issueId, dependsOnIssueId, kind, Date.now());
   }
 
-  dependencyBlockers(issueId: number): IssueDependencyBlocker[] {
+  dependencyBlockers(issueId: IssueId): IssueDependencyBlocker[] {
     return this.db
-      .query<{ issue_id: number; status: string }, [number]>(
+      .query<{ issue_id: IssueId; status: string }, [IssueId]>(
         `SELECT predecessor.id AS issue_id, predecessor.status
          FROM issue_dependencies d
          JOIN issues predecessor ON predecessor.id = d.depends_on_issue_id
@@ -1423,13 +1287,13 @@ export class IssueStore {
       .map((row) => ({ issueId: row.issue_id, status: row.status as IssueState }));
   }
 
-  designSyncSnapshot(issueId: number): IssueDesignSyncSnapshot | null {
+  designSyncSnapshot(issueId: IssueId): IssueDesignSyncSnapshot | null {
     const issue = this.get(issueId);
     if (!issue) return null;
     const project = this.db.query<{ manual_review: number }, [number]>(
       'SELECT manual_review FROM projects WHERE id = ?',
     ).get(issue.projectId);
-    const dependencyIssueIds = this.db.query<{ id: number }, [number]>(
+    const dependencyIssueIds = this.db.query<{ id: IssueId }, [IssueId]>(
       `SELECT depends_on_issue_id AS id FROM issue_dependencies
        WHERE issue_id = ? ORDER BY depends_on_issue_id`,
     ).all(issueId).map((row) => row.id);
@@ -1491,7 +1355,7 @@ export class IssueStore {
         }
         moduleSlug = module.slug;
       }
-      const dependencyIds = [...new Set(input.next.dependencyIssueIds)].sort((a, b) => a - b);
+      const dependencyIds = [...new Set(input.next.dependencyIssueIds)].sort(compareIssueIds);
       if (dependencyIds.length !== input.next.dependencyIssueIds.length || dependencyIds.includes(input.issueId)) {
         throw new Error('invalid design sync dependencies');
       }
@@ -1527,520 +1391,112 @@ export class IssueStore {
     return apply();
   }
 
-  requestExecutionSync(issueId: number, input: IssueExecutionSyncRequest): IssueExecutionSync {
-    if (!this.get(issueId)) throw new Error('issue does not exist');
-    const sourceKind = input.sourceKind.trim();
-    const sourceKey = input.sourceKey.trim();
-    const sourceRevision = input.sourceRevision.trim();
-    const sourceDigest = input.sourceDigest.trim();
-    if (!sourceKind || sourceKind.length > 40) throw new Error('invalid execution sync source kind');
-    if (!sourceKey || sourceKey.length > 240) throw new Error('invalid execution sync source key');
-    if (!sourceRevision || sourceRevision.length > 120) throw new Error('invalid execution sync source revision');
-    if (!sourceDigest || sourceDigest.length > 200) throw new Error('invalid execution sync source digest');
-    const diffJson = JSON.stringify(input.diff);
-    if (diffJson === undefined || diffJson.length > MAX_EXECUTION_SYNC_JSON) {
-      throw new Error('invalid execution sync diff');
-    }
-    const existing = this.db
-      .query<ExecutionSyncRow, [number, string, string, string]>(
-        `SELECT * FROM issue_execution_syncs
-         WHERE issue_id = ? AND source_kind = ? AND source_key = ? AND source_revision = ?`,
-      )
-      .get(issueId, sourceKind, sourceKey, sourceRevision);
-    if (existing) {
-      if (existing.source_digest !== sourceDigest || existing.diff_json !== diffJson) {
-        throw new Error('execution sync idempotency conflict');
-      }
-      return mapExecutionSync(existing);
-    }
-    const row = this.db
-      .query<ExecutionSyncRow, [number, string, string, string, string, string, number | null, number]>(
-        `INSERT INTO issue_execution_syncs
-           (issue_id, source_kind, source_key, source_revision, source_digest, diff_json,
-            state, requested_by, requested_ts)
-         VALUES (?, ?, ?, ?, ?, ?, 'requested', ?, ?)
-         RETURNING *`,
-      )
-      .get(
-        issueId,
-        sourceKind,
-        sourceKey,
-        sourceRevision,
-        sourceDigest,
-        diffJson,
-        input.requestedBy ?? null,
-        Date.now(),
-      );
-    if (!row) throw new Error('create execution sync failed');
-    return mapExecutionSync(row);
+  requestExecutionSync(issueId: IssueId, input: IssueExecutionSyncRequest): IssueExecutionSync {
+    return this.sync.requestExecutionSync(issueId, input);
   }
 
-  requestLatestExecutionSync(issueId: number, input: IssueExecutionSyncRequest): IssueExecutionSync {
-    const request = this.db.transaction(() => {
-      const existing = this.db.query<ExecutionSyncRow, [number, string, string, string]>(
-        `SELECT * FROM issue_execution_syncs
-         WHERE issue_id = ? AND source_kind = ? AND source_key = ? AND source_revision = ?`,
-      ).get(issueId, input.sourceKind.trim(), input.sourceKey.trim(), input.sourceRevision.trim());
-      if (existing) return this.requestExecutionSync(issueId, input);
-      this.db.query(
-        `UPDATE issue_execution_syncs SET state = 'stale', decided_ts = COALESCE(decided_ts, ?)
-         WHERE issue_id = ? AND source_kind = ? AND source_key = ?
-           AND state IN ('requested', 'boundary_waiting')`,
-      ).run(Date.now(), issueId, input.sourceKind.trim(), input.sourceKey.trim());
-      return this.requestExecutionSync(issueId, input);
-    });
-    return request();
+  requestLatestExecutionSync(issueId: IssueId, input: IssueExecutionSyncRequest): IssueExecutionSync {
+    return this.sync.requestLatestExecutionSync(issueId, input);
   }
 
-  latestExecutionSync(issueId: number, sourceKind: string, sourceKey: string): IssueExecutionSync | null {
-    const row = this.db.query<ExecutionSyncRow, [number, string, string]>(
-      `SELECT * FROM issue_execution_syncs
-       WHERE issue_id = ? AND source_kind = ? AND source_key = ?
-       ORDER BY requested_ts DESC, id DESC LIMIT 1`,
-    ).get(issueId, sourceKind, sourceKey);
-    return row ? mapExecutionSync(row) : null;
+  latestExecutionSync(issueId: IssueId, sourceKind: string, sourceKey: string): IssueExecutionSync | null {
+    return this.sync.latestExecutionSync(issueId, sourceKind, sourceKey);
   }
 
-  activeExecutionSyncBoundary(issueId: number): IssueExecutionSync | null {
-    const row = this.db.query<ExecutionSyncRow, [number]>(
-      `SELECT * FROM issue_execution_syncs
-       WHERE issue_id = ? AND state = 'boundary_waiting'
-       ORDER BY requested_ts DESC, id DESC LIMIT 1`,
-    ).get(issueId);
-    return row ? mapExecutionSync(row) : null;
+  activeExecutionSyncBoundary(issueId: IssueId): IssueExecutionSync | null {
+    return this.sync.activeExecutionSyncBoundary(issueId);
   }
 
-  hasUnresolvedExecutionSyncEffect(issueId: number): boolean {
-    return this.db.query<{ found: number }, [number]>(
-      `SELECT 1 AS found
-       FROM issue_execution_sync_effect_outbox effect
-       JOIN issue_execution_syncs sync ON sync.id = effect.sync_id
-       WHERE sync.issue_id = ? AND effect.delivery_state <> 'delivered'
-       LIMIT 1`,
-    ).get(issueId) !== null;
+  hasUnresolvedExecutionSyncEffect(issueId: IssueId): boolean {
+    return this.syncEffects.hasUnresolved(issueId);
   }
 
   getExecutionSync(id: number): IssueExecutionSync | undefined {
-    const row = this.db.query<ExecutionSyncRow, [number]>('SELECT * FROM issue_execution_syncs WHERE id = ?').get(id);
-    return row ? mapExecutionSync(row) : undefined;
+    return this.sync.getExecutionSync(id);
   }
 
-  holdExecutionSyncBoundary(
-    issueId: number,
-    boundaryKind: string,
-    deferredAction: unknown,
-  ): IssueExecutionSync | null {
-    const boundary = boundaryKind.trim();
-    if (!boundary || boundary.length > 80) throw new Error('invalid execution sync boundary');
-    const actionJson = JSON.stringify(deferredAction);
-    if (actionJson === undefined || actionJson.length > MAX_EXECUTION_SYNC_JSON) {
-      throw new Error('invalid deferred execution action');
-    }
-    const hold = this.db.transaction(() => {
-      const requested = this.db
-        .query<ExecutionSyncRow, [number]>(
-          `SELECT * FROM issue_execution_syncs
-           WHERE issue_id = ? AND state IN ('requested', 'boundary_waiting')
-           ORDER BY requested_ts DESC, id DESC LIMIT 1`,
-        )
-        .get(issueId);
-      if (!requested) return null;
-      if (requested.state === 'boundary_waiting') {
-        if (requested.boundary_kind === boundary && requested.deferred_action_json === actionJson) {
-          return mapExecutionSync(requested);
-        }
-        let existingAction: { kind?: unknown } | null = null;
-        try {
-          existingAction = JSON.parse(requested.deferred_action_json ?? 'null') as { kind?: unknown } | null;
-        } catch {
-          // Malformed durable action fails closed below.
-        }
-        if (existingAction?.kind !== 'safe_state') throw new Error('execution sync boundary conflict');
-        const upgraded = this.db.query<ExecutionSyncRow, [string, string, number]>(
-          `UPDATE issue_execution_syncs SET boundary_kind = ?, deferred_action_json = ?
-           WHERE id = ? AND state = 'boundary_waiting' RETURNING *`,
-        ).get(boundary, actionJson, requested.id);
-        if (!upgraded) throw new Error('execution sync boundary race');
-        return mapExecutionSync(upgraded);
-      }
-      const row = this.db
-        .query<ExecutionSyncRow, [string, string, number, number]>(
-          `UPDATE issue_execution_syncs
-           SET state = 'boundary_waiting', boundary_kind = ?, deferred_action_json = ?,
-               acknowledged_ts = ?
-           WHERE id = ? AND state = 'requested'
-           RETURNING *`,
-        )
-        .get(boundary, actionJson, Date.now(), requested.id);
-      if (!row) throw new Error('execution sync boundary race');
-      return mapExecutionSync(row);
-    });
-    return hold();
+  holdExecutionSyncBoundary(issueId: IssueId, boundaryKind: string, deferredAction: unknown): IssueExecutionSync | null {
+    return this.sync.holdExecutionSyncBoundary(issueId, boundaryKind, deferredAction);
   }
 
-  decideExecutionSync(
-    id: number,
-    decision: IssueExecutionSyncDecision,
-    actor: number,
-  ): IssueExecutionSync {
-    const target: Exclude<IssueExecutionSyncState, 'requested' | 'boundary_waiting' | 'stale'> =
-      decision === 'apply' ? 'applied' : decision === 'ignore' ? 'ignored' : 'supplemented';
-    const decide = this.db.transaction(() => {
-      const existing = this.getExecutionSync(id);
-      if (!existing) throw new Error('execution sync does not exist');
-      if (existing.state === target) return existing;
-      if (existing.state !== 'boundary_waiting') throw new Error('execution sync decision conflict');
-      const resumeKey = `issue-sync:${randomUUID()}`;
-      const row = this.db
-        .query<ExecutionSyncRow, [string, number, number, string, number]>(
-          `UPDATE issue_execution_syncs
-           SET state = ?, decided_by = ?, decided_ts = ?, resume_state = 'pending', resume_key = ?
-           WHERE id = ? AND state = 'boundary_waiting'
-           RETURNING *`,
-        )
-        .get(target, actor, Date.now(), resumeKey, id);
-      if (!row) throw new Error('execution sync decision race');
-      return mapExecutionSync(row);
-    });
-    return decide();
+  decideExecutionSync(id: number, decision: IssueExecutionSyncDecision, actor: number): IssueExecutionSync {
+    return this.sync.decideExecutionSync(id, decision, actor);
   }
 
   listResumableExecutionSyncs(limit: number): IssueExecutionSync[] {
-    return this.db
-      .query<ExecutionSyncRow, [number]>(
-        `SELECT * FROM issue_execution_syncs
-         WHERE state IN ('applied', 'ignored', 'supplemented')
-           AND deferred_action_json IS NOT NULL
-           AND resume_state = 'pending'
-         ORDER BY decided_ts, id LIMIT ?`,
-      )
-      .all(limit)
-      .map(mapExecutionSync);
+    return this.sync.listResumableExecutionSyncs(limit);
   }
 
   getExecutionSyncEffectReceipt(id: number): IssueExecutionSyncEffectReceipt | null {
-    const row = this.db
-      .query<ExecutionSyncEffectReceiptRow, [number]>(
-        'SELECT * FROM issue_execution_sync_effect_receipts WHERE sync_id = ?',
-      )
-      .get(id);
-    return row ? mapExecutionSyncEffectReceipt(row) : null;
+    return this.sync.getExecutionSyncEffectReceipt(id);
   }
 
   claimExecutionSyncResume(id: number, now: number): IssueExecutionSync | null {
-    const claim = this.db.transaction(() => {
-      const receipt = this.getExecutionSyncEffectReceipt(id);
-      if (receipt) {
-        this.db.query(
-          `UPDATE issue_execution_syncs
-           SET resume_state = 'complete', resume_token = NULL, resume_claimed_ts = NULL,
-               resumed_ts = COALESCE(resumed_ts, ?)
-           WHERE id = ? AND resume_key = ? AND resume_state <> 'complete'`,
-        ).run(receipt.completedTs, id, receipt.resumeKey);
-        return null;
-      }
-      const token = randomUUID();
-      const row = this.db
-        .query<ExecutionSyncRow, [string, number, number]>(
-          `UPDATE issue_execution_syncs
-           SET resume_state = 'running', resume_token = ?, resume_claimed_ts = ?
-           WHERE id = ?
-             AND state IN ('applied', 'ignored', 'supplemented')
-             AND deferred_action_json IS NOT NULL
-             AND resume_state = 'pending'
-           RETURNING *`,
-        )
-        .get(token, now, id);
-      return row ? mapExecutionSync(row) : null;
-    });
-    return claim();
+    return this.sync.claimExecutionSyncResume(id, now);
   }
 
   releaseExecutionSyncResume(id: number, token: string): void {
-    this.db.query(
-      `UPDATE issue_execution_syncs
-       SET resume_state = 'pending', resume_token = NULL, resume_claimed_ts = NULL
-       WHERE id = ? AND resume_state = 'running' AND resume_token = ?`,
-    ).run(id, token);
+    this.sync.releaseExecutionSyncResume(id, token);
   }
 
   resetAbandonedExecutionSyncResume(id: number, resumeKey: string, abandonedToken: string): boolean {
-    if (!resumeKey || !abandonedToken) return false;
-    const reset = this.db.transaction(() => {
-      const owned = this.db.query<{ id: number }, [number, string, string]>(
-        `SELECT id FROM issue_execution_syncs
-         WHERE id = ? AND resume_state = 'running' AND resume_key = ? AND resume_token = ?`,
-      ).get(id, resumeKey, abandonedToken);
-      if (!owned) return false;
-      const receipt = this.getExecutionSyncEffectReceipt(id);
-      if (receipt) {
-        return this.db.query(
-          `UPDATE issue_execution_syncs
-           SET resume_state = 'complete', resume_token = NULL, resume_claimed_ts = NULL,
-               resumed_ts = COALESCE(resumed_ts, ?)
-           WHERE id = ? AND resume_state = 'running' AND resume_key = ? AND resume_token = ?`,
-        ).run(receipt.completedTs, id, resumeKey, abandonedToken).changes === 1;
-      }
-      return this.db.query(
-        `UPDATE issue_execution_syncs
-         SET resume_state = 'pending', resume_token = NULL, resume_claimed_ts = NULL
-         WHERE id = ? AND resume_state = 'running' AND resume_key = ? AND resume_token = ?`,
-      ).run(id, resumeKey, abandonedToken).changes === 1;
-    });
-    return reset();
+    return this.sync.resetAbandonedExecutionSyncResume(id, resumeKey, abandonedToken);
   }
 
   completeExecutionSyncResume(id: number, token: string): boolean {
-    const result = this.db.query(
-      `UPDATE issue_execution_syncs
-       SET resume_state = 'complete', resume_token = NULL, resume_claimed_ts = NULL,
-           resumed_ts = COALESCE(resumed_ts, receipt.completed_ts)
-       FROM issue_execution_sync_effect_receipts receipt
-       WHERE issue_execution_syncs.id = ?
-         AND issue_execution_syncs.resume_state = 'running'
-         AND issue_execution_syncs.resume_token = ?
-         AND receipt.sync_id = issue_execution_syncs.id
-         AND receipt.resume_key = issue_execution_syncs.resume_key`,
-    ).run(id, token);
-    return result.changes === 1;
+    return this.sync.completeExecutionSyncResume(id, token);
   }
 
   commitExecutionSyncEffect<Result>(
     id: number,
     token: string,
-    effect: (
-      sync: IssueExecutionSync,
-      context: IssueExecutionSyncEffectContext,
-    ) => SynchronousCallbackResult<Result>,
+    effect: (sync: IssueExecutionSync, context: IssueExecutionSyncEffectContext) => SynchronousCallbackResult<Result>,
   ): { applied: boolean; result: Result } {
-    if (isDeclaredAsyncFunction(effect)) {
-      throw new Error('execution sync effect callback must be synchronous');
-    }
-    const commit = this.db.transaction(() => {
-      const row = this.db.query<ExecutionSyncRow, [number, string]>(
-        `SELECT * FROM issue_execution_syncs
-         WHERE id = ? AND resume_state = 'running' AND resume_token = ?`,
-      ).get(id, token);
-      if (!row || !row.resume_key) throw new Error('execution sync resume claim lost');
-      const existing = this.getExecutionSyncEffectReceipt(id);
-      if (existing) {
-        if (!this.completeExecutionSyncResume(id, token)) throw new Error('execution sync resume claim lost');
-        return { applied: false, result: existing.result as Result };
-      }
-      const sync = mapExecutionSync(row);
-      const context: IssueExecutionSyncEffectContext = Object.freeze({
-        enqueueExternalEffect: (intentKey: string, kind: string, payload: unknown): void => {
-          if (!this.db.inTransaction) throw new Error('execution sync effect intent requires active transaction');
-          const stableIntentKey = intentKey.trim();
-          const stableKind = kind.trim();
-          if (!stableIntentKey || stableIntentKey.length > 120 || !stableKind || stableKind.length > 80) {
-            throw new Error('invalid execution sync effect intent');
-          }
-          const payloadJson = JSON.stringify(payload);
-          if (payloadJson === undefined || payloadJson.length > MAX_EXECUTION_SYNC_JSON) {
-            throw new Error('invalid execution sync effect intent payload');
-          }
-          this.db.query(
-            `INSERT INTO issue_execution_sync_effect_outbox
-               (resume_key, sync_id, intent_key, kind, payload_json, created_ts)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-          ).run(row.resume_key, id, stableIntentKey, stableKind, payloadJson, Date.now());
-        },
-      });
-      const result = effect(sync, context);
-      if (isThenable(result)) throw new Error('execution sync effect callback must be synchronous');
-      const resultJson = encodeExecutionSyncEffectResult(result);
-      const completedTs = Date.now();
-      this.db.query(
-        `INSERT INTO issue_execution_sync_effect_receipts
-           (resume_key, sync_id, result_json, completed_ts)
-         VALUES (?, ?, ?, ?)`,
-      ).run(row.resume_key, id, resultJson, completedTs);
-      if (!this.completeExecutionSyncResume(id, token)) throw new Error('execution sync resume claim lost');
-      return { applied: true, result };
-    });
-    return commit();
+    return this.sync.commitExecutionSyncEffect(id, token, effect);
   }
 
   listExecutionSyncEffectOutbox(limit: number): IssueExecutionSyncEffectOutboxItem[] {
-    const bounded = Math.max(1, Math.min(500, Math.trunc(limit)));
-    return this.db.query<ExecutionSyncEffectOutboxRow, [number]>(
-      `SELECT * FROM issue_execution_sync_effect_outbox
-       WHERE delivery_state = 'pending' ORDER BY created_ts, sync_id, intent_key LIMIT ?`,
-    ).all(bounded).map((row) => ({
-      resumeKey: row.resume_key,
-      syncId: row.sync_id,
-      intentKey: row.intent_key,
-      kind: row.kind,
-      payload: JSON.parse(row.payload_json) as unknown,
-      createdTs: row.created_ts,
-      deliveredTs: row.delivered_ts,
-      deliveryState: row.delivery_state as IssueExecutionSyncEffectOutboxItem['deliveryState'],
-      deliveryToken: row.delivery_token,
-      dispatchStartedTs: row.dispatch_started_ts,
-    }));
+    return this.syncEffects.listExecutionSyncEffectOutbox(limit);
   }
 
   listUncertainExecutionSyncEffects(limit: number): IssueExecutionSyncEffectOutboxItem[] {
-    const bounded = Math.max(1, Math.min(500, Math.trunc(limit)));
-    return this.db.query<ExecutionSyncEffectOutboxRow, [number]>(
-      `SELECT * FROM issue_execution_sync_effect_outbox
-       WHERE delivery_state IN ('dispatching', 'uncertain')
-       ORDER BY created_ts, sync_id, intent_key LIMIT ?`,
-    ).all(bounded).map((row) => ({
-      resumeKey: row.resume_key,
-      syncId: row.sync_id,
-      intentKey: row.intent_key,
-      kind: row.kind,
-      payload: JSON.parse(row.payload_json) as unknown,
-      createdTs: row.created_ts,
-      deliveredTs: row.delivered_ts,
-      deliveryState: row.delivery_state as IssueExecutionSyncEffectOutboxItem['deliveryState'],
-      deliveryToken: row.delivery_token,
-      dispatchStartedTs: row.dispatch_started_ts,
-    }));
+    return this.syncEffects.listUncertainExecutionSyncEffects(limit);
   }
 
   getUncertainExecutionSyncEffect(syncId: number): IssueExecutionSyncEffectOutboxItem | null {
-    const row = this.db.query<ExecutionSyncEffectOutboxRow, [number]>(
-      `SELECT * FROM issue_execution_sync_effect_outbox
-       WHERE sync_id = ? AND delivery_state IN ('dispatching', 'uncertain')
-       ORDER BY created_ts, intent_key LIMIT 1`,
-    ).get(syncId);
-    return row ? {
-      resumeKey: row.resume_key,
-      syncId: row.sync_id,
-      intentKey: row.intent_key,
-      kind: row.kind,
-      payload: JSON.parse(row.payload_json) as unknown,
-      createdTs: row.created_ts,
-      deliveredTs: row.delivered_ts,
-      deliveryState: row.delivery_state as IssueExecutionSyncEffectOutboxItem['deliveryState'],
-      deliveryToken: row.delivery_token,
-      dispatchStartedTs: row.dispatch_started_ts,
-    } : null;
+    return this.syncEffects.getUncertainExecutionSyncEffect(syncId);
   }
 
   resolveUncertainExecutionSyncEffect(
-    resumeKey: string,
-    intentKey: string,
-    resolution: 'confirm_delivered' | 'retry',
+    resumeKey: string, intentKey: string, resolution: 'confirm_delivered' | 'retry',
   ): boolean {
-    if (resolution === 'confirm_delivered') {
-      return this.db.query(
-        `UPDATE issue_execution_sync_effect_outbox
-         SET delivery_state = 'delivered', delivered_ts = COALESCE(delivered_ts, ?),
-             delivery_token = NULL, last_error = NULL
-         WHERE resume_key = ? AND intent_key = ?
-           AND delivery_state IN ('dispatching', 'uncertain')`,
-      ).run(Date.now(), resumeKey, intentKey).changes === 1;
-    }
-    return this.db.query(
-      `UPDATE issue_execution_sync_effect_outbox
-       SET delivery_state = 'pending', delivery_token = NULL, dispatch_started_ts = NULL,
-           last_error = NULL
-       WHERE resume_key = ? AND intent_key = ?
-         AND delivery_state IN ('dispatching', 'uncertain')`,
-    ).run(resumeKey, intentKey).changes === 1;
+    return this.syncEffects.resolveUncertainExecutionSyncEffect(resumeKey, intentKey, resolution);
   }
 
   claimExecutionSyncEffectDelivery(
-    resumeKey: string,
-    intentKey: string,
-    now: number,
+    resumeKey: string, intentKey: string, now: number,
   ): IssueExecutionSyncEffectOutboxItem | null {
-    const token = randomUUID();
-    const row = this.db.query<ExecutionSyncEffectOutboxRow, [string, number, string, string]>(
-      `UPDATE issue_execution_sync_effect_outbox
-       SET delivery_state = 'dispatching', delivery_token = ?, dispatch_started_ts = ?, last_error = NULL
-       WHERE resume_key = ? AND intent_key = ? AND delivery_state = 'pending'
-       RETURNING *`,
-    ).get(token, now, resumeKey, intentKey);
-    return row ? {
-      resumeKey: row.resume_key,
-      syncId: row.sync_id,
-      intentKey: row.intent_key,
-      kind: row.kind,
-      payload: JSON.parse(row.payload_json) as unknown,
-      createdTs: row.created_ts,
-      deliveredTs: row.delivered_ts,
-      deliveryState: 'dispatching',
-      deliveryToken: row.delivery_token,
-      dispatchStartedTs: row.dispatch_started_ts,
-    } : null;
+    return this.syncEffects.claimExecutionSyncEffectDelivery(resumeKey, intentKey, now);
   }
 
   recordExecutionSyncEffectStep(
-    resumeKey: string,
-    intentKey: string,
-    deliveryToken: string,
-    stepKey: string,
-    payload: unknown,
+    resumeKey: string, intentKey: string, deliveryToken: string, stepKey: string, payload: unknown,
   ): boolean {
-    const payloadJson = JSON.stringify(payload);
-    if (!stepKey || stepKey.length > 80 || payloadJson === undefined || payloadJson.length > MAX_EXECUTION_SYNC_JSON) {
-      throw new Error('invalid execution sync effect step');
-    }
-    const record = this.db.transaction(() => {
-      const owned = this.db.query<{ found: number }, [string, string, string]>(
-        `SELECT 1 AS found FROM issue_execution_sync_effect_outbox
-         WHERE resume_key = ? AND intent_key = ? AND delivery_state = 'dispatching' AND delivery_token = ?`,
-      ).get(resumeKey, intentKey, deliveryToken);
-      if (!owned) return false;
-      this.db.query(
-        `INSERT INTO issue_execution_sync_effect_steps
-           (resume_key, intent_key, step_key, payload_json, completed_ts)
-         VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
-      ).run(resumeKey, intentKey, stepKey, payloadJson, Date.now());
-      return true;
-    });
-    return record();
+    return this.syncEffects.recordExecutionSyncEffectStep(resumeKey, intentKey, deliveryToken, stepKey, payload);
   }
 
   reconcileCompletedExecutionSyncEffectDeliveries(limit: number): number {
-    const bounded = Math.max(1, Math.min(500, Math.trunc(limit)));
-    const rows = this.db.query<{ resume_key: string; intent_key: string }, [number]>(
-      `SELECT o.resume_key, o.intent_key
-       FROM issue_execution_sync_effect_outbox o
-       JOIN issue_execution_sync_effect_steps s
-         ON s.resume_key = o.resume_key AND s.intent_key = o.intent_key AND s.step_key = 'action-complete'
-       WHERE o.delivery_state IN ('dispatching', 'uncertain')
-       ORDER BY o.created_ts, o.sync_id, o.intent_key LIMIT ?`,
-    ).all(bounded);
-    let reconciled = 0;
-    for (const row of rows) {
-      reconciled += this.db.query(
-        `UPDATE issue_execution_sync_effect_outbox
-         SET delivery_state = 'delivered', delivered_ts = COALESCE(delivered_ts, ?),
-             delivery_token = NULL, last_error = NULL
-         WHERE resume_key = ? AND intent_key = ? AND delivery_state IN ('dispatching', 'uncertain')`,
-      ).run(Date.now(), row.resume_key, row.intent_key).changes;
-    }
-    return reconciled;
+    return this.syncEffects.reconcileCompletedExecutionSyncEffectDeliveries(limit);
   }
 
   markExecutionSyncEffectDelivered(resumeKey: string, intentKey: string, deliveryToken: string): boolean {
-    return this.db.query(
-      `UPDATE issue_execution_sync_effect_outbox
-       SET delivery_state = 'delivered', delivered_ts = COALESCE(delivered_ts, ?),
-           delivery_token = NULL, last_error = NULL
-       WHERE resume_key = ? AND intent_key = ?
-         AND delivery_state = 'dispatching' AND delivery_token = ?`,
-    ).run(Date.now(), resumeKey, intentKey, deliveryToken).changes === 1;
+    return this.syncEffects.markExecutionSyncEffectDelivered(resumeKey, intentKey, deliveryToken);
   }
 
   markExecutionSyncEffectUncertain(
-    resumeKey: string,
-    intentKey: string,
-    deliveryToken: string,
-    error: string,
+    resumeKey: string, intentKey: string, deliveryToken: string, error: string,
   ): boolean {
-    return this.db.query(
-      `UPDATE issue_execution_sync_effect_outbox
-       SET delivery_state = 'uncertain', last_error = ?, delivery_token = NULL
-       WHERE resume_key = ? AND intent_key = ?
-         AND delivery_state = 'dispatching' AND delivery_token = ?`,
-    ).run(error.slice(0, 4000), resumeKey, intentKey, deliveryToken).changes === 1;
+    return this.syncEffects.markExecutionSyncEffectUncertain(resumeKey, intentKey, deliveryToken, error);
   }
 
   /**
@@ -2058,7 +1514,7 @@ export class IssueStore {
            i.status IN ('planning', 'plan_review', 'implementing', 'testing')
            AND EXISTS (SELECT 1 FROM issue_workflows iw WHERE iw.issue_id = i.id)
          )
-         ORDER BY i.id`,
+         ORDER BY i.created_ts, i.id`,
       )
       .all()
       .map(mapIssue);
@@ -2084,21 +1540,15 @@ export class IssueStore {
              OR (t.kind = 'error' AND t.data_json LIKE '%"where":"clarify"%')
            )
          )
-         ORDER BY i.id`,
+         ORDER BY i.created_ts, i.id`,
       )
       .all()
       .map(mapIssue);
   }
 
   /** CAS 状态迁移：仅当当前状态仍是 from 才写入（读-判-重读-CAS 的落库端） */
-  casStatus(id: number, from: IssueState, to: IssueState): boolean {
-    const r = this.db
-      .query(
-        `UPDATE issues SET status = ?, done_ts = CASE WHEN ? = 'done' THEN ? ELSE done_ts END
-         WHERE id = ? AND status = ?`,
-      )
-      .run(to, to, Date.now(), id, from);
-    return r.changes > 0;
+  casStatus(id: IssueId, from: IssueState, to: IssueState): boolean {
+    return this.stateEvents.casStatus(id, from, to);
   }
 
   /**
@@ -2114,9 +1564,9 @@ export class IssueStore {
    * 不轮换，那时仍要靠这里放行。所以豁免不能收紧——一收紧，那条崩在半路的 blocked 就把
    * 整个模块锁死了。
    */
-  setConv(id: number, convId: string): void {
+  setConv(id: IssueId, convId: string): void {
     const clash = this.db
-      .query<{ id: number; status: string }, [string, number]>(
+      .query<{ id: IssueId; status: string }, [string, IssueId]>(
         `SELECT id, status FROM issues WHERE conv_id = ? AND status NOT IN ('done', 'cancelled') AND id != ?`,
       )
       .get(convId, id);
@@ -2127,10 +1577,10 @@ export class IssueStore {
   }
 
   /** 该 conv 是 issue 所属模块的模块会话，且占用者已不在驱动中 → 可顺序复用 */
-  private canShareConv(id: number, convId: string, clashStatus: string): boolean {
+  private canShareConv(id: IssueId, convId: string, clashStatus: string): boolean {
     if (BUSY_STATES.includes(clashStatus as IssueState)) return false;
     return !!this.db
-      .query<{ n: number }, [string, number]>(
+      .query<{ n: number }, [string, IssueId]>(
         `SELECT 1 AS n FROM project_modules pm
           JOIN issues i ON i.module_id = pm.id
          WHERE pm.conversation_id = ? AND i.id = ?`,
@@ -2138,37 +1588,37 @@ export class IssueStore {
       .get(convId, id);
   }
 
-  setBranch(id: number, branch: string): void {
-    this.db.query('UPDATE issues SET branch = ? WHERE id = ?').run(branch, id);
+  setBranch(id: IssueId, branch: string): void {
+    this.stateEvents.setBranch(id, branch);
   }
 
-  setBody(id: number, body: string): void {
+  setBody(id: IssueId, body: string): void {
     this.db.query('UPDATE issues SET body = ? WHERE id = ?').run(body.slice(0, MAX_ISSUE_BODY_CHARS), id);
   }
 
-  setNote(id: number, note: string | null): void {
-    this.db.query('UPDATE issues SET note = ? WHERE id = ?').run(note, id);
+  setNote(id: IssueId, note: string | null): void {
+    this.stateEvents.setNote(id, note);
   }
 
   /** 置顶时刻（ms）；null = 取消置顶。仅影响 pending 排队顺序（queue.pickNext 置顶层） */
-  setPinned(id: number, pinnedTs: number | null): void {
+  setPinned(id: IssueId, pinnedTs: number | null): void {
     this.db.query('UPDATE issues SET pinned_ts = ? WHERE id = ?').run(pinnedTs, id);
   }
 
   /** 自动批准档位（038）：随时可改，下一轮弹窗即按新档位分级 */
-  setAutoApprove(id: number, level: AutoApproveLevel): void {
+  setAutoApprove(id: IssueId, level: AutoApproveLevel): void {
     this.db.query('UPDATE issues SET auto_approve = ? WHERE id = ?').run(level, id);
   }
 
   /** 创建时执行代理反馈（033）；null = 清空（重新分析前） */
-  setClarifyFeedback(id: number, text: string | null): void {
+  setClarifyFeedback(id: IssueId, text: string | null): void {
     this.db
       .query('UPDATE issues SET clarify_feedback = ? WHERE id = ?')
       .run(text ? text.slice(0, 8000) : null, id);
   }
 
   /** 收尾执行结果总结（033）；null = 清空 */
-  setResultSummary(id: number, text: string | null): void {
+  setResultSummary(id: IssueId, text: string | null): void {
     this.db
       .query('UPDATE issues SET result_summary = ? WHERE id = ?')
       .run(text ? text.slice(0, 16000) : null, id);
@@ -2178,7 +1628,7 @@ export class IssueStore {
    * 本轮门禁范围（047 / #279）：进 testing 时算出来落库，供 UI 展示与复跑。
    * null = 清空（回到「还没算过」）；文件清单截到 200 条，防一次巨改把整列撑爆。
    */
-  setValidationScope(id: number, scope: ValidationScope | null): void {
+  setValidationScope(id: IssueId, scope: ValidationScope | null): void {
     const value = scope
       ? JSON.stringify({
           kind: scope.kind,
@@ -2190,9 +1640,9 @@ export class IssueStore {
   }
 
   /** 读回本轮门禁范围（坏数据当没配过，调用方据此退回全量） */
-  validationScope(id: number): ValidationScope | null {
+  validationScope(id: IssueId): ValidationScope | null {
     const r = this.db
-      .query<{ validation_scope_json: string | null }, [number]>(
+      .query<{ validation_scope_json: string | null }, [IssueId]>(
         'SELECT validation_scope_json FROM issues WHERE id = ?',
       )
       .get(id);
@@ -2219,7 +1669,7 @@ export class IssueStore {
    * 本条 issue 的推理档覆盖（048 / #281）：null = 清空，回到继承模块。
    * 非法值直接拒绝——存进去只会在启动命令里变成一个谁也不认识的参数。
    */
-  setIssueReasoningEffort(id: number, effort: ReasoningEffort | null): void {
+  setIssueReasoningEffort(id: IssueId, effort: ReasoningEffort | null): void {
     if (effort !== null && !REASONING_EFFORTS.includes(effort)) {
       throw new Error(`非法推理档位: ${String(effort)}`);
     }
@@ -2227,13 +1677,11 @@ export class IssueStore {
   }
 
   /** 结构化完成报告（044）；写入前按 v1 契约规范化，null = 清空。 */
-  setCompletionReport(id: number, report: CompletionReport | null): void {
-    this.db
-      .query('UPDATE issues SET completion_report_json = ? WHERE id = ?')
-      .run(report ? serializeCompletionReport(report) : null, id);
+  setCompletionReport(id: IssueId, report: CompletionReport | null): void {
+    this.stateEvents.setCompletionReport(id, report);
   }
 
-  patchMeta(id: number, meta: IssueMetaPatch): void {
+  patchMeta(id: IssueId, meta: IssueMetaPatch): void {
     if (meta.title !== undefined) this.db.query('UPDATE issues SET title = ? WHERE id = ?').run(meta.title.slice(0, 200), id);
     if (meta.body !== undefined) this.db.query('UPDATE issues SET body = ? WHERE id = ?').run(meta.body ? meta.body.slice(0, MAX_ISSUE_BODY_CHARS) : null, id);
     if (meta.module !== undefined) this.db.query('UPDATE issues SET module = ? WHERE id = ?').run((meta.module || '未分类').slice(0, 60), id);
@@ -2252,13 +1700,13 @@ export class IssueStore {
    * 这样状态迁移与 Git 意图编辑无论谁先写，另一个都能看到确定的先后顺序。
    */
   patchPendingGitMeta(
-    id: number,
+    id: IssueId,
     meta: { targetBranch?: string | null; sourceRef?: string | null },
   ): boolean {
     const targetGiven = meta.targetBranch !== undefined;
     const sourceGiven = meta.sourceRef !== undefined;
     const r = this.db
-      .query<unknown, [number, string | null, number, string | null, number]>(
+      .query<unknown, [number, string | null, number, string | null, IssueId]>(
         `UPDATE issues
          SET target_branch = CASE WHEN ? = 1 THEN ? ELSE target_branch END,
              source_ref = CASE WHEN ? = 1 THEN ? ELSE source_ref END
@@ -2284,14 +1732,14 @@ export class IssueStore {
     }
   }
 
-  setSubtasks(id: number, texts: string[]): void {
+  setSubtasks(id: IssueId, texts: string[]): void {
     const subs: Subtask[] = texts.map((t) => ({ text: t.slice(0, MAX_SUBTASK_TEXT_LENGTH), done: false }));
     this.db
       .query('UPDATE issues SET subtasks_json = ?, sub_index = 0, plan_json = ? WHERE id = ?')
       .run(JSON.stringify(subs), JSON.stringify({ subtasks: texts, ts: Date.now() }), id);
   }
 
-  setSubtasksAtDesignBoundary(id: number, texts: string[]): IssueExecutionSync | null {
+  setSubtasksAtDesignBoundary(id: IssueId, texts: string[]): IssueExecutionSync | null {
     const persist = this.db.transaction(() => {
       this.setSubtasks(id, texts);
       return this.holdExecutionSyncBoundary(id, 'plan_ready', {
@@ -2302,7 +1750,7 @@ export class IssueStore {
   }
 
   /** 保留完成进度地替换计划文本；plan_review 时同步待确认卡点，避免详情与卡点显示两版计划。 */
-  replaceSubtasks(id: number, subs: Subtask[], syncWaitingPlanGate: boolean): void {
+  replaceSubtasks(id: IssueId, subs: Subtask[], syncWaitingPlanGate: boolean): void {
     const issue = this.get(id);
     if (!issue) return;
     const texts = subs.map((subtask) => subtask.text);
@@ -2318,7 +1766,7 @@ export class IssueStore {
         .run(JSON.stringify(subs), JSON.stringify({ ...plan, subtasks: texts }), id);
       if (!syncWaitingPlanGate) return;
       const gate = this.db
-        .query<GateRow, [number]>(
+        .query<GateRow, [IssueId]>(
           `SELECT * FROM gates
            WHERE issue_id = ? AND kind = 'plan' AND status = 'waiting'
            ORDER BY id DESC LIMIT 1`,
@@ -2339,7 +1787,7 @@ export class IssueStore {
   }
 
   /** 标记当前子任务完成、前进一个；返回是否全部完成（v1 advanceSubtask 平移） */
-  advanceSubtask(id: number): { allDone: boolean; nextIdx: number } | null {
+  advanceSubtask(id: IssueId): { allDone: boolean; nextIdx: number } | null {
     const issue = this.get(id);
     if (!issue) return null;
     const subs = this.subtasksOf(issue);
@@ -2355,7 +1803,7 @@ export class IssueStore {
 
   /** Complete exactly the current seq subtask and atomically withhold its next injection if needed. */
   advanceSubtaskAtDesignBoundary(
-    id: number,
+    id: IssueId,
   ): { allDone: boolean; nextIdx: number; held: IssueExecutionSync | null } | null {
     const advance = this.db.transaction(() => {
       const issue = this.get(id);
@@ -2378,7 +1826,7 @@ export class IssueStore {
     return advance();
   }
 
-  markAllSubtasksDone(id: number): void {
+  markAllSubtasksDone(id: IssueId): void {
     const issue = this.get(id);
     if (!issue) return;
     const subs = this.subtasksOf(issue);
@@ -2389,7 +1837,7 @@ export class IssueStore {
       .run(JSON.stringify(subs), subs.length, id);
   }
 
-  remove(id: number): boolean {
+  remove(id: IssueId): boolean {
     return this.db.query('DELETE FROM issues WHERE id = ?').run(id).changes > 0;
   }
 
@@ -2406,17 +1854,12 @@ export class IssueStore {
 
   // ---- 事件时间线（全量，不截断） ----
 
-  logEvent(issueId: number, kind: string, data?: Record<string, unknown>): void {
-    this.db
-      .query('INSERT INTO issue_events (issue_id, kind, data_json, ts) VALUES (?, ?, ?, ?)')
-      .run(issueId, kind, data ? JSON.stringify(data) : null, Date.now());
+  logEvent(issueId: IssueId, kind: string, data?: Record<string, unknown>): void {
+    this.stateEvents.logEvent(issueId, kind, data);
   }
 
-  listEvents(issueId: number): IssueEvent[] {
-    return this.db
-      .query<EventRow, [number]>('SELECT * FROM issue_events WHERE issue_id = ? ORDER BY id')
-      .all(issueId)
-      .map(mapEvent);
+  listEvents(issueId: IssueId): IssueEvent[] {
+    return this.stateEvents.listEvents(issueId);
   }
 
   /**
@@ -2489,7 +1932,7 @@ export class IssueStore {
         });
       }
     }
-    return out.sort((a, b) => a.startTs - b.startTs || a.issueId - b.issueId);
+    return out.sort((a, b) => a.startTs - b.startTs || compareIssueIds(a.issueId, b.issueId));
   }
 
   /**
@@ -2515,20 +1958,21 @@ export class IssueStore {
     if (current && !convIds.includes(current)) convIds.push(current);
     return convIds
       .flatMap((convId) => this.listConversationSegments(convId))
-      .sort((a, b) => a.startTs - b.startTs || a.issueId - b.issueId);
+      .sort((a, b) => a.startTs - b.startTs || compareIssueIds(a.issueId, b.issueId));
   }
 
   /**
    * 最近一次门禁结果（#279）：给详情页只读展示用。
    * 从事件里派生，不加列——门禁可以跑很多轮，列只能存最后一次，事件本来就全都有。
    */
-  lastValidation(issueId: number): {
+  lastValidation(issueId: IssueId): {
     outcome: 'passed' | 'failed' | 'skipped' | 'error';
     scope: 'targeted' | 'full' | 'docs' | null;
     label: string | null;
     code: number | null;
     timedOut: boolean;
     durationMs: number | null;
+    reason: string | null;
     ts: number;
   } | null {
     const kinds = new Set(['validation_passed', 'validation_failed', 'validation_skipped', 'validation_error']);
@@ -2553,6 +1997,7 @@ export class IssueStore {
       code: typeof d.code === 'number' ? d.code : null,
       timedOut: d.timedOut === true,
       durationMs: typeof d.durationMs === 'number' ? d.durationMs : null,
+      reason: typeof d.reason === 'string' ? d.reason : null,
       ts: latest.ts,
     };
   }
@@ -2563,7 +2008,7 @@ export class IssueStore {
    * 拆回是一次明确的人工否决：「这几条不该并」。所以拆回过的 issue 不再进自动合并候选，
    * 否则下一轮调度立刻又并回去，拆了个寂寞。
    */
-  wasUnmerged(issueId: number): boolean {
+  wasUnmerged(issueId: IssueId): boolean {
     return this.listEvents(issueId)
       .some((e) => e.kind === 'tasks_unmerged' || e.kind === 'unmerged_from');
   }
@@ -2575,7 +2020,7 @@ export class IssueStore {
    * 不给拆第二次（否则会把手工改过的正文又覆盖回旧快照）。老数据没有 snapshot 字段 → 拆不了，
    * 如实返回 null（发起人已明确：历史误合并不做人工补救）。
    */
-  lastUnmergeableMerge(issueId: number): {
+  lastUnmergeableMerge(issueId: IssueId): {
     eventId: number;
     snapshot: MergeSnapshotEntry[];
   } | null {
@@ -2593,9 +2038,10 @@ export class IssueStore {
           ? data.snapshot.flatMap((raw) => {
             if (!raw || typeof raw !== 'object') return [];
             const entry = raw as Record<string, unknown>;
-            if (typeof entry.id !== 'number' || typeof entry.title !== 'string') return [];
+            const entryId = parseIssueId(entry.id);
+            if (entryId === null || typeof entry.title !== 'string') return [];
             return [{
-              id: entry.id,
+              id: entryId,
               title: entry.title,
               body: typeof entry.body === 'string' ? entry.body : null,
               clarifyFeedback: typeof entry.clarifyFeedback === 'string' ? entry.clarifyFeedback : null,
@@ -2618,7 +2064,7 @@ export class IssueStore {
    * `unblock` transition，则意图已作废。issue 已经不是 blocked 也一律作废——
    * 它可能被取消、被手动开跑，这时候再自动恢复就是「用户没让我做的事」。
    */
-  pendingUnblockRequest(issueId: number): PendingUnblockRequest | null {
+  pendingUnblockRequest(issueId: IssueId): PendingUnblockRequest | null {
     const issue = this.get(issueId);
     if (!issue || (issue.status !== 'blocked' && issue.status !== 'paused')) return null;
     let request: { data: Record<string, unknown>; ts: number } | null = null;
@@ -2670,7 +2116,7 @@ export class IssueStore {
           if (b.pinnedTs === null) return -1;
           return b.pinnedTs - a.pinnedTs; // 后置顶的在前，与 queue.orderPending 同口径
         }
-        return a.issueId - b.issueId;
+        return compareIssueIds(a.issueId, b.issueId);
       })
       .map(({ pinnedTs: _pinned, ...rest }) => rest);
   }
@@ -2681,12 +2127,12 @@ export class IssueStore {
    * 口径统一在这一处：UI 与离线核对都读它，别在调用方各自数一遍事件——那样迟早会出现
    * 「详情页说重试 3 次、成本页说 2 次」这种谁也说不清的分歧。
    */
-  issueCostStats(issueId: number): IssueCostStats {
+  issueCostStats(issueId: IssueId): IssueCostStats {
     const usageRow = this.db
       .query<{
         requests: number; input_tokens: number; cached_input_tokens: number; output_tokens: number;
         reasoning_tokens: number; compactions: number; tool_calls: number; skill_reads: number;
-      }, [number]>('SELECT * FROM issue_usage WHERE issue_id = ?')
+      }, [IssueId]>('SELECT * FROM issue_usage WHERE issue_id = ?')
       .get(issueId);
     const usage: UsageTotals = usageRow
       ? {
@@ -2705,7 +2151,7 @@ export class IssueStore {
     let validationMs = 0;
     let validationRuns = 0;
     for (const e of this.db
-      .query<{ data_json: string | null }, [number]>(
+      .query<{ data_json: string | null }, [IssueId]>(
         `SELECT data_json FROM issue_events
           WHERE issue_id = ? AND kind IN ('validation_passed', 'validation_failed')`,
       )
@@ -2758,15 +2204,7 @@ export class IssueStore {
 
   /** 项目维度最近一次某类事件（issue_events 免迁移复用：跨 issue 冷却/读最新建议） */
   lastProjectEvent(projectId: number, kind: string): IssueEvent | null {
-    const r = this.db
-      .query<EventRow, [number, string]>(
-        `SELECT e.* FROM issue_events e
-         JOIN issues i ON i.id = e.issue_id
-         WHERE i.project_id = ? AND e.kind = ?
-         ORDER BY e.ts DESC, e.id DESC LIMIT 1`,
-      )
-      .get(projectId, kind);
-    return r ? mapEvent(r) : null;
+    return this.stateEvents.lastProjectEvent(projectId, kind);
   }
 
   lastProjectEventTs(projectId: number, kind: string): number | null {
@@ -2775,24 +2213,11 @@ export class IssueStore {
 
   /** 项目维度某类事件全量（整理方案的 applied 标记回放用；量小不分页） */
   listProjectEvents(projectId: number, kind: string): IssueEvent[] {
-    return this.db
-      .query<EventRow, [number, string]>(
-        `SELECT e.* FROM issue_events e
-         JOIN issues i ON i.id = e.issue_id
-         WHERE i.project_id = ? AND e.kind = ?
-         ORDER BY e.id`,
-      )
-      .all(projectId, kind)
-      .map(mapEvent);
+    return this.stateEvents.listProjectEvents(projectId, kind);
   }
 
-  countEvents(issueId: number, kind: string): number {
-    const r = this.db
-      .query<{ n: number }, [number, string]>(
-        'SELECT COUNT(*) AS n FROM issue_events WHERE issue_id = ? AND kind = ?',
-      )
-      .get(issueId, kind);
-    return r?.n ?? 0;
+  countEvents(issueId: IssueId, kind: string): number {
+    return this.stateEvents.countEvents(issueId, kind);
   }
 
   /** 最近一次某类事件的 id；从未发生过返回 0（可直接当作「不设下界」用） */
@@ -2822,23 +2247,13 @@ export class IssueStore {
       .get(convId);
   }
 
-  lastEventId(issueId: number, kind: string): number {
-    const r = this.db
-      .query<{ id: number }, [number, string]>(
-        'SELECT id FROM issue_events WHERE issue_id = ? AND kind = ? ORDER BY id DESC LIMIT 1',
-      )
-      .get(issueId, kind);
-    return r?.id ?? 0;
+  lastEventId(issueId: IssueId, kind: string): number {
+    return this.stateEvents.lastEventId(issueId, kind);
   }
 
   /** 某类事件在 afterEventId 之后的条数（afterEventId=0 即全量，与 countEvents 等价） */
-  countEventsSince(issueId: number, kind: string, afterEventId: number): number {
-    const r = this.db
-      .query<{ n: number }, [number, string, number]>(
-        'SELECT COUNT(*) AS n FROM issue_events WHERE issue_id = ? AND kind = ? AND id > ?',
-      )
-      .get(issueId, kind, afterEventId);
-    return r?.n ?? 0;
+  countEventsSince(issueId: IssueId, kind: string, afterEventId: number): number {
+    return this.stateEvents.countEventsSince(issueId, kind, afterEventId);
   }
 
   /**
@@ -2848,10 +2263,8 @@ export class IssueStore {
    * 刻意不动的：`conv_id` 与模块绑定（模块会话本就该被同模块 issue 顺序复用，清了反而
    * 要重新建会话）、事件历史（审计与「上一轮干到哪」全靠它）、截图、置顶、目标分支。
    */
-  clearRunState(id: number): void {
-    this.db
-      .query('UPDATE issues SET plan_json = NULL, subtasks_json = NULL, sub_index = 0, note = NULL, done_ts = NULL, result_summary = NULL, completion_report_json = NULL WHERE id = ?')
-      .run(id);
+  clearRunState(id: IssueId): void {
+    this.stateEvents.clearRunState(id);
   }
 
   /**
@@ -2859,7 +2272,7 @@ export class IssueStore {
    * 其后的 clarified 答复并入最近一轮（多次答复换行连接）。exec（执行中澄清）问答不混入——
    * 它有自己的会话内上下文，也不该占创建时的提问轮数。
    */
-  clarifyRounds(issueId: number): Array<{ questions: string[]; answer: string | null }> {
+  clarifyRounds(issueId: IssueId): Array<{ questions: string[]; answer: string | null }> {
     const rounds: Array<{ questions: string[]; answer: string | null }> = [];
     for (const e of this.listEvents(issueId)) {
       let data: Record<string, unknown> = {};
@@ -2889,10 +2302,10 @@ export class IssueStore {
    * 跨状态适用（事件溯源）：创建时问题开跑后仍持续显示到回答为止（spec 第 5 点），执行中澄清
    * 同理——被回答（clarified）或 20 分钟超时自动继续（clarify_timeout）后即收起。
    */
-  clarifyPendingOf(issueId: number): boolean {
+  clarifyPendingOf(issueId: IssueId): boolean {
     const maxOf = (kind: string): number =>
       this.db
-        .query<{ m: number | null }, [number, string]>(
+        .query<{ m: number | null }, [IssueId, string]>(
           'SELECT MAX(id) AS m FROM issue_events WHERE issue_id = ? AND kind = ?',
         )
         .get(issueId, kind)?.m ?? 0;
@@ -2908,9 +2321,9 @@ export class IssueStore {
    * 供 watcher 停催 + 20 分钟超时自动继续、以及 API 的 awaitingClarify 派生使用。
    * （创建时澄清 source≠exec，不在此列——那类由 clarifyPendingOf 覆盖，不触发停催/超时。）
    */
-  execClarifyWait(issueId: number): { since: number; questions: string[]; stage: string } | null {
+  execClarifyWait(issueId: IssueId): { since: number; questions: string[]; stage: string } | null {
     const last = this.db
-      .query<EventRow, [number]>(
+      .query<EventRow, [IssueId]>(
         "SELECT * FROM issue_events WHERE issue_id = ? AND kind = 'clarify_questions' ORDER BY id DESC LIMIT 1",
       )
       .get(issueId);
@@ -2925,7 +2338,7 @@ export class IssueStore {
     // 其后若已回答（clarified）或超时自动继续（clarify_timeout），则不再等待
     const terminated =
       this.db
-        .query<{ n: number }, [number, number]>(
+        .query<{ n: number }, [IssueId, number]>(
           "SELECT COUNT(*) AS n FROM issue_events WHERE issue_id = ? AND id > ? AND kind IN ('clarified', 'clarify_timeout')",
         )
         .get(issueId, last.id)?.n ?? 0;
@@ -2938,7 +2351,7 @@ export class IssueStore {
   }
 
   /** 最近一次「转入 stage」的 transition 事件 id（kickoff 判重锚点）；没有则 0 */
-  lastEnterEventId(issueId: number, stage: IssueState): number {
+  lastEnterEventId(issueId: IssueId, stage: IssueState): number {
     for (const e of this.recentEvents(issueId, 'transition')) {
       if (parseTransData(e.dataJson).to === stage) return e.id;
     }
@@ -2947,7 +2360,7 @@ export class IssueStore {
 
   /** 最近一次「转入 stage」的事件详情（event/from/note）——返工 prompt 取意见用 */
   lastEnterInfo(
-    issueId: number,
+    issueId: IssueId,
     stage: IssueState,
   ): { event: string; from: string; note?: string; resumeState?: string; stopLoss?: boolean } | null {
     for (const e of this.recentEvents(issueId, 'transition')) {
@@ -2969,7 +2382,7 @@ export class IssueStore {
    * 自 sinceEventId 以来最近**连续** judged=done 的次数（issue #48：planning 判 done
    * 死循环出口的计数器；遇到非 done 判定即断，事件为凭、重启不丢）。
    */
-  consecutiveJudgedDone(issueId: number, sinceEventId: number): number {
+  consecutiveJudgedDone(issueId: IssueId, sinceEventId: number): number {
     let n = 0;
     for (const e of this.recentEvents(issueId, 'judged')) {
       if (e.id <= sinceEventId) break;
@@ -2992,7 +2405,7 @@ export class IssueStore {
    * 结论一变 streak 归 1，退避间隔随之落回基准——判定结论变了说明现场在动，不该继续拉长。
    */
   consecutiveJudged(
-    issueId: number,
+    issueId: IssueId,
     sinceEventId: number,
   ): { result: string | null; streak: number } {
     let result: string | null = null;
@@ -3029,7 +2442,7 @@ export class IssueStore {
    * 事件损坏就跳过那一条，宁可少算（晚一点触发）也不要把闸算早。
    */
   stopLossStats(
-    issueId: number,
+    issueId: IssueId,
     sinceEventId: number,
     stage: IssueState,
     now: number,
@@ -3073,7 +2486,7 @@ export class IssueStore {
   }
 
   /** stage 进入后是否已注入过该阶段首条 prompt（kickoff 幂等判据，重启安全） */
-  hasInjectedSince(issueId: number, stage: IssueState, sinceEventId: number): boolean {
+  hasInjectedSince(issueId: IssueId, stage: IssueState, sinceEventId: number): boolean {
     for (const e of this.recentEvents(issueId, 'injected')) {
       if (e.id <= sinceEventId) break; // 按 id 降序，早于锚点的不用再看
       if (parseTransData(e.dataJson).stage === stage) return true;
@@ -3081,64 +2494,32 @@ export class IssueStore {
     return false;
   }
 
-  private recentEvents(issueId: number, kind: string, limit = 200): IssueEvent[] {
-    return this.db
-      .query<EventRow, [number, string, number]>(
-        'SELECT * FROM issue_events WHERE issue_id = ? AND kind = ? ORDER BY id DESC LIMIT ?',
-      )
-      .all(issueId, kind, limit)
-      .map(mapEvent);
+  private recentEvents(issueId: IssueId, kind: string, limit = 200): IssueEvent[] {
+    return this.stateEvents.recentEvents(issueId, kind, limit);
   }
 
   // ---- gates ----
 
-  createGate(issueId: number, kind: GateKind, payload: Record<string, unknown>): Gate {
-    const row = this.db
-      .query<GateRow, [number, string, string]>(
-        `INSERT INTO gates (issue_id, kind, payload_json) VALUES (?, ?, ?) RETURNING *`,
-      )
-      .get(issueId, kind, JSON.stringify(payload));
-    if (!row) throw new Error('insert gate failed');
-    return mapGate(row);
+  createGate(issueId: IssueId, kind: GateKind, payload: Record<string, unknown>): Gate {
+    return this.gates.createGate(issueId, kind, payload);
   }
 
   getGate(id: number): Gate | undefined {
-    const r = this.db.query<GateRow, [number]>('SELECT * FROM gates WHERE id = ?').get(id);
-    return r ? mapGate(r) : undefined;
+    return this.gates.getGate(id);
   }
 
-  listGates(issueId: number): Gate[] {
-    return this.db
-      .query<GateRow, [number]>('SELECT * FROM gates WHERE issue_id = ? ORDER BY id')
-      .all(issueId)
-      .map(mapGate);
+  listGates(issueId: IssueId): Gate[] {
+    return this.gates.listGates(issueId);
   }
 
   /** waiting→decided 的 CAS（一次性防重放，评审 5.4#3）；返回是否本次生效 */
   decideGate(id: number, status: 'approved' | 'rejected', userId: number, note?: string): boolean {
-    const gate = this.getGate(id);
-    if (!gate) return false;
-    let payload: Record<string, unknown> = {};
-    try {
-      payload = gate.payloadJson ? (JSON.parse(gate.payloadJson) as Record<string, unknown>) : {};
-    } catch {
-      payload = {};
-    }
-    if (note) payload.decisionNote = note.slice(0, 2000);
-    const r = this.db
-      .query(
-        `UPDATE gates SET status = ?, decided_by = ?, decided_ts = ?, payload_json = ?
-         WHERE id = ? AND status = 'waiting'`,
-      )
-      .run(status, userId, Date.now(), JSON.stringify(payload), id);
-    return r.changes > 0;
+    return this.gates.decideGate(id, status, userId, note);
   }
 
   /** issue 关闭（blocked/cancelled/done）时把遗留 waiting 卡点关掉，防孤儿卡片被点 */
-  expireWaitingGates(issueId: number): void {
-    this.db
-      .query(`UPDATE gates SET status = 'rejected', decided_ts = ? WHERE issue_id = ? AND status = 'waiting'`)
-      .run(Date.now(), issueId);
+  expireWaitingGates(issueId: IssueId): void {
+    this.gates.expireWaitingGates(issueId);
   }
 }
 
@@ -3339,6 +2720,10 @@ export interface EngineDeps {
   driver: ExecutorDriver;
   convs: EngineConvOps;
   locator: EngineLocator;
+  /** Driver and JSONL locator are an inseparable project-scoped pair. */
+  executionForProject?(project: Project): { driver: ExecutorDriver; locator: EngineLocator };
+  /** Until every execution port is project-scoped, reject projects that would use another executor. */
+  executionUnavailable?(project: Project): string | null;
   /** Neutral adapter; omitted preserves legacy Issue behavior exactly. */
   executionWorkspaces?: EngineExecutionWorkspaceOps;
   pmFor(project: Project): EnginePm;
@@ -3374,7 +2759,7 @@ export interface EngineDeps {
      */
     recordModuleKnowledge?(
       module: ProjectModule,
-      entry: { issueId: number; status: string; title: string; note?: string },
+      entry: { issueId: IssueId; status: string; title: string; note?: string },
     ): Promise<void>;
     /** 模块合并（归档来源前经 repoint 让引擎重指 issues）；缺省 = 旧装配不支持合并。 */
     merge?(input: {
@@ -3500,7 +2885,7 @@ export type UnblockResult = ApplyResult | { ok: true; queued: true; requestedTs:
 
 /** 一条待消费的解除意图 */
 export interface PendingUnblockRequest {
-  issueId: number;
+  issueId: IssueId;
   guidance: string;
   resumeState: IssueState | null;
   actor: number | null;
@@ -3534,7 +2919,7 @@ export const AGENT_RESTART_COOLDOWN_MS = 60_000;
 export const MAX_AGENT_RESTARTS = 3;
 
 interface ProjectTickFlight {
-  issueId: number;
+  issueId: IssueId;
   since: number;
   stuckWarned: boolean;
   promise: Promise<void>;
@@ -3543,14 +2928,17 @@ interface ProjectTickFlight {
 export class IssueEngine {
   readonly store: IssueStore;
   private readonly cfg: EngineConfig;
+  private readonly effects: IssueEffectJournal;
+  private readonly gitDelivery: GitDeliveryService;
   /** Engine-local prepare capability; a structurally identical or foreign-engine batch is untrusted. */
   private readonly preparedDesignBatches = new WeakSet<object>();
   private readonly workflowScheduler: WorkflowScheduler;
   private readonly watch = new Map<string, WatchState>();
-  /** 同 issue 状态迁移尾队列；首项同步启动，后续项严格等待前项完成。 */
-  private readonly issueTransitionTails = new Map<number, Promise<void>>();
-  /** 正在实际执行 entry action 的 issue；收尾接力不得重新挑中自身，否则会等待自己的 tail。 */
-  private readonly activeIssueTransitions = new Set<number>();
+  private readonly transitionCoordinator = new IssueTransitionCoordinator();
+  private readonly transitionRepository: IssueTransitionRepository;
+  private readonly schedulingPolicy: IssueSchedulingPolicy;
+  private readonly scheduler: IssueScheduler;
+  private readonly clarifyRecoveryCoordinator: ClarifyRecoveryCoordinator;
   /** 项目启动最小 reservation：只覆盖空闲检查/绑会话到 pending→planning commit。 */
   private readonly startingProjects = new Set<number>();
   /** reservation 等待信号；并发 start 等前一个 commit 后重读 busy 状态。 */
@@ -3561,11 +2949,6 @@ export class IssueEngine {
   private acceptingTicks = true;
   /** 停机在途期间拒绝 start；重复 stop 复用同一个等待链。 */
   private stopPromise: Promise<void> | null = null;
-  /**
-   * 调度单飞（每项目）：scheduleNext 里的合并会 cancel 掉被并入的 pending，其 onEnter
-   * 又会触发接力 scheduleNext——用它挡掉嵌套重入，避免合并中途把 host 抢跑/递归判合并。
-   */
-  private readonly scheduling = new Set<number>();
   /** 创建时澄清的每项目串行链（单飞限流）：projectId → 链尾 promise */
   private readonly clarifyChain = new Map<number, Promise<void>>();
   /** start() 触发的一次性悬空澄清恢复（重启把内存态分析链杀掉后的补救）；waitClarify 先等它 */
@@ -3576,10 +2959,38 @@ export class IssueEngine {
 
   constructor(private readonly deps: EngineDeps) {
     this.store = new IssueStore(deps.db);
+    this.transitionRepository = new IssueTransitionRepository(deps.db, this.store);
+    this.schedulingPolicy = new IssueSchedulingPolicy(this.store, (id) => this.transitionCoordinator.isActive(id));
+    this.scheduler = new IssueScheduler({
+      store: this.store,
+      policy: this.schedulingPolicy,
+      canSchedule: (id) => {
+        const project = this.project(id);
+        return this.acceptingTicks && !!project && !this.deps.executionUnavailable?.(project);
+      },
+      startIssue: (id) => this.startIssue(id),
+      applyUnblock: (id, guidance, actor) => this.applyUnblock(id, guidance, actor),
+      mergeModule: (id, key) => this.maybeMergeModule(id, key),
+      scheduleClarify: (id) => this.scheduleClarify(id),
+    });
+    this.clarifyRecoveryCoordinator = new ClarifyRecoveryCoordinator({
+      store: this.store,
+      project: (id) => this.project(id),
+      driverForProject: (project) => this.driverForProject(project),
+      scheduleClarify: (id) => this.scheduleClarify(id),
+    });
     this.cfg = { ...DEFAULT_ENGINE_CONFIG, ...(deps.config ?? {}) };
+    this.effects = new IssueEffectJournal(deps.db, () => this.now());
+    this.gitDelivery = new GitDeliveryService({
+      store: this.store,
+      journal: this.effects,
+      driverForProject: (project) => this.driverForProject(project),
+      ownerUsername: (project) => this.ownerUsername(project),
+    });
     const nodes = new WorkflowNodeRunner({
       db: deps.db,
       driver: deps.driver,
+      driverForProjectId: (projectId) => this.driverForProjectId(projectId),
       conversations: deps.convs,
       mutex: deps.mutex,
       now: () => this.now(),
@@ -3587,6 +2998,7 @@ export class IssueEngine {
     const worktrees = new WorkflowWorktreeManager({
       db: deps.db,
       driver: deps.driver,
+      driverForProjectId: (projectId) => this.driverForProjectId(projectId),
       conversations: deps.convs,
       mutex: deps.mutex,
       now: () => this.now(),
@@ -3602,8 +3014,32 @@ export class IssueEngine {
     });
   }
 
-  private get reader(): JsonlReader {
-    return this.deps.driver;
+  private executionForProject(project: Project): { driver: ExecutorDriver; locator: EngineLocator } {
+    return this.deps.executionForProject?.(project) ?? { driver: this.deps.driver, locator: this.deps.locator };
+  }
+
+  private executionForIssue(issue: EngineIssue): { driver: ExecutorDriver; locator: EngineLocator } {
+    const project = this.project(issue.projectId);
+    if (!project) throw new Error(`项目 ${issue.projectId} 不存在`);
+    return this.executionForProject(project);
+  }
+
+  private driverForProject(project: Project): ExecutorDriver {
+    return this.executionForProject(project).driver;
+  }
+
+  private driverForProjectId(projectId: number): ExecutorDriver {
+    const project = this.project(projectId);
+    if (!project) throw new Error(`项目 ${projectId} 不存在`);
+    return this.driverForProject(project);
+  }
+
+  private executionForConversation(convId: string): { driver: ExecutorDriver; locator: EngineLocator } {
+    const conversation = this.deps.convs.get(convId);
+    if (!conversation) throw new Error(`对话 ${convId} 不存在`);
+    const project = this.project(conversation.projectId);
+    if (!project) throw new Error(`项目 ${conversation.projectId} 不存在`);
+    return this.executionForProject(project);
   }
 
   /** 配置的基线分支名（仅作展示 + 老 issue 无 impl_base 时的兜底 diff 范围；引擎不并回它） */
@@ -3623,19 +3059,28 @@ export class IssueEngine {
 
   start(): void {
     if (this.timer || this.stopPromise) return;
+    if (this.clarificationDelivery && !this.clarificationDelivery.reopen()) return;
+    this.clarificationClosed = false;
     this.acceptingTicks = true;
+    for (const effect of this.effects.reconcileInterrupted()) {
+      this.store.logEvent(effect.issueId, 'effect_uncertain', {
+        operationKey: effect.operationKey,
+        reason: 'interrupted before confirmation',
+      });
+    }
     // 一次性恢复被重启打断的创建时澄清（分析链是内存态，重启即蒸发只留悬空事件）
-    this.clarifyRecovery ??= this.recoverClarify().catch(() => {});
+    if (this.deps.clarify) this.clarifyRecovery ??= this.clarifyRecoveryCoordinator.recover().catch(() => {});
     this.timer = setInterval(() => void this.tick(), this.cfg.tickMs);
   }
 
   /** M1：停节拍、关闭新 tick 入口并等所有项目 flight 归还，之后调用方才能 close driver/db。 */
-  async stop(): Promise<void> {
+  async stop(options: { deferClarificationDrain?: boolean } = {}): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.acceptingTicks = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    const pending = Promise.allSettled([...this.tickFlights.values()].map((flight) => flight.promise)).then(
+    const clarificationDrain = this.closeClarifications();
+    const pending = Promise.allSettled([...this.tickFlights.values()].map((flight) => flight.promise).concat(options.deferClarificationDrain ? [] : [clarificationDrain])).then(
       () => {
         if (this.stopPromise === pending) this.stopPromise = null;
       },
@@ -3659,6 +3104,8 @@ export class IssueEngine {
   ): Promise<EngineIssue> {
     const proj = this.project(projectId);
     if (!proj) throw new Error(`项目 ${projectId} 不存在`);
+    const unavailable = this.deps.executionUnavailable?.(proj);
+    if (unavailable) throw new Error(unavailable);
     const workflows = new WorkflowTemplateStore(this.deps.db, () => this.now());
     let selectedWorkflow: WorkflowTemplateDetail | null = null;
     if (input.workflowTemplateId !== undefined) {
@@ -3835,7 +3282,7 @@ export class IssueEngine {
    */
   async completeDesignBatch(
     projectId: number,
-    issueIds: readonly number[],
+    issueIds: readonly IssueId[],
     outbox?: IssuePublicationPostCommitOutboxPort,
     signal?: AbortSignal,
   ): Promise<void> {
@@ -3855,7 +3302,7 @@ export class IssueEngine {
     const requireActive = (): void => {
       if (signal?.aborted) throw new Error('publication post-commit drain aborted');
     };
-    const batchIssueIds = Object.freeze([...uniqueIds].sort((a, b) => a - b));
+    const batchIssueIds = Object.freeze([...uniqueIds].sort(compareIssueIds));
     const perform = async (
       operation: IssuePublicationPostCommitOperation,
       effect: () => void | Promise<void>,
@@ -3945,11 +3392,11 @@ export class IssueEngine {
     if (failures.length > 0) throw new IssuePublicationPostCommitError(failures);
   }
 
-  requestExecutionSync(issueId: number, input: IssueExecutionSyncRequest): IssueExecutionSync {
+  requestExecutionSync(issueId: IssueId, input: IssueExecutionSyncRequest): IssueExecutionSync {
     return this.store.requestExecutionSync(issueId, input);
   }
 
-  getDesignSyncSnapshot(issueId: number): IssueDesignSyncSnapshot | null {
+  getDesignSyncSnapshot(issueId: IssueId): IssueDesignSyncSnapshot | null {
     return this.store.designSyncSnapshot(issueId);
   }
 
@@ -3960,11 +3407,11 @@ export class IssueEngine {
     return this.store.updateFromDesignInTransaction(input, afterUpdate);
   }
 
-  requestLatestExecutionSync(issueId: number, input: IssueExecutionSyncRequest): IssueExecutionSync {
+  requestLatestExecutionSync(issueId: IssueId, input: IssueExecutionSyncRequest): IssueExecutionSync {
     return this.store.requestLatestExecutionSync(issueId, input);
   }
 
-  latestExecutionSync(issueId: number, sourceKind: string, sourceKey: string): IssueExecutionSync | null {
+  latestExecutionSync(issueId: IssueId, sourceKind: string, sourceKey: string): IssueExecutionSync | null {
     return this.store.latestExecutionSync(issueId, sourceKind, sourceKey);
   }
 
@@ -3972,12 +3419,12 @@ export class IssueEngine {
     return this.store.getExecutionSync(syncId) ?? null;
   }
 
-  hasExecutionSyncBoundary(issueId: number): boolean {
+  hasExecutionSyncBoundary(issueId: IssueId): boolean {
     return this.store.activeExecutionSyncBoundary(issueId) !== null;
   }
 
   holdExecutionSyncBoundary(
-    issueId: number,
+    issueId: IssueId,
     boundaryKind: string,
     deferredAction: unknown,
   ): IssueExecutionSync | null {
@@ -4080,6 +3527,17 @@ export class IssueEngine {
     let examined = 0;
     for (const row of rows) {
       if (options.signal?.aborted) break;
+      const queuedPayload = row.payload as {
+        issueId?: unknown;
+        action?: { kind?: unknown };
+      };
+      if (queuedPayload.action?.kind === 'inject_subtask') {
+        const queuedIssueId = parseIssueId(queuedPayload.issueId);
+        const queuedIssue = queuedIssueId === null ? undefined : this.store.get(queuedIssueId);
+        // 未就绪时不抢 delivery claim，让下一轮继续重试；抢完再发现会进入 uncertain，反而
+        // 需要人工裁决是否已投递，不能作为正常冷启动的等待机制。
+        if (!queuedIssue || !(await this.issueInputReady(queuedIssue))) continue;
+      }
       const claimed = this.store.claimExecutionSyncEffectDelivery(row.resumeKey, row.intentKey, this.now());
       if (!claimed?.deliveryToken) continue;
       examined++;
@@ -4094,10 +3552,10 @@ export class IssueEngine {
             from?: unknown; to?: unknown;
           };
         };
-        if (!Number.isSafeInteger(payload.issueId) || typeof payload.action !== 'object' || payload.action === null) {
+        if (parseIssueId(payload.issueId) === null || typeof payload.action !== 'object' || payload.action === null) {
           throw new Error('malformed execution sync boundary effect');
         }
-        const issueId = payload.issueId as number;
+        const issueId = parseIssueId(payload.issueId)!;
         if (payload.action.kind === 'issue-event') {
           const event = payload.action.event as IssueMachineEvent;
           const actionOptions = (payload.action.options ?? {}) as {
@@ -4119,7 +3577,7 @@ export class IssueEngine {
           const subtasks = this.store.subtasksOf(issue).map((subtask) => subtask.text);
           if (!subtasks[nextIndex as number]) throw new Error('deferred subtask no longer exists');
           const session = this.deps.convs.tmuxName(issue.projectId, issue.convId);
-          await this.inject(session, buildSubtaskPrompt({
+          await this.injectOnce(issue, session, `sync-subtask:${claimed.resumeKey}:${claimed.intentKey}`, buildSubtaskPrompt({
             issue,
             subtasks,
             idx: nextIndex as number,
@@ -4181,7 +3639,7 @@ export class IssueEngine {
     return this.store.resolveUncertainExecutionSyncEffect(resumeKey, intentKey, resolution);
   }
 
-  hasUnresolvedExecutionSyncEffect(issueId: number): boolean {
+  hasUnresolvedExecutionSyncEffect(issueId: IssueId): boolean {
     return this.store.hasUnresolvedExecutionSyncEffect(issueId);
   }
 
@@ -4226,17 +3684,17 @@ export class IssueEngine {
     };
   }
 
-  workflowSnapshot(issueId: number): IssueWorkflowSnapshot | null {
+  workflowSnapshot(issueId: IssueId): IssueWorkflowSnapshot | null {
     return new WorkflowTemplateStore(this.deps.db, () => this.now()).issueWorkflow(issueId);
   }
 
-  workflowRuntime(issueId: number): IssueWorkflowRuntime | null {
+  workflowRuntime(issueId: IssueId): IssueWorkflowRuntime | null {
     return new WorkflowTemplateStore(this.deps.db, () => this.now()).issueWorkflowRuntime(issueId);
   }
 
   /** 只有 pending 可以换正式模块；模块固定代理，因此换绑时代理随模块原子更新。 */
   async changePendingModule(
-    issueId: number,
+    issueId: IssueId,
     selection: PendingModuleSelection,
   ): Promise<EngineIssue> {
     return this.updatePendingMeta(issueId, {}, selection);
@@ -4250,7 +3708,7 @@ export class IssueEngine {
    * 判据一律走 isEditableStatus，别照着方法名想当然。
    */
   async updatePendingMeta(
-    issueId: number,
+    issueId: IssueId,
     meta: IssueMetaPatch,
     moduleSelection?: PendingModuleSelection,
   ): Promise<EngineIssue> {
@@ -4365,7 +3823,7 @@ export class IssueEngine {
    * - 并行模式开工即全量派发，其余阶段也不开放修改。
    */
   async updateUnstartedSubtask(
-    issueId: number,
+    issueId: IssueId,
     index: number,
     text: string,
     actor?: number,
@@ -4412,7 +3870,7 @@ export class IssueEngine {
     projectId: number,
     sourceIds: number[],
     targetId: number,
-  ): Promise<{ target: ProjectModule; movedIssueIds: number[] }> {
+  ): Promise<{ target: ProjectModule; movedIssueIds: IssueId[] }> {
     const project = this.project(projectId);
     if (!project) throw new Error('项目不存在');
     const modules = this.deps.modulesFor?.(project);
@@ -4895,9 +4353,9 @@ export class IssueEngine {
    */
   async moveIssuesToModule(
     projectId: number,
-    issueIds: number[],
+    issueIds: IssueId[],
     targetModuleId: number,
-  ): Promise<{ target: ProjectModule; movedIssueIds: number[] }> {
+  ): Promise<{ target: ProjectModule; movedIssueIds: IssueId[] }> {
     const project = this.project(projectId);
     if (!project) throw new Error('项目不存在');
     const modules = this.deps.modulesFor?.(project);
@@ -4952,8 +4410,8 @@ export class IssueEngine {
    * 每项目串行单飞（链式排队）——防同项目多条新 issue 同时起多个分析会话压垮执行机；
    * 不同项目互不排队。仅 pending（还在排队）的才值得分析——已开跑的由规划阶段对齐。
    */
-  scheduleClarify(issueId: number): void {
-    if (!this.deps.clarify) return;
+  scheduleClarify(issueId: IssueId): void {
+    if (!this.deps.clarify || this.clarificationClosed || !this.acceptingTicks) return;
     const issue = this.store.get(issueId);
     if (!issue || issue.status !== 'pending') return;
     const tail = this.clarifyChain.get(issue.projectId) ?? Promise.resolve();
@@ -4961,36 +4419,15 @@ export class IssueEngine {
     this.clarifyChain.set(issue.projectId, tail.then(() => this.runClarifyTask(issueId)).catch(() => {}));
   }
 
-  /** 等所有在途创建时澄清分析归还（测试确定性用；生产停机不等——分析可长达分钟级） */
+  /** 等所有在途创建时澄清分析归还；调用方可限时返回，但必须保留资源到此屏障结束。 */
   async waitClarify(): Promise<void> {
     if (this.clarifyRecovery) await this.clarifyRecovery; // 恢复扫描先归还，链上才看得到重跑任务
     await Promise.all([...this.clarifyChain.values()]);
   }
 
-  /**
-   * 重启恢复扫描（start() 一次性）：悬空分析按状态分流——仍 pending 的重新
-   * scheduleClarify 全新重跑（runner 步骤 0 自清残留会话与 scratch，天然幂等）；
-   * 已开跑/完结的补不回也无意义，只补记 clarify_discarded 收口事件，并清掉
-   * 本该由 runner finally 清理的残留 clr-<id> 会话与 .panda/tmp/clarify/<id>。
-   */
-  private async recoverClarify(): Promise<void> {
-    if (!this.deps.clarify) return;
-    for (const issue of this.store.listDanglingClarify()) {
-      if (issue.status === 'pending') {
-        this.scheduleClarify(issue.id);
-        continue;
-      }
-      this.store.logEvent(issue.id, 'clarify_discarded', { status: issue.status, via: 'recover' });
-      const cwd = this.project(issue.projectId)?.cwd;
-      if (!cwd) continue;
-      await this.deps.driver.killSession(clarifySessionName(issue.id)).catch(() => {});
-      await this.deps.driver.removeTree(clarifyPaths(cwd, issue.id).scratch).catch(() => {});
-    }
-  }
-
-  private async runClarifyTask(issueId: number): Promise<void> {
+  private async runClarifyTask(issueId: IssueId): Promise<void> {
     const clarify = this.deps.clarify;
-    if (!clarify) return;
+    if (!clarify || this.clarificationClosed || !this.acceptingTicks) return;
     const issue = this.store.get(issueId);
     if (!issue) return; // 已删除，无处记事件
     if (issue.status !== 'pending') {
@@ -5104,7 +4541,7 @@ export class IssueEngine {
    * 三条纪律：不足窗口条数不告警（样本太少的比率没有意义）；带冷却（跌破之后每次失败都发
    * 一遍只会让人把通知静音）；告警本身失败绝不影响澄清流程。
    */
-  private async alertClarifySuccessRate(project: Project, issueId: number): Promise<void> {
+  private async alertClarifySuccessRate(project: Project, issueId: IssueId): Promise<void> {
     const window = this.cfg.clarifyAlertWindow;
     if (window <= 0 || this.cfg.clarifyAlertCooldownMs <= 0) return; // 关掉了
     const stat = this.store.clarifySuccessRate(project.id, window);
@@ -5129,126 +4566,9 @@ export class IssueEngine {
     });
   }
 
-  /**
-   * 队列接力：项目空闲时按「模块聚合」挑下一条 pending 开跑（同模块优先→模块间不交错→FIFO）。
-   * 开跑前先对**将要运行的那个模块**的 pending 做一次 LLM 智能合并（同模块小任务并成一条，
-   * 减少反复起会话/重复读代码）。合并会 cancel 掉被并入项，其接力经 scheduling 单飞挡掉重入。
-   *
-   * `preferModuleKey` 必须是 `moduleKeyOf(issue)` 的结果（module_id 优先），不能直接传
-   * issues.module 文本——文本列可能与模块 slug 不同步，会让「同模块连着跑」静默失效。
-   */
+  /** Project-level relay and resume orchestration lives in IssueScheduler. */
   async scheduleNext(projectId: number, opts: ScheduleNextOptions | string = {}): Promise<void> {
-    // 旧签名（第二个参数直接传 preferModuleKey）仍然可用：调用点多，一次性全改风险大于收益
-    const options: ScheduleNextOptions = typeof opts === 'string' ? { preferModuleKey: opts } : opts;
-    const source: ScheduleSource = options.source ?? 'relay';
-    if (this.scheduling.has(projectId)) return; // 合并 cancel 触发的嵌套接力：本轮外层会收尾
-    this.scheduling.add(projectId);
-    const mergedHosts: number[] = [];
-    try {
-      let preferred = options.preferModuleKey;
-      for (;;) {
-        // #283：先看有没有「等项目空闲就恢复」的受阻 issue——恢复一条已经花过钱的，
-        // 比开一条全新的更值得优先。**但手动置顶的 pending 又压过它**（发起人拍板）：
-        // 置顶是用户当场表达的「先跑这个」，比系统的成本优化更该被尊重。
-        // 消费成功后项目就忙了，本轮到此为止。
-        if (await this.consumeUnblockRequest(projectId, source, preferred)) return;
-
-        let next = pickNext(this.schedulableIssues(projectId), preferred);
-        if (!next) return;
-        const pickedModule = moduleKeyOf(next); // 模块身份用键（module_id 优先），不用可能过期的文本列
-        // 目标模块的 pending 先智能合并，再在同模块内重挑（合并后 host 仍是最早的一条）
-        mergedHosts.push(...(await this.maybeMergeModule(projectId, pickedModule)));
-        next = pickNext(this.schedulableIssues(projectId), pickedModule);
-        if (!next) return;
-
-        const beforeStatus = next.status;
-        const r = await this.startIssue(next.id);
-        if (!r.ok) {
-          // 正常排队 vs 真故障：前者是调度器每天都走的路径，落 error 只会制造噪音并掩盖真问题
-          if (r.deferral) {
-            this.store.logEvent(next.id, 'scheduling_deferred', {
-              source,
-              reason: r.deferral,
-              issueId: next.id,
-            });
-          } else {
-            this.store.logEvent(next.id, 'error', { where: 'scheduleNext', source, error: r.error });
-          }
-          return;
-        }
-
-        const projectIssues = this.store.listByProject(projectId);
-        if (isBusy(projectIssues)) return; // 正常开跑成功：项目已有唯一 active，接力结束
-        const fresh = projectIssues.find((issue) => issue.id === next.id);
-        if (!fresh || fresh.status === beforeStatus) {
-          // 这一档是真故障：开跑调用返回成功，issue 却没动——多半是 entry action 半路失败
-          this.store.logEvent(next.id, 'error', {
-            where: 'scheduleNext',
-            source,
-            error: fresh ? `开跑后状态无进展（仍为 ${fresh.status}）` : '开跑后 issue 不存在',
-          });
-          return;
-        }
-
-        // startIssue 的 planning onEnter 可能同步激活失败并转 blocked；其嵌套 scheduleNext
-        // 被 scheduling guard 吞掉。当前 flight 负责继续挑下一条，避免项目无 active 冻结。
-        preferred = pickedModule;
-      }
-    } finally {
-      this.scheduling.delete(projectId);
-      // 合并过的 host 正文已变 → 仍在排队的重新分析；刚被 startIssue 挑中开跑的已非
-      // pending，scheduleClarify 无声跳过（放在 startIssue 之后调度即为消除这层竞态）
-      for (const hid of mergedHosts) this.scheduleClarify(hid);
-    }
-  }
-
-  /**
-   * 消费一条待恢复意图（#283）：项目空闲时把「用户点过继续运行」的那条真正恢复起来。
-   *
-   * 走的是与手动解除**完全相同**的 `applyUnblock` 路径，所以 `unblock_guidance` 留痕、
-   * resumeState 注入、止损锚点这些一个都不会少。返回 true 表示本轮已经把项目占上了。
-   */
-  private async consumeUnblockRequest(
-    projectId: number,
-    source: ScheduleSource,
-    preferModuleKey?: string,
-  ): Promise<boolean> {
-    if (isBusy(this.store.listByProject(projectId))) return false;
-    const [request] = this.store.listPendingUnblockRequests(projectId);
-    if (!request) return false;
-    if (this.activeIssueTransitions.has(request.issueId)) return false; // 正在迁移，等下一轮
-
-    // 手动置顶的 pending 优先（发起人拍板）：置顶是用户当场说的「先跑这个」。
-    // 受阻那条自己也被置顶时按置顶时刻比——后置顶的在前，与 queue.orderPending 同口径。
-    const topPending = pickNext(this.schedulableIssues(projectId), preferModuleKey);
-    if (topPending?.pinnedTs != null) {
-      const requestPinnedTs = this.store.get(request.issueId)?.pinnedTs ?? null;
-      if (requestPinnedTs === null || requestPinnedTs < topPending.pinnedTs) return false;
-    }
-
-    const r = await this.applyUnblock(
-      request.issueId,
-      request.guidance,
-      request.actor ?? undefined,
-    );
-    if (!r.ok) {
-      // 恢复失败不该把意图吃掉：留着下一轮再试，但要留痕说明这轮为什么没成
-      this.store.logEvent(request.issueId, 'scheduling_deferred', {
-        source,
-        reason: 'unblock-failed',
-        issueId: request.issueId,
-        error: r.error.slice(0, 200),
-      });
-      return false;
-    }
-    this.store.logEvent(request.issueId, 'unblock_request_consumed', { source, requestedTs: request.ts });
-    return true;
-  }
-
-  private schedulableIssues(projectId: number): EngineIssue[] {
-    return this.store
-      .listRunnableByProject(projectId)
-      .filter((issue) => !this.activeIssueTransitions.has(issue.id));
+    return this.scheduler.scheduleNext(projectId, opts);
   }
 
   /**
@@ -5259,8 +4579,8 @@ export class IssueEngine {
    * 相容约束：合并出的 host 只有一套 agent/category/implMode/目标分支/源 ref——跨这些维度
    * 合并会改变实施或 Git 语义，故只在完全相同的子组内合并。
    */
-  private async maybeMergeModule(projectId: number, moduleKey: string): Promise<number[]> {
-    const hosts: number[] = [];
+  private async maybeMergeModule(projectId: number, moduleKey: string): Promise<IssueId[]> {
+    const hosts: IssueId[] = [];
     if (!this.cfg.autoMerge) return hosts;
     const project = this.project(projectId);
     if (!project) return hosts;
@@ -5273,7 +4593,7 @@ export class IssueEngine {
       .listRunnableByProject(projectId)
       .filter((i) =>
         i.status === 'pending'
-        && !this.activeIssueTransitions.has(i.id)
+        && !this.transitionCoordinator.isActive(i.id)
         && moduleKeyOf(i) === moduleKey
         && !i.convId
         && !i.publicationLocked
@@ -5346,8 +4666,8 @@ export class IssueEngine {
    * 依据是 `tasks_merged` 事件里的快照（合并时存的全文），所以：宿主恢复自己的 title/body/
    * 澄清反馈，被并项 reopen 回 pending 并各自恢复原文。已经拆过的那次合并不会被拆第二次。
    */
-  async unmergeIssues(hostId: number, actor?: number): Promise<
-    { ok: true; restored: number[] } | { ok: false; error: string }
+  async unmergeIssues(hostId: IssueId, actor?: number): Promise<
+    { ok: true; restored: IssueId[] } | { ok: false; error: string }
   > {
     const host = this.store.get(hostId);
     if (!host) return { ok: false, error: '无此 issue' };
@@ -5361,7 +4681,7 @@ export class IssueEngine {
     const hostSnapshot = byId.get(hostId);
     if (!hostSnapshot) return { ok: false, error: '合并快照缺少宿主原文，无法拆回' };
 
-    const restored: number[] = [];
+    const restored: IssueId[] = [];
     // 宿主先复原：拆回失败时宁可停在「宿主已还原、被并项还没回来」，也不要反过来
     this.store.patchMeta(hostId, { title: hostSnapshot.title, body: hostSnapshot.body });
     this.store.setClarifyFeedback(hostId, hostSnapshot.clarifyFeedback ?? null);
@@ -5404,7 +4724,7 @@ export class IssueEngine {
     moduleKey: string,
     group: EngineIssue[],
     merge: EngineMergeGroup,
-  ): Promise<number | null> {
+  ): Promise<IssueId | null> {
     return this.deps.mutex.runExclusive(
       issueMetaLockKey(projectId),
       () => this.applyMergeLocked(projectId, moduleKey, group, merge),
@@ -5417,7 +4737,7 @@ export class IssueEngine {
     moduleKey: string,
     group: EngineIssue[],
     merge: EngineMergeGroup,
-  ): Promise<number | null> {
+  ): Promise<IssueId | null> {
     const byId = new Map(group.map((i) => [i.id, i]));
     // 只认此刻仍 pending 的成员（LLM 可能引用已被上一组折叠掉的 id）
     const members = merge.members
@@ -5438,7 +4758,7 @@ export class IssueEngine {
       });
     if (members.length < 2) return null;
     // host = 最早的一条（保住 FIFO 位次；title/body 换成合并后内容）
-    members.sort((a, b) => a.createdTs - b.createdTs || a.id - b.id);
+    members.sort((a, b) => a.createdTs - b.createdTs || compareIssueIds(a.id, b.id));
     const host = members[0]!;
     const foldedIds = members.slice(1).map((i) => i.id);
 
@@ -5501,7 +4821,8 @@ export class IssueEngine {
     return resolved;
   }
 
-  async startIssue(issueId: number): Promise<ApplyResult> {
+  async startIssue(issueId: IssueId): Promise<ApplyResult> {
+    if (!this.acceptingTicks) return { ok: false, error: 'Issue scheduling is stopped.' };
     const issue = this.store.get(issueId);
     // 这两条与锁内的同款判定要一起标 deferral（#283）：调度器多半是在这里被挡下的——
     // 挑中之后、真正开跑之前，issue 被取消/被别的 flight 抢先都走这里。
@@ -5511,6 +4832,8 @@ export class IssueEngine {
     }
     const project = this.project(issue.projectId);
     if (!project) return { ok: false, error: '项目不存在' };
+    const unavailable = this.deps.executionUnavailable?.(project);
+    if (unavailable) return { ok: false, error: unavailable };
 
     // 不持粗 project mutex：这里只串行化“从 pending 抢启动权到 planning commit”的最小窗口。
     // 已有 reservation 时等待其 commit/失败释放，再从头重读 issue/project/busy，避免脏判断。
@@ -5566,7 +4889,7 @@ export class IssueEngine {
         const pausedWorkflow = siblings.some(
           (candidate) => (candidate.status === 'blocked' || candidate.status === 'paused') && this.workflowSnapshot(candidate.id)?.status === 'paused',
         );
-        if (isBusy(siblings) || pausedWorkflow) {
+        if (isBusy(siblings) || pausedWorkflow || this.schedulingPolicy.inputSubmitHeldBy(fresh, siblings)) {
           immediate = { ok: false, error: '项目忙（已有 issue 在跑），先排队', deferral: 'project-busy' };
           return;
         }
@@ -5713,7 +5036,7 @@ export class IssueEngine {
           metaReleaseSignalled = true;
           signalMetaRelease();
         };
-        transitionPromise = this.runIssueTransition(issueId, () =>
+        transitionPromise = this.transitionCoordinator.run(issueId, () =>
           this.applyEventLocked(issueId, this.store.get(issueId)?.executionMode === 'direct'
             && !project.manualReview && !this.workflowSnapshot(issueId)
             && !this.store.get(issueId)?.publicationLocked ? 'start_direct' : 'skip_clarifying', {}, () => {
@@ -5743,7 +5066,21 @@ export class IssueEngine {
    *   execClarifyWait/clarifyPendingOf 自动清零 = 解除等待），复位 nudge/activity 让 watcher 续跑。
    *   覆盖两种来源：执行中澄清（NEED_CLARIFY / PM 兜底）、创建时问题开跑后才回答（spec 第 5 点）。
    */
-  async clarify(issueId: number, answer: string): Promise<ApplyResult> {
+  private clarificationDelivery?: ClarificationDelivery;
+  private clarificationClosed = false;
+  /** Embedders may bound their wait only if they retain resources until this barrier settles. */
+  closeClarifications(): Promise<void> {
+    this.clarificationClosed = true;
+    this.clarificationDelivery ??= new ClarificationDelivery(this.deps.db);
+    return this.clarificationDelivery.close().then(() => this.waitClarify());
+  }
+  async clarify(issueId: IssueId, answer: string, delivery?: ClarificationDeliveryInput): Promise<ApplyResult> {
+    if(!this.acceptingTicks)return {ok:false,error:'clarification_delivery_stopped'};
+    this.clarificationDelivery ??= new ClarificationDelivery(this.deps.db);
+    return this.clarificationDelivery.run(issueId, answer, delivery, (guard, deliveryKey) => this.performClarify(issueId, answer, guard, deliveryKey));
+  }
+
+  private async performClarify(issueId: IssueId, answer: string, guard: () => void, deliveryKey?: string): Promise<ApplyResult> {
     const issue = this.store.get(issueId);
     if (!issue) return { ok: false, error: '无此 issue' };
     const a = answer.trim().slice(0, 4000);
@@ -5755,8 +5092,9 @@ export class IssueEngine {
     const openQuestions = lastRound && lastRound.answer === null ? lastRound.questions : [];
 
     if (issue.status === 'pending') {
+      guard();
       this.store.setBody(issueId, `${issue.body ?? ''}\n\n${formatClarifyAppend(openQuestions, a)}`.trim());
-      this.store.logEvent(issueId, 'clarified', { answer: a.slice(0, 500), source: 'pending' });
+      this.store.logEvent(issueId, 'clarified', { answer: a.slice(0, 500), source: 'pending', ...(deliveryKey ? { deliveryKey } : {}) });
       // 答复已并入正文 → 重新分析（重生成反馈、可能再抛新一轮问题，来回多轮直到理解一致）；
       // 沿用 scheduleClarify 自身守卫（仅 pending + 每项目链式单飞），仍在排队才值得重分析。
       this.scheduleClarify(issueId);
@@ -5764,28 +5102,45 @@ export class IssueEngine {
     }
 
     if (issue.status === 'clarifying') {
+      guard();
       this.store.setBody(issueId, `${issue.body ?? ''}\n\n${formatClarifyAppend(openQuestions, a)}`.trim());
-      this.store.logEvent(issueId, 'clarified', { answer: a.slice(0, 500), source: 'clarifying' });
+      this.store.logEvent(issueId, 'clarified', { answer: a.slice(0, 500), source: 'clarifying', ...(deliveryKey ? { deliveryKey } : {}) });
       return this.applyEvent(issueId, 'clarified');
     }
 
     if (DRIVING_STATES.includes(issue.status)) {
       if (!issue.convId) return { ok: false, error: '该 issue 未绑定会话，无法注入澄清答复' };
+      if (this.deps.convs.currentConv(issue.projectId) !== issue.convId) {
+        return { ok: false, error: '当前激活的不是该 issue 对话，请切回后重发答复' };
+      }
       const wasWaiting = this.store.execClarifyWait(issueId) !== null; // 记录来源（执行中澄清 vs 开跑后补答）
       const session = this.deps.convs.tmuxName(issue.projectId, issue.convId);
       // 统一门禁（issue #97）：代理已退回 shell 时，答复打进 bash 就彻底丢了（既没进正文
       // 也没进会话，用户还以为答过了）。判死则先把代理重起来，让用户重发——不在这里等就绪
       // 后再补发：这是同步请求路径，等代理启动会把接口挂住十几秒。
+      const pane = await this.executionForIssue(issue).driver.capturePane(session).catch(() => '');
       const quiet = await this.convQuietMs(issue.convId);
-      if ((await this.sessionLiveness(issue.agent, session, undefined, quiet)) === 'shell') {
+      const guardSession = () => {
+        guard();
+        const current = this.store.get(issueId);
+        if (!current || current.convId !== issue.convId || current.status !== issue.status) throw new ClarificationNotDeliveredError();
+      };
+      if ((await this.sessionLiveness(issue.projectId, issue.agent, session, pane, quiet)) === 'shell') {
+        guardSession();
         this.store.logEvent(issueId, 'agent_down', { session, agent: issue.agent, where: 'answerClarify' });
-        await this.relaunchConv(issue).catch(() => {});
+        await this.relaunchConv(issue, guardSession).catch(error => { if (error instanceof ClarificationNotDeliveredError || error instanceof Error && error.message === 'clarification_question_changed') throw error; });
         return { ok: false, error: '代理不在（已自动重启），请稍等几秒后重发答复' };
       }
-      await this.inject(session, `【澄清答复】${a}`);
+      if (!paneHasAgentInput(issue.agent, pane)) {
+        return { ok: false, error: '代理输入区尚未就绪，请稍等几秒后重发答复' };
+      }
+      await this.injectOnce(issue, session,
+        `clarify-answer:${this.store.lastEventId(issueId, 'clarify_questions')}:${this.store.lastEnterEventId(issueId, issue.status)}`,
+        `【澄清答复】${a}`, guardSession);
       this.store.logEvent(issueId, 'clarified', {
         answer: a.slice(0, 500),
         source: wasWaiting ? 'exec' : 'post_start',
+        ...(deliveryKey ? { deliveryKey } : {}),
       });
       const w = this.watch.get(issue.convId);
       if (w) {
@@ -5835,7 +5190,7 @@ export class IssueEngine {
     return this.applyEvent(issue.id, ev, { note, actor: userId });
   }
 
-  async cancelIssue(issueId: number, actor?: number): Promise<ApplyResult> {
+  async cancelIssue(issueId: IssueId, actor?: number): Promise<ApplyResult> {
     return this.applyEvent(issueId, 'cancel', { actor });
   }
 
@@ -5843,7 +5198,7 @@ export class IssueEngine {
    * 仅删除未在驱动的 issue。与 pending 编辑/自动合并/start 共用 issue-meta 锁：
    * start 在锁内完成分支准备与 planning CAS 后才释放，因此不会出现“行已删、checkout 留下”的现场。
    */
-  async removeIssue(issueId: number): Promise<{ ok: true } | { ok: false; error: string }> {
+  async removeIssue(issueId: IssueId): Promise<{ ok: true } | { ok: false; error: string }> {
     const initial = this.store.get(issueId);
     if (!initial) return { ok: false, error: '无此 issue' };
     return this.deps.mutex.runExclusive(issueMetaLockKey(initial.projectId), () => {
@@ -5860,7 +5215,7 @@ export class IssueEngine {
     });
   }
 
-  async blockIssue(issueId: number, note: string, actor?: number): Promise<ApplyResult> {
+  async blockIssue(issueId: IssueId, note: string, actor?: number): Promise<ApplyResult> {
     return this.applyEvent(issueId, 'block', { note, actor });
   }
 
@@ -5872,7 +5227,7 @@ export class IssueEngine {
    * 这正是本条要消灭的人工守候。现在把解除意图排队（`unblock_requested`），
    * 由接力在项目空闲时自动消费；意图可撤销、重复提交以最后一次为准。
    */
-  async unblockIssue(issueId: number, guidance: string, actor?: number): Promise<UnblockResult> {
+  async unblockIssue(issueId: IssueId, guidance: string, actor?: number): Promise<UnblockResult> {
     const normalized = guidance.trim();
     if (!normalized) return { ok: false, error: '解除阻塞前必须填写补充意见或解除方法' };
     if (normalized.length > 4000) return { ok: false, error: '解除方法不能超过 4000 字' };
@@ -5896,7 +5251,7 @@ export class IssueEngine {
   }
 
   /** 撤销一条尚未消费的解除意图（#283）；没有意图时返回失败，避免静默无操作 */
-  cancelUnblockRequest(issueId: number, actor?: number): { ok: true } | { ok: false; error: string } {
+  cancelUnblockRequest(issueId: IssueId, actor?: number): { ok: true } | { ok: false; error: string } {
     const request = this.store.pendingUnblockRequest(issueId);
     if (!request) return { ok: false, error: '没有待恢复的请求' };
     this.store.logEvent(issueId, 'unblock_request_cancelled', {
@@ -5906,7 +5261,7 @@ export class IssueEngine {
   }
 
   /** 受阻前的可恢复阶段（读不出来就回 pending，与既有口径一致） */
-  private resumeStateOf(issueId: number): IssueState | undefined {
+  private resumeStateOf(issueId: IssueId): IssueState | undefined {
     const blocked = this.store.lastEnterInfo(issueId, this.store.get(issueId)?.status === 'paused' ? 'paused' : 'blocked');
     const raw = isResumableState(blocked?.resumeState)
       ? blocked.resumeState
@@ -5917,7 +5272,7 @@ export class IssueEngine {
   }
 
   /** 真正执行恢复：手动解除与接力消费意图共用这一条路径，保证留痕与注入完全一致 */
-  private async applyUnblock(issueId: number, guidance: string, actor?: number): Promise<ApplyResult> {
+  private async applyUnblock(issueId: IssueId, guidance: string, actor?: number): Promise<ApplyResult> {
     const blocked = this.store.lastEnterInfo(issueId, this.store.get(issueId)?.status === 'paused' ? 'paused' : 'blocked');
     const resumeState = this.resumeStateOf(issueId);
     return this.applyEvent(issueId, 'unblock', {
@@ -5947,10 +5302,10 @@ export class IssueEngine {
    * 立刻重新排队开跑。典型用法是「取消 → 改需求 → 重新运行」，所以**编辑必须发生在调用
    * 本方法之前**——一旦落到 pending 就可能马上开跑，没有给人再改的窗口。
    *
-   * 清理挂在 afterCommit（CAS 之后、调度之前，同步执行、仍在 transition 临界区内），
+   * 清理挂在 finalizeDb（与 CAS、事件同事务；调度之前），
    * 不能放到 applyEvent 返回之后：那时接力可能已经把它开跑，清理会连新计划一起抹掉。
    */
-  async reopenIssue(issueId: number, actor?: number, guidance = ''): Promise<ApplyResult> {
+  async reopenIssue(issueId: IssueId, actor?: number, guidance = ''): Promise<ApplyResult> {
     const issue = this.store.get(issueId);
     if (!issue) return { ok: false, error: '无此 issue' };
     // 友好错误；真正的守卫是状态机（非 cancelled 一律「非法转换」）
@@ -5980,10 +5335,10 @@ export class IssueEngine {
    * 只允许确实缺少当前 waiting gate 时重跑，沿用 issue transition queue 防并发重复创建。
    */
   async retryMissingGate(
-    issueId: number,
+    issueId: IssueId,
     actor?: number,
   ): Promise<{ ok: true; gate: Gate } | { ok: false; error: string }> {
-    return this.runIssueTransition(issueId, async () => {
+    return this.transitionCoordinator.run(issueId, async () => {
       const issue = this.store.get(issueId);
       if (!issue) return { ok: false, error: '无此 issue' };
       const kind: GateKind | null =
@@ -6020,7 +5375,7 @@ export class IssueEngine {
    * 仅影响排队顺序（queue.pickNext 置顶层）。改完触发一次接力——项目忙则无操作，
    * 空闲则按新顺序挑（此时置顶项即队首）。仅 pending 可置顶（已开跑/已结的置顶无意义）。
    */
-  async setPinned(issueId: number, pinned: boolean, actor?: number): Promise<ApplyResult> {
+  async setPinned(issueId: IssueId, pinned: boolean, actor?: number): Promise<ApplyResult> {
     const issue = this.store.get(issueId);
     if (!issue) return { ok: false, error: '无此 issue' };
     if (issue.status !== 'pending') return { ok: false, error: `仅待办（pending）可置顶（当前 ${issue.status}）` };
@@ -6036,7 +5391,7 @@ export class IssueEngine {
    * 只有已收尾的（done/cancelled）拒改：不会再有弹窗，改了纯属误导（#111）。
    * **blocked 仍可改**——受阻能恢复，继续前调档正是它的用法，别顺手把它一起锁掉。
    */
-  setAutoApprove(issueId: number, level: AutoApproveLevel, actor?: number): ApplyResult {
+  setAutoApprove(issueId: IssueId, level: AutoApproveLevel, actor?: number): ApplyResult {
     const issue = this.store.get(issueId);
     if (!issue) return { ok: false, error: '无此 issue' };
     if (issue.status === 'done' || issue.status === 'cancelled') {
@@ -6058,25 +5413,24 @@ export class IssueEngine {
    * transition 事件 → 阶段进入动作 → 通知。
    */
   async applyEvent(
-    issueId: number,
+    issueId: IssueId,
     ev: IssueMachineEvent,
-    opts: {
-      note?: string;
-      failCount?: number;
-      actor?: number;
-      resumeState?: IssueState;
-      /** #274：本次 blocked 是止损闸打的。写进 transition 事件供计数排除与 #275 派生 */
-      stopLoss?: boolean;
-    } = {},
-    /** CAS 落库后、任何调度之前**同步**执行（仍在本 issue 的 transition 临界区内）。
-     *  reopen 的清理挂在这里：先落 pending 再清，接力可能已经把它开跑，会抹掉新计划。 */
-    afterCommit?: () => void,
+    opts: TransitionOptions = {},
+    /** 与状态、事件同事务执行的同步数据库收尾。
+     * reopen 的清理必须先于事务提交和下一条调度。 */
+    finalizeDb?: () => void,
   ): Promise<ApplyResult> {
+    const projectId = this.store.get(issueId)?.projectId;
+    const project = projectId === undefined ? undefined : this.project(projectId);
+    const unavailable = project && this.deps.executionUnavailable?.(project);
+    if (unavailable && ev !== 'pause' && ev !== 'block' && ev !== 'cancel') {
+      return { ok: false, error: unavailable };
+    }
     // 锁序：pending 入口必须 issue-meta → transition queue → git；会话入口必须
     // project → tmux。严禁 transition 反向获取 issue-meta。onEnter 内的递归迁移必须
     // 直接调用 applyEventLocked，重新排入同一 issue 尾队列会自等。
-    const result = await this.runIssueTransition(issueId, () =>
-      this.applyEventLocked(issueId, ev, opts, afterCommit),
+    const result = await this.transitionCoordinator.run(issueId, () =>
+      this.applyEventLocked(issueId, ev, opts, finalizeDb),
     );
     // 仅缺少有效恢复上下文的 unblock 会回 pending，并在 transition 锁释放后走既有启动入口。
     if (result.ok && result.to === 'pending' && result.from !== 'pending') {
@@ -6088,57 +5442,12 @@ export class IssueEngine {
     return result;
   }
 
-  /**
-   * 同 issue 严格串行，但第一项不经 `await resolvedPromise`：fn 在当前调用栈立即执行到自己的
-   * 首个 await。这样 startIssue(A) 的 pending→planning CAS 会先落库，紧随其后的 startIssue(B)
-   * 才做项目 busy 检查。占位 tail 在调用 fn 前登记，连同步重入也只能排到后面。
-   */
-  private runIssueTransition<T>(issueId: number, fn: () => T | Promise<T>): Promise<T> {
-    const previous = this.issueTransitionTails.get(issueId);
-    let release!: () => void;
-    const tail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.issueTransitionTails.set(issueId, tail);
-
-    const execute = async (): Promise<T> => {
-      this.activeIssueTransitions.add(issueId);
-      try {
-        return await fn();
-      } finally {
-        this.activeIssueTransitions.delete(issueId);
-      }
-    };
-    let result: Promise<T>;
-    if (previous) {
-      result = previous.then(execute);
-    } else {
-      try {
-        result = execute();
-      } catch (e) {
-        result = Promise.reject(e);
-      }
-    }
-    void result.then(release, release);
-    void tail.then(() => {
-      if (this.issueTransitionTails.get(issueId) === tail) this.issueTransitionTails.delete(issueId);
-    });
-    return result;
-  }
-
   /** 已占用本 issue transition queue 槽位的迁移实现；只供本类递归 entry action 使用。 */
   private async applyEventLocked(
-    issueId: number,
+    issueId: IssueId,
     ev: IssueMachineEvent,
-    opts: {
-      note?: string;
-      failCount?: number;
-      actor?: number;
-      resumeState?: IssueState;
-      /** #274：本次 blocked 是止损闸打的。写进 transition 事件供计数排除与 #275 派生 */
-      stopLoss?: boolean;
-    } = {},
-    afterCommit?: () => void,
+    opts: TransitionOptions = {},
+    finalizeDb?: () => void,
   ): Promise<ApplyResult> {
     let issue = this.store.get(issueId);
     if (!issue) return { ok: false, error: '无此 issue' };
@@ -6163,49 +5472,14 @@ export class IssueEngine {
       });
       if (held) return { ok: true, from, to: from };
     }
-    const commitTransition = (fresh: EngineIssue): boolean => {
-      if (!this.store.casStatus(issueId, from, to)) return false;
-      this.store.logEvent(issueId, 'transition', {
-        event: ev,
-        from,
-        to,
-        ...(opts.note ? { note: opts.note.slice(0, 500) } : {}),
-        ...(opts.actor !== undefined ? { actor: opts.actor } : {}),
-        ...(opts.stopLoss ? { stopLoss: true } : {}),
-        ...((to === 'blocked' || to === 'paused') ? {
-          resumeState: from,
-          resumeContext: {
-            subIndex: fresh.subIndex,
-            convId: fresh.convId,
-            branch: fresh.branch,
-            targetBranch: fresh.targetBranch,
-            sourceRef: fresh.sourceRef,
-            workflowStatus: this.workflowSnapshot(issueId)?.status ?? null,
-          },
-        } : {}),
-        ...(ev === 'unblock' && opts.resumeState !== undefined ? { resumeState: opts.resumeState } : {}),
+    const commitTransition = (fresh: EngineIssue, finalize?: () => void): boolean => {
+      const committed = this.transitionRepository.commit({
+        issueId, from, to, event: ev, options: opts, fresh,
+        workflowStatus: () => this.workflowSnapshot(issueId)?.status ?? null,
+        finalizeDb, finalize,
       });
-      if (ev === 'request_plan' || (ev === 'skip_clarifying' && fresh.executionMode === 'direct')) {
-        this.deps.db.run("UPDATE issues SET execution_mode = 'planned' WHERE id = ?", [issueId]);
-      }
-      if (ev === 'start_direct' || ev === 'request_plan' || ev === 'skip_clarifying') {
-        this.store.logEvent(issueId, 'execution_route', {
-          mode: ev === 'start_direct' ? 'direct' : 'planned', reason: opts.note ?? ev,
-        });
-      }
-      if (to === 'implementing') {
-        this.deps.db.run('UPDATE issues SET completion_report_json = NULL WHERE id = ?', [issueId]);
-      }
-      if (ev === 'unblock' && to === 'testing' && fresh.completionReport
-        && (fresh.completionReport.outcome !== 'complete'
-          || fresh.completionReport.unmetGoals.length > 0 || fresh.completionReport.remainingWork.length > 0)) {
-        // 旧报告记录的是解除之前的障碍，不能拿它重新判定本轮恢复失败。
-        // 已验证完整的报告仍可用于执行器/门禁异常后的继续收尾。
-        this.store.setCompletionReport(issueId, null);
-      }
-      issue = fresh;
-      afterCommit?.();
-      return true;
+      if (committed) issue = fresh;
+      return committed;
     };
     let committed = false;
 
@@ -6220,7 +5494,7 @@ export class IssueEngine {
         try { workspace = await this.resolveExecutionWorkspace(issue, project); }
         catch (e) {
           this.store.logEvent(issueId, 'error', { where: 'execution-workspace', error: String(e).slice(0, 200) });
-          return this.applyEventLocked(issueId, 'pause', { note: '执行工作区不可用' }, afterCommit);
+          return this.applyEventLocked(issueId, 'pause', { note: '执行工作区不可用' }, finalizeDb);
         }
         // git 身份预检（#272 / B-01）：必须在 git_branch_prepared 之前，且**两条路径都要过**——
         // 只读/只补 config，不碰工作树与 HEAD，故不破坏下面 legacy 路径「不动 Git 状态」的语义。
@@ -6231,27 +5505,34 @@ export class IssueEngine {
         const prepared = await this.deps.mutex.runExclusive(gitLockKey(project.id), async () => {
           const fresh = this.store.get(issueId);
           if (!fresh || fresh.status !== from) return { kind: 'stale' as const };
-          const branch = await this.prepareIssueBranchLocked(project, fresh, workspace);
+          let branch: Awaited<ReturnType<typeof this.prepareIssueBranchLocked>>;
+          try { branch = await this.prepareIssueBranchLocked(project, fresh, workspace); }
+          catch (error) { return { kind: 'unavailable' as const, err: String(error).slice(0, 300) }; }
           if (!branch.ok) {
             if (branch.actualBranch && fresh.branch !== branch.actualBranch) {
               this.store.setBranch(issueId, branch.actualBranch);
             }
             return { kind: 'blocked' as const, err: branch.err };
           }
-          if (!commitTransition(fresh)) return { kind: 'stale' as const };
-          if (fresh.branch !== branch.branch) this.store.setBranch(issueId, branch.branch);
-          this.store.logEvent(issueId, 'git_branch_prepared', {
-            branch: branch.branch,
-            mode: branch.mode,
-            ...(fresh.sourceRef ? { sourceRef: fresh.sourceRef } : {}),
-          });
+          if (!commitTransition(fresh, () => {
+            if (fresh.branch !== branch.branch) this.store.setBranch(issueId, branch.branch);
+            this.store.logEvent(issueId, 'git_branch_prepared', {
+              branch: branch.branch,
+              mode: branch.mode,
+              ...(fresh.sourceRef ? { sourceRef: fresh.sourceRef } : {}),
+            });
+          })) return { kind: 'stale' as const };
           return { kind: 'ok' as const };
         });
+        if (prepared.kind === 'unavailable') {
+          this.store.logEvent(issueId, 'error', { where: 'git-branch-executor', error: prepared.err });
+          return this.applyEventLocked(issueId, 'pause', { note: `执行机 Git 不可用：${prepared.err}` }, finalizeDb);
+        }
         if (prepared.kind === 'blocked') {
           this.store.logEvent(issueId, 'error', { where: 'git-branch', error: prepared.err });
           return this.applyEventLocked(issueId, 'block', {
             note: `git 分支准备失败：${prepared.err}`,
-          }, afterCommit);
+          }, finalizeDb);
         }
         if (prepared.kind === 'stale') {
           return { ok: false, error: `状态已被并发修改（不再是 ${from}），事件 ${ev} 作废` };
@@ -6269,33 +5550,44 @@ export class IssueEngine {
         try { workspace = await this.resolveExecutionWorkspace(issue, project); }
         catch (e) {
           this.store.logEvent(issueId, 'error', { where: 'execution-workspace', error: String(e).slice(0, 200) });
-          return this.applyEventLocked(issueId, 'pause', { note: '执行工作区不可用' }, afterCommit);
+          return this.applyEventLocked(issueId, 'pause', { note: '执行工作区不可用' }, finalizeDb);
         }
         if (ev === 'start_direct') await this.precheckGitIdentity(project, issueId, workspace.cwd);
         const inspected = await this.deps.mutex.runExclusive(gitLockKey(project.id), async () => {
           const fresh = this.store.get(issueId);
           if (!fresh || fresh.status !== from) return { kind: 'stale' as const };
+          let preparedBranch: { branch: string; mode: string } | null = null;
           if (ev === 'start_direct') {
             if (fresh.targetBranch || workspace.kind === 'design-worktree') {
-              const prepared = await this.prepareIssueBranchLocked(project, fresh, workspace);
+              let prepared: Awaited<ReturnType<typeof this.prepareIssueBranchLocked>>;
+              try { prepared = await this.prepareIssueBranchLocked(project, fresh, workspace); }
+              catch (error) { return { kind: 'unavailable' as const, err: String(error).slice(0, 300) }; }
               if (!prepared.ok) return { kind: 'blocked' as const, err: prepared.err };
-              this.store.logEvent(issueId, 'git_branch_prepared', prepared);
+              preparedBranch = { branch: prepared.branch, mode: prepared.mode };
             }
           }
-          const branch = await this.inspectIssueBranchLocked(project, fresh, workspace);
+          let branch: Awaited<ReturnType<typeof this.inspectIssueBranchLocked>>;
+          try { branch = await this.inspectIssueBranchLocked(project, fresh, workspace); }
+          catch (error) { return { kind: 'unavailable' as const, err: String(error).slice(0, 300) }; }
           if (!branch.ok) return { kind: 'blocked' as const, err: branch.err };
-          if (!commitTransition(fresh)) return { kind: 'stale' as const };
-          if (fresh.branch !== branch.branch) this.store.setBranch(issueId, branch.branch);
-          if (this.store.countEvents(issueId, 'impl_base') === 0 && branch.head) {
-            this.store.logEvent(issueId, 'impl_base', { sha: branch.head, branch: branch.branch });
-          }
+          if (!commitTransition(fresh, () => {
+            if (preparedBranch) this.store.logEvent(issueId, 'git_branch_prepared', preparedBranch);
+            if (fresh.branch !== branch.branch) this.store.setBranch(issueId, branch.branch);
+            if (this.store.countEvents(issueId, 'impl_base') === 0 && branch.head) {
+              this.store.logEvent(issueId, 'impl_base', { sha: branch.head, branch: branch.branch });
+            }
+          })) return { kind: 'stale' as const };
           return { kind: 'ok' as const };
         });
+        if (inspected.kind === 'unavailable') {
+          this.store.logEvent(issueId, 'error', { where: 'git-branch-executor', error: inspected.err });
+          return this.applyEventLocked(issueId, 'pause', { note: `执行机 Git 不可用：${inspected.err}` }, finalizeDb);
+        }
         if (inspected.kind === 'blocked') {
           this.store.logEvent(issueId, 'error', { where: 'git-branch', error: inspected.err });
           return this.applyEventLocked(issueId, 'block', {
             note: `git 分支校验失败：${inspected.err}`,
-          }, afterCommit);
+          }, finalizeDb);
         }
         if (inspected.kind === 'stale') {
           return { ok: false, error: `状态已被并发修改（不再是 ${from}），事件 ${ev} 作废` };
@@ -6357,7 +5649,7 @@ export class IssueEngine {
     return null;
   }
 
-  private async syncModuleIssue(issueId: number): Promise<void> {
+  private async syncModuleIssue(issueId: IssueId): Promise<void> {
     const issue = this.store.get(issueId);
     if (!issue?.moduleId) return;
     const project = this.project(issue.projectId);
@@ -6381,13 +5673,43 @@ export class IssueEngine {
     }
   }
 
+  /**
+   * 解锁 / 恢复 / 重开后重新进入驱动态：上一段已在 blocked/paused/done 时收口，这里补开新段。
+   * 执行页对话按 segment 时间归属过滤消息，不补开的话续跑的整段对话都会被隐藏，
+   * 原生终端里却看得到（#20260928-0fa767d）。首段仍由 startIssue 绑定会话时开启，这里只接续。
+   */
+  private reopenConversationSegment(issue: EngineIssue, to: IssueState): void {
+    if (!DRIVING_STATES.includes(to) || !issue.moduleId || !issue.convId) return;
+    const lastStart = this.store.lastEventId(issue.id, 'conversation_segment_started');
+    const lastEnd = this.store.lastEventId(issue.id, 'conversation_segment_ended');
+    if (lastEnd === 0 || lastStart > lastEnd) return;
+    this.store.logEvent(issue.id, 'conversation_segment_started', {
+      convId: issue.convId,
+      moduleId: issue.moduleId,
+      agent: issue.agent,
+      title: issue.title,
+    });
+  }
+
   /** 阶段进入动作（git 分支流 / 建 gate / 收尾接力）；全部确定性，不交给 LLM */
-  private async onEnter(issueId: number, from: IssueState, to: IssueState, note?: string): Promise<void> {
+  private async onEnter(issueId: IssueId, from: IssueState, to: IssueState, note?: string): Promise<void> {
     const issue = this.store.get(issueId);
     // 防御共享 mutex 之外的 DB 写入：只为仍停留在本次目标状态的 issue 执行 entry action。
     if (!issue || issue.status !== to) return;
     const project = this.project(issue.projectId);
     if (!project) return;
+    // A project may have been moved while an issue was running. The pause transition itself is
+    // durable, but its normal cleanup must not inspect Git or kill tmux on the former executor.
+    const unavailable = this.deps.executionUnavailable?.(project);
+    if (unavailable) {
+      if (to === 'paused' || to === 'blocked' || to === 'cancelled') {
+        if (to === 'cancelled') this.workflowScheduler.cancel(issueId);
+        else this.workflowScheduler.pause(issueId, note ?? unavailable);
+        if (issue.convId) this.watch.delete(issue.convId);
+        this.store.expireWaitingGates(issueId);
+      }
+      return;
+    }
     let workspace: EngineExecutionWorkspace;
     try { workspace = await this.resolveExecutionWorkspace(issue, project); }
     catch (e) {
@@ -6400,6 +5722,8 @@ export class IssueEngine {
       }
       return;
     }
+
+    this.reopenConversationSegment(issue, to);
 
     switch (to) {
       case 'planning': {
@@ -6416,7 +5740,7 @@ export class IssueEngine {
             await this.activateConv(issue);
           } catch (e) {
             await this.applyEventLocked(issueId, 'pause', {
-              note: `激活对话失败：${String(e).slice(0, 200)}`,
+              note: e instanceof InputSubmitUnconfirmedError ? e.message : `激活对话失败：${String(e).slice(0, 200)}`,
             });
             return;
           }
@@ -6479,12 +5803,27 @@ export class IssueEngine {
         // 实际分支校验、issues.branch 与首条 impl_base 已在 implementing CAS 发布前原子准备。
         // I1：plan_review approve 等路径进 implementing 时项目可能没有激活对话
         // （迁移场景：issue/conv 已入库但 project_active_conv 空）——此时激活，别静默冻结。
-        if (!(await this.ensureActiveConv(issue, from === 'blocked' || from === 'paused'))) return;
+        // #306：直执行开工（pending/clarifying → implementing）与 planning 首次进入同理，
+        // 已取得队列执行权，必须无条件激活本 issue 对话。上一条 paused/blocked 收尾时先接力
+        // 再判休眠，接力后项目仍 busy → 不 sleep，激活行还指着旧 conv；只 ensure 会被
+        // tick 的 conv_displaced 门禁永久跳过（状态 implementing、tmux 会话却从未创建）。
+        if (from === 'pending' || from === 'clarifying') {
+          try {
+            await this.activateConv(issue);
+          } catch (e) {
+            await this.applyEventLocked(issueId, 'pause', {
+              note: e instanceof InputSubmitUnconfirmedError ? e.message : `激活对话失败：${String(e).slice(0, 200)}`,
+            });
+            return;
+          }
+        } else if (!(await this.ensureActiveConv(issue, from === 'blocked' || from === 'paused'))) {
+          return;
+        }
         break;
       }
       case 'testing': {
         if (this.workflowSnapshot(issueId)) {
-          await this.applyEventLocked(issueId, 'tests_passed', { note: '工作流节点已全部完成' });
+          await this.completeWorkflowTesting(issueId, project, true);
           break;
         }
         if (!(await this.ensureActiveConv(issue, from === 'blocked' || from === 'paused'))) return;
@@ -6498,10 +5837,8 @@ export class IssueEngine {
             this.store.logEvent(issueId, 'error', { where: 'validation-scope', error: String(e).slice(0, 200) });
           }
         }
-        if ((from === 'paused' || from === 'blocked') && issue.executionMode === 'direct' && !issue.completionReport && issue.convId) {
-          await this.inject(this.deps.convs.tmuxName(issue.projectId,issue.convId),this.buildIssueNudge({issue,stage:'testing',locale:this.promptLocale(issue,project)}));
-          this.store.logEvent(issue.id,'injected',{stage:'testing',kind:'report_recovery'});
-        }
+        // 恢复后不能在 activate 刚返回时立刻补发报告：此刻新 tmux 的前台仍可能是 bash。
+        // 统一交给 tick，在真实输入行出现后按正常 kickoff / 报告补发路径继续。
         break; // kickoff 注入测试 prompt
       }
       case 'merge_review': {
@@ -6525,9 +5862,9 @@ export class IssueEngine {
             .runExclusive(gitLockKey(project.id), async () => {
               const branch = await this.inspectIssueBranchLocked(project, issue, workspace);
               if (!branch.ok) return branch;
-              const autoFailure = await this.autoCommitPushLocked(project, issue, workspace);
+              const autoFailure = await this.gitDelivery.deliverLocked(project, issue, workspace);
               await this.stampImplTip(project, issue, workspace);
-              const status = await this.deps.driver.git(workspace.cwd, ['status', '--porcelain']);
+              const status = await this.driverForProject(project).git(workspace.cwd, ['status', '--porcelain']);
               const snapshot = this.implCommits(issue.id);
               const emptyImplRange = !snapshot
                 || (snapshot.commits.length === 0 && snapshot.files.length === 0);
@@ -6622,6 +5959,11 @@ export class IssueEngine {
       case 'cancelled': {
         if (to === 'blocked' || to === 'paused') this.workflowScheduler.pause(issueId, note ?? 'issue.blocked');
         if (to === 'cancelled') this.workflowScheduler.cancel(issueId);
+        if (to === 'paused' && note?.startsWith('PANDA_INPUT_SUBMIT_UNCONFIRMED') && issue.convId) {
+          // 保留 tmux 输入现场，但释放项目激活指针；否则其它模块 activate 会杀掉旧会话。
+          this.deps.db.query('DELETE FROM project_active_conv WHERE project_id = ? AND conv_id = ?')
+            .run(issue.projectId, issue.convId);
+        }
         if (issue.convId) this.watch.delete(issue.convId);
         this.store.expireWaitingGates(issueId);
         // 定格本 issue 终点 + 提交快照——仅作**兜底**：blocked/cancelled 若没走过 merge_review
@@ -6675,6 +6017,7 @@ export class IssueEngine {
           await this.scheduleNext(issue.projectId, { preferModuleKey: moduleKeyOf(issue), source: 'relay' });
         }
         if (
+          !(to === 'paused' && note?.startsWith('PANDA_INPUT_SUBMIT_UNCONFIRMED')) &&
           issue.convId &&
           !isBusy(this.store.listByProject(issue.projectId)) &&
           this.deps.convs.sleepIssue
@@ -6713,7 +6056,7 @@ export class IssueEngine {
    */
   private async precheckGitIdentity(
     project: Project,
-    issueId: number,
+    issueId: IssueId,
     cwd: string,
   ): Promise<void> {
     const fallback = buildFallbackIdentity({
@@ -6721,7 +6064,7 @@ export class IssueEngine {
       ownerUsername: this.ownerUsername(project),
     });
     const ensured = await this.deps.mutex
-      .runExclusive(gitLockKey(project.id), () => ensureGitIdentity(this.deps.driver, cwd, fallback))
+      .runExclusive(gitLockKey(project.id), () => ensureGitIdentity(this.driverForProject(project), cwd, fallback))
       .catch((e: unknown) => ({ ok: false as const, error: String(e).slice(0, 300) }));
     if (!ensured.ok) {
       this.store.logEvent(issueId, 'error', {
@@ -6781,8 +6124,9 @@ export class IssueEngine {
       const project = this.project(issue.projectId)!;
       const ex = this.deps.db.query<{claude_dir:string},[number]>('SELECT claude_dir FROM executors WHERE id=?').get(project.executorId);
       const homes = ex ? agentHomesFromClaudeDir(ex.claude_dir) : null;
-      const skills = [...await listProjectSkills(this.deps.driver,cwd),
-        ...(homes ? await listGlobalSkills(this.deps.driver,homes) : [])];
+      const driver = this.driverForProject(project);
+      const skills = [...await listProjectSkills(driver,cwd),
+        ...(homes ? await listGlobalSkills(driver,homes) : [])];
       const policy = effectiveSkillPolicy(this.deps.db,{projectId:issue.projectId,moduleId:issue.moduleId ?? undefined,issueId:issue.id});
       // Preserve explicit module allow-lists during migration to three-state policy.
       if (issue.moduleId) {
@@ -6820,6 +6164,7 @@ export class IssueEngine {
     | { ok: true; branch: string; mode: 'current' | 'existing' | 'created' }
     | { ok: false; err: string; actualBranch?: string }
   > {
+    const driver = this.driverForProject(project);
     // 调用方已持有 git:<projectId>；这里不得再次获取同 key（KeyedMutex 非重入）。
       const cwd = workspace.cwd;
       const target = workspace.kind === 'design-worktree'
@@ -6834,20 +6179,20 @@ export class IssueEngine {
           : inspected;
       }
 
-      const repo = await this.deps.driver.git(cwd, ['rev-parse', '--is-inside-work-tree']);
+      const repo = await driver.git(cwd, ['rev-parse', '--is-inside-work-tree']);
       if (repo.code !== 0 || repo.out.trim() !== 'true') {
         return { ok: false, err: `不是有效 Git 工作区：${(repo.err || repo.out).trim().slice(0, 200)}` };
       }
-      const targetFormat = await this.deps.driver.git(cwd, ['check-ref-format', `refs/heads/${target}`]);
+      const targetFormat = await driver.git(cwd, ['check-ref-format', `refs/heads/${target}`]);
       if (targetFormat.code !== 0) return { ok: false, err: `目标分支名无效：${target}` };
 
-      const currentResult = await this.deps.driver.git(cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+      const currentResult = await driver.git(cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
       const current = currentResult.code === 0 ? currentResult.out.trim() : '';
       if (current === target) {
         return { ok: true, branch: target, mode: 'current' };
       }
 
-      const status = await this.deps.driver.git(cwd, [
+      const status = await driver.git(cwd, [
         'status',
         '--porcelain=v1',
         '--untracked-files=normal',
@@ -6863,7 +6208,7 @@ export class IssueEngine {
       }
 
       const targetRef = `refs/heads/${target}`;
-      const exists = await this.deps.driver.git(cwd, ['show-ref', '--verify', '--quiet', targetRef]);
+      const exists = await driver.git(cwd, ['show-ref', '--verify', '--quiet', targetRef]);
       if (exists.code !== 0 && exists.code !== 1) {
         return { ok: false, err: `检查目标分支失败：${(exists.err || exists.out).trim().slice(0, 200)}` };
       }
@@ -6872,16 +6217,16 @@ export class IssueEngine {
       let mode: 'existing' | 'created';
       if (exists.code === 0) {
         mode = 'existing';
-        checkout = await this.deps.driver.git(cwd, ['checkout', '--no-overwrite-ignore', target]);
+        checkout = await driver.git(cwd, ['checkout', '--no-overwrite-ignore', target]);
       } else {
         const source = issue.sourceRef?.trim() ?? '';
         if (!source) return { ok: false, err: `目标分支 ${target} 不存在，且未选择源分支` };
         if (!/^refs\/(?:heads|remotes)\/.+/.test(source)) {
           return { ok: false, err: `源分支引用无效：${source}` };
         }
-        const sourceFormat = await this.deps.driver.git(cwd, ['check-ref-format', source]);
+        const sourceFormat = await driver.git(cwd, ['check-ref-format', source]);
         if (sourceFormat.code !== 0) return { ok: false, err: `源分支引用无效：${source}` };
-        const sourceCommit = await this.deps.driver.git(cwd, [
+        const sourceCommit = await driver.git(cwd, [
           'rev-parse',
           '--verify',
           '--quiet',
@@ -6893,7 +6238,7 @@ export class IssueEngine {
         mode = 'created';
         // source 只是创建基线，不是目标分支的 upstream；尤其从 origin/main 创建 feature/*
         // 时不能让后续普通 push 误推 main。ignored 冲突也必须失败，不能静默覆盖本地文件。
-        checkout = await this.deps.driver.git(cwd, [
+        checkout = await driver.git(cwd, [
           'checkout',
           '--no-overwrite-ignore',
           '--no-track',
@@ -6908,10 +6253,10 @@ export class IssueEngine {
           err: `切换目标分支 ${target} 失败：${(checkout.err || checkout.out).trim().slice(0, 200)}`,
         };
       }
-      const after = await this.deps.driver.git(cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+      const after = await driver.git(cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
       let actual = after.code === 0 ? after.out.trim() : '';
       if (!actual) {
-        const fallback = await this.deps.driver.git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
+        const fallback = await driver.git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
         const fallbackBranch = fallback.code === 0 ? fallback.out.trim() : '';
         if (fallbackBranch && fallbackBranch !== 'HEAD') actual = fallbackBranch;
       }
@@ -6937,7 +6282,7 @@ export class IssueEngine {
     workspace: EngineExecutionWorkspace,
   ): Promise<string> {
     if (issue.branch) return issue.branch;
-    const cur = await this.deps.driver.git(workspace.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    const cur = await this.driverForProject(project).git(workspace.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
     const b = cur.code === 0 ? cur.out.trim() : '';
     if (b && b !== 'HEAD') return b;
     return (project.workBranch ?? '').trim();
@@ -6956,7 +6301,8 @@ export class IssueEngine {
     | { ok: true; branch: string; head: string | null }
     | { ok: false; err: string }
   > {
-    const currentResult = await this.deps.driver.git(workspace.cwd, [
+    const driver = this.driverForProject(project);
+    const currentResult = await driver.git(workspace.cwd, [
       'symbolic-ref',
       '--quiet',
       '--short',
@@ -6973,7 +6319,7 @@ export class IssueEngine {
       };
     }
     const branch = expected || actual || (project.workBranch ?? '').trim();
-    const headResult = await this.deps.driver.git(workspace.cwd, ['rev-parse', '--verify', 'HEAD']);
+    const headResult = await driver.git(workspace.cwd, ['rev-parse', '--verify', 'HEAD']);
     const head = headResult.code === 0 && headResult.out.trim() ? headResult.out.trim() : null;
     return { ok: true, branch, head };
   }
@@ -6983,7 +6329,7 @@ export class IssueEngine {
    * per-issue git 视图都据此只取本 issue 的提交，而非分支上历史 issue 的全部改动）。public：
    * server 装配 issueGitRef 时读取（见 routes/index）。
    */
-  implBaseSha(issueId: number): string | null {
+  implBaseSha(issueId: IssueId): string | null {
     return this.eventSha(issueId, 'impl_base', 'first');
   }
 
@@ -6992,7 +6338,7 @@ export class IssueEngine {
    * blocked→unblock 再实施会覆写。per-issue git 视图据此把范围收在 start..tip，避免把分支上
    * **后续** issue 的提交也算进本 issue。issue 仍在推进（implementing/testing）时无此锚点，视图退回分支 tip。
    */
-  implTipSha(issueId: number): string | null {
+  implTipSha(issueId: IssueId): string | null {
     return this.eventSha(issueId, 'impl_tip', 'last');
   }
 
@@ -7001,7 +6347,7 @@ export class IssueEngine {
    * commit id 不可变，据此重算 diff 永远稳定，天然免疫「固定分支后续其它 issue 又提交」把范围
    * 算糊的问题。无快照（老 issue / 从未落地改动）→ null。取最后一条（unblock 再实施会覆写）。
    */
-  implCommits(issueId: number): ImplCommitsSnapshot | null {
+  implCommits(issueId: IssueId): ImplCommitsSnapshot | null {
     let found: ImplCommitsSnapshot | null = null;
     for (const e of this.store.listEvents(issueId)) {
       if (e.kind !== 'impl_commits' || !e.dataJson) continue;
@@ -7016,7 +6362,7 @@ export class IssueEngine {
   }
 
   /** 取某 kind 事件 data.sha（first=最早一条，last=最新一条），无则 null。 */
-  private eventSha(issueId: number, kind: string, pick: 'first' | 'last'): string | null {
+  private eventSha(issueId: IssueId, kind: string, pick: 'first' | 'last'): string | null {
     let found: string | null = null;
     for (const e of this.store.listEvents(issueId)) {
       if (e.kind !== kind || !e.dataJson) continue;
@@ -7047,20 +6393,20 @@ export class IssueEngine {
   ): Promise<void> {
     const startSha = this.implBaseSha(issue.id);
     if (startSha === null) return; // 无起点则无从定范围
-    const head = await this.deps.driver.git(workspace.cwd, ['rev-parse', 'HEAD']);
+    const head = await this.driverForProject(project).git(workspace.cwd, ['rev-parse', 'HEAD']);
     const tip = head.code === 0 ? head.out.trim() : '';
     if (!tip) return;
     this.store.logEvent(issue.id, 'impl_tip', { sha: tip });
     // 耐久快照：本 issue 净提交（commit ids）+ 逐文件改动。同一 base..tip 已记过则不重复
     // （merge_review 与终态各会调一次 stampImplTip）。
     if (!this.hasCommitSnapshot(issue.id, startSha, tip)) {
-      const snap = await this.collectImplCommits(workspace.cwd, startSha, tip);
+      const snap = await this.collectImplCommits(project, workspace.cwd, startSha, tip);
       this.store.logEvent(issue.id, 'impl_commits', { base: startSha, tip, ...snap });
     }
   }
 
   /** 同一 base..tip 的 impl_commits 快照是否已记过（避免 merge_review + 终态重复落库）。 */
-  private hasCommitSnapshot(issueId: number, base: string, tip: string): boolean {
+  private hasCommitSnapshot(issueId: IssueId, base: string, tip: string): boolean {
     for (const e of this.store.listEvents(issueId)) {
       if (e.kind !== 'impl_commits' || !e.dataJson) continue;
       try {
@@ -7078,178 +6424,26 @@ export class IssueEngine {
    * base 是 tip 的祖先，故两点 range 即「本 issue 自己的提交/改动」，与分支上历史 issue 无涉。
    */
   private async collectImplCommits(
+    project: Project,
     cwd: string,
     base: string,
     tip: string,
   ): Promise<{ commits: ImplCommit[]; files: ImplFile[] }> {
     const range = `${base}..${tip}`;
+    const driver = this.driverForProject(project);
     const [logR, nameR, numR] = await Promise.all([
-      this.deps.driver.git(cwd, [
+      driver.git(cwd, [
         'log', '--date-order', '-n', '500',
         `--pretty=format:%H${GIT_FIELD_SEP}%h${GIT_FIELD_SEP}%an${GIT_FIELD_SEP}%at${GIT_FIELD_SEP}%s`,
         range,
       ]),
-      this.deps.driver.git(cwd, ['diff', '-M', '--name-status', range]),
-      this.deps.driver.git(cwd, ['diff', '-M', '--numstat', range]),
+      driver.git(cwd, ['diff', '-M', '--name-status', range]),
+      driver.git(cwd, ['diff', '-M', '--numstat', range]),
     ]);
     return {
       commits: logR.code === 0 ? parseImplCommits(logR.out) : [],
       files: parseImplFiles(nameR.code === 0 ? nameR.out : '', numR.code === 0 ? numR.out : ''),
     };
-  }
-
-  /**
-   * commit 失败后的身份自愈（#272 / B-01）：绝大多数自动提交失败其实只是
-   * `Author identity unknown`。补上身份返回 true（值得原样重试一次）；本来就有身份
-   * （说明失败另有原因）或补不上，返回 false 让调用方照常降级。
-   *
-   * 调用方已持有 `git:<projectId>`，这里**不得**再取同 key（KeyedMutex 非重入）。
-   */
-  private async healGitIdentityLocked(
-    project: Project,
-    issueId: number,
-    cwd: string,
-  ): Promise<boolean> {
-    const fallback = buildFallbackIdentity({
-      runUser: project.runUser,
-      ownerUsername: this.ownerUsername(project),
-    });
-    const ensured = await ensureGitIdentity(this.deps.driver, cwd, fallback);
-    if (!ensured.ok) {
-      this.store.logEvent(issueId, 'error', {
-        where: 'git-identity',
-        error: (ensured.error ?? 'Git 身份自愈失败').slice(0, 300),
-      });
-      return false;
-    }
-    if (!ensured.changed) return false; // 身份本来就在，重试同一条 commit 只会再失败一次
-    this.store.logEvent(issueId, 'git_identity', {
-      applied: true,
-      recovered: true, // 与开跑前的预检区分：这条是提交失败后现补的
-      scope: ensured.scope,
-      name: ensured.name,
-      email: ensured.email,
-    });
-    return true;
-  }
-
-  /**
-   * push 被远端拒（远端有我没有的提交）→ `fetch origin <branch>` + `rebase FETCH_HEAD`
-   * 后重试一次（#272 / B-02）。返回重试后的 push 结果；没条件重试则返回 null（保留原始失败）。
-   *
-   * 两个必须守住的点：
-   * - **rebase 冲突一定要 `--abort`**：否则仓库停在 rebase 中途，下一条 issue 一开跑
-   *   就撞上「工作区有未保存改动」，一个推送失败会连坐整条队列。
-   * - **detached HEAD 不重试**：没有对应的远端分支可 fetch/rebase，硬试只会把现场搅乱。
-   */
-  private async rebaseAndRetryPushLocked(
-    issueId: number,
-    cwd: string,
-    pushArgs: string[],
-  ): Promise<GitResult | null> {
-    const head = await this.deps.driver.git(cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
-    const branch = head.code === 0 ? head.out.trim() : '';
-    if (!branch) return null;
-    const fetched = await this.gitTransport(cwd, ['fetch', 'origin', branch]);
-    if (fetched.code !== 0) return fetched;
-    const rebased = await this.deps.driver.git(cwd, ['rebase', 'FETCH_HEAD']);
-    if (rebased.code !== 0) {
-      await this.deps.driver.git(cwd, ['rebase', '--abort']); // 收干净，别把仓库留在半途
-      this.store.logEvent(issueId, 'auto_push_retry', {
-        reason: 'rejected',
-        branch,
-        result: 'rebase_failed',
-        error: (rebased.err || rebased.out).slice(0, 300),
-      });
-      return null;
-    }
-    this.store.logEvent(issueId, 'auto_push_retry', { reason: 'rejected', branch, result: 'rebased' });
-    return this.gitTransport(cwd, pushArgs);
-  }
-
-  // 网络命令超时与普通非零退出码走同一条“未推送”路径。
-  // 不包住 commit/rebase 等本地写操作：这些失败可能影响开发现场，仍须单独处理。
-  private async gitTransport(cwd: string, args: string[]): Promise<GitResult> {
-    try {
-      return await this.deps.driver.git(cwd, args);
-    } catch (error) {
-      return { code: 1, out: '', err: String(error) };
-    }
-  }
-
-  /**
-   * 自动收尾（manual_review 关，tests_passed 后）：git add -A → 有暂存改动才 commit
-   * 「<标题> (#id)」→ push origin 当前分支（HEAD）。commit 失败会保留现场并阻止完成；
-   * push 失败只记事件+通知，不阻止本地已经提交完成的 issue 收尾。
-   * 没有新 commit 也照样 push（CC 实施中自己 commit 过、只欠 push 是常态）。
-   *
-   * #272 加固的三处：
-   * - commit 失败先补身份重试一次（见 healGitIdentityLocked），仍失败才降级；
-   * - **push 前预检 origin**：没有远端的项目（本地私有仓库）记 `push_skipped` 就收工，
-   *   那不是故障，不该每次收尾都刷一条 error 和一次通知；
-   * - 被拒（fetch first / non-fast-forward）fetch+rebase 重试一次；最终仍失败要留下
-   *   `auto_push_failed` 这个**持久可见标记**——push 失败不挡完成，但绝不能静默 done。
-   */
-  private async autoCommitPushLocked(
-    project: Project,
-    issue: EngineIssue,
-    workspace: EngineExecutionWorkspace,
-  ): Promise<{ where: 'auto_commit' | 'auto_push'; detail: string } | null> {
-    const cwd = workspace.cwd;
-    const branchLabel = issue.branch ?? 'HEAD';
-    const fail = (where: 'auto_commit' | 'auto_push', detail: string) => {
-      this.store.logEvent(issue.id, 'error', { where, error: detail.slice(0, 300) });
-      return { where, detail };
-    };
-    const add = await this.deps.driver.git(cwd, ['add', '-A']);
-    if (add.code !== 0) {
-      return fail('auto_commit', add.err || add.out);
-    }
-    // diff --cached --quiet：0 = 无暂存改动（跳过 commit），非 0 = 有改动要提
-    const staged = await this.deps.driver.git(cwd, ['diff', '--cached', '--quiet']);
-    if (staged.code !== 0) {
-      const msg = `${issue.title.slice(0, 120)} (#${issue.id})`;
-      let commit = await this.deps.driver.git(cwd, ['commit', '-m', msg]);
-      if (commit.code !== 0) {
-        // 自愈一次：身份补上了就原样重试，别为 Author identity unknown 叫醒用户
-        if (!(await this.healGitIdentityLocked(project, issue.id, cwd))) {
-          return fail('auto_commit', commit.err || commit.out); // commit 失败就没有新提交可推
-        }
-        commit = await this.deps.driver.git(cwd, ['commit', '-m', msg]);
-        if (commit.code !== 0) return fail('auto_commit', commit.err || commit.out);
-      }
-      this.store.logEvent(issue.id, 'auto_commit', { message: msg });
-    }
-    const remote = await this.deps.driver.git(cwd, ['remote', 'get-url', 'origin']);
-    if (remote.code !== 0) {
-      this.store.logEvent(issue.id, 'push_skipped', { reason: 'no-remote', branch: branchLabel });
-      return null; // 没有远端可推 ≠ 推失败
-    }
-    let pushArgs = ['push', 'origin', 'HEAD'];
-    if (workspace.kind === 'design-worktree') {
-      const upstream = await this.deps.driver.git(cwd, [
-        'rev-parse', '--symbolic-full-name', '@{upstream}',
-      ]);
-      if (upstream.code !== 0 || !upstream.out.trim().startsWith('refs/remotes/')) {
-        pushArgs = ['push', '--set-upstream', 'origin', 'HEAD'];
-      }
-    }
-    let push = await this.gitTransport(cwd, pushArgs);
-    if (push.code !== 0 && PUSH_REJECTED_RE.test(push.err || push.out)) {
-      const retried = await this.rebaseAndRetryPushLocked(issue.id, cwd, pushArgs);
-      if (retried) push = retried;
-    }
-    if (push.code !== 0) {
-      const detail = push.err || push.out;
-      // 持久可见标记：本地已提交，issue 照常完成，但详情页要一直挂着「未推送」
-      this.store.logEvent(issue.id, 'auto_push_failed', {
-        branch: branchLabel,
-        detail: detail.slice(0, 300),
-      });
-      return fail('auto_push', detail);
-    }
-    this.store.logEvent(issue.id, 'auto_push', { branch: branchLabel });
-    return null;
   }
 
   private async buildMergeReviewPayload(
@@ -7265,10 +6459,11 @@ export class IssueEngine {
     const startSha = this.implBaseSha(issue.id);
     const endSha = this.implTipSha(issue.id) ?? branch;
     const range = startSha ? `${startSha}..${endSha}` : `${base}...${branch}`;
-    const stat = await this.deps.driver.git(workspace.cwd, ['diff', '--stat', range]);
-    const diff = await this.deps.driver.git(workspace.cwd, ['diff', range]);
+    const driver = this.driverForProject(project);
+    const stat = await driver.git(workspace.cwd, ['diff', '--stat', range]);
+    const diff = await driver.git(workspace.cwd, ['diff', range]);
     // 本 issue 涉及的 commit ids + 逐文件改动随卡点②一并给出（评审直接看到具体提交）。
-    const snap = startSha ? await this.collectImplCommits(workspace.cwd, startSha, endSha) : null;
+    const snap = startSha ? await this.collectImplCommits(project, workspace.cwd, startSha, endSha) : null;
     return {
       branch,
       base,
@@ -7390,7 +6585,7 @@ export class IssueEngine {
     } catch (e) {
       // ensureActiveConv 只从 onEnter 调用，此处已持有本 issue 的 transition 锁。
       await this.applyEventLocked(issue.id, 'pause', {
-        note: `激活对话失败：${String(e).slice(0, 200)}`,
+        note: e instanceof InputSubmitUnconfirmedError ? e.message : `激活对话失败：${String(e).slice(0, 200)}`,
       });
       return false;
     }
@@ -7411,11 +6606,20 @@ export class IssueEngine {
     await this.resetWatch(convId);
   }
 
+  /** 自动文本投递的统一前置条件：目标逻辑会话当前激活，且窗格已画出真实代理输入行。 */
+  private async issueInputReady(issue: EngineIssue): Promise<boolean> {
+    if (!issue.convId || this.deps.convs.currentConv(issue.projectId) !== issue.convId) return false;
+    const session = this.deps.convs.tmuxName(issue.projectId, issue.convId);
+    const pane = await this.executionForIssue(issue).driver.capturePane(session).catch(() => '');
+    return paneHasAgentInput(issue.agent, pane);
+  }
+
   private async resetWatch(convId: string): Promise<WatchState> {
     let offset = 0;
-    const path = await this.deps.locator.locate(convId);
+    const execution = this.executionForConversation(convId);
+    const path = await execution.locator.locate(convId);
     if (path) {
-      const st = await this.reader.statPath(path).catch(() => null);
+      const st = await execution.driver.statPath(path).catch(() => null);
       offset = st?.size ?? 0;
     }
     const now = this.now();
@@ -7445,9 +6649,11 @@ export class IssueEngine {
   }
 
   /** tmux 会话判活；listSessions 失败返回 null（未知——保守不按死会话处理） */
-  private async sessionAlive(name: string): Promise<boolean | null> {
+  private async sessionAlive(projectId: number, name: string): Promise<boolean | null> {
     try {
-      return (await this.deps.driver.listSessions()).some((s) => s.name === name);
+      const project = this.project(projectId);
+      if (!project) return null;
+      return (await this.driverForProject(project).listSessions()).some((s) => s.name === name);
     } catch {
       return null;
     }
@@ -7464,20 +6670,24 @@ export class IssueEngine {
    * - listSessions 失败一律 unknown（与 sessionAlive 同纪律：判活失败绝不当成死会话）。
    */
   private async sessionLiveness(
+    projectId: number,
     agent: AgentKind,
     session: string,
     pane?: string,
     quietMs?: number,
   ): Promise<AgentLiveness | 'no-session'> {
     if (pane !== undefined && !shouldProbeLiveness(agent, pane)) return 'live';
+    const project = this.project(projectId);
+    if (!project) return 'unknown';
+    const driver = this.driverForProject(project);
     let entry: { name: string; command?: string } | undefined;
     try {
-      entry = (await this.deps.driver.listSessions()).find((s) => s.name === session);
+      entry = (await driver.listSessions()).find((s) => s.name === session);
     } catch {
       return 'unknown';
     }
     if (!entry) return 'no-session';
-    const screen = pane ?? (await this.deps.driver.capturePane(session).catch(() => undefined));
+    const screen = pane ?? (await driver.capturePane(session).catch(() => undefined));
     return judgeAgentLiveness({
       agent,
       ...(entry.command !== undefined ? { paneCommand: entry.command } : {}),
@@ -7488,9 +6698,10 @@ export class IssueEngine {
 
   /** 距该对话的 jsonl 最近一次写入过了多久（判死硬闸的第三方证据）；拿不到返回 undefined */
   private async convQuietMs(convId: string): Promise<number | undefined> {
-    const p = await this.deps.locator.locate(convId).catch(() => null);
+    const execution = this.executionForConversation(convId);
+    const p = await execution.locator.locate(convId).catch(() => null);
     if (!p) return undefined;
-    const st = await this.deps.driver.statPath(p).catch(() => null);
+    const st = await execution.driver.statPath(p).catch(() => null);
     return st ? Math.max(0, this.now() - st.mtimeMs) : undefined;
   }
 
@@ -7544,7 +6755,7 @@ export class IssueEngine {
         where: 'agentRestart',
         error: String(e).slice(0, 200),
       });
-      if (e instanceof AgentExecutableNotFoundError) {
+      if (e instanceof AgentExecutableNotFoundError || e instanceof InputSubmitUnconfirmedError) {
         await this.applyEvent(issue.id, 'pause', { note: e.message });
       }
     }
@@ -7555,16 +6766,17 @@ export class IssueEngine {
    * （project → tmux，见 mutex.ts），但走 relaunch——activate 在「会话还在」时会短路，
    * 正是本 issue 要治的那种壳。重启后 resetWatch（offset 从新文件末尾起）。
    */
-  private async relaunchConv(issue: EngineIssue): Promise<void> {
+  private async relaunchConv(issue: EngineIssue, beforeLaunch?: () => void): Promise<void> {
     if (!issue.convId) throw new Error('issue 未绑对话');
     const convId = issue.convId;
     const session = this.deps.convs.tmuxName(issue.projectId, convId);
     const got = await this.deps.mutex.runExclusive(projectLockKey(issue.projectId), () =>
-      this.deps.mutex.runExclusive(tmuxLockKey(session), () =>
-        this.deps.convs.relaunch
+      this.deps.mutex.runExclusive(tmuxLockKey(session), () => {
+        beforeLaunch?.();
+        return this.deps.convs.relaunch
           ? this.deps.convs.relaunch(convId)
-          : this.deps.convs.activate(convId),
-      ),
+          : this.deps.convs.activate(convId);
+      }),
     );
     if (!got) throw new Error(`对话 ${convId} 不存在`);
     await this.resetWatch(convId);
@@ -7581,7 +6793,7 @@ export class IssueEngine {
    * planning/implementing/testing 各 5 次共 15 次，对不上；而真正的病灶（#41 的 71 次）
    * 本来就集中在同一个阶段里。从未介入过返回 0 = 从 issue 创建起算全量。
    */
-  private attentionAnchor(issueId: number): number {
+  private attentionAnchor(issueId: IssueId): number {
     return Math.max(
       this.store.lastEventId(issueId, 'reopened'),
       this.store.lastEventId(issueId, 'unblock_guidance'),
@@ -7596,7 +6808,7 @@ export class IssueEngine {
    * 因为催办/判定的预算该随任何一次人工介入回满；而止损闸盯的是「这条 issue 到底
    * 烧了多少」，只有用户明确看过账单说「继续」才应该重新计。
    */
-  private stopLossAnchor(issueId: number): number {
+  private stopLossAnchor(issueId: IssueId): number {
     return this.store.lastEventId(issueId, 'stop_loss_resumed');
   }
 
@@ -7642,7 +6854,7 @@ export class IssueEngine {
    */
   private async tripStopLoss(
     issue: EngineIssue,
-    apply: (id: number, ev: IssueMachineEvent, opts: {
+    apply: (id: IssueId, ev: IssueMachineEvent, opts: {
       note?: string; stopLoss?: boolean;
     }) => Promise<ApplyResult>,
   ): Promise<boolean> {
@@ -7711,8 +6923,8 @@ export class IssueEngine {
   }
 
   /** 弹窗滞留中的驱动 issue id 集合（summary 聚合「待确认」角标的数据源之二） */
-  menuStuckIssueIds(): Set<number> {
-    const out = new Set<number>();
+  menuStuckIssueIds(): Set<IssueId> {
+    const out = new Set<IssueId>();
     for (const issue of this.store.listDriving()) {
       if (this.menuStuck(issue)) out.add(issue.id);
     }
@@ -7741,8 +6953,12 @@ export class IssueEngine {
       let promise!: Promise<void>;
       promise = Promise.resolve()
         .then(() => this.tickIssue(issue))
-        .catch((e) => {
+        .catch(async (e) => {
           this.store.logEvent(issue.id, 'error', { where: 'tick', error: String(e).slice(0, 300) });
+          if (e instanceof InputSubmitUnconfirmedError) {
+            // 输入仍在 composer；暂停并保留阶段，下一轮不能重新灌入整段 prompt。
+            await this.applyEvent(issue.id, 'pause', { note: e.message });
+          }
         })
         .finally(() => {
           const current = this.tickFlights.get(issue.projectId);
@@ -7785,7 +7001,7 @@ export class IssueEngine {
       case 'testing': {
         const workflow = this.workflowSnapshot(issue.id);
         if (workflow?.status === 'completed') {
-          await this.applyEvent(issue.id, 'tests_passed', { note: '工作流节点已全部完成' });
+          await this.completeWorkflowTesting(issue.id, project, false);
         } else if (workflow?.status === 'failed') {
           await this.applyEvent(issue.id, 'pause', {
             note: `工作流执行失败：${workflow.pauseReason ?? 'workflow.failed'}`,
@@ -7802,7 +7018,7 @@ export class IssueEngine {
    * 从 assistant 文本里捞结构化完成报告（#275 / I-05）：多条文本取**第一份能解析通过的**。
    * 报告是锦上添花——解析不通过只落一条观测事件，绝不影响收尾流程本身。
    */
-  private captureCompletionReport(issueId: number, texts: string[]): void {
+  private captureCompletionReport(issueId: IssueId, texts: string[]): void {
     let sawBlock = false;
     for (const t of texts) {
       if (!/^\s*REPORT_BEGIN\s*$/m.test(t)) continue;
@@ -7826,6 +7042,12 @@ export class IssueEngine {
       || this.store.hasUnresolvedExecutionSyncEffect(issue.id)) return;
     const project = this.project(issue.projectId);
     if (!project) return;
+    const unavailable = this.deps.executionUnavailable?.(project);
+    if (unavailable) {
+      await this.applyEvent(issue.id, 'pause', { note: unavailable });
+      return;
+    }
+    const execution = this.executionForProject(project);
     // 止损闸（#274）：放在最前面。「累计运行 > 4 小时」这类条件不依赖任何状态迁移，
     // 只有 tick 会发现它；命中就收手，本 tick 一个字都不再注入。
     if (await this.tripStopLoss(issue, (id, blockEvent, blockOpts) =>
@@ -7851,7 +7073,7 @@ export class IssueEngine {
           where: 'reactivate',
           error: String(e).slice(0, 200),
         });
-        if (e instanceof AgentExecutableNotFoundError) {
+        if (e instanceof AgentExecutableNotFoundError || e instanceof InputSubmitUnconfirmedError) {
           await this.applyEvent(issue.id, 'pause', { note: e.message });
         }
         return;
@@ -7879,14 +7101,14 @@ export class IssueEngine {
     const now = this.now();
 
     // 菜单检测 + 滞留可观测（评审 H16 黑洞防线）
-    const pane = await this.deps.driver.capturePane(session).catch(() => '');
+    const pane = await execution.driver.capturePane(session).catch(() => '');
 
     // 会话自愈（issue #88）：systemd 重启/宿主重启会把 tmux 连坐杀掉，而 project_active_conv
     // 行还在——currentConv 一致但 tmux 会话已不存在时，旧逻辑每 tick 往死会话 send-keys 刷错、
     // 永不重建。pane 空（capturePane 抛错被吞）才查判活（健康路径零额外开销）；确认死会话 →
     // activateConv 重建（jsonl 已落地即 --resume 续上下文），恢复后由既有 kickoff
     // （hasInjectedSince 幂等）+ 催办接续驱动。失败按冷却重试，冷却期不驱动死会话防错误刷屏。
-    if (pane === '' && (await this.sessionAlive(session)) === false) {
+    if (pane === '' && (await this.sessionAlive(issue.projectId, session)) === false) {
       if (now - w.recoverAt < SESSION_RECOVER_COOLDOWN_MS) return;
       w.recoverAt = now;
       try {
@@ -7895,7 +7117,7 @@ export class IssueEngine {
         this.store.logEvent(issue.id, 'session_recovered', { session });
       } catch (e) {
         this.store.logEvent(issue.id, 'error', { where: 'recover', error: String(e).slice(0, 200) });
-        if (e instanceof AgentExecutableNotFoundError) {
+        if (e instanceof AgentExecutableNotFoundError || e instanceof InputSubmitUnconfirmedError) {
           await this.applyEvent(issue.id, 'pause', { note: e.message });
         }
       }
@@ -7909,7 +7131,7 @@ export class IssueEngine {
       if (now - w.codexUpdateAt > 30_000) {
         w.codexUpdateAt = now;
         this.store.logEvent(issue.id, 'codex_update', { action: 'update' });
-        await this.inject(session, '1');
+        await this.injectOnce(issue, session, `codex-update:${this.store.lastEventId(issue.id, 'codex_update')}`, '1');
       }
       return; // 弹窗未消失前不 kickoff/不催（prompt 会被弹窗吃掉）
     }
@@ -7921,7 +7143,7 @@ export class IssueEngine {
     // 而 activate 会因「会话还在」直接 return）。
     // 判死硬闸：jsonl 最近还在长 = 代理活着（它可能只是在跑一条前台 Bash 工具，屏幕和
     // pane_current_command 双双像 shell——生产实测靠这两个信号会误杀，见 agent-liveness 常量注释）
-    const liveness = await this.sessionLiveness(issue.agent, session, pane, now - w.growTs);
+    const liveness = await this.sessionLiveness(issue.projectId, issue.agent, session, pane, now - w.growTs);
     if (liveness === 'shell') {
       const pm = this.deps.pmFor(project);
       const failure = issue.agent === 'codex' && pm.judgeAgentFailure
@@ -7982,20 +7204,20 @@ export class IssueEngine {
     }
 
     // kickoff（幂等 + 单飞 + 启动下限 + 无弹窗 + I4 就绪真检测）。
-    // 就绪判据：jsonl 已可定位（两家 CLI 启动即建会话文件）或 pane 出现输入框特征
-    // （claude：❯ / ╭─ 边框；codex：› 提示符 / OpenAI Codex 横幅——0.144 实测）。
-    const path = await this.deps.locator.locate(convId);
-    const paneReady = paneHasAgentUi(issue.agent, pane); // 与存活判定共用同一套 UI 特征
-    const ccReady = path !== null || paneReady;
+    // JSONL 可能是 --resume 前就存在的旧文件，启动横幅/旧边框也可能是残留画面；两者都不能
+    // 证明新进程已经接管终端。所有自动文本投递只认当前 pane 的真实输入行。
+    const path = await execution.locator.locate(convId);
+    const paneReady = paneHasAgentUi(issue.agent, pane); // 存活/失效检测继续使用较宽的 UI 特征
+    const inputReady = paneHasAgentInput(issue.agent, pane);
     const fedBefore = w.fedTs;
-    await this.maybeKickoff(issue, project, w, session, sel !== null, ccReady);
+    await this.maybeKickoff(issue, project, w, session, sel !== null, inputReady);
 
     // 重启接续（issue #97）：代理被重启后**等它真就绪**再补一次催办，让它接着干上一轮的活。
-    // 就绪判据只认 paneReady（输入框真画出来了），**不能用 ccReady**——重启走的是
+    // 就绪判据只认 inputReady（输入框真画出来了），**不能用 JSONL 存在性**——重启走的是
     // `--resume`，jsonl 早就在了，`path !== null` 证明不了新进程已经起来，照它注入就是
     // 往还在启动的终端里盲打。有弹窗时也先不接续（prompt 会被弹窗吃掉），留着 flag 下轮再说。
     // 若这一 tick 刚好被 kickoff 发了正式的阶段 prompt（fedTs 变了），接续就没必要了。
-    if (w.resumePending && paneReady && !sel && w.fedTs === fedBefore) {
+    if (w.resumePending && inputReady && !sel && w.fedTs === fedBefore) {
       w.resumePending = false;
       const resumed = this.store.get(issue.id);
       if (resumed && DRIVING_STATES.includes(resumed.status)) {
@@ -8005,8 +7227,10 @@ export class IssueEngine {
           subs.length > 0 &&
           resumed.subIndex < subs.length &&
           !this.isRework(resumed);
-        await this.inject(
+        await this.injectOnce(
+          resumed,
           session,
+          `agent-resume:${this.store.lastEventId(resumed.id, 'session_recovered')}:${this.store.lastEnterEventId(resumed.id, resumed.status)}`,
           this.buildIssueNudge({
             issue: resumed,
             stage: resumed.status as 'planning' | 'implementing' | 'testing',
@@ -8022,7 +7246,8 @@ export class IssueEngine {
 
     // tail 新输出 → 协议解析推进
     if (path) {
-      const t = await tailConversation(this.reader, path, w.offset, 0);
+      // 协议块可长于 UI 气泡的 4000 字截断上限；只在引擎 tail 保留 assistant 原文。
+      const t = await tailConversation(execution.driver, path, w.offset, 0, { fullAssistantText: true });
       if (t.offset > w.offset) {
         // growTs 观测文件健康度，任何增长都刷新；activityTs 只认代理侧进展。
         w.growTs = now;
@@ -8052,7 +7277,30 @@ export class IssueEngine {
             error: String(e).slice(0, 200),
           });
         }
-        await this.ingest(issue.id, t.msgs, w, session);
+        await this.ingest(issue.id, t.msgs, w, session, inputReady);
+      }
+    }
+
+    // assistant 已确认上一子任务、但当时输入行尚未重绘时，协议状态已安全前移；在后续 tick
+    // 输入行恢复后补发当前子任务，避免为了防 shell 注入而把接力永久丢掉。
+    const afterIngest = this.store.get(issue.id);
+    if (afterIngest && inputReady) {
+      await this.maybeInjectCurrentSubtask(afterIngest, project, session);
+      if (
+        afterIngest.status === 'testing' &&
+        !afterIngest.completionReport &&
+        this.store.countEventsSince(
+          afterIngest.id,
+          'completion_report_deferred',
+          this.store.lastEnterEventId(afterIngest.id, 'implementing'),
+        ) > 0 &&
+        this.store.countEventsSince(
+          afterIngest.id,
+          'completion_report_retry',
+          this.store.lastEnterEventId(afterIngest.id, 'implementing'),
+        ) === 0
+      ) {
+        await this.completeTesting(afterIngest.id, 'sentinel', true);
       }
     }
 
@@ -8072,7 +7320,7 @@ export class IssueEngine {
     if (
       this.cfg.sessionStaleMs > 0 &&
       path &&
-      paneReady &&
+      inputReady &&
       !sel &&
       w.nudged &&
       w.growTs < w.fedTs &&
@@ -8082,13 +7330,13 @@ export class IssueEngine {
       w.reclaimAt = now;
       let np: string | null = null;
       try {
-        np = (await this.deps.locator.reclaim?.(convId)) ?? null;
+        np = (await execution.locator.reclaim?.(convId)) ?? null;
       } catch (e) {
         this.store.logEvent(issue.id, 'error', { where: 'reclaim', error: String(e).slice(0, 200) });
       }
       if (np && np !== path) {
         w.reclaimFailures = 0; // 认领到新会话即视作恢复，退避从头开始
-        const st = await this.reader.statPath(np).catch(() => null);
+        const st = await execution.driver.statPath(np).catch(() => null);
         w.offset = st?.size ?? 0;
         w.growTs = this.now();
         this.store.logEvent(issue.id, 'session_reclaimed', { path: np });
@@ -8097,8 +7345,10 @@ export class IssueEngine {
           const subs2 = this.store.subtasksOf(fresh2);
           const seqPending2 =
             fresh2.implMode === 'seq' && subs2.length > 0 && fresh2.subIndex < subs2.length && !this.isRework(fresh2);
-          await this.inject(
+          await this.injectOnce(
+            fresh2,
             session,
+            `session-reclaim:${this.store.lastEventId(fresh2.id, 'session_reclaimed')}`,
             this.buildIssueNudge({
               issue: fresh2,
               stage: fresh2.status as 'planning' | 'implementing' | 'testing',
@@ -8146,7 +7396,7 @@ export class IssueEngine {
     const idleMs = now - Math.max(w.fedTs, w.activityTs);
     // quiet 是「静默且没有弹窗挡着」这个基础判据，judge 仍按它 + fallbackSec 走；
     // 催办另有一条按次数退避、会越抬越高的阈值（见下）。
-    const quiet = idleMs > this.cfg.nudgeSec * 1000 && !sel;
+    const quiet = idleMs > this.cfg.nudgeSec * 1000 && !sel && inputReady;
 
     // 催办退避与封顶（#273 / B-03）。#41 曾在 272 分钟里被催 71 次，每次都是一发带
     // 100k+ 上下文的完整模型请求。次数取「人工介入锚点之后的 nudged 事件数」——事件为凭、
@@ -8190,7 +7440,7 @@ export class IssueEngine {
           seqPending,
           locale: this.promptLocale(fresh, project),
         });
-        await this.inject(session, msg);
+        await this.injectOnce(fresh, session, `nudge:${anchor}:${sent + 1}`, msg);
         w.nudged = true;
         w.fedTs = this.now();
         nudgedThisTick = true;
@@ -8271,7 +7521,7 @@ export class IssueEngine {
     w: WatchState,
     session: string,
     hasMenu: boolean,
-    ccReady: boolean,
+    inputReady: boolean,
   ): Promise<void> {
     if (w.kickInFlight) return; // 每对话单飞守卫
     if (hasMenu) return;
@@ -8279,12 +7529,12 @@ export class IssueEngine {
     const stage = issue.status;
     const entryId = this.store.lastEnterEventId(issue.id, stage);
     if (this.store.hasInjectedSince(issue.id, stage, entryId)) return; // 重启/重连安全
-    if (!ccReady) {
-      // I4：CC 未就绪（jsonl 未落地 且 pane 无输入框特征）——prompt 打进 bash 会被当
-      // shell 命令执行。等就绪；超时（默认 120s，从本进程开始盯（bootTs）计）→ block 交人工。
+    if (!inputReady) {
+      // I4：代理输入行未出现——prompt 打进冷启动 shell 会被当命令执行。等就绪；超时
+      // （默认 120s，从本进程开始盯（bootTs）计）→ paused，保留原阶段供恢复。
       if (this.now() - w.bootTs > this.cfg.kickoffReadyTimeoutMs) {
         await this.applyEvent(issue.id, 'pause', {
-          note: `CC 启动超时：${Math.round(this.cfg.kickoffReadyTimeoutMs / 1000)}s 未就绪（jsonl 未落地且无输入框特征）`,
+          note: `CC 启动超时：${Math.round(this.cfg.kickoffReadyTimeoutMs / 1000)}s 未出现可输入的代理提示符`,
         });
       }
       return;
@@ -8304,12 +7554,58 @@ export class IssueEngine {
       }
       const built = this.buildKickoffPrompt(fresh, project, workspace);
       if (!built) return;
-      await this.inject(session, built.text);
+      await this.injectOnce(fresh, session, `kickoff:${stage}:${entryId}`, built.text);
       this.store.logEvent(fresh.id, 'injected', { stage, ...built.meta });
       w.fedTs = this.now();
       w.nudged = false;
     } finally {
       w.kickInFlight = false;
+    }
+  }
+
+  /** 当前顺序子任务是否已经投递；事件是耐久判据，服务重启后也不会重复灌入。 */
+  private hasInjectedSubtask(issue: EngineIssue, idx: number): boolean {
+    const entryId = this.store.lastEnterEventId(issue.id, 'implementing');
+    return this.store.listEvents(issue.id).some((event) => {
+      if (event.id <= entryId || event.kind !== 'injected') return false;
+      try {
+        const data = JSON.parse(event.dataJson ?? '{}') as {
+          stage?: unknown;
+          kind?: unknown;
+          idx?: unknown;
+        };
+        return data.stage === 'implementing' && data.kind === 'subtask' && data.idx === idx;
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  /** 输入行延迟重绘时，后续 tick 幂等补发已经前移到的当前子任务。 */
+  private async maybeInjectCurrentSubtask(
+    issue: EngineIssue,
+    project: Project,
+    session: string,
+  ): Promise<void> {
+    if (issue.status !== 'implementing' || issue.executionMode === 'direct'
+      || issue.implMode !== 'seq' || this.isRework(issue)) return;
+    const subtasks = this.store.subtasksOf(issue).map((subtask) => subtask.text);
+    const idx = issue.subIndex;
+    if (!subtasks[idx] || this.hasInjectedSubtask(issue, idx)) return;
+    await this.injectOnce(issue, session,
+      `subtask:${this.store.lastEnterEventId(issue.id, 'implementing')}:${idx}`,
+      buildSubtaskPrompt({
+      issue,
+      subtasks,
+      idx,
+      branch: issue.branch ?? `issue/${issue.id}`,
+      locale: this.promptLocale(issue, project),
+      }));
+    this.store.logEvent(issue.id, 'injected', { stage: 'implementing', kind: 'subtask', idx });
+    const watch = issue.convId ? this.watch.get(issue.convId) : undefined;
+    if (watch) {
+      watch.fedTs = this.now();
+      watch.nudged = false;
     }
   }
 
@@ -8474,14 +7770,20 @@ export class IssueEngine {
    * limit 检测在协议解析**之后**（解耦，同批哨兵不丢）。
    * （public 以便测试直接投喂；生产只有 tick 调用）
    */
-  async ingest(issueId: number, msgs: ChatMessage[], w: WatchState | null, session: string): Promise<void> {
+  async ingest(
+    issueId: IssueId,
+    msgs: ChatMessage[],
+    w: WatchState | null,
+    session: string,
+    inputReady = true,
+  ): Promise<void> {
     for (const msg of msgs) {
       if (msg.role === 'tool_use' && msg.tool === 'Skill') this.store.logEvent(issueId,'skill_invoked',{tool:msg.tool,input:msg.input?.slice(0,300),callId:msg.toolCallId});
       else if (msg.role === 'tool_use' && /SKILL\.md/.test(msg.input ?? '')) this.store.logEvent(issueId,'skill_read',{tool:msg.tool,input:msg.input?.slice(0,300),callId:msg.toolCallId});
     }
     const texts = extractAssistantTexts(msgs);
     if (texts.length > 0) {
-      await this.handleAssistantTexts(issueId, texts, session);
+      await this.handleAssistantTexts(issueId, texts, session, inputReady);
       // limit 识别（解析后判；只看 assistant 文本）
       const fresh = this.store.get(issueId);
       if (fresh && DRIVING_STATES.includes(fresh.status) && texts.some((t) => looksRateLimited(t))) {
@@ -8503,7 +7805,12 @@ export class IssueEngine {
     }
   }
 
-  private async handleAssistantTexts(issueId: number, texts: string[], session: string): Promise<void> {
+  private async handleAssistantTexts(
+    issueId: IssueId,
+    texts: string[],
+    session: string,
+    inputReady: boolean,
+  ): Promise<void> {
     const issue = this.store.get(issueId); // 重读最新状态（哨兵与判定竞态的读端）
     if (!issue || !DRIVING_STATES.includes(issue.status)) return;
     if (this.store.activeExecutionSyncBoundary(issueId)
@@ -8570,10 +7877,16 @@ export class IssueEngine {
             this.captureCompletionReport(id, reportTexts);
             this.store.logEvent(id, 'direct_ready', { attempt });
             await this.applyEvent(id, 'impl_done');
-            if (this.store.get(id)?.status === 'testing') await this.completeTesting(id, 'sentinel');
+            if (this.store.get(id)?.status === 'testing') await this.completeTesting(id, 'sentinel', inputReady);
           } else {
-            const plan = texts.flatMap(t => t.split('\n')).find(line => line.startsWith(`NEED_PLAN:${id}:${attempt} `));
-            if (plan) await this.applyEvent(id, 'request_plan', { note: plan.slice(plan.indexOf(' ') + 1, 500) });
+            const plans = texts.map(t => parseNeedPlan(t, id, attempt));
+            const plan = plans.find(p => p?.kind === 'valid');
+            if (plan?.kind === 'valid') {
+              await this.applyEvent(id, 'request_plan', { note: plan.reason });
+            } else if (plans.some(p => p?.kind === 'invalid')) {
+              this.store.logEvent(id, 'error', { where: 'need-plan', attempt,
+                error: 'NEED_PLAN 格式无效、缺少理由或 issue/轮次不匹配；未升级规划' });
+            }
           }
           return;
         }
@@ -8595,7 +7908,7 @@ export class IssueEngine {
               break;
             }
           }
-          if (advanced && !stageDone) {
+          if (advanced && !stageDone && inputReady) {
             // 喂下一个子任务
             const fresh = this.store.get(id);
             const project = fresh ? this.project(fresh.projectId) : undefined;
@@ -8610,7 +7923,8 @@ export class IssueEngine {
                   branch: fresh.branch ?? `issue/${fresh.id}`,
                   locale: this.promptLocale(fresh, project),
                 });
-                await this.inject(session, prompt);
+                await this.injectOnce(fresh, session,
+                  `subtask:${this.store.lastEnterEventId(fresh.id, 'implementing')}:${idx}`, prompt);
                 this.store.logEvent(id, 'injected', { stage: 'implementing', kind: 'subtask', idx });
                 const w = fresh.convId ? this.watch.get(fresh.convId) : undefined;
                 if (w) {
@@ -8639,7 +7953,7 @@ export class IssueEngine {
             t.split('\n').some(line => line.trim() === `ISSUE_READY:${id}:${this.store.lastEnterEventId(id, 'implementing')}`)) : texts);
           this.store.logEvent(id, 'sentinel', { kind: 'stage_done', stage: 'testing' });
           // #279：代理只做自检与完成报告，门禁由引擎在会话外跑（通过才放行）
-          await this.completeTesting(id, 'sentinel');
+          await this.completeTesting(id, 'sentinel', inputReady);
           return;
         }
         let failed: { note: string } | null = null;
@@ -8676,14 +7990,15 @@ export class IssueEngine {
     workspace: EngineExecutionWorkspace,
   ): Promise<ValidationScope> {
     const cwd = workspace.cwd;
+    const driver = this.executionForIssue(issue).driver;
     const base = this.implBaseSha(issue.id);
     const changed = new Set<string>();
     try {
       if (base) {
-        const diff = await this.deps.driver.git(cwd, ['diff', '--name-only', base]);
+        const diff = await driver.git(cwd, ['diff', '--name-only', base]);
         if (diff.code === 0) for (const line of diff.out.split('\n')) if (line.trim()) changed.add(line.trim());
       }
-      const status = await this.deps.driver.git(cwd, ['status', '--porcelain']);
+      const status = await driver.git(cwd, ['status', '--porcelain']);
       if (status.code === 0) {
         for (const line of status.out.split('\n')) {
           const p = line.slice(3).trim();
@@ -8699,26 +8014,27 @@ export class IssueEngine {
     for (const f of files) {
       for (const candidate of candidateTestFiles(f)) {
         if (existing.has(candidate)) continue;
-        const stat = await this.deps.driver.statPath(join(cwd, candidate)).catch(() => null);
+        const stat = await driver.statPath(join(cwd, candidate)).catch(() => null);
         if (stat?.isFile) existing.add(candidate);
       }
     }
     if (existing.size === 0 && files.length) {
-      const tracked = await this.deps.driver.git(cwd, ['ls-files', '-z']);
+      const tracked = await driver.git(cwd, ['ls-files', '-z']);
       if (tracked.code === 0) for (const name of tracked.out.split('\0')) {
-        if (/\.test\.[cm]?[jt]sx?$/.test(name) && (await this.deps.driver.statPath(join(cwd, name)))?.isFile) existing.add(name);
+        if (/\.test\.[cm]?[jt]sx?$/.test(name) && (await driver.statPath(join(cwd, name)))?.isFile) existing.add(name);
       }
     }
     return deriveValidationScope(files, existing);
   }
 
   /** 读项目 package.json（探测默认门禁命令用）；读不到返回 null，由调用方降级 */
-  private async readPackageJson(cwd: string): Promise<string | null> {
+  private async readPackageJson(project: Project, cwd: string): Promise<string | null> {
     try {
+      const driver = this.driverForProject(project);
       const path = join(cwd, 'package.json');
-      const stat = await this.deps.driver.statPath(path);
+      const stat = await driver.statPath(path);
       if (!stat?.isFile || stat.size === 0) return null;
-      const r = await this.deps.driver.readFileRange(path, 0, Math.min(stat.size, 256 * 1024));
+      const r = await driver.readFileRange(path, 0, Math.min(stat.size, 256 * 1024));
       return new TextDecoder().decode(r.data);
     } catch {
       return null;
@@ -8726,14 +8042,25 @@ export class IssueEngine {
   }
 
   /**
-   * 跑一轮门禁。返回 'passed' | 'failed' | 'skipped'；**skipped 一律按放行处理**——
-   * 没配命令、也探测不到（不是 bun 项目、临时仓库），不能因此把 issue 卡在 testing。
+   * 跑一轮门禁。required 项目无命令时返回 error，禁止把缺失证据当成通过；
+   * optional 保留原有跳过行为，none 则记录明确豁免。
    */
   private async runValidationGate(
     issue: EngineIssue,
     project: Project,
   ): Promise<{ outcome: 'passed' | 'failed' | 'skipped' | 'error'; note: string }> {
-    if (this.cfg.validationTimeoutMs <= 0) return { outcome: 'skipped', note: '门禁执行已关闭' };
+    if (project.validationPolicy === 'none') {
+      this.store.logEvent(issue.id, 'validation_skipped', { reason: 'policy-none' });
+      return { outcome: 'skipped', note: '项目明确豁免验证' };
+    }
+    if (this.cfg.validationTimeoutMs <= 0) {
+      if (project.validationPolicy === 'required') {
+        this.store.logEvent(issue.id, 'validation_error', { reason: 'required-gate-disabled' });
+        return { outcome: 'error', note: '项目要求验证，但验证执行已关闭' };
+      }
+      this.store.logEvent(issue.id, 'validation_skipped', { reason: 'gate-disabled' });
+      return { outcome: 'skipped', note: '门禁执行已关闭' };
+    }
     let workspace: EngineExecutionWorkspace;
     try {
       workspace = await this.resolveExecutionWorkspace(issue, project);
@@ -8747,9 +8074,13 @@ export class IssueEngine {
 
     const commands = resolveValidationCommands(
       project.validationCommands,
-      await this.readPackageJson(workspace.cwd),
+      await this.readPackageJson(project, workspace.cwd),
     );
     if (commands.length === 0) {
+      if (project.validationPolicy === 'required') {
+        this.store.logEvent(issue.id, 'validation_error', { reason: 'required-no-commands' });
+        return { outcome: 'error', note: '项目要求验证，但没有配置或探测到可执行的门禁命令' };
+      }
       this.store.logEvent(issue.id, 'validation_skipped', { reason: 'no-commands' });
       return { outcome: 'skipped', note: '没有可执行的门禁命令' };
     }
@@ -8758,8 +8089,10 @@ export class IssueEngine {
       files: scope.files.length,
       commands: commands.map((c) => c.label),
     });
+    const driver = this.driverForProject(project);
     const cacheable = project.validationCommands === null && commands.every(c => c.argv[0] === 'bun');
-    const identity = cacheable ? await validationIdentity(this.deps.driver, workspace.cwd) : null;
+    const workspaceIdentity = await validationIdentity(driver, workspace.cwd);
+    const identity = cacheable ? workspaceIdentity : null;
     const passed = new Set(this.store.listEvents(issue.id).filter(e => e.kind === 'validation_check_passed')
       .flatMap(e => { try { return [JSON.parse(e.dataJson ?? '{}').key as string]; } catch { return []; } }));
     const executor = {
@@ -8769,10 +8102,10 @@ export class IssueEngine {
           this.store.logEvent(issue.id, 'validation_reused', { key, argv });
           return { code: 0, out: '', err: '', durationMs: 0, timedOut: false };
         }
-        const result = await this.deps.driver.runCommand(cwd, argv, timeoutMs);
+        const result = await driver.runCommand(cwd, argv, timeoutMs);
         if (key && result.code === 0 && !result.timedOut) {
           // Commands that change inputs must never certify the old identity.
-          if (await validationIdentity(this.deps.driver, cwd) === identity) {
+          if (await validationIdentity(driver, cwd) === identity) {
             this.store.logEvent(issue.id, 'validation_check_passed', { key, argv, durationMs: result.durationMs });
           } else this.store.logEvent(issue.id, 'validation_invalidated', { reason: 'inputs-changed-during-check' });
         }
@@ -8796,8 +8129,17 @@ export class IssueEngine {
       return { outcome: 'skipped', note: '没有可执行的门禁命令' };
     }
     if (run.ok) {
+      if (workspaceIdentity) {
+        const currentIdentity = await validationIdentity(driver, workspace.cwd);
+        if (!currentIdentity || currentIdentity !== workspaceIdentity) {
+          this.store.logEvent(issue.id, 'validation_invalidated', { reason: 'inputs-changed-during-gate' });
+          this.store.logEvent(issue.id, 'validation_error', { reason: 'inputs-changed-during-gate' });
+          return { outcome: 'error', note: '验证期间工作区发生变化，请重新运行门禁' };
+        }
+      }
       this.store.logEvent(issue.id, 'validation_passed', {
         scope: scope.kind,
+        workspaceIdentity,
         durationMs: run.durationMs,
         steps: run.steps.map((x) => ({ label: x.label, durationMs: x.durationMs })),
       });
@@ -8818,54 +8160,95 @@ export class IssueEngine {
     };
   }
 
+  /** Workflow node success is only an execution result. Validate the final workspace after
+   * worktree integration, on both the entry-action and restart-recovery paths. */
+  private async completeWorkflowTesting(
+    issueId: IssueId,
+    project: Project,
+    withinTransition: boolean,
+  ): Promise<void> {
+    const issue = this.store.get(issueId);
+    if (!issue || issue.status !== 'testing' || this.workflowSnapshot(issueId)?.status !== 'completed') return;
+    const gate = await this.runValidationGate(issue, project);
+    const runtime = this.workflowRuntime(issueId);
+    const { report, nodeRunIds } = workflowCompletionReport(
+      issue.title, runtime?.runs ?? [], gate, this.promptLocale(issue, project),
+    );
+    const recordReport = () => {
+      this.store.setCompletionReport(issueId, report);
+      this.store.logEvent(issueId, 'completion_report', {
+        via: 'workflow', outcome: report.outcome, nodeRunIds,
+      });
+    };
+    const apply = withinTransition
+      ? this.applyEventLocked.bind(this)
+      : this.applyEvent.bind(this);
+    if (gate.outcome === 'error' || gate.outcome === 'failed') {
+      // The graph has already finished: returning to implementing would immediately replay
+      // completed nodes and loop. Preserve the integrated workspace for a deliberate repair.
+      await apply(issueId, 'pause', { note: gate.note }, recordReport);
+      return;
+    }
+    await apply(issueId, 'tests_passed', { note: '工作流最终工作区验证已完成' }, recordReport);
+  }
+
   /**
    * testing 收尾的**唯一出口**（#279）：代理说完事了（哨兵或 PM 兜底判定）之后，
    * 由引擎在会话外跑门禁，通过才 `tests_passed`，不通过按 `tests_failed` 回灌输出尾部返工。
    * 两个调用点（哨兵、空闲兜底）都走这里，别再各自 applyEvent('tests_passed')。
    */
-  private async completeTesting(issueId: number, source: 'sentinel' | 'judge'): Promise<void> {
+  private async completeTesting(
+    issueId: IssueId,
+    source: 'sentinel' | 'judge',
+    inputReady = true,
+  ): Promise<void> {
     const issue = this.store.get(issueId);
     const project = issue ? this.project(issue.projectId) : undefined;
     if (!issue || !project) return;
-    // A missing report is a protocol repair, not a user-action blocker. Ask once before
-    // running gates, so the repair does not repeat validation or lose the testing context.
-    if (this.cfg.resultSummaryTimeoutMs > 0 && !issue.completionReport && issue.convId
-      && this.store.countEventsSince(issueId, 'completion_report_retry', this.store.lastEnterEventId(issueId, 'implementing')) === 0) {
-      const session = this.deps.convs.tmuxName(issue.projectId, issue.convId);
-      await this.inject(session, this.buildIssueNudge({ issue, stage: 'testing', locale: this.promptLocale(issue, project) }));
+    const reportDecision = decideCompletionReport(
+      issue.completionReport,
+      this.cfg.resultSummaryTimeoutMs > 0,
+      !!issue.convId && this.store.countEventsSince(
+        issueId, 'completion_report_retry', this.store.lastEnterEventId(issueId, 'implementing'),
+      ) === 0,
+    );
+    if (reportDecision.kind === 'retry') {
+      if (!inputReady) {
+        if (this.store.countEventsSince(
+          issueId,
+          'completion_report_deferred',
+          this.store.lastEnterEventId(issueId, 'implementing'),
+        ) === 0) {
+          this.store.logEvent(issueId, 'completion_report_deferred', {
+            source,
+            reason: 'agent-input-not-ready',
+          });
+        }
+        return;
+      }
+      const session = this.deps.convs.tmuxName(issue.projectId, issue.convId!);
+      await this.injectOnce(issue, session, `completion-report-retry:${this.store.lastEnterEventId(issueId, 'testing')}`,
+        this.buildIssueNudge({ issue, stage: 'testing', locale: this.promptLocale(issue, project) }));
       this.store.logEvent(issueId, 'completion_report_retry', { source });
-      const watch = this.watch.get(issue.convId);
+      const watch = this.watch.get(issue.convId!);
       if (watch) { watch.nudged = true; watch.fedTs = this.now(); }
       return;
     }
-    if (this.cfg.resultSummaryTimeoutMs > 0 && !issue.completionReport) {
-      await this.applyEvent(issueId, 'pause', { note: '完成报告补报仍无效；保留现场，修复报告协议后继续验证' });
-      return;
-    }
-    if (issue.completionReport && (issue.completionReport.outcome !== 'complete'
-      || issue.completionReport.unmetGoals.length || issue.completionReport.remainingWork.length)) {
-      const report = issue.completionReport;
-      await this.applyEvent(issueId, report.outcome === 'blocked' ? 'block' : 'work_remaining', {
-        note: [...report.unmetGoals, ...report.remainingWork, report.completion].join('；').slice(0, 1400),
-      });
+    if (reportDecision.kind !== 'validate') {
+      await this.applyEvent(issueId, reportDecision.kind, { note: reportDecision.note });
       return;
     }
     const gate = await this.runValidationGate(issue, project);
-    if (gate.outcome === 'error') {
-      await this.applyEvent(issueId, 'pause', { note: gate.note });
-      return;
-    }
-    if (gate.outcome !== 'failed') {
-      await this.applyEvent(issueId, 'tests_passed', ...(source === 'judge'
-        ? [{ note: '空闲兜底：PM 判定已完成' }] as const
-        : [] as const));
+    const gateDecision = decideValidationGate(gate, source);
+    if (gateDecision.event !== 'tests_failed') {
+      await this.applyEvent(issueId, gateDecision.event, gateDecision.note ? { note: gateDecision.note } : {});
       return;
     }
     // 只数**本轮**的失败（复活后重新开始，口径同哨兵路径）
     const failCount =
       this.store.countEventsSince(issueId, 'tests_failed', this.store.lastEventId(issueId, 'reopened')) + 1;
-    this.store.logEvent(issueId, 'tests_failed', { note: gate.note, failCount, source: 'validation' });
-    await this.applyEvent(issueId, 'tests_failed', { failCount, note: gate.note });
+    this.store.logEvent(issueId, 'tests_failed', { note: gateDecision.note, failCount, source: 'validation' });
+    await this.applyEvent(issueId, 'tests_failed', { failCount, note: gateDecision.note });
   }
 
   /** 三级判定第 3 级：PM 保守判（读-判-重读-CAS，applyEvent 的 CAS 即重读端） */
@@ -8877,7 +8260,7 @@ export class IssueEngine {
     w: WatchState,
   ): Promise<void> {
     if (!path) return;
-    const msgs = await readRecentMessages(this.reader, path, this.cfg.judgeWindowBytes);
+    const msgs = await readRecentMessages(this.driverForProject(project), path, this.cfg.judgeWindowBytes);
     const recent = msgs
       .filter((m) => m.role === 'assistant' || m.role === 'tool_result')
       .map((m) => m.text || m.result || '')
@@ -8894,7 +8277,8 @@ export class IssueEngine {
     this.store.logEvent(issue.id, 'judged', { stage: issue.status, result: j });
     if (j === 'done') {
       if (issue.status === 'implementing' && issue.executionMode === 'direct') {
-        await this.inject(session, this.buildIssueNudge({ issue, stage: 'implementing', locale: this.promptLocale(issue, project) }));
+        await this.injectOnce(issue, session, `judge-done:${this.store.lastEventId(issue.id, 'judged')}`,
+          this.buildIssueNudge({ issue, stage: 'implementing', locale: this.promptLocale(issue, project) }));
         w.fedTs = this.now();
       } else if (issue.status === 'implementing') {
         this.store.markAllSubtasksDone(issue.id);
@@ -8913,7 +8297,8 @@ export class IssueEngine {
             note: `planning 连续 ${strikes} 次判完成但未收到 SUBTASKS 块（产物丢失或格式不符），转人工`,
           });
         } else {
-          await this.inject(session, buildReplanRequest(this.promptLocale(issue, project)));
+          await this.injectOnce(issue, session, `replan:${this.store.lastEventId(issue.id, 'judged')}`,
+            buildReplanRequest(this.promptLocale(issue, project)));
           this.store.logEvent(issue.id, 'replan_requested', { strikes });
           w.fedTs = this.now();
           w.nudged = false; // 重置催促状态：重输出指令后允许常规 nudge 再催
@@ -8972,18 +8357,64 @@ export class IssueEngine {
 
   // ---- 注入 / 通知 ----
 
-  /** 唯一注入出口：per-session 互斥（评审 H9），PM/路由请复用同一把锁（tmuxLockKey） */
-  private inject(session: string, text: string): Promise<void> {
-    return this.deps.mutex.runExclusive(tmuxLockKey(session), () =>
-      this.deps.driver.sendKeys(session, text),
-    );
+  /** The tmux lock covers the final delivery guard and journal claim. A rejected guard has
+   * performed no external action and must not leave an uncertain input that blocks recovery. */
+  private async injectOnce(
+    issue: EngineIssue, session: string, operationKey: string, text: string, beforeSend?: () => void,
+  ): Promise<void> {
+    const project = this.project(issue.projectId);
+    if (!project) throw new Error(`项目 ${issue.projectId} 不存在`);
+    await this.deps.mutex.runExclusive(tmuxLockKey(session), async () => {
+      beforeSend?.();
+      if (this.effects.hasUncertainInput(issue.id)) {
+        throw new InputSubmitUnconfirmedError('此前终端输入结果不确定；已停止后续自动注入，需先核对现场');
+      }
+      await this.effects.runOnce({
+        issueId: issue.id,
+        operationKey,
+        projectId: issue.projectId,
+        executorId: project.executorId,
+        target: session,
+        input: text,
+      }, () => this.driverForProject(project).sendKeys(session, text));
+    });
   }
 
   private async notifySafe(ev: EngineNotifyEvent): Promise<void> {
     try {
-      await this.deps.notify.dispatch(ev);
+      const project = this.project(ev.projectId);
+      if (!project) throw new Error(`项目 ${ev.projectId} 不存在`);
+      // Anchor to the specific business cause, never the latest timeline event: an unrelated
+      // event after a lost provider receipt must not create a fresh delivery key.
+      const causeKind: Record<string, string> = {
+        module_organization: 'module_organize_suggested',
+        analysis_clarification: 'clarify_questions',
+        clarification_needed: 'clarify_questions',
+        clarify_success_low: 'clarify_success_low',
+        auto_git_failure: ev.summaryParams?.action === 'push' ? 'auto_push_failed' : 'error',
+        stop_loss_paused: 'stop_loss_triggered',
+        conversation_displaced: 'conv_displaced',
+        menu_stuck: 'menu_stuck',
+        auto_retry_exhausted: ev.summaryParams?.reason === 'nudge' ? 'nudge_exhausted' : 'judge_exhausted',
+        rate_limited: 'limit',
+      };
+      const cause = ev.gate?.id ?? (ev.summaryCode === 'status_transition' || ev.kind === 'issue_done'
+        || ev.summaryCode === 'issue_blocked'
+        ? this.store.lastEnterEventId(ev.issueId, ev.to ?? (ev.kind === 'issue_done' ? 'done' : 'blocked'))
+        : this.store.lastEventId(ev.issueId, causeKind[ev.summaryCode ?? ''] ?? 'transition'));
+      const payload = JSON.stringify(ev);
+      const digest = createHash('sha256').update(payload).digest('hex');
+      await this.effects.runOnce({
+        issueId: ev.issueId,
+        operationKey: `notify:${cause}:${ev.kind}:${digest}`,
+        projectId: ev.projectId,
+        executorId: project.executorId,
+        target: `notify:${ev.kind}`,
+        input: payload,
+      }, () => this.deps.notify.dispatch(ev));
     } catch (e) {
-      // 通知失败不阻断状态机，但要可见（评审铁律：失败要么上抛要么落事件）
+      // Provider timeout may mean delivered. Keep the uncertain journal row and never retry
+      // automatically; notification failure still must not block the issue state machine.
       this.store.logEvent(ev.issueId, 'notify_error', { kind: ev.kind, error: String(e).slice(0, 200) });
     }
   }

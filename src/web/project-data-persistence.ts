@@ -11,6 +11,8 @@ import { moduleIssueRelPath, syncIssueDocumentContent } from '../issues/module-d
 import { gitLockKey, type KeyedMutex } from '../issues/mutex';
 import { workflowDataProjection } from '../issues/workflow-project-data';
 import { getProject } from '../issues/engine';
+import { lastRenumberFromDocPath } from '../issues/issue-renumber';
+import type { IssueId } from '../../shared/issue-id';
 
 function replaceManaged(content: string, name: string, body: string): string {
   const start = `<!-- panda:${name}:start -->`;
@@ -87,29 +89,46 @@ async function persistMarkdown(
   let name: string;
   let body: string;
   let fallback: string;
-  let issueContent: { id: number; title: string; body: string | null } | null = null;
+  let issueContent: { id: IssueId; title: string; body: string | null } | null = null;
   if (job.entityKind === 'module') {
     const row = db.query<{ slug: string; display_name: string }, [number]>('SELECT slug, display_name FROM project_modules WHERE id = ?').get(Number(job.entityId));
     if (!row) return;
     path = `.panda/modules/${row.slug}/MODULE.md`;
     name = 'module-meta'; body = moduleMetaProjection(db, Number(job.entityId)); fallback = `# ${row.display_name}\n`;
   } else {
-    const row = db.query<{ id: number; doc_path: string | null; module_id: number | null; title: string; body: string | null; slug: string | null }, [number]>(
+    const row = db.query<{ id: IssueId; doc_path: string | null; module_id: number | null; title: string; body: string | null; slug: string | null }, [IssueId]>(
       `SELECT issue.id, issue.doc_path, issue.module_id, issue.title, issue.body, module.slug
        FROM issues issue LEFT JOIN project_modules module ON module.id = issue.module_id WHERE issue.id = ?`,
-    ).get(Number(job.entityId));
+    ).get(job.entityId);
     if (!row || !row.slug) return;
     issueContent = { id: row.id, title: row.title, body: row.body };
-    path = row.doc_path || moduleIssueRelPath(row.slug, Number(job.entityId), row.title);
-    name = 'issue-meta'; body = issueMetaProjection(db, Number(job.entityId));
+    path = row.doc_path || moduleIssueRelPath(row.slug, row.id, row.title);
+    name = 'issue-meta'; body = issueMetaProjection(db, row.id);
     fallback = `# #${job.entityId} ${row.title}\n\n## 原始需求\n\n${row.body ?? ''}\n`;
   }
   const read = await driver.readFileNoFollowWithin!(cwd, path, 25 * 1024 * 1024).catch(() => null);
-  const current = read ? new TextDecoder().decode(read.data) : fallback;
+  // #307：换号后旧过程页还在 → 新路径没文件时沿用旧正文，写好新文件后删掉旧文件（重试也会补删）
+  let movedFrom: { path: string; sha: string } | null = null;
+  let current = read ? new TextDecoder().decode(read.data) : fallback;
+  if (issueContent) {
+    const renumbered = lastRenumberFromDocPath(db, issueContent.id);
+    if (renumbered && renumbered.fromDocPath !== path) {
+      const old = await driver.readFileNoFollowWithin!(cwd, renumbered.fromDocPath, 25 * 1024 * 1024).catch(() => null);
+      if (old) {
+        movedFrom = { path: renumbered.fromDocPath, sha: sha256Hex(old.data) };
+        if (!read) current = new TextDecoder().decode(old.data)
+          .replace(new RegExp(`^# #${renumbered.from}(?=\\s|$)`, 'm'), `# #${issueContent.id}`);
+      }
+    }
+  }
   const synchronized = issueContent
     ? syncIssueDocumentContent(current, issueContent)
     : current;
   const next = new TextEncoder().encode(replaceManaged(synchronized, name, body));
   const status = await driver.replaceFileNoFollowWithin!(cwd, path, next, read ? sha256Hex(read.data) : null);
   if (status === 'conflict') throw new Error(`协作文件并发冲突：${path}`);
+  if (movedFrom && driver.removeFileNoFollowWithin) {
+    const removed = await driver.removeFileNoFollowWithin(cwd, movedFrom.path, movedFrom.sha);
+    if (removed === 'conflict') throw new Error(`协作文件并发冲突：${movedFrom.path}`);
+  }
 }

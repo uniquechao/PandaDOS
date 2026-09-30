@@ -21,7 +21,12 @@ const BASE_MSGS: ChatMessage[] = [
   { seq: 2, role: 'tool_use', tool: 'Read', input: '{"file_path":"src/web/routes/auth.ts"}' },
   { seq: 3, role: 'tool_result', result: 'POST /api/login → {ok,userId,username,role}\n401 → {ok:false,error}' },
   { seq: 4, role: 'tool_result', result: 'Error: ENOENT no such file', isError: true },
-  { seq: 5, role: 'assistant', text: '好的，登录页已经写好了。\n接下来要不要把「记住用户名」也加上？' },
+  // 正文里刻意留两种写法的文件路径（行内代码 + 裸路径）：issue #310 的路径链接靠它演练
+  {
+    seq: 5,
+    role: 'assistant',
+    text: '好的，登录页已经写好了。\n改动落在 `ui/src/views/Login.tsx` 和 src/web/routes/auth.ts。\n接下来要不要把「记住用户名」也加上？',
+  },
 ];
 
 const MENU: ChatSelection = {

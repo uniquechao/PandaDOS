@@ -44,7 +44,7 @@ const EXPECTED_TABLES = [
 ].sort();
 
 /** core/migrations 当前最新编号（新增迁移文件时同步 +1） */
-const LATEST_MIGRATION = 68;
+const LATEST_MIGRATION = 76;
 
 function tableNames(db: Database): string[] {
   return db
@@ -378,7 +378,7 @@ describe('迁移编号守卫', () => {
 
   test('仓库现有迁移目录不存在跨目录撞号', () => {
     expect(() => assertUniqueMigrationIds()).not.toThrow();
-    expect(ALL_MIGRATION_DIRS.length).toBe(5);
+    expect(ALL_MIGRATION_DIRS.length).toBe(6);
   });
 
   test('两个目录用同一编号 → 报错点名两个文件', () => {
@@ -452,4 +452,42 @@ test('paused migration preserves issue rows, child references and installed trig
     expect(db.query("SELECT name FROM sqlite_master WHERE name='keep_index'").get()).toBeTruthy();
     migrate(db, dir);
   } finally { db.close(); rmSync(dir, {recursive:true,force:true}); }
+});
+
+test('text issue IDs preserve legacy foreign key violations when rebuild changes rowids', () => {
+  const db = new Database(':memory:');
+  const root = join(process.cwd(), '.panda', 'tmp');
+  mkdirSync(root, { recursive: true });
+  const dir = mkdtempSync(join(root, 'panda-text-id-migration-'));
+  try {
+    db.exec(`
+      CREATE TABLE users (id INTEGER PRIMARY KEY);
+      CREATE TABLE issues (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_user_id INTEGER REFERENCES users(id)
+      );
+      CREATE TABLE issue_events (
+        id INTEGER PRIMARY KEY,
+        issue_id INTEGER REFERENCES issues(id)
+      );
+      INSERT INTO users VALUES (1);
+      INSERT INTO issues (id, owner_user_id) VALUES (1, 1);
+      INSERT INTO issues (id, owner_user_id) VALUES (35, 999);
+      INSERT INTO issue_events VALUES (1, 35);
+    `);
+    db.run('PRAGMA foreign_keys = ON');
+    expect(db.query('PRAGMA foreign_key_check').all()).toHaveLength(1);
+    writeFileSync(join(dir, '074_issue_text_id.sql'), '-- panda:issue-text-id\n');
+
+    migrate(db, dir);
+
+    expect(db.query<{ name: string; type: string }, []>('PRAGMA table_info(issues)').all().find((c) => c.name === 'id')?.type).toBe('TEXT');
+    expect(db.query('SELECT id FROM issues WHERE id = ?').get('35')).toEqual({ id: '35' });
+    expect(db.query('SELECT issue_id FROM issue_events WHERE id = 1').get()).toEqual({ issue_id: '35' });
+    expect(db.query('PRAGMA foreign_key_check').all()).toHaveLength(1);
+    expect(db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

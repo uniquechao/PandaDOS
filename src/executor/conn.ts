@@ -73,6 +73,8 @@ export interface SftpLike {
   ): void;
   chmod(path: string, mode: number, cb: (err: Error | null | undefined) => void): void;
   rename?(oldPath: string, newPath: string, cb: (err: Error | null | undefined) => void): void;
+  /** ssh2's OpenSSH extension: atomic rename that replaces an existing regular destination. */
+  ext_openssh_rename?(oldPath: string, newPath: string, cb: (err: Error | null | undefined) => void): void;
   unlink?(path: string, cb: (err: Error | null | undefined) => void): void;
 }
 

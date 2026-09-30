@@ -14,6 +14,7 @@ import type { ProgressAnalysis, ProgressEventLike } from '../../agents/progress'
 import type { ChatMessage } from '../../core/jsonl';
 import type { Project } from '../../core/types';
 import type { EngineIssue } from '../../issues/engine';
+import type { IssueId } from '../../../shared/issue-id';
 
 // ---------- 依赖最小面 ----------
 
@@ -37,7 +38,7 @@ export interface ProgressNotifier {
   dispatch(e: {
     kind: 'status_change';
     projectId: number;
-    issueId: number;
+    issueId: IssueId;
     summaryCode: 'progress' | 'progress_needs_reply';
     summaryParams: { emoji: string; headline: string };
   }): Promise<void>;
@@ -62,10 +63,10 @@ const STATUS_EMOJI: Record<string, string> = {
 /** {push,status,needsReply,headline} → NotifyEvent 的确定性翻译（导出便于测形状） */
 export function progressToEvent(
   projectId: number,
-  issueId: number,
+  issueId: IssueId,
   a: ProgressAnalysis,
 ): {
-  kind: 'status_change'; projectId: number; issueId: number;
+  kind: 'status_change'; projectId: number; issueId: IssueId;
   summaryCode: 'progress' | 'progress_needs_reply';
   summaryParams: { emoji: string; headline: string };
 } {
@@ -80,7 +81,7 @@ export function progressToEvent(
 export class ProgressBridge {
   private readonly reporters = new Map<number, ReporterLike>();
   /** 通知落到哪条 issue：跟随该项目最近一次喂消息的 issue */
-  private readonly lastIssue = new Map<number, number>();
+  private readonly lastIssue = new Map<number, IssueId>();
   private stopped = false;
 
   constructor(private readonly deps: ProgressBridgeDeps) {}
@@ -112,7 +113,7 @@ export class ProgressBridge {
     r = pm.createProgressReporter(
       async (a) => {
         await this.deps.notify.dispatch(
-          progressToEvent(project.id, this.lastIssue.get(project.id) ?? 0, a),
+          progressToEvent(project.id, this.lastIssue.get(project.id) ?? '0', a),
         );
       },
       this.deps.throttleSeconds !== undefined ? { throttleSeconds: this.deps.throttleSeconds } : {},

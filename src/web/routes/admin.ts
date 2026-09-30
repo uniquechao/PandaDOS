@@ -34,8 +34,10 @@ import { UsageStore, type UsageBucket } from '../../core/usage-store';
 import { costOf } from '../../core/usage';
 import { weeklyReport } from '../../core/usage-weekly';
 import { IssueStore } from '../../issues/engine';
+import { apiError } from '../errors';
 import { json, type RouteDef } from '../middleware';
 import { parseSettingsBody } from './me';
+import type { IssueId } from '../../../shared/issue-id';
 
 export interface AdminRoutesDeps {
   db: Database;
@@ -172,9 +174,9 @@ export function adminRoutes(deps: AdminRoutesDeps): RouteDef[] {
             .filter((r) => projectId === undefined || r.projectId === projectId)
             .map((r) => ({ ...r, projectName: names.get(r.projectId) ?? '', costUsd: costOf(r, pricing) }));
 
-        const meta = new Map<number, { projectId: number; title: string; status: string; createdTs: number }>();
+        const meta = new Map<IssueId, { projectId: number; title: string; status: string; createdTs: number }>();
         for (const row of db
-          .query<{ id: number; project_id: number; title: string; status: string; created_ts: number }, []>(
+          .query<{ id: IssueId; project_id: number; title: string; status: string; created_ts: number }, []>(
             'SELECT id, project_id, title, status, created_ts FROM issues',
           )
           .all()) {
@@ -685,6 +687,10 @@ export function adminRoutes(deps: AdminRoutesDeps): RouteDef[] {
         const existing = id ? getExecutor(db, id) : undefined;
         if (!id || !existing) return json({ ok: false, error: '无此执行机' }, 404);
         const b = await readBody(req);
+        const requestedPort = b.port === undefined ? null : Number(b.port);
+        if (requestedPort !== null && (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 65535)) {
+          return json({ ok: false, error: 'port 必须是 1-65535 的整数' }, 400);
+        }
         if (
           existing.isSystemLocal &&
           ['host', 'port', 'sshUser', 'keyRef'].some((key) => b[key] !== undefined)
@@ -739,6 +745,19 @@ export function adminRoutes(deps: AdminRoutesDeps): RouteDef[] {
             );
           }
         }
+        // Executor IDs are durable location identities. Repointing a referenced ID to another
+        // machine/user/workspace would make existing issue paths and session IDs silently resolve there.
+        const locationChanged =
+          (str(b, 'host') !== undefined && str(b, 'host') !== existing.host) ||
+          (requestedPort !== null && requestedPort !== existing.port) ||
+          (str(b, 'sshUser') !== undefined && str(b, 'sshUser') !== existing.sshUser) ||
+          (str(b, 'workspaceRoot') !== undefined && str(b, 'workspaceRoot') !== existing.workspaceRoot);
+        if (locationChanged && db.query<{ found: number }, [number]>(
+          'SELECT 1 AS found FROM projects WHERE executor_id = ? LIMIT 1',
+        ).get(id)) {
+          return json(apiError('executor.location_immutable',
+            'An executor with projects cannot be repointed to a different location.', 409), 409);
+        }
         const strFields: Array<[string, string]> = [
           ['name', 'name'],
           ['host', 'host'],
@@ -767,13 +786,9 @@ export function adminRoutes(deps: AdminRoutesDeps): RouteDef[] {
           sets.push('capabilities_checked_ts = ?');
           vals.push(b.capabilitiesCheckedTs as number | null);
         }
-        if (b.port !== undefined) {
-          const port = Number(b.port);
-          if (!Number.isInteger(port) || port < 1 || port > 65535) {
-            return json({ ok: false, error: 'port 必须是 1-65535 的整数' }, 400);
-          }
+        if (requestedPort !== null) {
           sets.push('port = ?');
-          vals.push(port);
+          vals.push(requestedPort);
         }
         if (sets.length === 0) return json({ ok: false, error: '没有可更新的字段' }, 400);
         db.query(`UPDATE executors SET ${sets.join(', ')} WHERE id = ?`).run(...vals, id);

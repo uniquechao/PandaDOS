@@ -111,8 +111,8 @@ describe('looksTruncated：正文残缺时不许做不可逆的合并决策', ()
 
 describe('composeMergedBody：摘要在前，原文分节追加（#289 / B-14）', () => {
   const entries = [
-    { id: 7, title: 'A', body: '定位：engine.ts:5245' },
-    { id: 9, title: 'B', body: '验收：门禁全绿' },
+    { id: '7', title: 'A', body: '定位：engine.ts:5245' },
+    { id: '9', title: 'B', body: '验收：门禁全绿' },
   ];
 
   test('原文一字不改地跟在摘要后面，分节标题带 #id', () => {
@@ -128,8 +128,8 @@ describe('composeMergedBody：摘要在前，原文分节追加（#289 / B-14）
   test('超限时从最后一节开始省略，前面的原文与摘要保全', () => {
     const long = '正'.repeat(400);
     const body = composeMergedBody('摘要', [
-      { id: 1, title: 'A', body: long },
-      { id: 2, title: 'B', body: long },
+      { id: '1', title: 'A', body: long },
+      { id: '2', title: 'B', body: long },
     ], 600);
     expect(body.length).toBeLessThanOrEqual(600);
     expect(body).toContain('摘要');
@@ -144,7 +144,7 @@ describe('composeMergedBody：摘要在前，原文分节追加（#289 / B-14）
   });
 
   test('空正文的分支也留下分节，让人知道它被并进来了', () => {
-    const body = composeMergedBody('摘要', [{ id: 3, title: 'C', body: null }]);
+    const body = composeMergedBody('摘要', [{ id: '3', title: 'C', body: null }]);
     expect(body).toContain('### #3 C');
     expect(body).toContain(MERGED_SECTION_OMITTED);
   });

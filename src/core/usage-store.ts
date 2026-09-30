@@ -8,6 +8,7 @@
  */
 import type { Database } from 'bun:sqlite';
 import { emptyUsage, type UsagePricing, type UsageTotals } from './usage';
+import type { IssueId } from '../../shared/issue-id';
 
 export type UsageKind = 'issue' | 'chat';
 
@@ -24,7 +25,7 @@ export interface ConversationUsageRow extends UsageTotals {
 export interface UsageBucket extends UsageTotals {
   projectId: number;
   /** issue 维度才有 */
-  issueId?: number;
+  issueId?: IssueId;
 }
 
 /**
@@ -189,7 +190,7 @@ export class UsageStore {
   }
 
   /** 把一份增量累加到某条 issue 上（归因写入用；同一 issue 会被多次追加） */
-  addIssue(issueId: number, projectId: number, delta: UsageTotals, now = Date.now()): void {
+  addIssue(issueId: IssueId, projectId: number, delta: UsageTotals, now = Date.now()): void {
     this.db
       .query(
         `INSERT INTO issue_usage
@@ -215,9 +216,9 @@ export class UsageStore {
       );
   }
 
-  getIssue(issueId: number): UsageTotals {
+  getIssue(issueId: IssueId): UsageTotals {
     const r = this.db
-      .query<CounterRow, [number]>('SELECT * FROM issue_usage WHERE issue_id = ?')
+      .query<CounterRow, [IssueId]>('SELECT * FROM issue_usage WHERE issue_id = ?')
       .get(issueId);
     return r ? mapTotals(r) : emptyUsage();
   }
@@ -225,10 +226,10 @@ export class UsageStore {
   /** 按 issue 列出（可限定项目）；只列真有用量的 */
   listIssueUsage(projectId?: number): UsageBucket[] {
     const rows = projectId === undefined
-      ? this.db.query<CounterRow & { issue_id: number; project_id: number }, []>(
+      ? this.db.query<CounterRow & { issue_id: IssueId; project_id: number }, []>(
         'SELECT * FROM issue_usage ORDER BY output_tokens DESC, issue_id',
       ).all()
-      : this.db.query<CounterRow & { issue_id: number; project_id: number }, [number]>(
+      : this.db.query<CounterRow & { issue_id: IssueId; project_id: number }, [number]>(
         'SELECT * FROM issue_usage WHERE project_id = ? ORDER BY output_tokens DESC, issue_id',
       ).all(projectId);
     return rows.map((r) => ({ projectId: r.project_id, issueId: r.issue_id, ...mapTotals(r) }));
@@ -240,7 +241,7 @@ export class UsageStore {
    * 与 `addIssue` 一样是**累加**写入：采集器每轮只处理新增的那一段字节，同一天会被追加很多次。
    * `issueId = 0` 表示未归因（chat 会话、模块空档期）——那块余量必须留在表里看得见。
    */
-  addDaily(day: string, projectId: number, issueId: number, delta: UsageTotals, now = Date.now()): void {
+  addDaily(day: string, projectId: number, issueId: IssueId, delta: UsageTotals, now = Date.now()): void {
     this.db
       .query(
         `INSERT INTO usage_daily

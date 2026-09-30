@@ -12,6 +12,7 @@ import type {
   ExternalIssueSourceConfig,
   ExternalIssueSourceSummary,
 } from './types';
+import type { IssueId } from '../../shared/issue-id';
 
 interface SourceRow {
   project_id: number;
@@ -34,7 +35,7 @@ interface RecordRow {
   external_number: string;
   external_url: string;
   disposition: string;
-  local_issue_id: number | null;
+  local_issue_id: IssueId | null;
   created_by: number | null;
   created_ts: number;
   updated_ts: number;
@@ -58,7 +59,7 @@ export interface RecordExternalIssueInput {
   externalNumber: string;
   externalUrl: string;
   disposition: ExternalIssueDisposition;
-  localIssueId?: number | null;
+  localIssueId?: IssueId | null;
   createdBy?: number | null;
 }
 
@@ -247,12 +248,12 @@ export class ExternalIssueStore {
    */
   recordImportedOnce(
     input: ExternalIssueIdentityInput,
-    localIssueId: number,
+    localIssueId: IssueId,
   ): ExternalIssueRecord | null {
     const ts = this.now();
     const row = this.db
       .query<RecordRow, [
-        number, string, string, string, string, string, number, number | null, number, number,
+        number, string, string, string, string, string, IssueId, number | null, number, number,
       ]>(
         `INSERT INTO external_issue_records
            (project_id, provider, source_key, external_id, external_number, external_url,

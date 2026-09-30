@@ -18,10 +18,17 @@ export class FeishuMessaging {
     config: FeishuLoginConfigStore;
     notify: NotifyRouter;
     defaultEnabled: boolean;
+    /** Deployment-level off takes precedence over a persisted admin preference. */
+    deploymentAllowed?: boolean;
     create(config: FeishuConfig): MessagingChannel;
   }) {}
 
+  get deploymentAllowed(): boolean {
+    return this.deps.deploymentAllowed !== false;
+  }
+
   enabled(): boolean {
+    if (!this.deploymentAllowed) return false;
     const row = this.deps.db.query<{ enabled: number }, []>('SELECT enabled FROM feishu_messaging_config WHERE id=1').get();
     return row ? row.enabled === 1 : this.deps.defaultEnabled;
   }

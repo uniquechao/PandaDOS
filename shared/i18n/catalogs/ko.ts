@@ -1,3 +1,7 @@
+import { roomMemberMessages } from '../domains/rooms-members';
+import { roomChatMessages } from '../domains/rooms-chat';
+import { roomExtraMessages } from '../domains/rooms-extra';
+import { roomMessages } from '../domains/rooms';
 import { feishuChatMessages } from '../domains/feishu-chat';
 import { feishuLoginMessages } from '../domains/feishu-login';
 import type { MessageCatalog } from '../messages';
@@ -9,6 +13,7 @@ import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
 import { projectSettingsMessages } from '../domains/project-settings';
 import { externalImportMessages } from '../domains/external-import';
+import { workspaceMessages } from '../domains/workspace';
 import { designWorkbenchMessages } from '../domains/design-workbench';
 import { designWorkbenchAdvancedMessages } from '../domains/design-workbench-advanced';
 import { designAssetsUiMessages } from '../domains/design-assets-ui';
@@ -19,12 +24,16 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const koCatalog = {
+  ...roomMemberMessages["ko"],
+  ...roomChatMessages["ko"],
+  ...roomExtraMessages["ko"],
+  ...roomMessages["ko"],
   ...feishuChatMessages["ko"],
   ...feishuLoginMessages["ko"],
   ...shellMessages.ko,
   ...actionMessages.ko,
   ...commonUiMessages.ko,
-  'issue.validation': '게이트', 'issue.validationTargeted': '선별({files}개 파일)', 'issue.validationFull': '전체', 'issue.validationPassed': '통과', 'issue.validationFailed': '실패({label}, 종료 코드 {code})', 'issue.validationSkipped': '건너뜀', 'issue.validationPending': '아직 실행 안 함', 'issue.pushFailedTitle':'완료되었지만 변경 사항이 원격에 푸시되지 않았습니다','issue.pushFailedHint':'변경 사항은 로컬에 커밋되어 있습니다. 수동으로 푸시한 뒤 확인하세요.','issue.pushFailedBranch':'브랜치 {branch}',
+  'issue.validation': '게이트', 'issue.validationTargeted': '선별({files}개 파일)', 'issue.validationFull': '전체', 'issue.validationPassed': '통과', 'issue.validationFailed': '실패({label}, 종료 코드 {code})', 'issue.validationSkipped': '건너뜀', 'issue.validationPending': '아직 실행 안 함', 'issue.validationUnavailable': '검증할 수 없음', 'issue.validationExempt': '명시적으로 면제됨', 'issue.validationNoCommands': '검증 명령 미설정', 'issue.validationDisabled': '필수 검증 비활성화', 'issue.deliveryLocalComplete': '로컬 작업 완료', 'issue.deliveryPushPushed': '푸시 완료', 'issue.deliveryPushFailed': '푸시 실패', 'issue.deliveryPushSkipped': '푸시 건너뜀', 'issue.deliveryPushNotAttempted': '푸시하지 않음', 'issue.deliveryMergeUnmanaged': '병합 관리 대상 아님', 'issue.deliveryDeployUnmanaged': '배포 관리 대상 아님', 'issue.pushFailedTitle':'완료되었지만 변경 사항이 원격에 푸시되지 않았습니다','issue.pushFailedHint':'변경 사항은 로컬에 커밋되어 있습니다. 수동으로 푸시한 뒤 확인하세요.','issue.pushFailedBranch':'브랜치 {branch}',
   'issue.completionReport':'완료 보고서','issue.reportOutcomeComplete':'목표 달성','issue.reportOutcomePartial':'일부 완료','issue.reportOutcomeBlocked':'차단됨','issue.reportOutcomeUnverified':'검증되지 않은 이전 요약','issue.reportObjective':'구현 목표','issue.reportImplementation':'구현 방법','issue.reportAdvantages':'장점','issue.reportDisadvantages':'단점 및 절충점','issue.reportVerification':'검증 근거','issue.reportCompletion':'완료 상태','issue.reportUnmetGoals':'달성하지 못한 목표','issue.reportRemainingWork':'필수 후속 작업','issue.reportAttentionTitle':'이 issue는 아직 완전히 완료되지 않았습니다','issue.reportLegacyWarningTitle':'이 완료 기록은 구조적으로 검증되지 않았습니다','issue.reportLegacyWarning':'이전 기록에는 자유 형식 요약만 있어 PandaDOS가 모든 목표 달성과 필수 후속 작업 여부를 확인할 수 없습니다.','issue.continueProcessing':'계속 처리','issue.continueProcessingTitle':'완료 상태 수정 후 계속','issue.continueProcessingWarningTitle':'issue를 다시 엽니다','issue.continueProcessingWarning':'완료되지 않은 내용을 입력하세요. issue는 계획 단계로 돌아가 즉시 실행될 수 있습니다.','issue.continueGuidance':'미달성 목표 또는 후속 작업 지침','issue.continueGuidancePlaceholder':'달성하지 못한 목표와 다음에 완료할 작업을 입력하세요…','issue.continueGuidanceRequired':'계속하기 전에 미달성 목표 또는 필수 후속 작업을 입력하세요.','issue.confirmContinueProcessing':'다시 열고 계속',
   'issue.recoveryLength':'{current} / {max}자',
   'issue.recoveryTitle':'차단 해결','issue.recoveryReason':'실행이 중단된 이유','issue.recoveryHelp':'구체적인 처리 지침을 추가하거나 계속하기 전에 issue와 차단된 하위 작업을 수정하세요. 편집 내용을 저장해도 실행이 자동으로 재개되지는 않습니다.','issue.recoveryGuidance':'추가 의견 또는 해결 방법','issue.recoveryGuidancePlaceholder':'변경할 내용, 사용할 방법 또는 차단 해결 방법을 입력하세요…','issue.recoveryGuidanceRequired':'계속하기 전에 추가 의견 또는 해결 방법을 입력하세요.','issue.editBlockedIssue':'issue 편집','issue.editBlockedIssueHint':'제목, 세부 정보, 설정 또는 이미지 수정','issue.editBlockedSubtask':'차단된 하위 작업 편집','issue.editBlockedSubtaskHint':'계속하기 전에 현재 차단된 단계 수정','issue.noEditableBlockedSubtask':'편집할 수 있는 미완료 하위 작업이 없습니다','issue.recoveryQueueHint':'확인 후 issue는 중단된 단계부터 계속됩니다. 복구 정보를 사용할 수 없는 경우에만 안전하게 계획 단계로 돌아갑니다.','issue.confirmRecovery':'지침을 제출하고 계속','issue.mergedFrom': '여러 issue를 병합한 항목', 'issue.unmerge': '병합 되돌리기', 'issue.unmergeLocked': '이미 실행 중이라 병합을 되돌릴 수 없습니다.', 'issue.unblockQueued': '대기 중입니다. 현재 작업이 끝나면 자동으로 재개됩니다.', 'issue.unblockQueuedCancel': '대기 취소', 'issue.openRecovery':'차단 해결',
@@ -33,6 +42,7 @@ export const koCatalog = {
   ...notifyMessages.ko,
   ...projectSettingsMessages.ko,
   ...externalImportMessages.ko,
+  ...workspaceMessages.ko,
   ...designWorkbenchMessages.ko,
   ...designWorkbenchAdvancedMessages.ko,
   ...designAssetsUiMessages.ko,

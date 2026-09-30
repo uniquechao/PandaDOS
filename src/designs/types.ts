@@ -1,4 +1,5 @@
 import type { AgentKind } from '../core/types';
+import type { IssueId } from '../../shared/issue-id';
 
 /** The design workbench is its own lifecycle domain, deliberately separate from IssueState. */
 export const DESIGN_TASK_STAGES = [
@@ -201,7 +202,7 @@ export interface DesignGraphNodeDraft {
   evidenceRequirements?: string[];
   completionInstructions?: string[];
   implMode?: 'direct' | 'team';
-  issueId?: number | null;
+  issueId?: IssueId | null;
   lastSyncedRevision?: number | null;
 }
 
@@ -225,7 +226,7 @@ export interface DesignGraphDraft {
 export interface DesignGraphNode extends Omit<DesignGraphNodeDraft, 'ordinal' | 'detail' | 'issueId' | 'lastSyncedRevision'> {
   ordinal: number;
   detail: unknown | null;
-  issueId: number | null;
+  issueId: IssueId | null;
   lastSyncedRevision: number | null;
 }
 
@@ -500,7 +501,7 @@ export interface DesignIssueLink {
   designTaskId: number;
   projectId: number;
   nodeId: string;
-  issueId: number;
+  issueId: IssueId;
   sourceRevision: number;
   lastSyncedRevision: number;
   originalImplMode: 'direct' | 'team';
@@ -509,7 +510,7 @@ export interface DesignIssueLink {
   syncState: string;
   syncError: string | null;
   nextRetryTs: number | null;
-  parentIssueId: number | null;
+  parentIssueId: IssueId | null;
   parentLinkId: number | null;
   createdTs: number;
   updatedTs: number;
@@ -530,11 +531,11 @@ export type DesignIssueSyncState = typeof DESIGN_ISSUE_SYNC_STATES[number];
 export interface DesignIssueSyncResult {
   linkId: number;
   nodeId: string;
-  issueId: number;
+  issueId: IssueId;
   targetRevision: number;
   state: DesignIssueSyncState;
   executionSyncId: number | null;
-  supplementIssueId: number | null;
+  supplementIssueId: IssueId | null;
   repeated: boolean;
 }
 
@@ -616,7 +617,7 @@ export interface DesignPublishConfirmation {
 
 export interface DesignPublishedIssue {
   nodeId: string;
-  issueId: number;
+  issueId: IssueId;
   title: string;
   implMode: 'direct' | 'team';
   moduleId: number | null;

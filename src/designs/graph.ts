@@ -3,6 +3,7 @@ import {
   DESIGN_GRAPH_COMPLEXITIES,
   DESIGN_GRAPH_RUNTIMES,
 } from './types';
+import { parseIssueId } from '../../shared/issue-id';
 import type { DesignGraphDraft, DesignGraphEdgeDraft, DesignGraphNodeDraft } from './types';
 
 export type DesignImplMode = 'direct' | 'team';
@@ -284,7 +285,7 @@ export function validateDesignGraph(graph: DesignGraphDraft): GraphValidation {
       errors.push({ code: 'INVALID_NODE_FIELD', nodeId: node.nodeId, field: 'moduleId', value: node.moduleId });
     }
     const issueId = node.issueId;
-    if (issueId !== undefined && issueId !== null && (!Number.isSafeInteger(issueId) || issueId <= 0)) {
+    if (issueId !== undefined && issueId !== null && parseIssueId(issueId) !== issueId) {
       errors.push({ code: 'INVALID_NODE_FIELD', nodeId: node.nodeId, field: 'issueId', value: issueId });
     }
     const lastSyncedRevision = node.lastSyncedRevision;

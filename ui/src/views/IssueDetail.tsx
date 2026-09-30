@@ -36,6 +36,7 @@ import type {
   Issue,
   IssueCategory,
   IssueDetail,
+  IssueDelivery,
   IssueEvent,
   IssueGitInfo,
   IssueWorkflowRuntime,
@@ -83,6 +84,7 @@ import { tr } from '../i18n/runtime';
 import { parseBlockedNote } from '../../../shared/blocked';
 import { WorkflowGraph } from '../components/WorkflowGraph';
 import { issueWorkflowStatusKey, workflowNodeStatusKey, workflowWorktreeStatusKey } from '../lib/workflow';
+import type { IssueId } from '../../../shared/issue-id';
 
 const POLL_MS = 5000;
 
@@ -111,7 +113,7 @@ export function IssueWorkbench({
   embedded = false,
 }: {
   pid: number;
-  iid: number;
+  iid: IssueId;
   embedded?: boolean;
 }) {
   const [detail, setDetail] = useState<IssueDetail | null>(null);
@@ -624,6 +626,7 @@ export function IssueWorkbench({
         {issue && tab === 'detail' && (
           <DetailTab
             issue={issue}
+            delivery={detail?.delivery ?? null}
             pid={pid}
             images={images}
             subs={subs}
@@ -1056,7 +1059,7 @@ function EditIssueModal({
 
 function useIssueGit(
   pid: number,
-  iid: number,
+  iid: IssueId,
   enabled: boolean,
   /** 刷新键：值变化即重拉（调用方复合 issue 状态 + 是否在 提交/改动 tab） */
   refreshKey: string,
@@ -1319,8 +1322,26 @@ function CompletionReportCard({ issue, onContinue }: { issue: Issue; onContinue:
   );
 }
 
+function DeliveryLine({ delivery }: { delivery: IssueDelivery }) {
+  const pushKey = {
+    pushed: 'issue.deliveryPushPushed',
+    failed: 'issue.deliveryPushFailed',
+    skipped: 'issue.deliveryPushSkipped',
+    not_attempted: 'issue.deliveryPushNotAttempted',
+  } as const;
+  return (
+    <div class="id-delivery small mut" role="status">
+      <span>{tr('issue.deliveryLocalComplete')}</span>
+      <span>{tr(pushKey[delivery.push])}</span>
+      <span>{tr('issue.deliveryMergeUnmanaged')}</span>
+      <span>{tr('issue.deliveryDeployUnmanaged')}</span>
+    </div>
+  );
+}
+
 function DetailTab({
   issue,
+  delivery,
   pid,
   images,
   subs,
@@ -1333,6 +1354,7 @@ function DetailTab({
   onContinue,
 }: {
   issue: Issue;
+  delivery: IssueDelivery | null;
   pid: number;
   images: string[];
   subs: Subtask[];
@@ -1397,6 +1419,7 @@ function DetailTab({
       {(issue.completionReport || issue.resultSummary || issue.status === 'done') && (
         <CompletionReportCard issue={issue} onContinue={onContinue} />
       )}
+      {issue.status === 'done' && delivery && <DeliveryLine delivery={delivery} />}
       {(issue.clarifyFeedback || analyzing) && (
         <div class="id-agentblock">
           <div class="h2" style={{ margin: '2px 0 4px' }}>
@@ -1678,7 +1701,7 @@ function IssueChangesTab({
   onRefresh,
 }: {
   pid: number;
-  iid: number;
+  iid: IssueId;
   info: IssueGitInfo | null;
   err: string;
   onRefresh: () => void;
@@ -2108,9 +2131,15 @@ function ValidationLine({ validation }: { validation: ValidationInfo | null }) {
     : last.outcome === 'passed'
       ? tr('issue.validationPassed')
       : last.outcome === 'skipped'
-        ? tr('issue.validationSkipped')
-        : tr('issue.validationFailed', { label: last.label ?? '', code: last.code ?? 0 });
-  const tone = !last ? 'b-gray' : last.outcome === 'passed' ? 'b-blue' : last.outcome === 'failed' ? 'b-red' : 'b-gray';
+        ? last.reason === 'policy-none' ? tr('issue.validationExempt')
+          : last.reason === 'no-commands' ? tr('issue.validationNoCommands')
+            : tr('issue.validationSkipped')
+        : last.outcome === 'error'
+          ? last.reason === 'required-no-commands' ? tr('issue.validationNoCommands')
+            : last.reason === 'required-gate-disabled' ? tr('issue.validationDisabled')
+              : tr('issue.validationUnavailable')
+          : tr('issue.validationFailed', { label: last.label ?? '', code: last.code ?? 0 });
+  const tone = !last ? 'b-gray' : last.outcome === 'passed' ? 'b-blue' : last.outcome === 'failed' || last.outcome === 'error' ? 'b-red' : 'b-gray';
   return (
     <div class="val-line mut" title={validation.scope?.reason ?? ''}>
       <span>{tr('issue.validation')}</span>

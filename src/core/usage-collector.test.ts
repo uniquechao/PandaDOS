@@ -8,6 +8,7 @@ import { migrate } from './migrate';
 import { migrateIssueEngine } from '../issues/engine';
 import { MODULE_NONE, MODULE_UNATTRIBUTED, UsageStore } from './usage-store';
 import { attributeTo, lineTimestamp, UsageCollector } from './usage-collector';
+import type { IssueId } from '../../shared/issue-id';
 
 const iso = (ms: number) => new Date(ms).toISOString();
 
@@ -52,10 +53,10 @@ function setup(files: Record<string, string> = {}) {
 function conv(db: ReturnType<typeof openDb>, id: string, kind: 'issue' | 'chat' = 'issue') {
   db.run(`INSERT INTO conversations (id, project_id, label, created_ts, agent, kind) VALUES (?, 1, 'x', 1, 'claude', ?)`, [id, kind]);
 }
-function issueOn(db: ReturnType<typeof openDb>, issueId: number, convId: string) {
+function issueOn(db: ReturnType<typeof openDb>, issueId: IssueId, convId: string) {
   db.run(`INSERT INTO issues (id, project_id, title, conv_id, created_ts) VALUES (?, 1, ?, ?, 1)`, [issueId, `i${issueId}`, convId]);
 }
-function segment(db: ReturnType<typeof openDb>, issueId: number, start: number, end?: number) {
+function segment(db: ReturnType<typeof openDb>, issueId: IssueId, start: number, end?: number) {
   db.run(`INSERT INTO issue_events (issue_id, kind, data_json, ts) VALUES (?, 'conversation_segment_started', '{}', ?)`, [issueId, start]);
   if (end !== undefined) {
     db.run(`INSERT INTO issue_events (issue_id, kind, data_json, ts) VALUES (?, 'conversation_segment_ended', '{}', ?)`, [issueId, end]);
@@ -63,6 +64,41 @@ function segment(db: ReturnType<typeof openDb>, issueId: number, start: number, 
 }
 
 describe('增量游标', () => {
+  test('相同路径的第二执行机用自己的 locator 与 reader 计费', async () => {
+    const { db, usage } = setup();
+    db.run(`INSERT INTO executors (id, name, host, port, ssh_user, key_ref, workspace_root, claude_dir)
+      VALUES (2, 'remote', 'remote', 22, 'root', 'k', '/ws', '/claude')`);
+    db.run(`INSERT INTO projects (id, name, executor_id, cwd, owner_user_id, created_ts)
+      VALUES (2, 'b', 2, '/ws/a', 1, 1)`);
+    db.run(`INSERT INTO conversations (id, project_id, label, created_ts, agent, kind)
+      VALUES ('remote-conv', 2, 'x', 1, 'claude', 'chat')`);
+    const path = '/logs/same.jsonl';
+    const content = claudeLine('remote-message', 1000, { input_tokens: 11, output_tokens: 7 }) + '\n';
+    const touched: string[] = [];
+    const primary = {
+      async statPath() { throw new Error('primary executor touched'); },
+      async readFileRange() { throw new Error('primary executor touched'); },
+    };
+    const remote = {
+      async statPath(p: string) { touched.push(`stat:${p}`); return { size: Buffer.byteLength(content), isFile: true }; },
+      async readFileRange(p: string, offset: number, limit: number) {
+        touched.push(`read:${p}`);
+        return { data: new Uint8Array(Buffer.from(content).subarray(offset, offset + limit)), size: Buffer.byteLength(content) };
+      },
+    };
+    const collector = new UsageCollector({
+      db, driver: primary,
+      locate: async () => { throw new Error('primary locator touched'); },
+      executionForProject: (projectId) => projectId === 2
+        ? { driver: remote, locate: async () => path }
+        : { driver: primary, locate: async () => null },
+      now: () => 5000,
+    }, { intervalMs: 0 });
+    expect(await collector.tick()).toMatchObject([{ convId: 'remote-conv', scanned: Buffer.byteLength(content) }]);
+    expect(usage.getConversation('remote-conv')).toMatchObject({ inputTokens: 11, outputTokens: 7 });
+    expect(touched).toEqual([`stat:${path}`, `read:${path}`]);
+  });
+
   test('第二轮只处理新增字节；重复扫不重复计数', async () => {
     const first = claudeLine('m1', 1000, { input_tokens: 10, output_tokens: 5 }) + '\n';
     const { db, files, collector, usage } = setup({ '/logs/c1.jsonl': first });
@@ -133,14 +169,14 @@ describe('归因边界', () => {
     ].join('\n') + '\n';
     const { db, collector, usage } = setup({ '/logs/c1.jsonl': lines });
     conv(db, 'c1');
-    issueOn(db, 10, 'c1');
-    issueOn(db, 11, 'c1');
-    segment(db, 10, 1000, 2000);
-    segment(db, 11, 3000, 4000);
+    issueOn(db, '10', 'c1');
+    issueOn(db, '11', 'c1');
+    segment(db, '10', 1000, 2000);
+    segment(db, '11', 3000, 4000);
 
     await collector.tick();
-    expect(usage.getIssue(10)).toMatchObject({ requests: 1, inputTokens: 10 });
-    expect(usage.getIssue(11)).toMatchObject({ requests: 1, inputTokens: 30 });
+    expect(usage.getIssue('10')).toMatchObject({ requests: 1, inputTokens: 10 });
+    expect(usage.getIssue('11')).toMatchObject({ requests: 1, inputTokens: 30 });
     // 会话总量含全部四行，余量 = 没归因的两行
     expect(usage.getConversation('c1')).toMatchObject({ requests: 4, inputTokens: 69 });
     expect(usage.unattributedByProject()[0]).toMatchObject({ requests: 2, inputTokens: 29 });
@@ -151,15 +187,15 @@ describe('归因边界', () => {
       '/logs/c1.jsonl': claudeLine('m1', 9_000, { input_tokens: 4, output_tokens: 2 }) + '\n',
     });
     conv(db, 'c1');
-    issueOn(db, 10, 'c1');
-    segment(db, 10, 1000); // 只有 started
+    issueOn(db, '10', 'c1');
+    segment(db, '10', 1000); // 只有 started
     await collector.tick();
-    expect(usage.getIssue(10)).toMatchObject({ requests: 1, inputTokens: 4 });
+    expect(usage.getIssue('10')).toMatchObject({ requests: 1, inputTokens: 4 });
   });
 
   test('归因是纯函数判断：抠不出时间戳的行一律算非 Issue 会话', () => {
-    const segs = [{ issueId: 1, start: 100, end: 200 }];
-    expect(attributeTo(segs, 150)).toBe(1);
+    const segs = [{ issueId: '1', start: 100, end: 200 }];
+    expect(attributeTo(segs, 150)).toBe('1');
     expect(attributeTo(segs, 250)).toBeNull();
     expect(attributeTo(segs, undefined)).toBeNull();
     expect(lineTimestamp(claudeLine('m', 1000, {}))).toBe(1000);
@@ -179,8 +215,8 @@ describe('按天分桶（065 / #295）', () => {
       ].join('\n') + '\n',
     });
     conv(db, 'c1');
-    issueOn(db, 10, 'c1');
-    segment(db, 10, t1 - 1000);
+    issueOn(db, '10', 'c1');
+    segment(db, '10', t1 - 1000);
 
     await collector.tick();
     expect(usage.listDaily().map((r) => [r.day, r.inputTokens, r.outputTokens])).toEqual([
@@ -200,8 +236,8 @@ describe('按天分桶（065 / #295）', () => {
       ].join('\n') + '\n',
     });
     conv(db, 'c1');
-    issueOn(db, 10, 'c1');
-    segment(db, 10, day + 1000, day + 3000);
+    issueOn(db, '10', 'c1');
+    segment(db, '10', day + 1000, day + 3000);
 
     await collector.tick();
     const rows = usage.listDailyByModule();
@@ -209,7 +245,7 @@ describe('按天分桶（065 / #295）', () => {
       [MODULE_UNATTRIBUTED, 9], // 未归因那一行没被悄悄摊给 #10
       [MODULE_NONE, 10],        // #10 还没归模块
     ]);
-    expect(usage.getIssue(10)).toMatchObject({ inputTokens: 10 });
+    expect(usage.getIssue('10')).toMatchObject({ inputTokens: 10 });
   });
 
   test('抠不出时间戳的行落到扫描时刻当日（宁可摊到今天，也不丢账）', async () => {

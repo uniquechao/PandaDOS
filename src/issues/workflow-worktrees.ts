@@ -19,6 +19,7 @@ import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales'
 import { readDriverText } from '../core/skills';
 import { gitLockKey, KeyedMutex, tmuxLockKey } from './mutex';
 import type { WorkflowNodeConversationOps } from './workflow-node-runner';
+import type { IssueId } from '../../shared/issue-id';
 
 const MAX_CONFLICT_RESULT_BYTES = 64 * 1024;
 const MAX_DIAGNOSTIC_CHARS = 8_000;
@@ -48,7 +49,7 @@ interface WorktreeRow {
 
 interface RunLookupRow {
   issue_workflow_id: number;
-  issue_id: number;
+  issue_id: IssueId;
   project_id: number;
   cwd: string;
   node_key: string;
@@ -57,7 +58,7 @@ interface RunLookupRow {
 }
 
 interface WorkflowLookupRow {
-  issue_id: number;
+  issue_id: IssueId;
   project_id: number;
   cwd: string;
 }
@@ -81,10 +82,11 @@ export interface WorkflowWorktreeCoordinator {
 export interface WorkflowWorktreeManagerDeps {
   db: Database;
   driver: WorktreeDriver;
+  driverForProjectId?: (projectId: number) => WorktreeDriver;
   conversations: WorkflowNodeConversationOps;
   mutex: KeyedMutex;
   now?: () => number;
-  logEvent(issueId: number, kind: string, data?: Record<string, unknown>): void;
+  logEvent(issueId: IssueId, kind: string, data?: Record<string, unknown>): void;
 }
 
 function mapWorktree(row: WorktreeRow): IssueWorkflowWorktree {
@@ -168,6 +170,9 @@ function parseConflictResult(raw: string): { status: 'resolved' | 'blocked'; det
 }
 
 export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
+  private driver(projectId: number): WorktreeDriver {
+    return this.deps.driverForProjectId?.(projectId) ?? this.deps.driver;
+  }
   private readonly now: () => number;
   private readonly ownedResolvers = new Set<number>();
 
@@ -220,14 +225,14 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
     if (existing?.status === 'active') return existing.path;
     if (existing?.status === 'preparing') {
       return this.deps.mutex.runExclusive(gitLockKey(lookup.project_id), async () => {
-        const valid = await this.deps.driver.git(existing.path, ['rev-parse', '--is-inside-work-tree']);
+        const valid = await this.driver(lookup.project_id).git(existing.path, ['rev-parse', '--is-inside-work-tree']);
         if (valid.code !== 0) {
-          await this.deps.driver.git(lookup.cwd, ['worktree', 'prune']);
-          const branchExists = await this.deps.driver.git(
+          await this.driver(lookup.project_id).git(lookup.cwd, ['worktree', 'prune']);
+          const branchExists = await this.driver(lookup.project_id).git(
             lookup.cwd,
             ['show-ref', '--verify', '--quiet', `refs/heads/${existing.branch}`],
           );
-          const added = await this.deps.driver.git(
+          const added = await this.driver(lookup.project_id).git(
             lookup.cwd,
             branchExists.code === 0
               ? ['worktree', 'add', existing.path, existing.branch]
@@ -250,8 +255,8 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
     const path = `${lookup.cwd.replace(/\/+$/, '')}/.worktrees/workflow-${lookup.issue_workflow_id}/run-${runId}`;
     const branch = `workflow/${lookup.issue_id}/${runId}-${safeNodeKey(lookup.node_key)}`;
     return this.deps.mutex.runExclusive(gitLockKey(lookup.project_id), async () => {
-      const baseRefResult = await this.deps.driver.git(lookup.cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
-      const baseShaResult = await this.deps.driver.git(lookup.cwd, ['rev-parse', '--verify', 'HEAD']);
+      const baseRefResult = await this.driver(lookup.project_id).git(lookup.cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+      const baseShaResult = await this.driver(lookup.project_id).git(lookup.cwd, ['rev-parse', '--verify', 'HEAD']);
       if (baseShaResult.code !== 0) throw new Error(`workflow.worktree_base_missing:${diagnostic(baseShaResult.err)}`);
       const baseRef = baseRefResult.code === 0 ? baseRefResult.out.trim() : 'HEAD';
       const baseSha = baseShaResult.out.trim();
@@ -263,7 +268,7 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
            VALUES (?, ?, ?, ?, ?, ?, 'preparing', ?, ?) RETURNING id`,
         )
         .get(lookup.issue_workflow_id, runId, path, branch, baseRef, baseSha, ts, ts)!;
-      const added = await this.deps.driver.git(lookup.cwd, ['worktree', 'add', '-b', branch, path, baseSha]);
+      const added = await this.driver(lookup.project_id).git(lookup.cwd, ['worktree', 'add', '-b', branch, path, baseSha]);
       if (added.code !== 0) {
         this.deps.db.query(
           `UPDATE issue_workflow_worktrees SET status = 'failed', conflict_details = ?, updated_ts = ? WHERE id = ?`,
@@ -289,21 +294,21 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
     if (!worktree || worktree.status === 'cleaned' || worktree.headSha) return { ok: true };
     const lookup = this.workflow(run.issueWorkflowId);
     return this.deps.mutex.runExclusive(gitLockKey(lookup.project_id), async () => {
-      await this.deps.driver.git(worktree.path, ['reset', '--quiet', '--', '.panda/tmp']);
-      const add = await this.deps.driver.git(worktree.path, [
+      await this.driver(lookup.project_id).git(worktree.path, ['reset', '--quiet', '--', '.panda/tmp']);
+      const add = await this.driver(lookup.project_id).git(worktree.path, [
         'add', '-A', '--', '.', ':(exclude).panda/tmp', ':(exclude).panda/tmp/**',
       ]);
       if (add.code !== 0) return { ok: false, reason: `workflow.worktree_stage_failed:${diagnostic(add.err || add.out)}` };
-      const staged = await this.deps.driver.git(worktree.path, ['diff', '--cached', '--quiet']);
+      const staged = await this.driver(lookup.project_id).git(worktree.path, ['diff', '--cached', '--quiet']);
       if (staged.code === 1) {
-        const commit = await this.deps.driver.git(worktree.path, [
+        const commit = await this.driver(lookup.project_id).git(worktree.path, [
           'commit', '-m', `workflow: #${lookup.issue_id} ${run.nodeKey} (run ${run.id})`,
         ]);
         if (commit.code !== 0) return { ok: false, reason: `workflow.worktree_commit_failed:${diagnostic(commit.err || commit.out)}` };
       } else if (staged.code !== 0) {
         return { ok: false, reason: `workflow.worktree_diff_failed:${diagnostic(staged.err || staged.out)}` };
       }
-      const head = await this.deps.driver.git(worktree.path, ['rev-parse', '--verify', 'HEAD']);
+      const head = await this.driver(lookup.project_id).git(worktree.path, ['rev-parse', '--verify', 'HEAD']);
       if (head.code !== 0) return { ok: false, reason: `workflow.worktree_head_failed:${diagnostic(head.err || head.out)}` };
       this.deps.db.query(
         `UPDATE issue_workflow_worktrees SET head_sha = ?, updated_ts = ? WHERE id = ?`,
@@ -319,9 +324,9 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
   }
 
   private async cleanup(worktree: IssueWorkflowWorktree, lookup: WorkflowLookupRow): Promise<boolean> {
-    const removed = await this.deps.driver.git(lookup.cwd, ['worktree', 'remove', '--force', worktree.path]);
+    const removed = await this.driver(lookup.project_id).git(lookup.cwd, ['worktree', 'remove', '--force', worktree.path]);
     if (removed.code !== 0) {
-      const listed = await this.deps.driver.git(lookup.cwd, ['worktree', 'list', '--porcelain']);
+      const listed = await this.driver(lookup.project_id).git(lookup.cwd, ['worktree', 'list', '--porcelain']);
       if (listed.code !== 0 || listed.out.split('\n').some((line) => line === `worktree ${worktree.path}`)) {
         this.deps.db.query(
           `UPDATE issue_workflow_worktrees SET status = 'cleanup_pending', conflict_details = ?, updated_ts = ? WHERE id = ?`,
@@ -329,9 +334,9 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
         return false;
       }
     }
-    const deleted = await this.deps.driver.git(lookup.cwd, ['branch', '-D', worktree.branch]);
+    const deleted = await this.driver(lookup.project_id).git(lookup.cwd, ['branch', '-D', worktree.branch]);
     if (deleted.code !== 0) {
-      const exists = await this.deps.driver.git(lookup.cwd, ['show-ref', '--verify', '--quiet', `refs/heads/${worktree.branch}`]);
+      const exists = await this.driver(lookup.project_id).git(lookup.cwd, ['show-ref', '--verify', '--quiet', `refs/heads/${worktree.branch}`]);
       if (exists.code === 0) {
         this.deps.db.query(
           `UPDATE issue_workflow_worktrees SET status = 'cleanup_pending', conflict_details = ?, updated_ts = ? WHERE id = ?`,
@@ -355,23 +360,23 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
     return true;
   }
 
-  private async unresolved(cwd: string): Promise<string[]> {
-    const result = await this.deps.driver.git(cwd, ['diff', '--name-only', '--diff-filter=U']);
+  private async unresolved(cwd: string, projectId: number): Promise<string[]> {
+    const result = await this.driver(projectId).git(cwd, ['diff', '--name-only', '--diff-filter=U']);
     return result.code === 0 ? result.out.split('\n').map((line) => line.trim()).filter(Boolean) : [];
   }
 
   private async finishResolved(worktree: IssueWorkflowWorktree, lookup: WorkflowLookupRow): Promise<WorktreeStepResult> {
-    const files = await this.unresolved(lookup.cwd);
+    const files = await this.unresolved(lookup.cwd, lookup.project_id);
     if (files.length) return { state: 'paused', reason: `workflow.merge_conflict_unresolved:${files.join(',')}` };
-    const mergeHead = await this.deps.driver.git(lookup.cwd, ['rev-parse', '--quiet', '--verify', 'MERGE_HEAD']);
+    const mergeHead = await this.driver(lookup.project_id).git(lookup.cwd, ['rev-parse', '--quiet', '--verify', 'MERGE_HEAD']);
     if (mergeHead.code === 0) {
-      const staged = await this.deps.driver.git(lookup.cwd, ['add', '-u']);
+      const staged = await this.driver(lookup.project_id).git(lookup.cwd, ['add', '-u']);
       if (staged.code !== 0) return { state: 'paused', reason: `workflow.merge_stage_failed:${diagnostic(staged.err || staged.out)}` };
-      const commit = await this.deps.driver.git(lookup.cwd, ['commit', '--no-edit']);
+      const commit = await this.driver(lookup.project_id).git(lookup.cwd, ['commit', '--no-edit']);
       if (commit.code !== 0) return { state: 'paused', reason: `workflow.merge_commit_failed:${diagnostic(commit.err || commit.out)}` };
     }
     if (worktree.headSha) {
-      const applied = await this.deps.driver.git(
+      const applied = await this.driver(lookup.project_id).git(
         lookup.cwd,
         ['merge-base', '--is-ancestor', worktree.headSha, 'HEAD'],
       );
@@ -421,12 +426,12 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
       resultContract: { resultPath: paths.resultRel, donePath: paths.doneRel, statusValues: ['resolved', 'blocked'] },
     };
     try {
-      await this.deps.driver.writeFile(paths.context, JSON.stringify(context, null, 2));
+      await this.driver(lookup.project_id).writeFile(paths.context, JSON.stringify(context, null, 2));
       const session = chatTmux(conversation.id);
       await this.deps.mutex.runExclusive(tmuxLockKey(session), async () => {
         const active = await this.deps.conversations.activate(conversation.id, lookup.cwd);
         if (!active) throw new Error('workflow.conflict_conversation_missing');
-        await this.deps.driver.sendKeys(session, buildWorkflowConflictPrompt(agent, paths, locale));
+        await this.driver(lookup.project_id).sendKeys(session, buildWorkflowConflictPrompt(agent, paths, locale));
       });
       this.ownedResolvers.add(worktree.id);
       this.deps.db.query(
@@ -455,14 +460,14 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
     locale: SupportedLocale,
   ): Promise<WorktreeStepResult> {
     const paths = conflictPaths(lookup.cwd, worktree.issueWorkflowId, worktree.id);
-    const done = await this.deps.driver.statPath(paths.done).catch(() => null);
+    const done = await this.driver(lookup.project_id).statPath(paths.done).catch(() => null);
     if (!done?.isFile) {
       if (worktree.resolutionConversationId && !this.ownedResolvers.has(worktree.id)) {
         const session = chatTmux(worktree.resolutionConversationId);
         await this.deps.mutex.runExclusive(tmuxLockKey(session), async () => {
           const active = await this.deps.conversations.activate(worktree.resolutionConversationId!, lookup.cwd);
           if (!active) throw new Error('workflow.conflict_conversation_missing');
-          await this.deps.driver.sendKeys(
+          await this.driver(lookup.project_id).sendKeys(
             session,
             buildWorkflowConflictPrompt(this.resolverAgent(worktree), paths, locale, true),
           );
@@ -476,7 +481,7 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
       }
       return { state: 'running' };
     }
-    const raw = await readDriverText(this.deps.driver, paths.result, MAX_CONFLICT_RESULT_BYTES);
+    const raw = await readDriverText(this.driver(lookup.project_id), paths.result, MAX_CONFLICT_RESULT_BYTES);
     const parsed = raw ? parseConflictResult(raw) : null;
     if (!parsed || parsed.status === 'blocked') {
       const reason = parsed?.details ?? 'workflow.conflict_result_invalid';
@@ -509,7 +514,7 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
     }
     if (!worktree.headSha) return { state: 'running' };
 
-    const merged = await this.deps.driver.git(lookup.cwd, ['merge', '--no-ff', '--no-edit', worktree.branch]);
+    const merged = await this.driver(lookup.project_id).git(lookup.cwd, ['merge', '--no-ff', '--no-edit', worktree.branch]);
     if (merged.code === 0) {
       const ts = this.now();
       this.deps.db.query(
@@ -526,7 +531,7 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
         ? { state: 'completed' }
         : { state: 'running' };
     }
-    const files = await this.unresolved(lookup.cwd);
+    const files = await this.unresolved(lookup.cwd, lookup.project_id);
     const details = JSON.stringify({ code: 'workflow.merge_conflict', files, stderr: diagnostic(merged.err || merged.out) });
     if (!files.length) {
       this.deps.db.query(

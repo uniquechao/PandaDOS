@@ -13,6 +13,9 @@ describe('GET /api/llm-status', () => {
     const db = openDb(':memory:');
     migrate(db);
     migratePmAgent(db);
+    // 测试进程可能由已配置 PANDA_LLM_* 的服务拉起；用 DB 显式空值钉住
+    // 「未配置」基线，避免继承部署环境后把首个断言改成 configured=true。
+    saveLlmConfig(db, { baseUrl: '', model: '', apiKey: '' });
     const users = new UserStore(db);
     const alice = users.create('alice', 'user');
     const dispatch = createDispatcher(llmStatusRoutes({ db }), authDepsFromDb(db, users));

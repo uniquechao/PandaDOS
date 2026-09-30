@@ -30,9 +30,11 @@ import {
   type UpdateUnstartedSubtaskResult,
 } from '../../issues/engine';
 import { normalizeModuleSkills } from '../../issues/modules';
+import { issueDelivery } from '../../issues/delivery';
 import { resolveReasoningEffort } from '../../core/reasoning';
 import { apiError } from '../errors';
 import { json, type RouteDef } from '../middleware';
+import { parseIssueId, type IssueId } from '../../../shared/issue-id';
 
 export interface IssuesRoutesDeps {
   db: Database;
@@ -187,7 +189,7 @@ export function parseIssueGitPatch(
 /** issue 必须属于路径里的项目（防跨项目指鹿为马） */
 function issueOf(engine: IssueEngine, params: Record<string, string>): EngineIssue | null {
   const pid = num(params.projectId);
-  const iid = num(params.issueId);
+  const iid = parseIssueId(params.issueId);
   if (!pid || !iid) return null;
   const issue = engine.store.get(iid);
   return issue && issue.projectId === pid ? issue : null;
@@ -408,12 +410,22 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
       method: 'GET',
       path: '/api/projects/:projectId/issues',
       auth: 'project-access',
-      handler: ({ params }) => {
+      handler: ({ params, url }) => {
         const pid = num(params.projectId);
         if (!pid) return json({ ok: false, error: '缺 projectId' }, 400);
+        // 可选过滤（#368 本地代理拉新增 issue 用）：since=createdTs 下界（不含），status=逗号列表。
+        // 不带参数时行为与原来完全一致（UI 仍拿全量）。
+        const sinceRaw = url.searchParams.get('since');
+        const since = sinceRaw === null ? null : Number(sinceRaw);
+        if (since !== null && !Number.isFinite(since)) return json({ ok: false, error: 'since 须为毫秒时间戳' }, 400);
+        const statuses = (url.searchParams.get('status') ?? '')
+          .split(',')
+          .map((x) => x.trim())
+          .filter(Boolean);
         return json(
           engine.store
             .listByProject(pid)
+            .filter((i) => (since === null || i.createdTs > since) && (!statuses.length || statuses.includes(i.status)))
             .map((i) => ({
               ...i,
               createdByName: createdByName(i),
@@ -536,6 +548,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
             scope: issue.validationScope ?? null,
             last: engine.store.lastValidation(issue.id),
           },
+          delivery: issueDelivery(issue.status, engine.store.listEvents(issue.id)),
           workflow: engine.workflowSnapshot(issue.id),
           workflowRuntime: engine.workflowRuntime(issue.id),
         });

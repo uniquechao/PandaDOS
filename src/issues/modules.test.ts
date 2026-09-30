@@ -534,7 +534,7 @@ describe('ModuleManager.createManual / renameSlug / syncIssueIndex', () => {
     const ensured: string[] = [];
     const refreshed: string[][] = [];
     const renamedDirs: Array<{ from: string; to: string }> = [];
-    const issueIndexes: Array<{ slug: string; ids: number[] }> = [];
+    const issueIndexes: Array<{ slug: string; ids: string[] }> = [];
     let failRenameDir = false;
     const manager = new ModuleManager(modules, {
       suggest: async () => {
@@ -640,10 +640,10 @@ describe('ModuleManager.createManual / renameSlug / syncIssueIndex', () => {
     });
     const { manager, issueIndexes } = docsManager(modules);
     await manager.syncIssueIndex(m, [
-      { id: 1, title: 'a', status: 'done', moduleId: m.id },
-      { id: 2, title: 'b', status: 'pending', moduleId: 999 },
+      { id: '1', title: 'a', status: 'done', moduleId: m.id },
+      { id: '2', title: 'b', status: 'pending', moduleId: 999 },
     ]);
-    expect(issueIndexes).toEqual([{ slug: 'file-preview', ids: [1] }]);
+    expect(issueIndexes).toEqual([{ slug: 'file-preview', ids: ['1'] }]);
     db.close();
   });
 });

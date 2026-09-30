@@ -23,13 +23,14 @@ import { LoginView } from './views/Login';
 import { ProjectsView } from './views/Projects';
 import { BoardView } from './views/Board';
 import { ChatView } from './views/Chat';
-import { FilesView } from './views/Files';
-import { GitView } from './views/Git';
+import { WorkspaceView } from './views/Workspace';
 import { SkillsView } from './views/Skills';
 import { SettingsView } from './views/Settings';
 import { ProjectSettingsView } from './views/ProjectSettings';
 import { ExternalIssuesView } from './views/ExternalIssues';
 import { DesignsView } from './views/Designs';
+import { RoomsView } from './views/Rooms';
+import { RoomDetailView } from './views/RoomDetail';
 import { WorkflowTemplatesView } from './views/WorkflowTemplates';
 import { AdminView } from './views/Admin';
 import { I18nProvider, useI18n } from './i18n/provider';
@@ -50,6 +51,11 @@ const RELEASE_NOTE_KEYS = {
   'issue-pause-resume': 'release.note.issuePauseResume',
   'skill-policies': 'release.note.skillPolicies',
   'project-sync-reliability': 'release.note.projectSyncReliability',
+  'issue-handoff-activation': 'release.note.issueHandoffActivation',
+  'unified-workspace': 'release.note.unifiedWorkspace',
+  'issue-injection-recovery': 'release.note.issueInjectionRecovery',
+  'validation-delivery-evidence': 'release.note.validationDeliveryEvidence',
+  'dedicated-ssh-isolation': 'release.note.dedicatedSshIsolation',
 } as const;
 
 function ReleaseNotes({ onClose }: { onClose: () => void }) {
@@ -491,6 +497,12 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
     case 'design':
       view = <DesignsView key={route.pid} pid={route.pid} selDid={route.did} me={me} />;
       break;
+    case 'rooms':
+      view = <RoomsView key={route.pid} pid={route.pid} me={me} />;
+      break;
+    case 'room':
+      view = <RoomDetailView key={`${route.pid}:${route.rid}`} {...route} me={me} />;
+      break;
     case 'chat':
       // 对话模式视图（chat 项目的落地页 / issue 项目的项目级自由对话入口）
       // cid 走 prop 而非 key：换对话只重选、不重挂整个视图（列表与项目信息不重拉）
@@ -499,11 +511,9 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
     case 'term':
       view = <LazyTerm pid={route.pid} />;
       break;
-    case 'files':
-      view = <FilesView pid={route.pid} />;
-      break;
-    case 'git':
-      view = <GitView pid={route.pid} />;
+    case 'workspace':
+      // key=pid：切项目/工作位置即整页重建，旧项目的迟到响应不会落进新页面
+      view = <WorkspaceView key={route.pid} pid={route.pid} loc={route.loc} />;
       break;
     case 'skills':
       view = <SkillsView pid={route.pid} me={me} />;

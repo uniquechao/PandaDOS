@@ -17,6 +17,7 @@ import type {
 } from './types';
 import type { MessageKey, MessageValues } from '../../../shared/i18n/messages';
 import { tr } from '../i18n/runtime';
+import type { IssueId } from '../../../shared/issue-id';
 
 export interface ApiErrorDescriptor {
   code: string;
@@ -26,6 +27,18 @@ export interface ApiErrorDescriptor {
 }
 
 const ERROR_MESSAGE_KEYS: Readonly<Record<string, MessageKey>> = {
+  'rooms.not_found': 'errors.rooms.not_found',
+  'rooms.invalid_request': 'errors.rooms.invalid_request',
+  'rooms.conflict': 'errors.rooms.conflict',
+  'rooms.idempotency_conflict': 'errors.rooms.idempotency_conflict',
+  'rooms.state_conflict': 'errors.rooms.state_conflict',
+  'rooms.scope_mismatch': 'errors.rooms.scope_mismatch',
+  'rooms.budget_exhausted': 'errors.rooms.budget_exhausted',
+  'rooms.not_configured': 'errors.rooms.not_configured',
+  'rooms.unavailable': 'errors.rooms.unavailable',
+  'rooms.forbidden': 'errors.rooms.forbidden',
+  'rooms.operation_failed': 'errors.rooms.operation_failed',
+  'rooms.publication_pending': 'errors.rooms.publication_pending',
   'feishu.config_invalid': 'errors.feishu.config_invalid',
   'feishu.app_id_invalid': 'errors.feishu.app_id_invalid',
   'feishu.public_url_invalid': 'errors.feishu.public_url_invalid',
@@ -39,6 +52,56 @@ const ERROR_MESSAGE_KEYS: Readonly<Record<string, MessageKey>> = {
   'auth.route_undeclared': 'errors.auth.route_undeclared',
   'project.required': 'errors.project.required',
   'project.not_found': 'errors.project.not_found',
+  // 工作区（#388）：文件写操作 / Git / worktree / 预览
+  'workspace.path_invalid': 'errors.workspace.path_invalid',
+  'workspace.not_found': 'errors.workspace.not_found',
+  'workspace.exists': 'errors.workspace.exists',
+  'workspace.parent_missing': 'errors.workspace.parent_missing',
+  'workspace.not_directory': 'errors.workspace.not_directory',
+  'workspace.file_changed': 'errors.workspace.file_changed',
+  'workspace.delete_root': 'errors.workspace.delete_root',
+  'workspace.delete_count_changed': 'errors.workspace.delete_count_changed',
+  'workspace.dir_not_empty': 'errors.workspace.dir_not_empty',
+  'workspace.move_into_self': 'errors.workspace.move_into_self',
+  'workspace.name_invalid': 'errors.workspace.name_invalid',
+  'workspace.search_query_required': 'errors.workspace.search_query_required',
+  'workspace.operation_failed': 'errors.workspace.operation_failed',
+  'workspace.too_large': 'errors.workspace.too_large',
+  'workspace.preview_path_invalid': 'errors.workspace.preview_path_invalid',
+  'workspace.git.not_repo': 'errors.workspace.git.not_repo',
+  'workspace.git.hunk_invalid': 'errors.workspace.git.hunk_invalid',
+  'workspace.git.hunk_stale': 'errors.workspace.git.hunk_stale',
+  'workspace.git.hunk_failed': 'errors.workspace.git.hunk_failed',
+  'workspace.git.discard_untracked': 'errors.workspace.git.discard_untracked',
+  'workspace.git.discard_failed': 'errors.workspace.git.discard_failed',
+  'workspace.git.resolve_failed': 'errors.workspace.git.resolve_failed',
+  'workspace.git.operation_invalid': 'errors.workspace.git.operation_invalid',
+  'workspace.git.no_operation': 'errors.workspace.git.no_operation',
+  'workspace.git.continue_failed': 'errors.workspace.git.continue_failed',
+  'workspace.git.abort_failed': 'errors.workspace.git.abort_failed',
+  'workspace.git.fetch_failed': 'errors.workspace.git.fetch_failed',
+  'workspace.git.pull_mode_invalid': 'errors.workspace.git.pull_mode_invalid',
+  'workspace.git.detached': 'errors.workspace.git.detached',
+  'workspace.git.no_upstream': 'errors.workspace.git.no_upstream',
+  'workspace.git.operation_in_progress': 'errors.workspace.git.operation_in_progress',
+  'workspace.git.dirty': 'errors.workspace.git.dirty',
+  'workspace.git.diverged': 'errors.workspace.git.diverged',
+  'workspace.git.pull_conflict': 'errors.workspace.git.pull_conflict',
+  'workspace.git.pull_failed': 'errors.workspace.git.pull_failed',
+  'workspace.git.branch_invalid': 'errors.workspace.git.branch_invalid',
+  'workspace.git.branch_exists': 'errors.workspace.git.branch_exists',
+  'workspace.git.ref_invalid': 'errors.workspace.git.ref_invalid',
+  'workspace.git.branch_failed': 'errors.workspace.git.branch_failed',
+  'workspace.git.checkout_blocked': 'errors.workspace.git.checkout_blocked',
+  'workspace.git.checkout_failed': 'errors.workspace.git.checkout_failed',
+  'workspace.git.branch_in_worktree': 'errors.workspace.git.branch_in_worktree',
+  'workspace.git.worktree_path_exists': 'errors.workspace.git.worktree_path_exists',
+  'workspace.git.worktree_add_failed': 'errors.workspace.git.worktree_add_failed',
+  'workspace.git.worktree_not_found': 'errors.workspace.git.worktree_not_found',
+  'workspace.git.worktree_protected': 'errors.workspace.git.worktree_protected',
+  'workspace.git.worktree_busy': 'errors.workspace.git.worktree_busy',
+  'workspace.git.worktree_dirty': 'errors.workspace.git.worktree_dirty',
+  'workspace.git.worktree_remove_failed': 'errors.workspace.git.worktree_remove_failed',
   'user.not_found': 'errors.user.not_found',
   'executor.not_found': 'errors.executor.not_found',
   'executor.id_required': 'errors.executor.id_required',
@@ -404,7 +467,7 @@ export function transferOwner(
 /** 改这条 issue 的弹窗自动批准档位；任何状态都能改，下一次弹窗即按新档位分级 */
 export function setIssueAutoApprove(
   projectId: number,
-  issueId: number,
+  issueId: IssueId,
   level: AutoApproveLevel,
 ): Promise<{ ok: boolean; issue: Issue }> {
   return api(`/api/projects/${projectId}/issues/${issueId}/auto-approve`, 'POST', { level });

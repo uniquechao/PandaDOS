@@ -20,6 +20,7 @@ import {
   buildGitAiPrompt, GIT_AI_KINDS, gitRoutes,
   type GitCommitRec, type IssueGitInfo, type IssueGitRef,
 } from './git';
+import type { IssueId } from '../../../shared/issue-id';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -888,14 +889,14 @@ const SNAP: ImplCommitsSnapshot = {
  * issue 15 → 分支已删但有耐久快照，issue 16 → 起点锚失效但有耐久快照，
  * 其余 → null（非本项目）。
  */
-const issueRefStub = (projectId: number, issueId: number): IssueGitRef | null => {
+const issueRefStub = (projectId: number, issueId: IssueId): IssueGitRef | null => {
   if (projectId !== 1) return null;
-  if (issueId === 7) return { branch: 'issue/7', base: 'main' };
-  if (issueId === 8) return { branch: 'issue/8', base: 'main' }; // 分支不存在
-  if (issueId === 9) return { branch: 'issue/7', base: 'main', active: true };
-  if (issueId === 14) return { branch: 'issue/nope', base: 'main', active: true };
-  if (issueId === 15) return { branch: 'issue/deleted', base: 'main', snapshot: () => SNAP };
-  if (issueId === 16) return { branch: 'issue/7', base: 'main', startSha: 'deadbeef', snapshot: () => SNAP };
+  if (issueId === '7') return { branch: 'issue/7', base: 'main' };
+  if (issueId === '8') return { branch: 'issue/8', base: 'main' }; // 分支不存在
+  if (issueId === '9') return { branch: 'issue/7', base: 'main', active: true };
+  if (issueId === '14') return { branch: 'issue/nope', base: 'main', active: true };
+  if (issueId === '15') return { branch: 'issue/deleted', base: 'main', snapshot: () => SNAP };
+  if (issueId === '16') return { branch: 'issue/7', base: 'main', startSha: 'deadbeef', snapshot: () => SNAP };
   return null;
 };
 
@@ -1136,12 +1137,12 @@ async function setupShared() {
     `INSERT INTO projects (name, executor_id, cwd, owner_user_id, created_ts) VALUES (?, 1, ?, ?, ?)`,
   ).run('repo', repo, alice.user.id, Date.now());
   // 三条 issue 都落在固定分支 work：A/B 已定格（有 endSha），C 仍在推进（无 endSha→用分支 tip）
-  const stub = (projectId: number, issueId: number): IssueGitRef | null => {
+  const stub = (projectId: number, issueId: IssueId): IssueGitRef | null => {
     if (projectId !== 1) return null;
-    if (issueId === 10) return { branch: 'work', base: 'main', startSha: sha.base, endSha: sha.a2 };
-    if (issueId === 11) return { branch: 'work', base: 'main', startSha: sha.a2, endSha: sha.b1 };
-    if (issueId === 12) return { branch: 'work', base: 'main', startSha: sha.b1 }; // 无 endSha
-    if (issueId === 13) return { branch: 'work', base: 'main', startSha: 'deadbeef' }; // 失效锚点→降级
+    if (issueId === '10') return { branch: 'work', base: 'main', startSha: sha.base, endSha: sha.a2 };
+    if (issueId === '11') return { branch: 'work', base: 'main', startSha: sha.a2, endSha: sha.b1 };
+    if (issueId === '12') return { branch: 'work', base: 'main', startSha: sha.b1 }; // 无 endSha
+    if (issueId === '13') return { branch: 'work', base: 'main', startSha: 'deadbeef' }; // 失效锚点→降级
     return null;
   };
   const dispatch = createDispatcher(

@@ -11,6 +11,7 @@ import {
   type GuardNotifyEvent,
   type RegressionGuardDeps,
 } from './validation-guard';
+import type { IssueId } from '../../shared/issue-id';
 
 const project = (over: Partial<Project> = {}): Project => ({
   id: 1, name: 'demo', executorId: 1, cwd: '/repo', ownerUserId: 1,
@@ -23,7 +24,7 @@ const project = (over: Partial<Project> = {}): Project => ({
 const pkg = JSON.stringify({ scripts: { typecheck: 'tsc', test: 'bun test' } });
 
 function harness(over: Partial<RegressionGuardDeps> & { results?: CommandResult[] } = {}) {
-  const events: Array<{ issueId: number; kind: string; data: Record<string, unknown> }> = [];
+  const events: Array<{ issueId: IssueId; kind: string; data: Record<string, unknown> }> = [];
   const notifications: GuardNotifyEvent[] = [];
   const calls: string[][] = [];
   const results = over.results ?? [];
@@ -44,7 +45,7 @@ function harness(over: Partial<RegressionGuardDeps> & { results?: CommandResult[
     },
     listProjects: () => [project()],
     isBusy: () => false,
-    anchorIssueId: () => 42,
+    anchorIssueId: () => '42',
     logEvent: (issueId, kind, data) => { events.push({ issueId, kind, data }); },
     lastRunTs: () => null,
     notify: (e) => { notifications.push(e); },
@@ -60,6 +61,33 @@ function harness(over: Partial<RegressionGuardDeps> & { results?: CommandResult[
 }
 
 describe('批次全量回归守护', () => {
+  test('同一 cwd 的第二执行机只读取、运行自己的门禁', async () => {
+    const h = harness();
+    const second = project({ id: 2, executorId: 2, cwd: '/repo' });
+    const calls: string[] = [];
+    const forbidden = {
+      async runCommand() { throw new Error('primary executor touched'); },
+      async statPath() { throw new Error('primary executor touched'); },
+      async readFileRange() { throw new Error('primary executor touched'); },
+    };
+    const remote = {
+      async runCommand(_cwd: string, argv: string[]) {
+        calls.push(argv.join(' '));
+        return { code: 0, out: '', err: '', timedOut: false, durationMs: 1 };
+      },
+      async statPath() { calls.push('stat'); return { size: pkg.length, isFile: true }; },
+      async readFileRange() { calls.push('read'); return { data: new TextEncoder().encode(pkg) }; },
+    };
+    const guard = new RegressionGuard({
+      ...h.deps,
+      driver: forbidden,
+      listProjects: () => [second],
+      driverForProject: (p) => p.executorId === 2 ? remote : forbidden,
+    }, { intervalMs: 1000, timeoutMs: 1000 });
+    expect((await guard.tick())[0]?.kind).toBe('passed');
+    expect(calls).toEqual(['stat', 'read', 'bun run typecheck', 'bun run test']);
+  });
+
   test('全绿：跑完整清单并落 regression_passed，不发通知', async () => {
     const h = harness();
     expect(await h.guard.tick()).toEqual([{ kind: 'passed', durationMs: 0 }]);
@@ -77,12 +105,12 @@ describe('批次全量回归守护', () => {
     expect(outcome).toEqual({ kind: 'failed', label: 'test', code: 1 });
 
     const failed = h.events.find((e) => e.kind === 'regression_failed')!;
-    expect(failed.issueId).toBe(42); // 挂在项目锚点 issue 上（项目级事件的既有惯例）
+    expect(failed.issueId).toBe('42'); // 挂在项目锚点 issue 上（项目级事件的既有惯例）
     expect(failed.data).toMatchObject({ projectId: 1, label: 'test', code: 1 });
     expect(String(failed.data.tail)).toContain('3 fail');
 
     expect(h.notifications).toEqual([{
-      kind: 'issue_blocked', projectId: 1, issueId: 42,
+      kind: 'issue_blocked', projectId: 1, issueId: '42',
       summaryCode: 'regression_failed',
       summaryParams: { project: 'demo', label: 'test', code: 1 },
     }]);

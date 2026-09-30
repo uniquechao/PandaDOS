@@ -8,6 +8,7 @@ import type {
   EngineExecutionWorkspaceOps,
   EngineIssue,
 } from '../issues/engine';
+import type { IssueId } from '../../shared/issue-id';
 
 export type ExecutionWorkspaceErrorCode = 'RUN_UNHEALTHY' | 'WORKTREE_MISMATCH';
 
@@ -60,7 +61,7 @@ export class DesignExecutionWorkspaceAdapter implements EngineExecutionWorkspace
   }
 
   resolve(issue: EngineIssue, project: Project): EngineExecutionWorkspace {
-    const row = this.deps.db.query<LinkedRunRow, [number, number]>(`
+    const row = this.deps.db.query<LinkedRunRow, [IssueId, number]>(`
       SELECT run.id AS run_id, run.project_id AS run_project_id,
              run.design_task_id AS run_design_id, run.publication_id AS run_publication_id,
              run.execution_mode, run.lifecycle_state, run.assignment_active,

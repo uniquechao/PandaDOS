@@ -1,3 +1,4 @@
+import type { IssueId } from '../../shared/issue-id';
 /**
  * issues/merge-guards —— 智能合并的**确定性**守卫（#289 / B-14）。
  *
@@ -115,7 +116,7 @@ export function looksTruncated(candidate: MergeCandidateLike): boolean {
 
 /** 合并快照里的一条：拆回的唯一依据，所以字段必须齐 */
 export interface MergeSnapshotEntry {
-  id: number;
+  id: IssueId;
   title: string;
   body: string | null;
   clarifyFeedback?: string | null;

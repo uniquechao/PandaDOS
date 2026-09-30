@@ -22,6 +22,7 @@ import {
   type UploadFs,
 } from '../../core/uploads';
 import { getProject } from '../../issues/engine';
+import type { Project } from '../../core/types';
 import { json, type RouteDef } from '../middleware';
 
 /** 单张截图大小上限（v1 是 12MB；v2 收紧为 5MB，评审 [M11] 上传无上限教训的反向收口） */
@@ -32,8 +33,10 @@ const MULTIPART_OVERHEAD = 64 * 1024;
 
 export interface UploadsRoutesDeps {
   db: Database;
-  /** 项目所在执行机的 Driver（SshDriver/LocalDriver 均可，结构兼容 UploadFs） */
+  /** Legacy single-executor adapter. */
   driver: UploadFs;
+  /** Resolve the executor together with the project; identical cwd strings are not an identity. */
+  driverForProject?(project: Project): UploadFs;
 }
 
 export function uploadsRoutes(deps: UploadsRoutesDeps): RouteDef[] {
@@ -68,7 +71,7 @@ export function uploadsRoutes(deps: UploadsRoutesDeps): RouteDef[] {
 
         const data = new Uint8Array(await file.arrayBuffer());
         try {
-          const saved = await saveUploadImage(driver, project.cwd, name, data);
+          const saved = await saveUploadImage(deps.driverForProject?.(project) ?? driver, project.cwd, name, data);
           return json({ ok: true, path: saved.rel, abs: saved.abs, name: saved.name, size: data.length });
         } catch (e) {
           return json({ ok: false, error: String(e).slice(0, 200) }, 500);
@@ -104,7 +107,7 @@ export function uploadsRoutes(deps: UploadsRoutesDeps): RouteDef[] {
 
         const data = new Uint8Array(await file.arrayBuffer());
         try {
-          const saved = await saveUploadFile(driver, project.cwd, name, data);
+          const saved = await saveUploadFile(deps.driverForProject?.(project) ?? driver, project.cwd, name, data);
           return json({ ok: true, path: saved.rel, abs: saved.abs, name: saved.name, size: data.length });
         } catch (e) {
           return json({ ok: false, error: String(e).slice(0, 200) }, 500);

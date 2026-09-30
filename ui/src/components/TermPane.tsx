@@ -10,6 +10,7 @@ import { connectWs, type WsHandle } from '../lib/ws';
 import { bindTermTouchScroll, createTermTouchScrollController } from './termTouchScroll';
 import { createTermWheelScrollController } from './termWheelScroll';
 import { tr } from '../i18n/runtime';
+import type { IssueId } from '../../../shared/issue-id';
 
 const MAX_SCROLL_LINES_PER_FRAME = 100;
 
@@ -43,7 +44,7 @@ const TERM_KEYS: Array<[string, string]> = [
 
 export type TermStatus = 'connecting' | 'open' | 'closed' | 'exit';
 
-export type NativeTarget = { kind: 'bash' } | { kind: 'issue'; issueId: number } | { kind: 'conversation'; convId: string };
+export type NativeTarget = { kind: 'bash' } | { kind: 'issue'; issueId: IssueId } | { kind: 'conversation'; convId: string };
 
 export function buildTermWsPath(pid: number, target: NativeTarget, cols: number, rows: number): string {
   const params = new URLSearchParams();

@@ -21,6 +21,7 @@ import { json, type RouteDef } from '../middleware';
 // ---------- 依赖（与 ExecutorDriver 结构兼容的最小探查接口） ----------
 
 export interface ExecutorProbe {
+  runCommand?(cwd: string, argv: string[], timeoutMs: number): Promise<{ code: number; out: string }>;
   listSessions(): Promise<TmuxSession[]>;
   readFileRange(path: string, offset: number, limit: number): Promise<{ data: Uint8Array; size: number }>;
   statPath(path: string): Promise<PathStat | null>;

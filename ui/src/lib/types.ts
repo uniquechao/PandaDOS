@@ -1,4 +1,5 @@
 import type { SupportedLocale } from '../../../shared/i18n/locales';
+import type { IssueId } from '../../../shared/issue-id';
 
 /**
  * ui/lib/types —— 前端侧 API/WS 资源类型镜像。
@@ -123,6 +124,7 @@ export interface Project {
   createdTs: number;
   /** 项目归属的执行机 Linux 用户名（'' = 跟随执行机连接用户） */
   runUser: string;
+  executionIsolation?: 'shared' | 'dedicated-ssh';
   /** README 自动简介（按天巡检生成；null = 尚未生成） */
   readmeSummary: string | null;
   /** 项目工作分支（兜底用；引擎默认在开发者当前所在分支上干活，不建/不切/不合并分支） */
@@ -141,6 +143,7 @@ export interface Project {
   manualReview: boolean;
   /** 门禁命令（#279）：null = 未配置，按 package.json 探测；空数组 = 显式不跑门禁 */
   validationCommands?: ValidationCommand[] | null;
+  validationPolicy?: 'required' | 'optional' | 'none';
   /** 项目统一使用 Issue 看板。 */
   kind: 'issue';
 }
@@ -378,7 +381,7 @@ export type AttentionKind =
 
 /** EngineIssue（issues 路由返回的行） */
 export interface Issue {
-  id: number;
+  id: IssueId;
   projectId: number;
   title: string;
   body: string | null;
@@ -463,7 +466,7 @@ export interface Subtask {
 
 export interface IssueEvent {
   id: number;
-  issueId: number;
+  issueId: IssueId;
   kind: string;
   dataJson: string | null;
   ts: number;
@@ -474,7 +477,7 @@ export interface ConversationSegment {
   id: string;
   /** 这段挂在哪条会话上：与当前 issue 的 convId 不同 = 轮换之前的历史会话 */
   convId: string;
-  issueId: number;
+  issueId: IssueId;
   title: string;
   status: IssueStatus;
   startTs: number;
@@ -490,6 +493,7 @@ export interface ValidationScope {
 
 export interface ValidationResult {
   outcome: 'passed' | 'failed' | 'skipped' | 'error';
+  reason?: string | null;
   scope: 'targeted' | 'full' | 'docs' | null;
   label: string | null;
   code: number | null;
@@ -503,6 +507,15 @@ export interface ValidationInfo {
   last: ValidationResult | null;
 }
 
+export interface IssueDelivery {
+  implementation: 'complete' | 'incomplete';
+  commit: 'recorded' | 'unrecorded';
+  commitSha: string | null;
+  push: 'pushed' | 'failed' | 'skipped' | 'not_attempted';
+  merge: 'not_managed';
+  deploy: 'not_managed';
+}
+
 export interface ValidationCommand {
   label: string;
   argv: string[];
@@ -510,7 +523,7 @@ export interface ValidationCommand {
 
 /** 待恢复意图（#283）：用户点过「继续运行」但项目忙，等接力自动恢复 */
 export interface UnblockRequest {
-  issueId: number;
+  issueId: IssueId;
   guidance: string;
   resumeState: IssueStatus | null;
   actor: number | null;
@@ -519,7 +532,7 @@ export interface UnblockRequest {
 
 /** 可拆回的智能合并（#289）：宿主由哪几条并来，以及此刻还能不能拆 */
 export interface MergedFromInfo {
-  members: Array<{ id: number; title: string }>;
+  members: Array<{ id: IssueId; title: string }>;
   /** 只有宿主仍未开跑（pending）时才允许拆回 */
   canUnmerge: boolean;
 }
@@ -540,7 +553,7 @@ export type GateKind = 'plan' | 'merge_review';
 
 export interface Gate {
   id: number;
-  issueId: number;
+  issueId: IssueId;
   kind: GateKind;
   status: 'waiting' | 'approved' | 'rejected';
   payloadJson: string | null;
@@ -577,6 +590,7 @@ export interface IssueDetail {
   moduleSegments: ConversationSegment[];
   /** 门禁范围与最近一次结果（#279）；旧后端可能没有这个字段 */
   validation?: ValidationInfo;
+  delivery?: IssueDelivery;
   /** 生效推理档与来源（#281）；旧后端可能没有这个字段 */
   reasoning?: ReasoningInfo;
   /** 待恢复意图（#283）；null = 没有排队 */
@@ -595,7 +609,7 @@ export interface Subscription {
   id: number;
   userId: number;
   scope: SubscriptionScope;
-  targetId: number;
+  targetId: number | IssueId;
   createdTs: number;
 }
 
@@ -622,6 +636,8 @@ export interface FsEntry {
   size: number | null;
   mtimeMs: number | null;
   mode: number | null;
+  /** 工作区 Git 标记（?git=1 时给）：U 冲突 / M A D R 改动 / • 目录内有改动 / ? 未跟踪 / ! 忽略 */
+  git?: 'U' | 'M' | 'A' | 'D' | 'R' | '?' | '!' | '•';
 }
 
 /** GET /api/projects/:pid/fs?path= */
@@ -632,6 +648,85 @@ export interface FsList {
   path: string;
   entries: FsEntry[];
   truncated?: boolean;
+  /** 项目所在执行机（复制执行机绝对路径时标注） */
+  executor?: { name: string; local: boolean } | null;
+}
+
+/** GET /api/projects/:pid/fs/stat */
+export interface FsStat {
+  ok: boolean;
+  path: string;
+  exists: boolean;
+  type?: 'file' | 'dir' | 'other';
+  size?: number;
+  mtimeMs?: number;
+  /** version：目录条目摘要，删除非空目录时原样带回防竞态 */
+  count?: { files: number; dirs: number; truncated: boolean; version: string };
+}
+
+/** GET /api/projects/:pid/fs/search */
+export interface FsSearchResult {
+  ok: boolean;
+  mode: 'name' | 'content';
+  q: string;
+  results: Array<{ path: string; type?: string; line?: number; text?: string }>;
+  truncated: boolean;
+}
+
+/** 进行中的多步 Git 操作 */
+export type GitOperationState = 'merge' | 'rebase' | 'cherry-pick' | 'revert' | null;
+
+/** GET /api/projects/:pid/git/worktrees 的一项 */
+export interface WorktreeInfo {
+  path: string;
+  branch: string;
+  head: string;
+  detached: boolean;
+  locked: boolean;
+  prunable: boolean;
+  kind: 'main' | 'panda' | 'design' | 'external';
+  current: boolean;
+  changes: number | null;
+  projects: Array<{ id: number; name: string; running: number }>;
+}
+
+export interface WorktreeList {
+  ok: boolean;
+  prefix: string;
+  managedRoot: string;
+  suggestedPrefix: string;
+  worktrees: WorktreeInfo[];
+}
+
+/** GET /api/projects/:pid/git/pull-preview */
+export interface PullPreview {
+  ok: boolean;
+  branch: string;
+  upstream: string;
+  ahead: number;
+  behind: number;
+  dirty: number;
+  untracked: number;
+  operation: GitOperationState;
+  /** 绑定此 cwd 的运行中 issue 数（>0 不可 pull） */
+  running: number;
+  modes: Array<'ff-only' | 'merge' | 'rebase'>;
+}
+
+/** 切换分支的阻止原因 */
+export interface CheckoutBlocker {
+  code: 'dirty' | 'issue_running' | 'branch_in_worktree' | 'operation_in_progress';
+  count?: number;
+  path?: string;
+  projectId?: number | null;
+  operation?: string;
+}
+
+export interface CheckoutCheck {
+  ok: boolean;
+  branch: string;
+  tracking?: string;
+  blockers: CheckoutBlocker[];
 }
 
 /** GET /api/projects/:pid/fs/file?path= */
@@ -686,6 +781,13 @@ export interface GitInfo {
   commits?: GitCommit[];
   changes?: GitChange[];
   error?: string;
+  /** cwd 相对仓库根的前缀（工作区 #388） */
+  prefix?: string;
+  /** 上次 fetch 时间（FETCH_HEAD mtime）；从未 fetch 为 null */
+  lastFetchTs?: number | null;
+  operation?: GitOperationState;
+  remotes?: string[];
+  upstreamGone?: boolean;
 }
 
 /** GET /api/projects/:pid/git/branches 的分支引用；ref 是后端可直接解析的完整引用名。 */
@@ -992,7 +1094,7 @@ export type WorkflowWorktreeStatus = 'preparing' | 'active' | 'merging' | 'resol
 
 export interface IssueWorkflowSnapshot {
   id: number;
-  issueId: number;
+  issueId: IssueId;
   templateId: number | null;
   templateVersionId: number | null;
   templateName: string;

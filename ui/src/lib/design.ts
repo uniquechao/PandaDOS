@@ -1,5 +1,6 @@
 import type { AgentKind } from './types';
 import type { MessageKey } from '../../../shared/i18n/messages';
+import type { IssueId } from '../../../shared/issue-id';
 
 export type DesignTaskStage =
   | 'goal_setting'
@@ -142,7 +143,7 @@ export interface DesignGraphNode {
   agent?: AgentKind | null;
   implMode?: 'direct' | 'team';
   detail: unknown | null;
-  issueId: number | null;
+  issueId: IssueId | null;
   lastSyncedRevision: number | null;
 }
 
@@ -166,7 +167,7 @@ export interface DesignFindingView {
   evidence?: string[]; patch?: string[]; blocker?: boolean;
 }
 
-export interface DesignLinkedIssueView { linkId: number; issueId: number; status: string; syncState: string; pendingDiffId?: number | null }
+export interface DesignLinkedIssueView { linkId: number; issueId: IssueId; status: string; syncState: string; pendingDiffId?: number | null }
 
 export interface DesignPersonaView {
   id: number; key: string; origin: 'builtin' | 'market' | 'project'; contentHash: string;
@@ -205,11 +206,11 @@ export interface DesignRunView {
 
 export interface DesignPublicationView {
   publicationId: number; revision: number; graphDigest: string; status: string;
-  issues: { nodeId: string; issueId: number }[];
+  issues: { nodeId: string; issueId: IssueId }[];
 }
 
 export interface DesignSyncView {
-  linkId: number; executionSyncId: number | null; issueId: number; nodeId: string;
+  linkId: number; executionSyncId: number | null; issueId: IssueId; nodeId: string;
   targetRevision: number; state: string; decisionState: string | null;
   fields: { field: string; kind: string; base: unknown; local: unknown; incoming: unknown }[];
   recovery?: { pending: boolean; resolutionRequired: boolean };
@@ -475,7 +476,7 @@ export function graphSemanticRows(graph: DesignGraph): {
   nodeId: string;
   title: string;
   prerequisiteTitles: string[];
-  issueId: number | null;
+  issueId: IssueId | null;
 }[] {
   const byId = new Map(graph.nodes.map((node) => [node.nodeId, node] as const));
   return [...graph.nodes]

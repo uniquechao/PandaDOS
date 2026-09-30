@@ -28,6 +28,7 @@ import type {
 } from '../lib/types';
 import { useI18n } from '../i18n/provider';
 import { tr } from '../i18n/runtime';
+import type { IssueId } from '../../../shared/issue-id';
 
 /** 常用键条（key 名 = 后端 tmux 白名单键名，与 v1 ALLOWED_KEYS 一致） */
 const KEYS: Array<[string, string]> = [
@@ -79,7 +80,7 @@ export function ChatPane({
   conversationSegments?: ConversationSegment[];
   /** 本模块跨会话的全部分段（#277）：当前 issue 之前的历史时间线，列在消息流最前面 */
   moduleSegments?: ConversationSegment[];
-  currentIssueId?: number;
+  currentIssueId?: IssueId;
 }) {
   const { t } = useI18n();
   const [msgs, setMsgs] = useState<ChatMessage[]>([]);

@@ -19,6 +19,7 @@ import {
   threeWayDesignDiff,
   type DesignIssueSyncContract,
 } from './sync';
+import type { IssueId } from '../../shared/issue-id';
 
 function contract(overrides: Partial<DesignIssueSyncContract> = {}): DesignIssueSyncContract {
   return {
@@ -83,7 +84,7 @@ async function setupSync(nodes: DesignGraphNodeDraft[] = [publishableNode()]) {
     db,
     driver: {
       sendKeys: async (_session: string, text: string) => { injections.push(text); },
-      capturePane: async () => { captures++; return ''; },
+      capturePane: async () => { captures++; return '› '; },
       git: async (_cwd: string, args: string[]) => {
         gitCalls.push(args);
         const out = args[0] === 'symbolic-ref'
@@ -94,7 +95,12 @@ async function setupSync(nodes: DesignGraphNodeDraft[] = [publishableNode()]) {
         return { code: 0, out, err: '' };
       },
     } as never,
-    convs: { tmuxName: () => 'sync-session' } as never,
+    convs: {
+      tmuxName: () => 'sync-session',
+      currentConv: (projectId: number) => db.query<{ conv_id: string }, [number]>(
+        'SELECT conv_id FROM project_active_conv WHERE project_id = ?',
+      ).get(projectId)?.conv_id,
+    } as never,
     locator: {} as never,
     pmFor: () => ({}) as never,
     notify: { dispatch: async () => {} },
@@ -306,7 +312,7 @@ describe('DesignSyncCoordinator', () => {
     const isolatedIssues = new Proxy(s.issueEngine, {
       get(target, property, receiver) {
         if (property === 'getDesignSyncSnapshot') {
-          return (issueId: number) => {
+          return (issueId: IssueId) => {
             if (issueId === s.issueIds[0]) throw new Error('first link unavailable');
             return target.getDesignSyncSnapshot(issueId);
           };
@@ -416,7 +422,7 @@ describe('DesignSyncCoordinator', () => {
       expect(result!.state, status).toBe(linkState);
       expect(s.issueEngine.getExecutionSync(result!.executionSyncId!)!.state, status).toBe(executionState);
       if (status === 'plan_review' || status === 'merge_review') {
-        expect(s.db.query<{ n: number }, [number]>(
+        expect(s.db.query<{ n: number }, [IssueId]>(
           "SELECT COUNT(*) AS n FROM gates WHERE issue_id = ? AND status = 'waiting'",
         ).get(s.issueId)!.n, status).toBe(1);
       }
@@ -495,7 +501,7 @@ describe('DesignSyncCoordinator', () => {
 
     await s.coordinator.decide(requested.executionSyncId!, revision, 'ignore', 1);
     expect(s.issueEngine.store.get(s.issueId)!.status).toBe('plan_review');
-    expect(s.db.query<{ n: number }, [number]>(
+    expect(s.db.query<{ n: number }, [IssueId]>(
       "SELECT COUNT(*) AS n FROM gates WHERE issue_id = ? AND kind = 'plan' AND status = 'waiting'",
     ).get(s.issueId)!.n).toBe(1);
     s.db.close();
@@ -521,7 +527,7 @@ describe('DesignSyncCoordinator', () => {
         status, title: original.title, body: original.body,
       });
       expect(supplement).toMatchObject({ status: 'pending', title: `Supplement for ${status}` });
-      expect(s.db.query<{ n: number }, [number]>(
+      expect(s.db.query<{ n: number }, [IssueId]>(
         "SELECT COUNT(*) AS n FROM design_issue_links WHERE parent_issue_id = ? AND link_kind = 'supplement'",
       ).get(s.issueId)!.n).toBe(1);
       s.db.close();
@@ -766,6 +772,8 @@ describe('DesignSyncCoordinator', () => {
     const s = await setupSync();
     s.db.run(`INSERT INTO conversations (id, project_id, label, created_ts, agent, kind)
               VALUES ('sync-crash', 1, 'sync', 1, 'codex', 'issue')`);
+    s.db.run(`INSERT INTO project_active_conv (project_id, conv_id, updated_ts)
+              VALUES (1, 'sync-crash', 1)`);
     s.db.query(
       "UPDATE issues SET status = 'implementing', impl_mode = 'seq', conv_id = 'sync-crash' WHERE id = ?",
     ).run(s.issueId);
@@ -848,7 +856,7 @@ describe('DesignSyncCoordinator', () => {
     await s.issueEngine.applyEvent(s.issueId, 'plan_ready');
     const originalLog = s.issueEngine.store.logEvent.bind(s.issueEngine.store);
     s.issueEngine.store.logEvent = ((
-      issueId: number,
+      issueId: IssueId,
       kind: string,
       data?: Record<string, unknown>,
     ) => {
@@ -886,7 +894,7 @@ describe('DesignSyncCoordinator', () => {
     const requested = s.coordinator.reconcileRevision(s.designId, revision, 1)[0]!;
     const originalLog = s.issueEngine.store.logEvent.bind(s.issueEngine.store);
     s.issueEngine.store.logEvent = ((
-      issueId: number,
+      issueId: IssueId,
       kind: string,
       data?: Record<string, unknown>,
     ) => {

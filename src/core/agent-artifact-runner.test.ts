@@ -113,7 +113,7 @@ describe('runAgentArtifacts', () => {
     for (const [agent, executable, expected] of [
       ['claude', '/Applications/Claude Code/bin/claude', "'/Applications/Claude Code/bin/claude' --permission-mode acceptEdits"],
       // #281：一次性会话统一 low（codex 的 effort 是启动参数，只能在这里定）
-      ['codex', '/srv/tools/codex', '/srv/tools/codex --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort="low"'],
+      ['codex', '/srv/tools/codex', '/srv/tools/codex --approve-for-me -c model_reasoning_effort="low"'],
     ] as const) {
       const driver = new FakeDriver();
       driver.executable = executable;

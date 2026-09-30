@@ -5,6 +5,7 @@ import { issueStatusLabel } from '../lib/labels';
 import { fmtTime } from '../lib/fmt';
 import { tr } from '../i18n/runtime';
 import { RunStream } from './runstream';
+import type { IssueId } from '../../../shared/issue-id';
 
 /**
  * 本模块的历史工作段时间线（#277 / I-01）。
@@ -27,7 +28,7 @@ export function ConversationSegments({
   segments: ConversationSegment[];
   /** 当前打开的会话 id：等于它的段才有消息可展开 */
   convId?: string;
-  currentIssueId: number;
+  currentIssueId: IssueId;
   pid: number;
   onOpenImage: (path: string) => void;
 }) {

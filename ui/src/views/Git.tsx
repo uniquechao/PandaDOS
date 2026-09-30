@@ -1,5 +1,7 @@
 /**
- * Git 工作区 —— VSCode 式「左侧树 + 提交历史 | 右侧上下文」：
+ * Git 共用视图组件（#388 起页面主体迁到 views/Workspace.tsx 的统一工作区；这里保留
+ * diff / 提交详情 / 提交图绘制等被工作区与 issue 详情共用的部件）。原 Git 页说明：
+ * VSCode 式「左侧树 + 提交历史 | 右侧上下文」：
  *   顶栏：分支 / 上游 ↑↓ / 刷新；
  *   左上：完整文件 / 当前未提交 / 指定 commit 三来源统一文件树；
  *   左下：可折叠 lane 提交图，点行切换树，独立「查看详情」打开完整 commit message；
@@ -8,77 +10,42 @@
  */
 import type { ComponentChildren, RefObject } from 'preact';
 import { createPortal } from 'preact/compat';
-import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { api } from '../lib/api';
-import { useColSizes, type ColSizes } from '../lib/colsize';
+import type { ColSizes } from '../lib/colsize';
 import { fmtTime, timeAgo } from '../lib/fmt';
 import {
   aiCommitMessage, aiCommitRisk, aiExplainCommit, aiExplainFile, aiSummarizeCommit,
 } from '../lib/gitai';
-import { layoutGraph, type GraphEdge } from '../lib/gitgraph';
-import {
-  createGitOperationCoordinator,
-  deriveGitFileOperations,
-  requireGitOperationSuccess,
-  type GitFileOperation,
-  type GitOperationCoordinator,
-  type GitOperationKind,
-} from '../lib/gitoperations';
-import {
-  buildGitWorkspaceTree,
-  createGitWorkspaceState,
-  gitWorkspaceReducer,
-  type GitWorkspaceAction,
-  type GitWorkspaceFile,
-  type GitWorkspaceState,
-} from '../lib/gitworkspace';
-import {
-  beginGitLoad,
-  commitPanelLayout,
-  completeGitLoad,
-  createGitLoadState,
-  failGitLoad,
-  keyedResult,
-  requestKey,
-  type KeyedResult,
-} from '../lib/gitviewstate';
-import { nav } from '../lib/router';
+import type { GraphEdge } from '../lib/gitgraph';
+import { commitPanelLayout } from '../lib/gitviewstate';
 import { toast } from '../lib/toast';
-import { useTreeWidth } from '../lib/treewidth';
-import { useWide } from '../lib/useWide';
-import type {
-  GitChange, GitCommit, GitCommitDetail, GitCommitResult, GitDiff, GitFile, GitInfo,
-  GitPushResult, GitWriteResult, Project,
-} from '../lib/types';
+import type { GitChange, GitCommitDetail, GitDiff, GitFile } from '../lib/types';
 import { Loading } from '../components/Loaders';
-import { ChangeTree } from '../components/ChangeTree';
-import { FileTree } from '../components/FileTree';
-import { FileViewer } from '../components/FileViewer';
 import {
   GitImagePreview,
   gitImageUrls,
   type GitImageUrls,
 } from '../components/GitImagePreview';
-import { ListSplitter } from '../components/ListSplitter';
 import { Splitter } from '../components/Splitter';
 import { tr } from '../i18n/runtime';
 import { isImagePath } from '../lib/preview';
 
 // ---------- 绘图常量 ----------
 
-const ROW_H = 42;
-const LANE_W = 14;
-const PAD_X = 9;
+export const ROW_H = 42;
+export const LANE_W = 14;
+export const PAD_X = 9;
 
 /** 泳道配色（奶油亮底高辨识，首位用品牌橙黄） */
 const LANE_COLORS = [
   '#f59e0b', '#8b5cf6', '#16a34a', '#e8590c', '#db2777',
   '#0891b2', '#2563eb', '#65a30d', '#dc2626', '#b45309',
 ];
-const laneColor = (lane: number): string => LANE_COLORS[lane % LANE_COLORS.length]!;
+export const laneColor = (lane: number): string => LANE_COLORS[lane % LANE_COLORS.length]!;
 
-const cx = (lane: number): number => PAD_X + lane * LANE_W + LANE_W / 2;
-const cy = (row: number): number => row * ROW_H + ROW_H / 2;
+export const cx = (lane: number): number => PAD_X + lane * LANE_W + LANE_W / 2;
+export const cy = (row: number): number => row * ROW_H + ROW_H / 2;
 
 /** 两端竖直切线的 S 曲线（换道连接） */
 function sCurve(xa: number, ya: number, xb: number, yb: number): string {
@@ -87,7 +54,7 @@ function sCurve(xa: number, ya: number, xb: number, yb: number): string {
 }
 
 /** 子→父连线路径：出发端/汇入端换道各占一行行高，中段沿泳道竖直 */
-function edgePath(e: GraphEdge, rows: number): string {
+export function edgePath(e: GraphEdge, rows: number): string {
   const x1 = cx(e.fromLane);
   const xm = cx(e.lane);
   const x2 = cx(e.toLane);
@@ -190,7 +157,7 @@ export function PlusMinus({ adds, dels }: { adds?: number | null; dels?: number 
   );
 }
 
-function copyText(s: string, hint: string): void {
+export function copyText(s: string, hint: string): void {
   navigator.clipboard
     ?.writeText(s)
     .then(() => toast.success(tr('git.copiedHint', { hint })))
@@ -208,7 +175,7 @@ interface AiRun {
 }
 
 /** 单结果槽：一次只显示最近一次动作；序号护栏丢弃乱序返回（快速连点不同动作） */
-function useGitAi(): {
+export function useGitAi(): {
   run: AiRun | null;
   start: (label: string, fn: () => Promise<string>) => void;
   clear: () => void;
@@ -234,7 +201,7 @@ function useGitAi(): {
 }
 
 /** 内联可折叠 AI 结果面板：loading / 错误 / 文本结果 + 复制。默认展开。 */
-function AiPanel({ run, onClose }: { run: AiRun; onClose: () => void }) {
+export function AiPanel({ run, onClose }: { run: AiRun; onClose: () => void }) {
   const [open, setOpen] = useState(true);
   return (
     <div class="ai-panel">
@@ -284,7 +251,7 @@ function CommitAiBtns({ pid, sha, ai }: { pid: number; sha: string; ai: ReturnTy
 
 const DIFF_MAX_LINES = 4000;
 
-function diffLineCls(l: string): string {
+export function diffLineCls(l: string): string {
   if (l.startsWith('+++') || l.startsWith('---') || l.startsWith('diff ') || l.startsWith('index ')
     || l.startsWith('new file') || l.startsWith('deleted file') || l.startsWith('similarity')
     || l.startsWith('rename ') || l.startsWith('\\')) return 'dl dh';
@@ -808,7 +775,7 @@ function WorktreeSheet({
 // ---------- 右栏详情（宽屏，VS 风格） ----------
 
 /** 右栏 diff 子列：文件头（状态/路径/AI 解释/收起）+ 内联 AI 面板 + 着色 diff */
-function DiffCol({
+export function DiffCol({
   code, path, oldPath, imageUrls, diff, error, onClose, explain,
 }: {
   code: string;
@@ -1043,827 +1010,5 @@ function EmptyCols({ cols, splitRef }: { cols: ColSizes; splitRef: RefObject<HTM
         <div class="gd-empty">{tr('git.viewFileDiff')}</div>
       </div>
     </>
-  );
-}
-
-// ---------- VSCode 式工作区 ----------
-
-type WorkspaceDispatch = (action: GitWorkspaceAction) => void;
-
-function workspaceDiffUrl(pid: number, file: GitWorkspaceFile): string | null {
-  if (file.kind === 'all') return null;
-  const q = new URLSearchParams({ path: file.leaf.path });
-  if (file.leaf.oldPath) q.set('old', file.leaf.oldPath);
-  if (file.kind === 'worktree') {
-    if (file.leaf.code === '?') q.set('untracked', '1');
-    return `/api/projects/${pid}/git/worktree/diff?${q}`;
-  }
-  return `/api/projects/${pid}/git/commits/${file.sha}/diff?${q}`;
-}
-
-function workspaceImageUrls(pid: number, file: Exclude<GitWorkspaceFile, { kind: 'all' }>): GitImageUrls {
-  const endpoint = file.kind === 'worktree'
-    ? `/api/projects/${pid}/git/worktree/raw`
-    : `/api/projects/${pid}/git/commits/${file.sha}/raw`;
-  return gitImageUrls(endpoint, file.leaf.path, file.leaf.oldPath, file.leaf.code);
-}
-
-/** 当前工作区文件 diff；内容切换/刷新时重拉，并丢弃迟到响应。 */
-function useWorkspaceDiff(
-  pid: number,
-  state: GitWorkspaceState,
-): { diff: GitDiff | null; err: string } {
-  const file = state.content?.kind === 'file' ? state.content.file : null;
-  const url = file ? workspaceDiffUrl(pid, file) : null;
-  const diffKey = requestKey(pid, state.refreshToken, url);
-  const [result, setResult] = useState<KeyedResult<GitDiff> | null>(null);
-  useEffect(() => {
-    let alive = true;
-    setResult(null);
-    if (!file) return () => { alive = false; };
-    if (!url) return () => { alive = false; };
-    api<GitDiff>(url)
-      .then((result) => {
-        if (alive) setResult({ key: diffKey, value: result, error: '' });
-      })
-      .catch((e: Error) => {
-        if (alive) setResult({ key: diffKey, value: null, error: e.message });
-      });
-    return () => { alive = false; };
-  }, [pid, file, state.refreshToken, diffKey, url]);
-  const visible = keyedResult(result, diffKey);
-  return { diff: visible.value, err: visible.error };
-}
-
-function selectedTreeKey(state: GitWorkspaceState): string | undefined {
-  if (state.content?.kind !== 'file') return undefined;
-  const file = state.content.file;
-  return file.kind === 'all' ? file.key : file.leaf.key;
-}
-
-type GitMutationKind = Exclude<GitOperationKind, 'generate-message'>;
-type GitMutationResult = GitWriteResult | GitCommitResult | GitPushResult;
-
-interface GitOperationsController {
-  busy: GitOperationKind | null;
-  commitMessage: string;
-  setCommitMessage: (message: string) => void;
-  hasStaged: boolean;
-  hasUnstaged: boolean;
-  fileOperations: Record<string, GitFileOperation>;
-  write: (
-    operation: GitMutationKind,
-    body: unknown,
-    success: (result: GitMutationResult) => string,
-  ) => void;
-  generateMessage: () => void;
-}
-
-function operationError(error: unknown): string {
-  return error instanceof Error && error.message ? error.message : String(error);
-}
-
-/**
- * 页面级 Git 写操作协调器：所有按钮共用同步门闩与忙碌态；成功后统一刷新 GitInfo、
- * 文件树 refreshToken 和提交历史，失败只提示且保留输入。
- */
-function useGitOperations(
-  pid: number,
-  changes: GitChange[],
-  onRefresh: () => void,
-): GitOperationsController {
-  const mountedRef = useRef(true);
-  const [, setOperationRevision] = useState(0);
-  const [commitState, setCommitState] = useState({ pid, message: '' });
-  const coordinatorRef = useRef<GitOperationCoordinator | null>(null);
-  if (!coordinatorRef.current) {
-    coordinatorRef.current = createGitOperationCoordinator(() => {
-      if (mountedRef.current) setOperationRevision((revision) => revision + 1);
-    });
-  }
-  const coordinator = coordinatorRef.current;
-  const operationToken = coordinator.enter(pid);
-  const busy = coordinator.active(pid);
-  const commitMessage = commitState.pid === pid ? commitState.message : '';
-  const setCommitMessage = (message: string): void => setCommitState({ pid, message });
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => { mountedRef.current = false; };
-  }, []);
-
-  const fileOperations = useMemo(() => deriveGitFileOperations(changes), [changes]);
-  const operations = Object.values(fileOperations);
-  const hasStaged = operations.some((operation) => operation.staged);
-  const hasUnstaged = operations.some((operation) => operation.unstaged);
-
-  const write = (
-    operation: GitMutationKind,
-    body: unknown,
-    success: (result: GitMutationResult) => string,
-  ): void => {
-    const token = operationToken;
-    void coordinator.run(token, operation, async () =>
-      requireGitOperationSuccess(
-        await api<GitMutationResult>(
-          `/api/projects/${token.pid}/git/${operation}`,
-          'POST',
-          body,
-        ),
-      ))
-      .then((run) => {
-        if (!run.started || !mountedRef.current || !coordinator.isCurrent(token)) return;
-        toast.success(success(run.value));
-        onRefresh();
-      })
-      .catch((error: unknown) => {
-        if (mountedRef.current && coordinator.isCurrent(token)) {
-          toast.error(operationError(error));
-        }
-      });
-  };
-
-  const generateMessage = (): void => {
-    const token = operationToken;
-    void coordinator.run(token, 'generate-message', () => aiCommitMessage(token.pid))
-      .then((run) => {
-        if (!run.started || !mountedRef.current || !coordinator.isCurrent(token)) return;
-        const text = run.value.trim();
-        if (!text) throw new Error(tr('git.aiNoMessage'));
-        setCommitMessage(text.trim());
-        toast.success(tr('git.messageGenerated'));
-      })
-      .catch((error: unknown) => {
-        if (mountedRef.current && coordinator.isCurrent(token)) {
-          toast.error(operationError(error));
-        }
-      });
-  };
-
-  return {
-    busy,
-    commitMessage,
-    setCommitMessage,
-    hasStaged,
-    hasUnstaged,
-    fileOperations,
-    write,
-    generateMessage,
-  };
-}
-
-const OPERATION_LABEL: Record<GitOperationKind, Parameters<typeof tr>[0]> = {
-  stage: 'git.staging',
-  unstage: 'git.unstaging',
-  commit: 'git.committing',
-  push: 'git.pushing',
-  'generate-message': 'git.aiGenerating',
-};
-
-function GitOperationsPanel({
-  info,
-  operations,
-}: {
-  info: GitInfo;
-  operations: GitOperationsController;
-}) {
-  const {
-    busy,
-    commitMessage,
-    setCommitMessage,
-    hasStaged,
-    hasUnstaged,
-    write,
-    generateMessage,
-  } = operations;
-  const commit = (): void => {
-    const message = commitMessage.trim();
-    if (!message || !hasStaged) return;
-    write('commit', { message }, (result) => {
-      const committed = result as GitCommitResult;
-      setCommitMessage('');
-      return tr('git.committed', { sha: committed.short });
-    });
-  };
-  const push = (): void => {
-    write('push', undefined, (result) => {
-      const pushed = result as GitPushResult;
-      return pushed.createdUpstream
-        ? tr('git.pushedUpstream', { upstream: pushed.upstream })
-        : tr('git.pushedTo', { upstream: pushed.upstream });
-    });
-  };
-
-  return (
-    <div class="git-ops-panel">
-      <div class="git-ops-row">
-        <button
-          class="btn sm"
-          disabled={busy !== null || !hasUnstaged}
-          onClick={() => write('stage', { all: true }, () => tr('git.stageAllDone'))}
-        >
-          ＋ {tr('git.stageAll')}
-        </button>
-        <button
-          class="btn sm"
-          disabled={busy !== null || !hasStaged}
-          onClick={() => write('unstage', { all: true }, () => tr('git.unstageAllDone'))}
-        >
-          － {tr('git.unstageAll')}
-        </button>
-        <button
-          class="btn sm git-push-btn"
-          disabled={busy !== null || !info.branch}
-          title={!info.branch ? tr('git.detachedNoPush') : tr('git.pushCurrent')}
-          onClick={push}
-        >
-          ↑ {tr('git.pushCurrent')}
-        </button>
-      </div>
-      <textarea
-        class="git-commit-input"
-        rows={2}
-        maxLength={20_000}
-        disabled={busy !== null}
-        value={commitMessage}
-        placeholder={tr('git.commitPlaceholder')}
-        aria-label={tr('git.commitPlaceholder')}
-        onInput={(event) => setCommitMessage(event.currentTarget.value)}
-      />
-      <div class="git-ops-row git-commit-actions">
-        <button
-          class="btn sm"
-          disabled={busy !== null || !hasUnstaged && !hasStaged}
-          onClick={generateMessage}
-        >
-          ✨ {tr('git.generate')}
-        </button>
-        <span class="git-ops-status mut" role="status" aria-live="polite">
-          {busy ? tr(OPERATION_LABEL[busy]) : hasStaged ? tr('git.readyCommit') : tr('git.stageFirst')}
-        </span>
-        <button
-          class="btn sm primary"
-          disabled={busy !== null || !hasStaged || !commitMessage.trim()}
-          onClick={commit}
-        >
-          {tr('git.commitAction')}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function WorkspaceTree({
-  pid,
-  state,
-  info,
-  commit,
-  commitErr,
-  dispatch,
-  operations,
-}: {
-  pid: number;
-  state: GitWorkspaceState;
-  info: GitInfo;
-  commit: GitCommitDetail | null;
-  commitErr: string;
-  dispatch: WorkspaceDispatch;
-  operations: GitOperationsController;
-}) {
-  const changes = info.changes ?? [];
-  const tree = buildGitWorkspaceTree(state.source, {
-    worktree: changes,
-    commit,
-  });
-  const selKey = selectedTreeKey(state);
-  const selectedPath = state.content?.kind === 'file' && state.content.file.kind === 'all'
-    ? state.content.file.path
-    : null;
-
-  return (
-    <section class="git-tree-pane">
-      <div class="git-pane-head git-tree-head">
-        <span class="git-pane-title">{tr('git.files')}</span>
-        <div class="git-source-tabs" role="tablist" aria-label={tr('git.fileTreeSource')}>
-          <button
-            class={tree.kind === 'all' ? 'on' : ''}
-            onClick={() => dispatch({ type: 'show-all' })}
-          >
-            {tr('git.all')}
-          </button>
-          <button
-            class={tree.kind === 'worktree' ? 'on' : ''}
-            onClick={() => dispatch({ type: 'show-worktree' })}
-          >
-            {tr('git.changesOnly')}{(info.dirty ?? 0) > 0 ? ` ${info.dirty}` : ''}
-          </button>
-        </div>
-      </div>
-      {tree.kind === 'commit' && (
-        <div class="git-tree-context" title={tree.sha}>
-          <span>{tr('git.commitChanges')}</span>
-          <b class="mono">{tree.sha.slice(0, 8)}</b>
-        </div>
-      )}
-      {tree.kind === 'worktree' && (
-        <GitOperationsPanel info={info} operations={operations} />
-      )}
-      <div class="git-tree-body">
-        {tree.kind === 'all' ? (
-          <FileTree
-            pid={pid}
-            selectedPath={selectedPath}
-            reloadToken={state.refreshToken}
-            onSelectFile={(path) => dispatch({
-              type: 'select-file',
-              file: { kind: 'all', key: `all:${path}`, path },
-            })}
-          />
-        ) : tree.kind === 'commit' && tree.loading ? (
-          commitErr ? <div class="empty">{commitErr}</div> : <Loading />
-        ) : tree.leaves.length === 0 ? (
-          <div class="empty">
-            {tree.kind === 'worktree' ? tr('git.clean') : tr('git.commitNoFiles')}
-          </div>
-        ) : (
-          <ChangeTree
-            key={tree.kind === 'commit' ? tree.sha : 'worktree'}
-            leaves={tree.leaves}
-            selKey={selKey}
-            onOpen={(leaf) => dispatch({
-              type: 'select-file',
-              file: tree.kind === 'commit'
-                ? { kind: 'commit', sha: tree.sha, leaf }
-                : { kind: 'worktree', leaf },
-            })}
-            renderActions={tree.kind === 'worktree' ? (leaf) => {
-              const operation = operations.fileOperations[leaf.path];
-              if (!operation) return null;
-              return (
-                <>
-                  {operation.unstaged && (
-                    <button
-                      class="git-file-op"
-                      disabled={operations.busy !== null}
-                      title={tr('git.stagePath', { path: leaf.path })}
-                      aria-label={tr('git.stagePath', { path: leaf.path })}
-                      onClick={(ev) => {
-                        ev.stopPropagation();
-                        operations.write(
-                          'stage',
-                          { paths: operation.paths },
-                          () => tr('git.stagedPath', { path: leaf.path }),
-                        );
-                      }}
-                    >
-                      ＋
-                    </button>
-                  )}
-                  {operation.staged && (
-                    <button
-                      class="git-file-op"
-                      disabled={operations.busy !== null}
-                      title={tr('git.unstagePath', { path: leaf.path })}
-                      aria-label={tr('git.unstagePath', { path: leaf.path })}
-                      onClick={(ev) => {
-                        ev.stopPropagation();
-                        operations.write(
-                          'unstage',
-                          { paths: operation.paths },
-                          () => tr('git.unstagedPath', { path: leaf.path }),
-                        );
-                      }}
-                    >
-                      －
-                    </button>
-                  )}
-                </>
-              );
-            } : undefined}
-          />
-        )}
-      </div>
-    </section>
-  );
-}
-
-function CommitHistory({
-  commits,
-  selectedSha,
-  open,
-  rowsRef,
-  onToggle,
-  dispatch,
-}: {
-  commits: GitCommit[];
-  selectedSha: string | null;
-  open: boolean;
-  rowsRef: RefObject<HTMLDivElement>;
-  onToggle: () => void;
-  dispatch: WorkspaceDispatch;
-}) {
-  const layout = useMemo(
-    () => layoutGraph(commits.map((c) => ({ sha: c.sha, parents: c.parents }))),
-    [commits],
-  );
-  const laneOf = useMemo(
-    () => new Map(layout.nodes.map((n) => [n.sha, n.lane])),
-    [layout],
-  );
-  const graphW = PAD_X * 2 + Math.max(1, layout.maxLanes) * LANE_W;
-  const svgH = commits.length * ROW_H + 4;
-  const headSha = commits.find((c) =>
-    c.refs.some((r) => r === 'HEAD' || r.startsWith('HEAD -> ')))?.sha;
-
-  return (
-    <section class={`git-history-pane${open ? '' : ' collapsed'}`}>
-      <button
-        class="git-pane-head git-history-head"
-        aria-expanded={open}
-        onClick={onToggle}
-      >
-        <span class={`ft-arrow${open ? ' open' : ''}`}>▸</span>
-        <span class="git-pane-title">{tr('git.commitHistory')}</span>
-        <span class="mut small">{commits.length}</span>
-      </button>
-      {open && (
-        <div class="git-history-scroll">
-          {commits.length === 0 && <div class="empty">{tr('git.noCommits')}</div>}
-          {commits.length > 0 && (
-            <div class="git-rows" ref={rowsRef} style={{ minWidth: graphW + 286 }}>
-              <svg class="git-svg" width={graphW} height={svgH}>
-                {layout.edges.map((e) => (
-                  <path
-                    d={edgePath(e, commits.length)}
-                    fill="none"
-                    stroke={laneColor(e.lane)}
-                    strokeWidth={2}
-                    strokeLinecap="round"
-                    opacity={e.missing ? 0.3 : 0.85}
-                  />
-                ))}
-                {layout.nodes.map((n) => {
-                  const isMerge = (commits[n.row]?.parents.length ?? 0) > 1;
-                  const color = laneColor(n.lane);
-                  return (
-                    <>
-                      {n.sha === headSha && (
-                        <circle
-                          cx={cx(n.lane)}
-                          cy={cy(n.row)}
-                          r={7.5}
-                          fill="none"
-                          stroke={color}
-                          strokeWidth={1.5}
-                          opacity={0.55}
-                        />
-                      )}
-                      <circle
-                        cx={cx(n.lane)}
-                        cy={cy(n.row)}
-                        r={isMerge ? 3.6 : 4.4}
-                        fill={isMerge ? 'var(--bg)' : color}
-                        stroke={color}
-                        strokeWidth={isMerge ? 2 : 0}
-                      />
-                    </>
-                  );
-                })}
-              </svg>
-              {commits.map((c) => (
-                <div
-                  class={`git-row${selectedSha === c.sha ? ' on' : ''}`}
-                  data-sha={c.sha}
-                  role="button"
-                  tabIndex={0}
-                  style={{ paddingLeft: graphW + 6 }}
-                  onClick={() => dispatch({ type: 'select-commit', sha: c.sha })}
-                  onKeyDown={(ev) => {
-                    if (ev.target !== ev.currentTarget) return;
-                    if (ev.key === 'Enter' || ev.key === ' ') {
-                      ev.preventDefault();
-                      dispatch({ type: 'select-commit', sha: c.sha });
-                    }
-                  }}
-                >
-                  <div class="git-r1">
-                    <RefBadges refs={c.refs} />
-                    <span class="git-subj">{c.subject}</span>
-                    <button
-                      class="git-commit-detail"
-                      title={tr('git.viewFullMessage')}
-                      onClick={(ev) => {
-                        ev.stopPropagation();
-                        dispatch({ type: 'open-commit-detail', sha: c.sha });
-                      }}
-                    >
-                      {tr('git.viewDetails')}
-                    </button>
-                  </div>
-                  <div class="git-r2 mut">
-                    <span class="mono" style={{ color: laneColor(laneOf.get(c.sha) ?? 0) }}>
-                      {c.short}
-                    </span>
-                    <span>{c.author}</span>
-                    <span>{timeAgo(c.ts)}</span>
-                  </div>
-                </div>
-              ))}
-              {commits.length >= 200 && (
-                <div class="mut small" style={{ padding: '10px 12px 16px' }}>
-                  {tr('git.recentOnly')}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function WorkspaceContext({
-  pid,
-  state,
-  dispatch,
-  onJump,
-  mobile = false,
-}: {
-  pid: number;
-  state: GitWorkspaceState;
-  dispatch: WorkspaceDispatch;
-  onJump: (sha: string) => void;
-  mobile?: boolean;
-}) {
-  const { diff, err } = useWorkspaceDiff(pid, state);
-  const content = state.content;
-  if (!content) {
-    return <div class="gd-empty">{tr('git.chooseContent')}</div>;
-  }
-  if (content.kind === 'commit-detail') {
-    return (
-      <CommitPanel
-        key={content.sha}
-        pid={pid}
-        sha={content.sha}
-        reloadToken={state.refreshToken}
-        onJump={onJump}
-        mobile={mobile}
-      />
-    );
-  }
-
-  const file = content.file;
-  if (file.kind === 'all') {
-    return (
-      <FileViewer
-        key={`${file.path}:${state.refreshToken}`}
-        pid={pid}
-        path={file.path}
-      />
-    );
-  }
-  const leaf = file.leaf;
-  return (
-    <DiffCol
-      code={leaf.code}
-      path={leaf.path}
-      oldPath={leaf.oldPath}
-      imageUrls={workspaceImageUrls(pid, file)}
-      diff={diff}
-      error={err}
-      onClose={() => dispatch({ type: 'close-content' })}
-      explain={() => aiExplainFile(pid, file.kind === 'commit'
-        ? { sha: file.sha, path: leaf.path, old: leaf.oldPath }
-        : {
-            path: leaf.path,
-            old: leaf.oldPath,
-            untracked: leaf.code === '?',
-          })}
-    />
-  );
-}
-
-function WorkspaceNavigator({
-  pid,
-  state,
-  info,
-  commit,
-  commitErr,
-  commits,
-  historyOpen,
-  rowsRef,
-  dispatch,
-  onToggleHistory,
-  operations,
-}: {
-  pid: number;
-  state: GitWorkspaceState;
-  info: GitInfo;
-  commit: GitCommitDetail | null;
-  commitErr: string;
-  commits: GitCommit[];
-  historyOpen: boolean;
-  rowsRef: RefObject<HTMLDivElement>;
-  dispatch: WorkspaceDispatch;
-  onToggleHistory: () => void;
-  operations: GitOperationsController;
-}) {
-  return (
-    <div class="git-nav">
-      <WorkspaceTree
-        pid={pid}
-        state={state}
-        info={info}
-        commit={commit}
-        commitErr={commitErr}
-        dispatch={dispatch}
-        operations={operations}
-      />
-      <CommitHistory
-        commits={commits}
-        selectedSha={state.source.kind === 'commit' ? state.source.sha : null}
-        open={historyOpen}
-        rowsRef={rowsRef}
-        onToggle={onToggleHistory}
-        dispatch={dispatch}
-      />
-    </div>
-  );
-}
-
-// ---------- 主视图 ----------
-
-export function GitView({ pid }: { pid: number }) {
-  const [projectResult, setProjectResult] = useState<{
-    pid: number;
-    value: Project;
-  } | null>(null);
-  const [gitResult, setGitResult] = useState(() => createGitLoadState<GitInfo>(pid));
-  const [workspace, dispatch] = useReducer(gitWorkspaceReducer, createGitWorkspaceState());
-  const [historyOpen, setHistoryOpen] = useState(true);
-  const wide = useWide();
-  const treeW = useTreeWidth();
-  const rowsRef = useRef<HTMLDivElement>(null);
-  const splitRef = useRef<HTMLDivElement>(null);
-  const gitLoadSeq = useRef(0);
-  const project = projectResult?.pid === pid ? projectResult.value : null;
-  const info = gitResult.pid === pid ? gitResult.value : null;
-  const err = gitResult.pid === pid ? gitResult.error : '';
-
-  useEffect(() => {
-    let alive = true;
-    api<Project>(`/api/projects/${pid}`)
-      .then((value) => {
-        if (alive) setProjectResult({ pid, value });
-      })
-      .catch(() => {});
-    return () => { alive = false; };
-  }, [pid]);
-
-  const load = (clear = true): void => {
-    const request = ++gitLoadSeq.current;
-    setGitResult((prev) => beginGitLoad(prev, pid, request, !clear));
-    api<GitInfo>(`/api/projects/${pid}/git`)
-      .then((result) => {
-        setGitResult((prev) => completeGitLoad(prev, pid, request, result));
-      })
-      .catch((e: Error) => {
-        setGitResult((prev) => failGitLoad(prev, pid, request, e.message));
-      });
-  };
-
-  useEffect(() => {
-    dispatch({ type: 'reset' });
-    setHistoryOpen(true);
-    load();
-    return () => { gitLoadSeq.current++; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pid]);
-
-  const commits: GitCommit[] = info?.ok ? (info.commits ?? []) : [];
-  const selectedCommitSha = workspace.source.kind === 'commit' ? workspace.source.sha : null;
-  const commit = useCommitDetail(pid, selectedCommitSha, workspace.refreshToken);
-
-  const jump = (sha: string): void => {
-    if (!commits.some((c) => c.sha === sha)) {
-      toast.info(tr('git.notRecent'));
-      return;
-    }
-    dispatch({ type: 'open-commit-detail', sha });
-    setHistoryOpen(true);
-    requestAnimationFrame(() => {
-      rowsRef.current
-        ?.querySelector(`[data-sha="${sha}"]`)
-        ?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    });
-  };
-
-  const refresh = (): void => {
-    dispatch({ type: 'refresh' });
-    load(false);
-  };
-  const operations = useGitOperations(
-    pid,
-    info?.ok ? (info.changes ?? []) : [],
-    refresh,
-  );
-  const behindAhead = info?.ok && info.upstream
-    ? `${info.upstream} ↑${info.ahead ?? 0} ↓${info.behind ?? 0}`
-    : '';
-  const drilling = !wide && workspace.content !== null;
-
-  return (
-    <div class="fullcol">
-      <div class="bhead">
-        <div class="bhead-row">
-          <button
-            class="back"
-            aria-label={drilling ? tr('git.backWorkspace') : tr('git.backProject')}
-            onClick={() => drilling
-              ? dispatch({ type: 'close-content' })
-              : nav(`/p/${pid}`)}
-          >
-            ‹
-          </button>
-          <span class="btitle">{tr('git.pageTitle', { project: project?.name ?? tr('view.projectFallback', { id: pid }) })}</span>
-          <div class="bacts">
-            {info?.ok && (
-              <span class="gitstat">
-                <span class="badge b-blue">⎇ {info.branch || `(${tr('git.detached')})`}</span>
-                {behindAhead && (
-                  <span class={`badge ${(info.ahead ?? 0) + (info.behind ?? 0) > 0 ? 'b-purple' : 'b-gray'}`}>
-                    {behindAhead}
-                  </span>
-                )}
-              </span>
-            )}
-            <button class="btn sm" onClick={refresh}>↻ {tr('ui.refresh')}</button>
-          </div>
-        </div>
-        {err && <div class="err">{err}</div>}
-      </div>
-
-      {info === null && !err && <Loading />}
-      {info !== null && !info.ok && (
-        <div class="empty">
-          {info.error ?? tr('git.loadFailed')}
-          <div class="mut small">{info.cwd}</div>
-        </div>
-      )}
-
-      {info?.ok && drilling && (
-        <div class="git-mobile-content">
-          <WorkspaceContext
-            pid={pid}
-            state={workspace}
-            dispatch={dispatch}
-            onJump={jump}
-            mobile
-          />
-        </div>
-      )}
-      {info?.ok && !drilling && !wide && (
-        <WorkspaceNavigator
-          pid={pid}
-          state={workspace}
-          info={info}
-          commit={commit.d}
-          commitErr={commit.err}
-          commits={commits}
-          historyOpen={historyOpen}
-          rowsRef={rowsRef}
-          dispatch={dispatch}
-          onToggleHistory={() => setHistoryOpen((open) => !open)}
-          operations={operations}
-        />
-      )}
-      {info?.ok && wide && (
-        <div class="git-workspace" ref={splitRef}>
-          <div
-            class="git-nav-wrap"
-            style={treeW.width != null ? { width: treeW.width, maxWidth: treeW.width } : undefined}
-          >
-            <WorkspaceNavigator
-              pid={pid}
-              state={workspace}
-              info={info}
-              commit={commit.d}
-              commitErr={commit.err}
-              commits={commits}
-              historyOpen={historyOpen}
-              rowsRef={rowsRef}
-              dispatch={dispatch}
-              onToggleHistory={() => setHistoryOpen((open) => !open)}
-              operations={operations}
-            />
-          </div>
-          <ListSplitter containerRef={splitRef} list={treeW} label={tr('git.navWidth')} />
-          <main class="git-context">
-            <WorkspaceContext pid={pid} state={workspace} dispatch={dispatch} onJump={jump} />
-          </main>
-        </div>
-      )}
-    </div>
   );
 }

@@ -234,24 +234,38 @@ export function parseRetryAfter(header: string | null, now: number = Date.now())
 /** 简单 FIFO 信号量：PM 池 × tick 扇出的 LLM 调用全局限流（评审 5.3#8） */
 export class Semaphore {
   private active = 0;
-  private queue: Array<() => void> = [];
+  private queue: Array<{ grant(): void; cancel(): void }> = [];
 
   constructor(private readonly limit: number) {}
 
-  async acquire(): Promise<() => void> {
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    signal?.throwIfAborted();
     if (this.active < this.limit) {
       this.active++;
     } else {
-      await new Promise<void>((r) => this.queue.push(r));
-      this.active++;
+      await new Promise<void>((resolve, reject) => {
+        const entry = {
+          grant: () => { signal?.removeEventListener('abort', entry.cancel); resolve(); },
+          cancel: () => {
+            const index = this.queue.indexOf(entry);
+            if (index < 0) return;
+            this.queue.splice(index, 1);
+            signal?.removeEventListener('abort', entry.cancel);
+            reject(signal?.reason ?? new DOMException('Aborted', 'AbortError'));
+          },
+        };
+        this.queue.push(entry);
+        signal?.addEventListener('abort', entry.cancel, { once: true });
+      });
     }
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      this.active--;
       const next = this.queue.shift();
-      if (next) next();
+      // Transfer the reserved slot before waking a waiter, so a new caller cannot steal it.
+      if (next) next.grant();
+      else this.active--;
     };
   }
 
@@ -289,6 +303,11 @@ export class OpenAiCompatibleClient implements LlmClient {
     } finally {
       release();
     }
+  }
+
+  /** Bounded external runtimes share this client's provider gate without using its retry loop. */
+  acquireSlot(signal?: AbortSignal): Promise<() => void> {
+    return this.sem.acquire(signal);
   }
 
   private async request(config: LlmConfig, messages: LlmMessage[], opts: LlmChatOpts): Promise<LlmResult> {

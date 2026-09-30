@@ -145,7 +145,7 @@ describe('i18n guardrails', () => {
       // 标签页标题固定「项目名-PandaDOS」：品牌名不翻译，项目名是用户自己起的，两者都不进词条。
       '${name}-${BRAND_TITLE}',
       'PandaDOS', 'PandaDOS ·', 'Panda', 'DOS', 'AI', 'Git', 'codex', 'issue', 'Issue #', 'DEBUG', 'admin', 'user',
-      'persona', 'memory', 'ws:', '· claude:', '±0', '&lt;', '&gt;',
+      'persona', 'memory', 'ws:', '· claude:', '±0', '&lt;', '&gt;', 'HEAD',
       '{"quiet":"23:00-08:00"}', 'https://example.com/v1', 'model-name',
     ] })).toEqual([]);
   });

@@ -53,6 +53,116 @@ description: Use whenever working on an issue or module in a repository containi
 5. 不自行批量创建模块。文档身份、数据库事实和代码冲突时停止写入并明确报告。
 `;
 
+/**
+ * 内置技能 panda-issue-inbox（#368）：让不在 PandaDOS 队列里的本地 claude/codex 直接读取
+ * 项目新增 issue。只读：走 HTTP API（Bearer token，脚本经 stdin 传给 curl 不进 ps），
+ * 未配 token 时退回读 `.panda/modules` 过程页。脚本与 SKILL.md 同目录，claude/codex 各一份。
+ */
+export const PANDA_ISSUE_INBOX_SKILL = `---
+name: panda-issue-inbox
+description: Use when the user asks to read, list, check, pull or pick up new/pending/latest PandaDOS issues (新增 issue、待办 issue、issue 队列、有什么新任务) for the current project from a local agent session.
+---
+
+# PandaDOS 新增 issue 读取（${GEN_MARK}）
+
+本地代理（不在 PandaDOS 队列里跑的 claude / codex）用本技能**只读**获取当前项目的 issue。
+助手脚本与本文件同目录：\`~/.claude/skills/panda-issue-inbox/panda-issues.sh\`
+（codex 为 \`~/.codex/skills/panda-issue-inbox/panda-issues.sh\`），用 \`sh <脚本> <命令>\` 调用。
+
+## 1. 配置（首次）
+
+脚本按顺序取配置：环境变量 → \`~/.panda/agent.env\`（shell 格式，可写下面三个变量）。
+
+- \`PANDA_URL\`：PandaDOS 地址，缺省 \`http://127.0.0.1:8802\`。
+- \`PANDA_TOKEN\` 或 \`PANDA_TOKEN_FILE\`：用户自己的登录 token（文件建议 chmod 600）。
+- \`PANDA_PROJECT_ID\`：可选，省去按 cwd 匹配项目。
+
+未配置 token 时脚本以退出码 2 失败：不要自己去翻别的凭据文件，告诉用户如何配置，
+同时改走第 3 节的离线读取。
+
+## 2. 在线读取（推荐）
+
+1. \`sh panda-issues.sh projects\`：列出可访问项目，按 \`cwd\` 与当前项目根（\`git rev-parse --show-toplevel\`）匹配出项目 id。
+2. \`sh panda-issues.sh new <项目id>\`：列出上次确认之后新建的 issue（首次 = 全部）。
+   输出为 JSON 数组，关注 \`id\`、\`title\`、\`body\`、\`status\`、\`category\`、\`module\`、\`createdTs\`。
+3. \`sh panda-issues.sh issue <项目id> <issueId>\`：单条详情（含子任务、门禁、工作流）。
+4. \`sh panda-issues.sh issues <项目id> [since毫秒] [status逗号列表]\`：自定义过滤，
+   如 \`issues 3 0 pending,clarifying\`。
+5. 用户确认已看过后：\`sh panda-issues.sh ack <项目id> <最大createdTs>\` 推进游标
+   （游标存于项目 \`.panda/tmp/issue-inbox/\`，已被 git 忽略）。
+
+## 3. 离线读取（无 token / 服务不可达）
+
+从项目根读 \`.panda/modules/INDEX.md\` → 各模块 \`ISSUES.md\` 的「进行中 / 待办」小节 →
+对应 \`issues/<id>-*.md\` 过程页的「原始需求」。仅覆盖已归模块的 issue，需向用户说明。
+
+## 4. 纪律
+
+- 只读：不改 issue 状态、不写数据库、不调用任何 POST/PATCH/DELETE 接口。
+- 向用户汇报时按编号列出 id、标题、状态、一句话需求；不要回显 token。
+- \`pending\` 等状态的 issue 可能正被 PandaDOS 自动排队执行。用户要在本地实现某条时，
+  先提醒可能与队列冲突，由用户决定（如先在 PandaDOS 里取消或暂停）。
+`;
+
+export const PANDA_ISSUE_INBOX_SCRIPT = `#!/bin/sh
+# PandaDOS 新增 issue 只读助手（${GEN_MARK}）。用法见同目录 SKILL.md。
+set -eu
+CONF="\${PANDA_AGENT_ENV:-\$HOME/.panda/agent.env}"
+if [ -r "\$CONF" ]; then . "\$CONF"; fi
+URL="\${PANDA_URL:-http://127.0.0.1:8802}"
+URL="\${URL%/}"
+TOKEN="\${PANDA_TOKEN:-}"
+if [ -z "\$TOKEN" ] && [ -n "\${PANDA_TOKEN_FILE:-}" ] && [ -r "\$PANDA_TOKEN_FILE" ]; then
+  TOKEN=\$(tr -d ' \\r\\n' < "\$PANDA_TOKEN_FILE")
+fi
+
+die() { echo "panda-issues: \$1" >&2; exit "\${2:-1}"; }
+need_token() {
+  [ -n "\$TOKEN" ] || die "未配置 token：设置 PANDA_TOKEN / PANDA_TOKEN_FILE，或写入 \$CONF" 2
+}
+# token 经 stdin 传给 curl 配置，不出现在进程参数里
+api() {
+  need_token
+  printf 'header = "Authorization: Bearer %s"\\n' "\$TOKEN" |
+    curl -fsS --max-time 20 -K - "\$URL\$1" || die "请求失败：\$URL\$1" 3
+}
+pid_of() { p="\${1:-\${PANDA_PROJECT_ID:-}}"; [ -n "\$p" ] || die "缺项目 id（先运行 projects）"; echo "\$p"; }
+cursor_file() {
+  root=\$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+  echo "\$root/.panda/tmp/issue-inbox/\$1.since"
+}
+
+cmd="\${1:-help}"
+[ \$# -gt 0 ] && shift
+case "\$cmd" in
+  projects) api "/api/projects" ;;
+  issues)
+    p=\$(pid_of "\${1:-}")
+    q="?since=\${2:-0}"
+    [ -n "\${3:-}" ] && q="\$q&status=\$3"
+    api "/api/projects/\$p/issues\$q" ;;
+  issue)
+    p=\$(pid_of "\${1:-}")
+    [ -n "\${2:-}" ] || die "缺 issue id"
+    api "/api/projects/\$p/issues/\$2" ;;
+  new)
+    p=\$(pid_of "\${1:-}")
+    f=\$(cursor_file "\$p")
+    since=0
+    if [ -r "\$f" ]; then since=\$(tr -dc '0-9' < "\$f"); fi
+    api "/api/projects/\$p/issues?since=\${since:-0}" ;;
+  ack)
+    p=\$(pid_of "\${1:-}")
+    case "\${2:-}" in ''|*[!0-9]*) die "ack 需要毫秒时间戳" ;; esac
+    f=\$(cursor_file "\$p")
+    mkdir -p "\$(dirname "\$f")"
+    echo "\$2" > "\$f"
+    echo "已记录游标 \$2 → \$f" ;;
+  *)
+    echo "用法: sh panda-issues.sh projects | new <项目id> | issues <项目id> [since] [status,...] | issue <项目id> <issueId> | ack <项目id> <createdTs>" ;;
+esac
+`;
+
 const MODULE_GUIDE_BLOCK = `${MODULE_GUIDE_START}
 ## PandaDOS issue 模块记忆
 
@@ -227,6 +337,30 @@ export async function ensurePandaIssueSkill(d: CompatDriver, homes: CompatHomes)
     if (existing !== null && !existing.includes(GEN_MARK)) continue;
     await d.writeFile(path, PANDA_ISSUE_SKILL);
     wrote.push(path);
+  }
+  return wrote;
+}
+
+/**
+ * 安装 panda-issue-inbox（SKILL.md + 助手脚本），claude/codex 各一份。
+ * 与 panda-issue 同纪律：自动生成的旧版本随升级覆盖，人工改过（无生成标记）的文件不动。
+ */
+export async function ensurePandaIssueInboxSkill(d: CompatDriver, homes: CompatHomes): Promise<string[]> {
+  const wrote: string[] = [];
+  const files: Array<[string, string, number | undefined]> = [
+    ['skills/panda-issue-inbox/SKILL.md', PANDA_ISSUE_INBOX_SKILL, undefined],
+    ['skills/panda-issue-inbox/panda-issues.sh', PANDA_ISSUE_INBOX_SCRIPT, 0o755],
+  ];
+  for (const home of [homes.claudeHome, homes.codexHome]) {
+    if (!home) continue;
+    for (const [rel, content, mode] of files) {
+      const path = `${home.replace(/\/+$/, '')}/${rel}`;
+      const existing = await readText(d, path);
+      if (existing === content) continue;
+      if (existing !== null && !existing.includes(GEN_MARK)) continue;
+      await d.writeFile(path, content, mode);
+      wrote.push(path);
+    }
   }
   return wrote;
 }

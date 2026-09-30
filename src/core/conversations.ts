@@ -18,6 +18,7 @@ import type { Database } from 'bun:sqlite';
 import {
   ensureArtifactSkill,
   ensureCompatSkills,
+  ensurePandaIssueInboxSkill,
   ensurePandaIssueSkill,
   ensureModuleGuideBlocks,
   ensureProjectBridge,
@@ -28,6 +29,7 @@ import { isCodexUpdatePrompt } from './screen';
 import { parseReasoningEffort } from './types';
 import { effectiveSkillPolicy, skillSessionSettings } from './skill-policy';
 import type { AgentKind, AutoApproveLevel, Conversation, ConversationKind } from './types';
+import type { IssueId } from '../../shared/issue-id';
 
 // ---------- Driver 最小接口（与 ExecutorDriver 结构兼容） ----------
 
@@ -117,17 +119,20 @@ function mapConv(r: ConvRow): Conversation {
 // ---------- 管理器 ----------
 
 export interface ConversationManagerOpts {
+  /** Reject conversations whose project cannot safely use this manager's executor. */
+  executionUnavailable?(projectId: number): string | null;
+  /** Resolve the executor and agent paths as one project-scoped execution context. */
+  executionForProject?(projectId: number): ConversationExecution;
   /**
    * 执行机上的 ~/.claude.json（trustDir 预置信任用，v1 conversations.ts:101-113 平移）。
    * 不给则跳过预置——兜底是 PM 对 trust 弹窗自动同意（评审 M14 认可的双层兜底）。
    */
   trustFile?: string;
-  /** 执行机上的 ~/.codex/config.toml（codex trust_level 预置；缺省跳过，兜底=启动参数直接 bypass） */
+  /** 执行机上的 ~/.codex/config.toml（codex trust_level 预置；缺省跳过）。 */
   codexConfigFile?: string;
   /**
-   * codex 启动附加参数。默认 bypass 审批+沙箱：PandaDOS 无人守屏全自动驱动，codex 的
-   * 审批弹窗不走 CC 菜单协议（screen.ts 检不到），滞留即卡死——与 claude 侧
-   * 「PM 自动过菜单」对齐的等效选择。
+   * codex 启动附加参数。默认只允许在工作区写入，并由 Codex 自身自动审查越权请求。
+   * 对真正外部隔离的受信任执行机，调用方仍可显式覆盖此策略。
    */
   codexArgs?: string;
   /** 执行机 ~/.claude（装 agents-md-compat 默认技能；缺省跳过该侧） */
@@ -136,8 +141,17 @@ export interface ConversationManagerOpts {
   codexHome?: string;
 }
 
+export interface ConversationExecution {
+  driver: ConvDriver;
+  locator: ConvLocator;
+  trustFile?: string;
+  codexConfigFile?: string;
+  claudeHome?: string;
+  codexHome?: string;
+}
+
 /** codex 默认启动参数（见 ConversationManagerOpts.codexArgs 注释） */
-export const DEFAULT_CODEX_ARGS = '--dangerously-bypass-approvals-and-sandbox';
+export const DEFAULT_CODEX_ARGS = '--approve-for-me';
 
 /**
  * 启动时禁用 codex「standalone installer 自更新检查」的 config 覆盖（`-c` = 等价顶层 key）。
@@ -175,6 +189,24 @@ export class ConversationManager {
     private readonly locator: ConvLocator,
     private readonly opts: ConversationManagerOpts = {},
   ) {}
+
+  private assertExecutionProject(projectId: number): void {
+    const reason = this.opts.executionUnavailable?.(projectId);
+    if (reason) throw new Error(reason);
+    this.opts.executionForProject?.(projectId);
+  }
+
+  private execution(projectId: number): ConversationExecution {
+    if (this.opts.executionForProject) return this.opts.executionForProject(projectId);
+    return {
+      driver: this.driver,
+      locator: this.locator,
+      ...(this.opts.trustFile ? { trustFile: this.opts.trustFile } : {}),
+      ...(this.opts.codexConfigFile ? { codexConfigFile: this.opts.codexConfigFile } : {}),
+      ...(this.opts.claudeHome ? { claudeHome: this.opts.claudeHome } : {}),
+      ...(this.opts.codexHome ? { codexHome: this.opts.codexHome } : {}),
+    };
+  }
 
   // ---- 查询 ----
 
@@ -273,7 +305,7 @@ export class ConversationManager {
           `SELECT pm.slug FROM issues i
              JOIN project_modules pm ON pm.id = i.module_id
             WHERE pm.project_id = ? AND i.conv_id = ?
-            ORDER BY i.id DESC LIMIT 1`,
+            ORDER BY i.created_ts DESC, i.id DESC LIMIT 1`,
         )
         .get(projectId, convId);
       if (legacy) return moduleTmux(projectId, legacy.slug);
@@ -319,6 +351,7 @@ export class ConversationManager {
     agent: AgentKind,
     workspaceCwd: string,
   ): Conversation {
+    this.assertExecutionProject(projectId);
     if (!this.hasWorkspaceCwd()) throw new Error('managed workspace schema is unavailable');
     if (!workspaceCwd.startsWith('/') || workspaceCwd.trim() !== workspaceCwd || workspaceCwd.includes('\0')) {
       throw new Error('managed workspace cwd is invalid');
@@ -349,6 +382,7 @@ export class ConversationManager {
     agent: AgentKind = 'claude',
     kind: ConversationKind = 'issue',
   ): Conversation {
+    this.assertExecutionProject(projectId);
     const row = this.db
       .query<ConvRow, [string, number, string, number, string, string]>(
         `INSERT INTO conversations (id, project_id, label, created_ts, agent, kind)
@@ -375,6 +409,7 @@ export class ConversationManager {
     kind: ConversationKind,
     sagaToken: string,
   ): { conversationId: string; created: boolean; ownershipProof: string | null } {
+    this.assertExecutionProject(projectId);
     return this.db.transaction(() => {
       const inserted = this.db.query<{ id: string }, [string, number, string, number, string, string]>(
         `INSERT INTO conversations (id, project_id, label, created_ts, agent, kind)
@@ -423,6 +458,7 @@ export class ConversationManager {
   /** 归档对话；chat 对话顺手 kill 其独立 tmux 会话（关闭清理，best-effort） */
   async archive(id: string): Promise<void> {
     const c = this.get(id);
+    if (c) this.assertExecutionProject(c.projectId);
     this.db.query('UPDATE conversations SET archived = 1 WHERE id = ?').run(id);
     if (c?.kind === 'chat') await this.killChatSession(c);
   }
@@ -431,6 +467,7 @@ export class ConversationManager {
   async archiveStrict(id: string): Promise<void> {
     const c = this.get(id);
     if (!c) return;
+    this.assertExecutionProject(c.projectId);
     if (c.kind === 'chat') await this.killChatSessionStrict(c);
     this.db.query('UPDATE conversations SET archived = 1 WHERE id = ?').run(id);
   }
@@ -439,6 +476,7 @@ export class ConversationManager {
   async deleteStrict(id: string): Promise<void> {
     const c = this.get(id);
     if (!c) return;
+    this.assertExecutionProject(c.projectId);
     if (c.kind === 'chat') await this.killChatSessionStrict(c);
     this.db.query('DELETE FROM conversations WHERE id = ?').run(id);
   }
@@ -456,6 +494,7 @@ export class ConversationManager {
     if (ownership.sagaToken !== sagaToken) return false;
     const c = this.get(id);
     if (!c) return false;
+    this.assertExecutionProject(c.projectId);
     if (c.kind === 'chat') await this.killChatSessionStrict(c);
     return this.db.transaction(() => {
       const result = this.db.query(
@@ -476,6 +515,7 @@ export class ConversationManager {
    */
   async closeChat(id: string): Promise<void> {
     const c = this.get(id);
+    if (c) this.assertExecutionProject(c.projectId);
     if (c) await this.killChatSession(c);
   }
 
@@ -483,7 +523,8 @@ export class ConversationManager {
   async sleepIssue(id: string): Promise<void> {
     const c = this.get(id);
     if (!c || c.kind !== 'issue') return;
-    await this.driver.killSession(this.tmuxName(c.projectId, c.id)).catch(() => {});
+    this.assertExecutionProject(c.projectId);
+    await this.execution(c.projectId).driver.killSession(this.tmuxName(c.projectId, c.id)).catch(() => {});
     this.db
       .query('DELETE FROM project_active_conv WHERE project_id = ? AND conv_id = ?')
       .run(c.projectId, c.id);
@@ -493,7 +534,7 @@ export class ConversationManager {
   private async killChatSession(c: Conversation): Promise<void> {
     if (c.kind !== 'chat') return;
     try {
-      await this.driver.killSession(chatTmux(c.id));
+      await this.execution(c.projectId).driver.killSession(chatTmux(c.id));
     } catch {
       /* 会话不存在或已关，正常 */
     }
@@ -502,9 +543,10 @@ export class ConversationManager {
   private async killChatSessionStrict(c: Conversation): Promise<void> {
     if (c.kind !== 'chat') return;
     const session = chatTmux(c.id);
-    const sessions = await this.driver.listSessions();
+    const driver = this.execution(c.projectId).driver;
+    const sessions = await driver.listSessions();
     if (!sessions.some((candidate) => candidate.name === session)) return;
-    await this.driver.killSession(session);
+    await driver.killSession(session);
   }
 
   /** 记一条对话最近活跃时刻（009 last_active_ts；chat 列表按它排序） */
@@ -518,9 +560,9 @@ export class ConversationManager {
    * tmux 会话是否存在 + 它的前台命令（#{pane_current_command}）。
    * listSessions 抛错按「不存在」处理——沿用旧 tmuxAlive 语义（执行机不可达时宁可重起）。
    */
-  private async sessionInfo(name: string): Promise<{ alive: boolean; command?: string }> {
+  private async sessionInfo(driver: ConvDriver, name: string): Promise<{ alive: boolean; command?: string }> {
     try {
-      const s = (await this.driver.listSessions()).find((x) => x.name === name);
+      const s = (await driver.listSessions()).find((x) => x.name === name);
       if (!s) return { alive: false };
       return { alive: true, ...(s.command ? { command: s.command } : {}) };
     } catch {
@@ -543,14 +585,15 @@ export class ConversationManager {
    * capturePane 失败传 undefined（≠ 空屏），退化成只按前台命令判。
    */
   private async ensureAgentLive(session: string, c: Conversation, cwd: string): Promise<void> {
-    const info = await this.sessionInfo(session);
+    const driver = this.execution(c.projectId).driver;
+    const info = await this.sessionInfo(driver, session);
     if (!info.alive) {
       await this.launchInto(session, c, cwd);
       return;
     }
-    const pane = await this.driver.capturePane(session).catch(() => undefined);
+    const pane = await driver.capturePane(session).catch(() => undefined);
     if (pane !== undefined && isCodexUpdatePrompt(pane)) {
-      await this.driver.sendKeys(session, '2').catch(() => {}); // Skip，跳过「1. Update now」
+      await driver.sendKeys(session, '2').catch(() => {}); // Skip，跳过「1. Update now」
       return;
     }
     const state = judgeAgentLiveness({
@@ -562,20 +605,21 @@ export class ConversationManager {
   }
 
   /** 预置 cwd 信任（best-effort；失败静默，靠 trust 弹窗自动同意兜底） */
-  private async trustDir(cwd: string): Promise<void> {
-    const f = this.opts.trustFile;
+  private async trustDir(execution: ConversationExecution, cwd: string): Promise<void> {
+    const f = execution.trustFile;
     if (!f) return;
+    const driver = execution.driver;
     try {
-      const st = await this.driver.statPath(f);
+      const st = await driver.statPath(f);
       if (!st) return;
-      const { data } = await this.driver.readFileRange(f, 0, Math.max(st.size, 1));
+      const { data } = await driver.readFileRange(f, 0, Math.max(st.size, 1));
       const j = JSON.parse(new TextDecoder().decode(data)) as {
         projects?: Record<string, { hasTrustDialogAccepted?: boolean } & Record<string, unknown>>;
       };
       j.projects = j.projects || {};
       if (j.projects[cwd]?.hasTrustDialogAccepted === true) return;
       j.projects[cwd] = { ...(j.projects[cwd] || {}), hasTrustDialogAccepted: true };
-      await this.driver.writeFile(f, JSON.stringify(j, null, 2));
+      await driver.writeFile(f, JSON.stringify(j, null, 2));
     } catch {
       /* best-effort：失效兜底 = trust 弹窗自动同意 */
     }
@@ -590,20 +634,21 @@ export class ConversationManager {
    * CODEX_NO_UPDATE_FLAG（`-c check_for_update_on_startup=false`）保证每次生效（见 buildCommand）。
    * 历史上这里曾写 [tui] check_for_update_on_startup=false，实测对 standalone 自更新无效，已移除。
    */
-  private async codexTrustDir(cwd: string): Promise<void> {
-    const f = this.opts.codexConfigFile;
+  private async codexTrustDir(execution: ConversationExecution, cwd: string): Promise<void> {
+    const f = execution.codexConfigFile;
     if (!f) return;
+    const driver = execution.driver;
     try {
       const section = `[projects."${cwd}"]`;
-      const st = await this.driver.statPath(f);
+      const st = await driver.statPath(f);
       let text = '';
       if (st) {
-        const { data } = await this.driver.readFileRange(f, 0, Math.max(st.size, 1));
+        const { data } = await driver.readFileRange(f, 0, Math.max(st.size, 1));
         text = new TextDecoder().decode(data);
       }
       if (text.includes(section)) return;
       const sep = text.length && !text.endsWith('\n') ? '\n' : '';
-      await this.driver.writeFile(f, `${text}${sep}${section}\ntrust_level = "trusted"\n`);
+      await driver.writeFile(f, `${text}${sep}${section}\ntrust_level = "trusted"\n`);
     } catch {
       /* best-effort：兜底 = 启动参数 bypass 审批 */
     }
@@ -631,7 +676,7 @@ export class ConversationManager {
              FROM issues i
              LEFT JOIN project_modules m ON m.id = i.module_id
             WHERE i.conv_id = ? AND i.status NOT IN ('done', 'cancelled')
-            ORDER BY i.id DESC LIMIT 1`,
+            ORDER BY i.created_ts DESC, i.id DESC LIMIT 1`,
         )
         .get(c.id);
       issue = row?.issue_effort ?? null;
@@ -648,7 +693,8 @@ export class ConversationManager {
 
   /** 按对话 agent 组装启动命令；codex fresh/resume 一律重盖 launch_ts 锚点并清 path 缓存（会话发现/重定位用） */
   private async buildCommand(c: Conversation): Promise<string> {
-    const executable = await this.driver.findExecutable(c.agent);
+    const { driver, locator } = this.execution(c.projectId);
+    const executable = await driver.findExecutable(c.agent);
     if (!executable) throw new AgentExecutableNotFoundError(c.agent);
     const command = quoteShellWord(executable);
     const row = this.db
@@ -662,14 +708,14 @@ export class ConversationManager {
       if (
         row?.agent_session_id === c.id &&
         row.agent_jsonl_path &&
-        await this.driver.statPath(row.agent_jsonl_path).catch(() => null)
+        await driver.statPath(row.agent_jsonl_path).catch(() => null)
       ) {
         return `${command} --resume ${c.id}`;
       }
       // 清掉 reclaim 期间可能绑上的手动会话覆盖（agent_jsonl_path）：重启后 pane 里
       // 跑的是 --resume/--session-id 的原生会话，覆盖不清会让引擎继续 tail 死文件
       this.db.query('UPDATE conversations SET agent_jsonl_path = NULL WHERE id = ?').run(c.id);
-      const exists = (await this.locator.locate(c.id)) !== null;
+      const exists = (await locator.locate(c.id)) !== null;
       return exists ? `${command} --resume ${c.id}` : `${command} --session-id ${c.id}`;
     }
     const args = [this.opts.codexArgs ?? DEFAULT_CODEX_ARGS, this.reasoningArg(c)]
@@ -692,24 +738,27 @@ export class ConversationManager {
    * 失败上抛（评审铁律：不许 void 吞错）。
    */
   private async launchInto(session: string, c: Conversation, cwd: string): Promise<void> {
-    if (c.agent === 'codex') await this.codexTrustDir(cwd);
-    else await this.trustDir(cwd);
+    const execution = this.execution(c.projectId);
+    const driver = execution.driver;
+    if (c.agent === 'codex') await this.codexTrustDir(execution, cwd);
+    else await this.trustDir(execution, cwd);
 
     try {
-      const homes = { claudeHome: this.opts.claudeHome, codexHome: this.opts.codexHome };
-      await ensureCompatSkills(this.driver, homes);
-      await ensureArtifactSkill(this.driver, homes); // 产物落 cwd 内置技能（缺失才写）
-      await ensurePandaIssueSkill(this.driver, homes);
-      await ensureProjectBridge(this.driver, cwd);
-      await ensureModuleGuideBlocks(this.driver, cwd);
+      const homes = { claudeHome: execution.claudeHome, codexHome: execution.codexHome };
+      await ensureCompatSkills(driver, homes);
+      await ensureArtifactSkill(driver, homes); // 产物落 cwd 内置技能（缺失才写）
+      await ensurePandaIssueSkill(driver, homes);
+      await ensurePandaIssueInboxSkill(driver, homes);
+      await ensureProjectBridge(driver, cwd);
+      await ensureModuleGuideBlocks(driver, cwd);
     } catch {
       /* best-effort：兼容层缺失不阻断激活 */
     }
 
     // 确保项目 cwd 在执行机上存在（writeFile 会建父目录；已存在则跳过，不污染项目目录）
-    const cwdStat = await this.driver.statPath(cwd).catch(() => null);
+    const cwdStat = await driver.statPath(cwd).catch(() => null);
     if (!cwdStat) {
-      await this.driver.writeFile(`${cwd.replace(/\/+$/, '')}/.panda/keep`, '');
+      await driver.writeFile(`${cwd.replace(/\/+$/, '')}/.panda/keep`, '');
     }
 
     let cmd = await this.buildCommand(c);
@@ -720,7 +769,7 @@ export class ConversationManager {
     if (policyRow) {
       let snapshot=JSON.parse(policyRow.snapshot_json);
       // Re-evaluate saved choices on each actual launch; a running process keeps its settings.
-      const issue = this.db.query<{id:number;module_id:number|null},[string]>(
+      const issue = this.db.query<{id:IssueId;module_id:number|null},[string]>(
         'SELECT i.id,i.module_id FROM issues i JOIN skill_session_policies s ON s.issue_id=i.id WHERE s.conv_id=?').get(c.id);
       if (issue && Array.isArray(snapshot.inventory)) {
         const policy = effectiveSkillPolicy(this.db,{projectId:c.projectId,moduleId:issue.module_id ?? undefined,issueId:issue.id});
@@ -743,18 +792,18 @@ export class ConversationManager {
       }
       // The tmux injection protocol caps input at 2000 chars; execute long flags from a private script.
       const scriptPath = `${cwd.replace(/\/+$/, '')}/.panda/tmp/skill-sessions/${c.id}.sh`;
-      await this.driver.writeFile(`${cwd.replace(/\/+$/, '')}/.panda/tmp/skill-sessions/.gitignore`, '*\n');
-      await this.driver.writeFile(scriptPath, '#!/bin/sh\nexec ' + cmd + '\n', 0o700);
+      await driver.writeFile(`${cwd.replace(/\/+$/, '')}/.panda/tmp/skill-sessions/.gitignore`, '*\n');
+      await driver.writeFile(scriptPath, '#!/bin/sh\nexec ' + cmd + '\n', 0o700);
       cmd = '/bin/sh ' + quoteShellWord(scriptPath);
     }
 
     try {
-      await this.driver.killSession(session);
+      await driver.killSession(session);
     } catch {
       /* 会话不存在，正常 */
     }
-    await this.driver.createSession(session, cwd);
-    await this.driver.sendKeys(session, cmd);
+    await driver.createSession(session, cwd);
+    await driver.sendKeys(session, cmd);
   }
 
   /**
@@ -776,6 +825,7 @@ export class ConversationManager {
   async activate(id: string, cwdOverride?: string): Promise<Conversation | null> {
     const c = this.get(id);
     if (!c) return null;
+    this.assertExecutionProject(c.projectId);
     if (c.sharedReadOnly) throw new Error('共享归档对话为只读历史，不能启动或恢复 Agent 会话');
     const cwd = cwdOverride ?? await this.conversationCwd(c);
 
@@ -798,7 +848,7 @@ export class ConversationManager {
     const previousId = this.currentConv(c.projectId);
     if (previousId && previousId !== id) {
       const previous = this.tmuxName(c.projectId, previousId);
-      if (previous !== ded) await this.driver.killSession(previous).catch(() => {});
+      if (previous !== ded) await this.execution(c.projectId).driver.killSession(previous).catch(() => {});
     }
     await this.launchInto(ded, c, cwd);
     this.setActiveConv(c.projectId, id);
@@ -817,6 +867,7 @@ export class ConversationManager {
   async relaunch(id: string): Promise<Conversation | null> {
     const c = this.get(id);
     if (!c) return null;
+    this.assertExecutionProject(c.projectId);
     if (c.sharedReadOnly) throw new Error('共享归档对话为只读历史，不能启动或恢复 Agent 会话');
     await this.launchInto(this.sessionName(c), c, await this.conversationCwd(c));
     if (c.kind === 'chat') this.touch(id);
@@ -827,7 +878,7 @@ export class ConversationManager {
   /** 项目 cwd（对话必须挂在存在的项目上，取不到是数据不一致，直接上抛） */
   private async conversationCwd(c: Conversation): Promise<string> {
     if (c.workspaceCwd) {
-      const stat = await this.driver.statPath(c.workspaceCwd);
+      const stat = await this.execution(c.projectId).driver.statPath(c.workspaceCwd);
       if (!stat?.isDirectory) throw new Error('managed conversation workspace is unavailable');
       return c.workspaceCwd;
     }

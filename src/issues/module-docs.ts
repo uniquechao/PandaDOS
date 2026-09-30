@@ -6,6 +6,7 @@
  */
 import type { ProjectModule } from '../core/types';
 import type { ExecutorDriver } from '../executor/driver';
+import { ISSUE_ID_SOURCE, type IssueId } from '../../shared/issue-id';
 
 const ROOT_REL = '.panda/modules';
 const DECODER = new TextDecoder();
@@ -16,7 +17,7 @@ type DocDriver = Pick<
 >;
 
 export interface ModuleIssuePageInput {
-  id: number;
+  id: IssueId;
   syncUid?: string;
   title: string;
   body: string | null;
@@ -28,7 +29,7 @@ export interface ModuleIssuePageInput {
 }
 
 export interface ModuleIssueIndexItem {
-  id: number;
+  id: IssueId;
   title: string;
   status: string;
   docPath: string;
@@ -82,7 +83,7 @@ const KNOWLEDGE_HEADER =
   '（本区块由 PandaDOS 引擎在每条 issue 结束时自动维护，只保留最近若干条，手工修改会被覆盖。）';
 
 export interface ModuleKnowledgeEntry {
-  issueId: number;
+  issueId: IssueId;
   /** 收尾状态：done / blocked / cancelled … */
   status: string;
   title: string;
@@ -113,13 +114,15 @@ export function parseModuleKnowledge(text: string): string[] {
   return (m[1] ?? '')
     .split('\n')
     .map((l) => l.trimEnd())
-    .filter((l) => /^- #\d+ /.test(l));
+    .filter((l) => ENTRY_ISSUE_RE.test(l));
 }
 
 /** 该条对应的 issue id（去重用）；解析不出返回 null */
-function entryIssueId(line: string): number | null {
-  const m = /^- #(\d+) /.exec(line);
-  return m ? Number(m[1]) : null;
+const ENTRY_ISSUE_RE = new RegExp(`^- #(${ISSUE_ID_SOURCE}) `);
+
+function entryIssueId(line: string): IssueId | null {
+  const m = ENTRY_ISSUE_RE.exec(line);
+  return m ? m[1]! : null;
 }
 
 /**
@@ -154,7 +157,7 @@ function issueFileSlug(title: string): string {
   return words?.length ? words.join('-').slice(0, 60).replace(/-+$/, '') : 'issue';
 }
 
-export function moduleIssueRelPath(moduleSlug: string, issueId: number, title: string): string {
+export function moduleIssueRelPath(moduleSlug: string, issueId: IssueId, title: string): string {
   return `${ROOT_REL}/${moduleSlug}/issues/${issueId}-${issueFileSlug(title)}.md`;
 }
 

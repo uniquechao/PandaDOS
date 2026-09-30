@@ -31,6 +31,7 @@ import {
 } from './usage';
 import { UsageStore, type UsageKind } from './usage-store';
 import { localDay } from './daily-greeting';
+import type { IssueId } from '../../shared/issue-id';
 
 /** 回读窗口：只用来登记 id 挡跨批次重复，不参与累加 */
 export const OVERLAP_BYTES = 32 * 1024;
@@ -48,6 +49,11 @@ export interface UsageCollectorDeps {
   driver: UsageCollectorDriver;
   /** convId → jsonl 绝对路径（core/jsonl 的 JsonlLocator 结构兼容）；找不到返回 null */
   locate(convId: string): Promise<string | null>;
+  /** Project-scoped reader and locator must be selected together: identical paths may exist on different executors. */
+  executionForProject?(projectId: number): {
+    driver: UsageCollectorDriver;
+    locate(convId: string): Promise<string | null>;
+  };
   now?: () => number;
   /** 失败留痕（默认 console.error）；绝不抛出 */
   onError?: (convId: string, error: unknown) => void;
@@ -79,7 +85,7 @@ interface ConvRow {
 }
 
 interface Segment {
-  issueId: number;
+  issueId: IssueId;
   start: number;
   /** 未结束的段用 +∞：还在跑的 issue 也要算进去 */
   end: number;
@@ -94,7 +100,7 @@ export function lineTimestamp(line: string): number | undefined {
 }
 
 /** 按时间戳找归属 issue；落不进任何段返回 null（= 非 Issue 会话） */
-export function attributeTo(segments: readonly Segment[], ts: number | undefined): number | null {
+export function attributeTo(segments: readonly Segment[], ts: number | undefined): IssueId | null {
   if (ts === undefined) return null;
   for (const s of segments) {
     if (ts >= s.start && ts <= s.end) return s.issueId;
@@ -146,9 +152,10 @@ export class UsageCollector {
   async scanConversation(conv: ConvRow): Promise<ScanOutcome> {
     const convId = conv.id;
     try {
-      const path = await this.deps.locate(convId);
+      const execution = this.deps.executionForProject?.(conv.project_id) ?? this.deps;
+      const path = await execution.locate(convId);
       if (!path) return { convId, scanned: 0, attributed: 0, skipped: 'no-file' };
-      const stat = await this.deps.driver.statPath(path);
+      const stat = await execution.driver.statPath(path);
       if (!stat?.isFile) return { convId, scanned: 0, attributed: 0, skipped: 'no-file' };
 
       const saved = this.store.getConversation(convId);
@@ -171,7 +178,7 @@ export class UsageCollector {
       const overlapFrom = Math.max(0, cursor - OVERLAP_BYTES);
       const readFrom = overlapFrom;
       const limit = Math.min(MAX_SCAN_BYTES_PER_PASS, stat.size - readFrom);
-      const chunk = await this.deps.driver.readFileRange(path, readFrom, limit);
+      const chunk = await execution.driver.readFileRange(path, readFrom, limit);
       const text = new TextDecoder().decode(chunk.data);
 
       const seen = emptySeen();
@@ -186,7 +193,7 @@ export class UsageCollector {
       }
 
       const segments = this.segmentsOf(convId);
-      const perIssue = new Map<number, UsageTotals>();
+      const perIssue = new Map<IssueId, UsageTotals>();
       /** 按天分桶：key = `${day}\u0000${issueId}`（issueId 0 = 未归因），值是这一天这一桶的增量 */
       const perDay = new Map<string, UsageTotals>();
       const now = this.now();
@@ -236,7 +243,7 @@ export class UsageCollector {
       }
       for (const [key, delta] of perDay) {
         const sep = key.indexOf('\u0000');
-        this.store.addDaily(key.slice(0, sep), conv.project_id, Number(key.slice(sep + 1)), delta, now);
+        this.store.addDaily(key.slice(0, sep), conv.project_id, key.slice(sep + 1), delta, now);
       }
       return { convId, scanned: Math.max(0, consumed - cursor), attributed };
     } catch (e) {
@@ -251,7 +258,7 @@ export class UsageCollector {
    */
   private segmentsOf(convId: string): Segment[] {
     const rows = this.deps.db
-      .query<{ issue_id: number; kind: string; ts: number; data_json: string | null }, [string]>(
+      .query<{ issue_id: IssueId; kind: string; ts: number; data_json: string | null }, [string]>(
         `SELECT e.issue_id, e.kind, e.ts, e.data_json FROM issue_events e
            JOIN issues i ON i.id = e.issue_id
           WHERE i.conv_id = ?
@@ -260,7 +267,7 @@ export class UsageCollector {
       )
       .all(convId);
     const out: Segment[] = [];
-    const open = new Map<number, number>();
+    const open = new Map<IssueId, number>();
     for (const r of rows) {
       if (r.kind === 'conversation_segment_started') {
         open.set(r.issue_id, r.ts);

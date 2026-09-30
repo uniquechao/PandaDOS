@@ -85,6 +85,34 @@ export function paneHasAgentUi(agent: AgentKind, pane: string): boolean {
     : pane.includes('❯') || pane.includes('╭─');
 }
 
+/**
+ * 屏面是否已经画出可接收文本的代理输入行。
+ *
+ * 这比 `paneHasAgentUi` 刻意更严格：启动横幅、旧边框和残留输出只能证明“见过代理”，
+ * 不能证明当前进程已经接管终端并可接收输入。自动 prompt 只能使用这个判据，避免
+ * `--resume` 冷启动期间把整段内容打进仍处于前台的原生 shell。
+ */
+export function paneHasAgentInput(agent: AgentKind, pane: string): boolean {
+  if (shellPromptTail(pane)) return false;
+  const marker = agent === 'codex' ? '›' : '❯';
+  const lines = pane.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    const normalized = line.replace(/^\s*[│┃]\s*/, '').trimStart();
+    if (!normalized.startsWith(marker)
+      || (normalized.length !== marker.length && !/\s/.test(normalized[marker.length] ?? ''))) continue;
+    const afterMarker = normalized.slice(marker.length).trimStart();
+    if (/^\d+\.\s/u.test(afterMarker)) return false; // 选择菜单，不是 composer
+    const afterInput = lines.slice(i + 1).join('\n');
+    // 最后一个输入行后已经有代理输出，或正显示启动态：该 marker 属于历史画面。
+    if (/^\s*[•●]\s+\S/mu.test(afterInput) || /\b(?:Starting|Loading)\s+(?:Codex|Claude|session)\b/iu.test(afterInput)) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
 /** tmux 报的前台命令规范化：去登录 shell 的前导 `-`、去路径、转小写 */
 function normalizeCommand(cmd: string | null | undefined): string {
   if (!cmd) return '';

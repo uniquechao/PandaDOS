@@ -1,3 +1,7 @@
+import { roomMemberMessages } from '../domains/rooms-members';
+import { roomChatMessages } from '../domains/rooms-chat';
+import { roomExtraMessages } from '../domains/rooms-extra';
+import { roomMessages } from '../domains/rooms';
 import { feishuChatMessages } from '../domains/feishu-chat';
 import { feishuLoginMessages } from '../domains/feishu-login';
 import type { MessageCatalog } from '../messages';
@@ -9,6 +13,7 @@ import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
 import { projectSettingsMessages } from '../domains/project-settings';
 import { externalImportMessages } from '../domains/external-import';
+import { workspaceMessages } from '../domains/workspace';
 import { designWorkbenchMessages } from '../domains/design-workbench';
 import { designWorkbenchAdvancedMessages } from '../domains/design-workbench-advanced';
 import { designAssetsUiMessages } from '../domains/design-assets-ui';
@@ -19,12 +24,16 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const zhHantCatalog = {
+  ...roomMemberMessages["zh-Hant"],
+  ...roomChatMessages["zh-Hant"],
+  ...roomExtraMessages["zh-Hant"],
+  ...roomMessages["zh-Hant"],
   ...feishuChatMessages["zh-Hant"],
   ...feishuLoginMessages["zh-Hant"],
   ...shellMessages['zh-Hant'],
   ...actionMessages['zh-Hant'],
   ...commonUiMessages['zh-Hant'],
-  'issue.validation': '門禁', 'issue.validationTargeted': '定向（{files} 個檔案）', 'issue.validationFull': '全量', 'issue.validationPassed': '通過', 'issue.validationFailed': '未通過（{label}，結束代碼 {code}）', 'issue.validationSkipped': '已略過', 'issue.validationPending': '本輪待跑', 'issue.pushFailedTitle':'已完成，但變更未推送到遠端','issue.pushFailedHint':'變更已在本機提交，請手動推送後再確認。','issue.pushFailedBranch':'分支 {branch}',
+  'issue.validation': '門禁', 'issue.validationTargeted': '定向（{files} 個檔案）', 'issue.validationFull': '全量', 'issue.validationPassed': '通過', 'issue.validationFailed': '未通過（{label}，結束代碼 {code}）', 'issue.validationSkipped': '已略過', 'issue.validationPending': '本輪待跑', 'issue.validationUnavailable': '驗證不可用', 'issue.validationExempt': '已明確豁免', 'issue.validationNoCommands': '未設定驗證命令', 'issue.validationDisabled': '必要驗證已關閉', 'issue.deliveryLocalComplete': '本機任務已完成', 'issue.deliveryPushPushed': '已推送', 'issue.deliveryPushFailed': '推送失敗', 'issue.deliveryPushSkipped': '已略過推送', 'issue.deliveryPushNotAttempted': '尚未推送', 'issue.deliveryMergeUnmanaged': '未託管合併', 'issue.deliveryDeployUnmanaged': '未託管部署', 'issue.pushFailedTitle':'已完成，但變更未推送到遠端','issue.pushFailedHint':'變更已在本機提交，請手動推送後再確認。','issue.pushFailedBranch':'分支 {branch}',
   'issue.completionReport':'完成報告','issue.reportOutcomeComplete':'目標已達成','issue.reportOutcomePartial':'部分完成','issue.reportOutcomeBlocked':'已受阻','issue.reportOutcomeUnverified':'歷史摘要未驗證','issue.reportObjective':'實作目標','issue.reportImplementation':'實作方案','issue.reportAdvantages':'優勢','issue.reportDisadvantages':'劣勢與取捨','issue.reportVerification':'驗證證據','issue.reportCompletion':'完成情況','issue.reportUnmetGoals':'未達目標','issue.reportRemainingWork':'必要後續動作','issue.reportAttentionTitle':'此 issue 尚未全部完成','issue.reportLegacyWarningTitle':'這筆完成記錄未經結構化驗證','issue.reportLegacyWarning':'歷史記錄只有自由文字摘要，PandaDOS 無法確認原始目標是否全部達成，也無法確認是否仍有必要後續動作。','issue.continueProcessing':'繼續處理','issue.continueProcessingTitle':'修正完成狀態並繼續','issue.continueProcessingWarningTitle':'此操作會重新開啟 issue','issue.continueProcessingWarning':'請說明尚未完成的內容。issue 將返回規劃階段，並可能立即開始執行。','issue.continueGuidance':'未達目標或後續處理說明','issue.continueGuidancePlaceholder':'說明哪些目標尚未達成，以及下一步必須完成什麼…','issue.continueGuidanceRequired':'繼續前請填寫未達目標或必要後續動作。','issue.confirmContinueProcessing':'重新開啟並繼續',
   'issue.recoveryLength':'已輸入 {current} / {max} 字',
   'issue.recoveryTitle':'解除阻擋','issue.recoveryReason':'執行受阻原因','issue.recoveryHelp':'請補充明確的處理意見，或先修改 issue 與受阻子工作。儲存編輯不會自動繼續執行。','issue.recoveryGuidance':'補充意見或解除方法','issue.recoveryGuidancePlaceholder':'說明需要修改什麼、採用哪種方案，或如何解除目前阻擋…','issue.recoveryGuidanceRequired':'請先填寫補充意見或解除方法。','issue.editBlockedIssue':'編輯 issue 內容','issue.editBlockedIssueHint':'修改標題、詳細資料、設定或截圖','issue.editBlockedSubtask':'編輯受阻子工作','issue.editBlockedSubtaskHint':'繼續執行前修正目前受阻步驟','issue.noEditableBlockedSubtask':'沒有可編輯的未完成子工作','issue.recoveryQueueHint':'確認後 issue 將從受阻前的階段繼續；僅在復原資訊無法使用時安全返回規劃階段。','issue.confirmRecovery':'提交意見並繼續執行','issue.mergedFrom': '由多條 issue 合併而來', 'issue.unmerge': '拆回', 'issue.unmergeLocked': '已開始執行，合併無法再拆回。', 'issue.unblockQueued': '已排隊：目前工作結束後會自動繼續執行。', 'issue.unblockQueuedCancel': '撤銷排隊', 'issue.openRecovery':'處理阻擋',
@@ -33,6 +42,7 @@ export const zhHantCatalog = {
   ...notifyMessages['zh-Hant'],
   ...projectSettingsMessages['zh-Hant'],
   ...externalImportMessages['zh-Hant'],
+  ...workspaceMessages['zh-Hant'],
   ...designWorkbenchMessages['zh-Hant'],
   ...designWorkbenchAdvancedMessages['zh-Hant'],
   ...designAssetsUiMessages['zh-Hant'],

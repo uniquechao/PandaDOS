@@ -12,6 +12,7 @@ import path from 'node:path';
 import { openDb } from '../core/db';
 import { migrate } from '../core/migrate';
 import { ISSUE_ENGINE_MIGRATIONS_DIR, migrateIssueEngine } from './engine';
+import type { IssueId } from '../../shared/issue-id';
 
 const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => {
@@ -73,7 +74,7 @@ describe('037：issues.module 文本列收敛到模块 slug', () => {
     await applyRange(db, 35, 99);
 
     const rows = db
-      .query<{ id: number; module: string; module_id: number; slug: string; agent: string }, []>(
+      .query<{ id: string; module: string; module_id: number; slug: string; agent: string }, []>(
         `SELECT i.id, i.module, i.module_id, pm.slug, pm.agent
            FROM issues i JOIN project_modules pm ON pm.id = i.module_id ORDER BY i.id`,
       )
@@ -83,9 +84,9 @@ describe('037：issues.module 文本列收敛到模块 slug', () => {
     for (const r of rows) expect(r.module).toBe(r.slug);
     // 同名不同代理确实是两个模块，且文本列已经分得开
     const byId = new Map(rows.map((r) => [r.id, r]));
-    expect(byId.get(1)!.module_id).not.toBe(byId.get(2)!.module_id);
-    expect(byId.get(1)!.module).not.toBe(byId.get(2)!.module);
-    expect(byId.get(1)!.module).toBe(byId.get(3)!.module); // 同模块两条文本一致
+    expect(byId.get("1")!.module_id).not.toBe(byId.get("2")!.module_id);
+    expect(byId.get("1")!.module).not.toBe(byId.get("2")!.module);
+    expect(byId.get("1")!.module).toBe(byId.get("3")!.module); // 同模块两条文本一致
   });
 
   test('不动没绑模块的 issue，且重复执行幂等', async () => {
@@ -650,9 +651,9 @@ describe('065：用量按天分桶', () => {
       VALUES ('2026-09-07', 7, 33, 42, 5)`);
     db.run(`INSERT INTO usage_daily (day, project_id, issue_id, updated_ts)
       VALUES ('2026-09-07', 7, 0, 5)`); // issue_id = 0 = 未归因：没有外键挡它
-    expect(db.query<{ requests: number; issue_id: number }, []>(
+    expect(db.query<{ requests: number; issue_id: IssueId }, []>(
       'SELECT requests, issue_id FROM usage_daily WHERE issue_id = 0',
-    ).get()).toEqual({ requests: 0, issue_id: 0 });
+    ).get()).toEqual({ requests: 0, issue_id: 0 as unknown as IssueId }); // 065 建表时仍是 INTEGER，074 之后才转 TEXT
 
     // 主键是三元组：同一天同项目同 issue 只能有一行
     expect(() => db.run(`INSERT INTO usage_daily (day, project_id, issue_id, updated_ts)
@@ -778,5 +779,49 @@ describe('064：存量模块推理档位按风险下调', () => {
     expect(db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM issue_events').get()!.n).toBe(1);
     expect(db.query<{ module_id: number }, [number]>('SELECT module_id FROM issues WHERE id = ?')
       .get(33)!.module_id).toBe(3);
+  });
+});
+
+describe('074：issue 主键改文本编号（#307）', () => {
+  test('存量数字编号原样转文本，引用列一并转 TEXT、外键仍生效；新 issue 用新格式编号', async () => {
+    const db = await legacyDb();
+    await applyRange(db, 35, 73);
+    db.run(`INSERT INTO issues (id, project_id, title, created_ts) VALUES (307, 7, '老 issue', 3)`);
+    db.run(`INSERT INTO issues (id, project_id, title, created_ts) VALUES (308, 7, '依赖方', 4)`);
+    db.run(`INSERT INTO issue_events (issue_id, kind, ts) VALUES (307, 'created', 3)`);
+    db.run(`INSERT INTO gates (issue_id, kind, payload_json) VALUES (307, 'plan', '{}')`);
+    db.run(`INSERT INTO issue_dependencies (issue_id, depends_on_issue_id, kind, created_ts) VALUES (308, 307, 'blocks', 5)`);
+    db.run(`INSERT INTO subscriptions (user_id, scope, target_id, created_ts) VALUES (1, 'issue', 307, 5), (1, 'project', 7, 5)`);
+    db.run(`INSERT INTO usage_daily (day, project_id, issue_id, updated_ts) VALUES ('2026-09-17', 7, 0, 5)`);
+
+    await applyRange(db, 74, 74);
+
+    const typeOf = (table: string, column: string) => db
+      .query<{ name: string; type: string }, []>(`PRAGMA table_info(${table})`).all()
+      .find((c) => c.name === column)?.type;
+    expect(typeOf('issues', 'id')).toBe('TEXT');
+    for (const [table, column] of [
+      ['issue_events', 'issue_id'], ['gates', 'issue_id'], ['issue_dependencies', 'depends_on_issue_id'],
+      ['subscriptions', 'target_id'], ['usage_daily', 'issue_id'], ['issue_usage', 'issue_id'],
+    ] as const) expect(typeOf(table, column)).toBe('TEXT');
+
+    expect(db.query<{ id: IssueId }, []>('SELECT id FROM issues ORDER BY created_ts').all())
+      .toEqual([{ id: '307' }, { id: '308' }]);
+    expect(db.query<{ issue_id: IssueId }, []>('SELECT issue_id FROM issue_events').get()).toEqual({ issue_id: '307' });
+    expect(db.query<{ target_id: string }, []>("SELECT target_id FROM subscriptions WHERE scope = 'project'").get())
+      .toEqual({ target_id: '7' });
+    expect(db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM usage_daily WHERE issue_id = 0').get()!.n).toBe(1);
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    // 外键仍然指向 issues：删父行级联清子行
+    db.run(`DELETE FROM issues WHERE id = '308'`);
+    expect(db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM issue_dependencies').get()!.n).toBe(0);
+
+    // 幂等：再跑一次整链不重复重建；新建 issue 走新格式
+    migrateIssueEngine(db);
+    const { IssueStore } = await import('./engine');
+    const created = new IssueStore(db).create(7, { title: '新 issue', category: 'task' });
+    expect(created.id).toMatch(/^\d{8}-[0-9a-f]{7}$/);
+    db.run(`INSERT INTO issue_events (issue_id, kind, ts) VALUES (?, 'x', 6)`, [created.id]);
+    expect(() => db.run(`INSERT INTO issue_events (issue_id, kind, ts) VALUES ('20990101-0000000', 'x', 6)`)).toThrow();
   });
 });

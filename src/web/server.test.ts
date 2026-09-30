@@ -4,7 +4,7 @@
  * 建项目（自动订阅属主）→ 建 issue（引擎接管到 planning）→ 列表可见 →
  * 属主隔离（他人 403）→ 飞书未配置静默路径（绑定 503）→ 静态服务 → 优雅停机不抛。
  */
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { promises as fsp, readFileSync } from 'node:fs';
 import os from 'node:os';
@@ -19,7 +19,10 @@ import type { DesignRunner, RunDesignInput } from '../designs/runner';
 import type { DesignImageGenerator } from '../designs/image-provider';
 import { migrateIssueEngine } from '../issues/engine';
 import { ModuleStore } from '../issues/modules';
+import { saveLlmConfig } from '../agents/llm';
+import { migratePmAgent } from '../agents/pm';
 import { LocalDriver } from '../executor/local';
+import { SshDriver } from '../executor/ssh';
 import {
   designImageRuntimeFromEnv,
   executorStatusOf,
@@ -29,11 +32,17 @@ import {
   type PandaServer,
   type ServerOptions,
 } from './server';
+import type { IssueId } from '../../shared/issue-id';
+import type { RoomSnapshot } from '../../shared/rooms';
 
 const LEGACY_SAGA_050_SQL = readFileSync(
   new URL('../designs/test-fixtures/050_design_workbench-saga-legacy.sql', import.meta.url),
   'utf8',
 );
+
+// 完整装配会执行全部迁移并启动真实 HTTP 服务；全量门禁并行跑测试文件时，
+// Bun 默认 5 秒预算容易把正常但受资源竞争影响的用例误判为超时。
+setDefaultTimeout(15_000);
 
 function u32(value: number): number[] {
   return [(value >>> 24) & 255, (value >>> 16) & 255, (value >>> 8) & 255, value & 255];
@@ -76,6 +85,32 @@ class FakeDriver extends LocalDriver {
   override async sendKey() {}
   override async capturePane() {
     return '';
+  }
+}
+
+class SwitchableExecutorDriver extends FakeDriver {
+  offline = false;
+  offlineAttempts = 0;
+  override async git(cwd: string, args: string[]) {
+    if (this.offline) {
+      this.offlineAttempts++;
+      throw new Error('remote executor offline');
+    }
+    return super.git(cwd, args);
+  }
+  override async listSessions() {
+    if (this.offline) {
+      this.offlineAttempts++;
+      throw new Error('remote executor offline');
+    }
+    return super.listSessions();
+  }
+  override async sendKeys(session: string, text: string) {
+    if (this.offline) {
+      this.offlineAttempts++;
+      throw new Error('remote executor offline');
+    }
+    return super.sendKeys(session, text);
   }
 }
 
@@ -168,10 +203,22 @@ async function boot(
   const ws = path.join(dir, 'ws');
   const claudeDir = path.join(dir, 'home', '.claude', 'projects');
   const tokenFile = path.join(dir, 'admin-token');
+  const effectivePublicDir = publicDir ?? path.join(dir, 'public');
+  if (!publicDir) {
+    await fsp.mkdir(effectivePublicDir, { recursive: true });
+    await fsp.writeFile(
+      path.join(effectivePublicDir, 'index.html'),
+      '<!doctype html><title>PandaDOS test</title>',
+    );
+  }
 
   // 预置一台本机执行机（host=127.0.0.1 且无 keyRef → LocalDriver 规则；测试注入 FakeDriver）
   const db0 = openDb(dbPath);
   migrate(db0);
+  migratePmAgent(db0);
+  // 门禁由生产服务拉起时会继承 PANDA_LLM_*。在测试库中显式禁用 LLM，保证模块
+  // 分类始终走确定性回退，不发真实请求，也不受部署环境是否配置模型影响。
+  saveLlmConfig(db0, { baseUrl: '', model: '', apiKey: '' });
   db0.query(
     `INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir)
      VALUES ('local', '127.0.0.1', 22, 'root', '', ?, ?)`,
@@ -180,37 +227,18 @@ async function boot(
   db0.close();
 
   const driver = injectedDriver;
-  // LLM 指到本地不可达地址、单次重试：开发机/CI 环境常带真 PANDA_LLM_API_KEY，
-  // 不摘会让冒烟真调 驱动大模型（模块起名不定、耗时不定甚至超时）。配置在 startServer
-  // 装配时一次性捕获（createLlmClient），随后立刻恢复 env，不影响同进程其它测试文件。
-  const LLM_ENV: Record<string, string> = {
-    PANDA_LLM_BASE_URL: 'http://127.0.0.1:1',
-    PANDA_LLM_API_KEY: 'test-disabled',
-    PANDA_LLM_RETRIES: '1',
-    PANDA_LLM_TIMEOUT_MS: '500',
-  };
-  const savedEnv = Object.fromEntries(Object.keys(LLM_ENV).map((k) => [k, process.env[k]]));
-  Object.assign(process.env, LLM_ENV);
-  let server: PandaServer;
-  try {
-    server = await startServer({
-      port: 0,
-      dbPath,
-      adminTokenFile: tokenFile,
-      driverFactory: () => driver,
-      feishu: null, // 飞书不配置（静默路径）
-      engineConfig: { tickMs: 3_600_000 }, // 测试内不靠后台 tick
-      statusIntervalMs: 3_600_000,
-      designImageRuntime: null,
-      ...(publicDir ? { publicDir } : {}),
-      ...serverOverrides,
-    });
-  } finally {
-    for (const [k, v] of Object.entries(savedEnv)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-  }
+  const server = await startServer({
+    port: 0,
+    dbPath,
+    adminTokenFile: tokenFile,
+    driverFactory: () => driver,
+    feishu: null, // 飞书不配置（静默路径）
+    engineConfig: { tickMs: 3_600_000 }, // 测试内不靠后台 tick
+    statusIntervalMs: 3_600_000,
+    designImageRuntime: null,
+    publicDir: effectivePublicDir,
+    ...serverOverrides,
+  });
   cleanups.push(() => server.stop());
   return { server, base: `http://127.0.0.1:${server.port}`, dir, ws, tokenFile, driver };
 }
@@ -236,6 +264,218 @@ async function api(
 }
 
 describe('server 集成冒烟（完整装配）', () => {
+  test('room HTTP routes run the bounded team through independent review and completion', async () => {
+    let requests = 0;
+    const ctx = await boot(undefined, undefined, new FakeDriver(), {
+      roomRuntime: {
+        configured: () => true,
+        async run(context, _signal, beforeRequest) {
+          if (!beforeRequest?.()) throw new Error('dispatch denied');
+          requests++;
+          switch (context.member.role) {
+            case 'coach': return { message: 'Formal coaching decision.', decision: context.assessments.length ? 'complete' : 'continue' };
+            case 'planner': return { message: 'Write a verifiable introduction with one example.' };
+            case 'writer': return { message: 'Deliverable ready.', artifact: { title: 'Introduction', markdown: '# Introduction\n\nOne concrete example.' } };
+            case 'reviewer': {
+              const artifact = context.artifacts.at(-1)!;
+              return { message: 'This version satisfies the criteria.', review: { artifactId: artifact.id, artifactVersion: artifact.currentVersion, criteria: context.goal.criteria.map(criterion => ({ criterionId: criterion.id, verdict: 'passed' as const, note: 'The example is present in this exact version.' })) } };
+            }
+          }
+        },
+      },
+    });
+    const token = (await fsp.readFile(ctx.tokenFile, 'utf8')).trim();
+    const project = await api(ctx, 'POST', '/api/projects', token, { name: 'rooms-http', executorId: 1 });
+    expect(project.status).toBe(200);
+    const base = `/api/projects/${project.body.project.id}/rooms`;
+    const created = await api(ctx, 'POST', base, token, { title: 'Launch room', request: 'Write an introduction.', criteria: ['Include one concrete example.'], start: true }, { 'Idempotency-Key': 'full-server-room' });
+    expect(created.status).toBe(201);
+    let snapshot = created.body as RoomSnapshot;
+    const deadline = Date.now() + 5_000;
+    while (snapshot.mission?.state !== 'completed' && Date.now() < deadline) {
+      await Bun.sleep(20);
+      const read = await api(ctx, 'GET', `${base}/${snapshot.room.id}/snapshot`, token);
+      expect(read.status).toBe(200);
+      snapshot = read.body;
+    }
+    expect(snapshot.mission?.state).toBe('completed');
+    expect(snapshot.mission?.budget.modelRequests).toBe(5);
+    expect(requests).toBe(5);
+    expect(snapshot.members).toHaveLength(4);
+    expect(snapshot.artifacts[0].versions[0].markdown).toContain('One concrete example.');
+    expect(snapshot.assessments[0].reviewerMemberId).not.toBe(snapshot.artifacts[0].versions[0].authorMemberId);
+    const listed = await api(ctx, 'GET', base, token);
+    expect(listed.body.rooms[0].room.id).toBe(snapshot.room.id);
+    expect(ctx.driver.sent).toHaveLength(0);
+  });
+
+  // The loopback daemon must set an isolated TMUX_TMPDIR; never run this test against the
+  // host's normal sshd/tmux namespace (project ids would otherwise collide with live sessions).
+  const sshIssueTest = process.env.PANDA_R3_SSH_KEY && process.env.PANDA_R3_SSH_PORT
+    && process.env.PANDA_R3_SSH_TMUX_DIR && Bun.which('cc') ? test : test.skip;
+  sshIssueTest('真实 SSH 回环：远端 Issue 开工、重启恢复、验证和 Git 收尾', async () => {
+    const local = new FakeDriver();
+    let fakeAgent = '';
+    const sshConfig = {
+      host: '127.0.0.1', port: Number(process.env.PANDA_R3_SSH_PORT),
+      username: os.userInfo().username, privateKeyPath: process.env.PANDA_R3_SSH_KEY!,
+    };
+    class RemoteIssueDriver extends SshDriver {
+      override async findExecutable(_agent: 'claude' | 'codex') { return fakeAgent; }
+    }
+    const remote = new RemoteIssueDriver(sshConfig);
+    const ctx = await boot(undefined, (db) => {
+      db.query(`INSERT INTO executors
+        (name, host, port, ssh_user, key_ref, workspace_root, claude_dir, codex_dir)
+        SELECT 'ssh-test', '127.0.0.1', ?, ?, 'test-key', workspace_root,
+          claude_dir, codex_dir FROM executors WHERE id = 1`).run(sshConfig.port, sshConfig.username);
+    }, local, { driverFactory: (executor) => executor.id === 2 ? remote : local,
+      engineConfig: { tickMs: 3_600_000, resultSummaryTimeoutMs: 0, kickoffMinBootMs: 0 },
+    });
+    expect((await remote.runCommand('/', ['sh', '-c', 'printf %s "$TMUX_TMPDIR"'], 5_000)).out)
+      .toBe(process.env.PANDA_R3_SSH_TMUX_DIR!);
+    const source = path.join(ctx.dir, 'fake-agent.c');
+    fakeAgent = path.join(ctx.dir, 'claude');
+    await fsp.writeFile(source, '#include <stdio.h>\nint main(void) { char line[8192]; setbuf(stdout, NULL); puts("❯ "); while (fgets(line, sizeof(line), stdin)) puts("agent received\\n❯ "); return 0; }\n');
+    const compiled = Bun.spawnSync({ cmd: ['cc', '-o', fakeAgent, source] });
+    expect(compiled.exitCode).toBe(0);
+    const token = (await fsp.readFile(ctx.tokenFile, 'utf8')).trim();
+    const cwd = path.join(ctx.ws, 'ssh-private');
+    const project = await api(ctx, 'POST', '/api/projects', token, {
+      name: 'ssh issue', executorId: 2, cwd,
+    });
+    expect(project.status).toBe(200);
+    const pid = project.body.project.id as number;
+    await remote.writeFile(path.join(cwd, 'README.md'), '# SSH issue\n');
+    expect((await remote.git(cwd, ['add', 'README.md'])).code).toBe(0);
+    expect((await remote.git(cwd, ['commit', '-m', 'initial'])).code).toBe(0);
+    ctx.server.engine.store.setValidationCommands(pid, [{ label: 'ssh-check', argv: ['sh', '-c', 'test -f README.md'] }]);
+    const localGitBefore = local.gitCalls.length;
+    const created = await api(ctx, 'POST', `/api/projects/${pid}/issues`, token, {
+      title: 'SSH lifecycle', category: 'debug', body: 'validate remote execution',
+    });
+    expect(created.status).toBe(200);
+    const issueId = created.body.issue.id as IssueId;
+    expect(ctx.server.engine.store.get(issueId)?.status).toBe('implementing');
+    const session = `cc-${pid}-m-general-work`;
+    cleanups.push(() => remote.killSession(session).catch(() => {}));
+    expect((await remote.listSessions()).some((entry) => entry.name === session)).toBe(true);
+    expect(local.gitCalls).toHaveLength(localGitBefore);
+    expect(local.sessions.size).toBe(0);
+    const claudeDir = ctx.server.db.query<{ claude_dir: string }, []>(
+      'SELECT claude_dir FROM executors WHERE id = 2',
+    ).get()!.claude_dir;
+
+    await ctx.server.stop();
+    const recoveredDriver = new RemoteIssueDriver(sshConfig);
+    const recovered = await startServer({
+      port: 0, dbPath: path.join(ctx.dir, 'panda.db'), adminTokenFile: ctx.tokenFile,
+      driverFactory: (executor) => executor.id === 2 ? recoveredDriver : local,
+      feishu: null, engineConfig: { tickMs: 3_600_000, resultSummaryTimeoutMs: 0, kickoffMinBootMs: 0 },
+      statusIntervalMs: 3_600_000, designImageRuntime: null,
+    });
+    cleanups.push(async () => {
+      await recoveredDriver.killSession(session).catch(() => {});
+      await recovered.stop();
+    });
+    await recovered.engine.tick();
+    expect(recovered.engine.store.get(issueId)?.status).toBe('implementing');
+    await recovered.engine.tick();
+    expect(recovered.engine.store.countEvents(issueId, 'injected')).toBeGreaterThan(0);
+    const convId = recovered.engine.store.get(issueId)!.convId!;
+    const ready = `ISSUE_READY:${issueId}:${recovered.engine.store.lastEnterEventId(issueId, 'implementing')}`;
+    const report = { version: 1, outcome: 'complete', objective: 'SSH lifecycle',
+      implementation: ['remote change'], advantages: [], disadvantages: [],
+      verification: ['ssh-check passed'], completion: 'complete',
+      unmetGoals: [], remainingWork: [], optionalFollowUps: [] };
+    const jsonl = `${claudeDir}/ssh-private/${convId}.jsonl`;
+    await recoveredDriver.writeFile(jsonl, JSON.stringify({ type: 'assistant', message: {
+      content: [{ type: 'text', text: `${ready}\nREPORT_BEGIN\n${JSON.stringify(report)}\nREPORT_END` }],
+    } }) + '\n');
+    await recovered.engine.tick();
+    expect(recovered.engine.store.get(issueId)?.status).toBe('done');
+    expect(recovered.engine.store.countEvents(issueId, 'validation_passed')).toBeGreaterThan(0);
+    expect(recovered.engine.store.countEvents(issueId, 'auto_commit')).toBeGreaterThan(0);
+    expect((await recoveredDriver.git(cwd, ['log', '-1', '--format=%s'])).out).toContain('SSH lifecycle');
+    expect(local.gitCalls).toHaveLength(localGitBefore);
+    expect(local.sessions.size).toBe(0);
+
+    const pending = await recovered.engine.createIssue(pid, {
+      title: 'offline SSH issue', category: 'debug',
+    }, false);
+    await recoveredDriver.killSession(session).catch(() => {});
+    await recoveredDriver.close();
+    expect(await recovered.engine.startIssue(pending.id)).toMatchObject({ ok: true, to: 'paused' });
+    expect(recovered.engine.store.get(pending.id)?.status).toBe('paused');
+    expect(local.gitCalls).toHaveLength(localGitBefore);
+    expect(local.sessions.size).toBe(0);
+  }, 60_000);
+  test('第二执行机同 cwd 的 Issue 自动启动、重启恢复与离线失败均不落到主执行机', async () => {
+    const local = new FakeDriver();
+    const remote = new SwitchableExecutorDriver();
+    const ctx = await boot(undefined, (db) => {
+      db.run(`INSERT INTO executors
+        (name, host, port, ssh_user, key_ref, workspace_root, claude_dir, codex_dir)
+        SELECT 'remote', 'remote.example', 22, 'agent', 'test-key', workspace_root,
+          claude_dir, codex_dir FROM executors WHERE id = 1`);
+    }, local, { driverFactory: (executor) => executor.id === 2 ? remote : local });
+    const token = (await fsp.readFile(ctx.tokenFile, 'utf8')).trim();
+    const cwd = path.join(ctx.ws, 'same-cwd');
+    const primaryProject = await api(ctx, 'POST', '/api/projects', token, {
+      name: 'primary same path', executorId: 1, cwd,
+    });
+    expect(primaryProject.status).toBe(200);
+    const remoteProject = await api(ctx, 'POST', '/api/projects', token, {
+      name: 'remote same path', executorId: 2, cwd,
+    });
+    expect(remoteProject.status).toBe(200);
+    const remoteId = remoteProject.body.project.id as number;
+    const otherRemoteProject = await api(ctx, 'POST', '/api/projects', token, {
+      name: 'offline remote', executorId: 2, cwd: path.join(ctx.ws, 'offline-cwd'),
+    });
+    expect(otherRemoteProject.status).toBe(200);
+    const localGitBefore = local.gitCalls.length;
+    const issue = await api(ctx, 'POST', `/api/projects/${remoteId}/issues`, token, {
+      title: 'remote issue', category: 'debug', body: 'run only on remote executor',
+    });
+    expect(issue.status).toBe(200);
+    expect(issue.body.issue.status).toBe('implementing');
+    expect(remote.gitCalls.some((call) => call.cwd === cwd)).toBe(true);
+    expect(remote.sessions.has(`cc-${remoteId}-m-general-work`)).toBe(true);
+    expect(remote.sent.length).toBeGreaterThan(0);
+    expect(local.gitCalls).toHaveLength(localGitBefore);
+    expect(local.sessions.size).toBe(0);
+
+    // A fresh control plane must rediscover the existing remote run without starting one on A.
+    await ctx.server.stop();
+    const restarted = await startServer({
+      port: 0, dbPath: path.join(ctx.dir, 'panda.db'), adminTokenFile: ctx.tokenFile,
+      driverFactory: (executor) => executor.id === 2 ? remote : local,
+      feishu: null, engineConfig: { tickMs: 3_600_000 }, statusIntervalMs: 3_600_000,
+      designImageRuntime: null,
+    });
+    cleanups.push(() => restarted.stop());
+    await restarted.engine.tick();
+    expect(local.gitCalls).toHaveLength(localGitBefore);
+    expect(local.sessions.size).toBe(0);
+    expect(restarted.engine.store.get(issue.body.issue.id)?.status).toBe('implementing');
+
+    remote.offline = true;
+    const offlineGitBefore = local.gitCalls.length;
+    await restarted.engine.tick();
+    expect(local.gitCalls).toHaveLength(offlineGitBefore);
+    expect(local.sessions.size).toBe(0);
+    expect(restarted.engine.store.get(issue.body.issue.id)?.status).not.toBe('done');
+    const offlineIssue = await restarted.engine.createIssue(otherRemoteProject.body.project.id, {
+      title: 'queued while offline', category: 'debug',
+    }, false);
+    const start = await restarted.engine.startIssue(offlineIssue.id);
+    expect(start).toMatchObject({ ok: true, to: 'paused' });
+    expect(restarted.engine.store.get(offlineIssue.id)?.status).toBe('paused');
+    expect(remote.offlineAttempts).toBeGreaterThan(0);
+    expect(local.gitCalls).toHaveLength(offlineGitBefore);
+    expect(local.sessions.size).toBe(0);
+  }, 60_000);
   test('管理页保存飞书登录配置后立即启用扫码，关闭即时生效且无需通知通道', async () => {
     const ctx = await boot();
     const token = (await fsp.readFile(ctx.tokenFile, 'utf8')).trim();
@@ -482,7 +722,8 @@ describe('server 集成冒烟（完整装配）', () => {
     await didEnter;
     expect(await Promise.race([
       ctx.server.stop().then(() => true),
-      Bun.sleep(100).then(() => false),
+      // The server has other bounded drains; allow CI load while still detecting a hung provider.
+      Bun.sleep(1000).then(() => false),
     ])).toBe(true);
     let lateUnhandled: unknown = null;
     const onUnhandled = (error: unknown) => { lateUnhandled = error; };
@@ -876,7 +1117,9 @@ describe('server 集成冒烟（完整装配）', () => {
       const stopping = second.stop();
       stopReturned = await Promise.race([
         stopping.then(() => true),
-        Bun.sleep(100).then(() => false),
+        // Full-suite contention can delay timers beyond 100 ms even though the
+        // publication recovery deadline above is 15 ms. Keep a bounded assertion.
+        Bun.sleep(1_000).then(() => false),
       ]);
       driver.release();
       await stopping;
@@ -942,12 +1185,12 @@ describe('server 集成冒烟（完整装配）', () => {
   test('healthz → admin 登录 → 建用户/项目/issue → 属主隔离 → 优雅停机', async () => {
     const ctx = await boot();
 
-    // ---- healthz：迁移链全量（含协作 outbox、Issue 044/062/064/065、PM 040、Design 050-059/061/073 与 Notify 063）+ executor online + engine running ----
+    // ---- healthz：迁移链全量（含协作 outbox、Issue 044/062/064/065、PM 040、Design 050-059/061/073/075、Issue 074 与 Notify 063）+ executor online + engine running ----
     const h = await api(ctx, 'GET', '/healthz');
     expect(h.status).toBe(200);
     expect(h.body.ok).toBe(true);
-    expect(h.body.db.latest).toBe(73);
-    expect(h.body.db.applied).toBe(67);
+    expect(h.body.db.latest).toBe(86);
+    expect(h.body.db.applied).toBe(80);
     expect(h.body.executors).toEqual([{ id: 1, name: 'local', status: 'online' }]);
     expect(h.body.engine.running).toBe(true);
     expect(h.body.feishu).toBe(false);
@@ -1044,7 +1287,7 @@ describe('server 集成冒烟（完整装配）', () => {
     expect((await api(ctx,'PUT',policyUrl,bob.body.token,{superpowers:'disabled'})).status).toBe(403);
     expect((await api(ctx,'PUT',policyUrl,alice.body.token,{superpowers:'invalid'})).status).toBe(400);
 
-    // 模块会话已（模拟）拉起：boot 已把 LLM 指到不可达地址 → 分类器必走确定性回退 general-work
+    // 模块会话已（模拟）拉起：boot 已在测试 DB 禁用 LLM → 分类器必走确定性回退 general-work
     expect(ctx.driver.sessions.has(`cc-${pid}-m-general-work`)).toBe(true);
     expect(ctx.driver.sent.some((s) => s.text.includes('claude --session-id') || s.text.includes('.panda/tmp/skill-sessions/'))).toBe(true);
 
@@ -1179,8 +1422,8 @@ describe('server 集成冒烟（完整装配）', () => {
     expect(published.body.publication).toMatchObject({
       designId, projectId: pid, revision: 2,
       issues: [
-        { nodeId: 'server-api', issueId: expect.any(Number) },
-        { nodeId: 'server-worker', issueId: expect.any(Number) },
+        { nodeId: 'server-api', issueId: expect.any(String) },
+        { nodeId: 'server-worker', issueId: expect.any(String) },
       ],
     });
     expect(published.body.publication.error).toBeUndefined();
@@ -1220,7 +1463,7 @@ describe('server 集成冒烟（完整装配）', () => {
     ).get(published.body.publication.publicationId)!.cwd;
     expect(await fsp.readFile(path.join(worktreeCwd, `.panda/designs/design-${designId}/DESIGN.md`), 'utf8'))
       .toContain('Approved publication');
-    const linked = ctx.server.db.query<{ issue_id: number; node_id: string }, [number]>(
+    const linked = ctx.server.db.query<{ issue_id: IssueId; node_id: string }, [number]>(
       'SELECT issue_id, node_id FROM design_issue_links WHERE publication_id = ? ORDER BY node_id',
     ).all(published.body.publication.publicationId);
     ctx.server.db.query("UPDATE issues SET status = 'done' WHERE id = ?").run(linked[0]!.issue_id);
@@ -1228,7 +1471,7 @@ describe('server 集成冒烟（完整装配）', () => {
       "UPDATE design_execution_runs SET error_code = 'WORKTREE_MISSING' WHERE publication_id = ?",
     ).run(published.body.publication.publicationId);
     await ctx.server.engine.scheduleNext(pid);
-    expect(ctx.server.db.query<{ status: string }, [number]>(
+    expect(ctx.server.db.query<{ status: string }, [IssueId]>(
       'SELECT status FROM issues WHERE id = ?',
     ).get(linked[1]!.issue_id)?.status).toBe('pending');
     const publications = await api(
@@ -1239,7 +1482,7 @@ describe('server 集成冒烟（完整装配）', () => {
       'SELECT COUNT(*) AS n FROM issues WHERE project_id = ? AND publication_locked = 1',
     ).get(pid)!.n).toBe(2);
 
-    // ---- 静态服务：/ 回 index.html（build-ui 产物） ----
+    // ---- 静态服务：/ 回测试启动器准备的 index.html ----
     const home = await fetch(`${ctx.base}/`);
     expect(home.status).toBe(200);
     expect(home.headers.get('content-type') ?? '').toContain('text/html');

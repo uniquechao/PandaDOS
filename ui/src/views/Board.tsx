@@ -57,6 +57,7 @@ import { IssueWorkbench } from './IssueDetail';
 import { reconcileAgent } from '../components/AgentPicker';
 import { WorkflowGraph } from '../components/WorkflowGraph';
 import { tr } from '../i18n/runtime';
+import type { IssueId } from '../../../shared/issue-id';
 
 const POLL_MS = 5000;
 
@@ -75,12 +76,12 @@ const GROUPS: {
   { key: 'review', get label() { return tr('project.statusReview'); }, statuses: ['clarifying', 'plan_review', 'merge_review'], tone: 'review' },
   { key: 'doing', get label() { return tr('project.statusDoing'); }, statuses: ['planning', 'implementing', 'testing', 'merging'], tone: 'doing' },
   { key: 'todo', get label() { return tr('project.statusTodo'); }, statuses: ['pending'], tone: 'todo' },
-  { key: 'blocked', get label() { return tr('project.statusBlocked'); }, statuses: ['blocked'], tone: 'blocked', paged: true },
+  { key: 'blocked', get label() { return tr('project.statusBlocked'); }, statuses: ['blocked', 'paused'], tone: 'blocked', paged: true },
   { key: 'finished', get label() { return tr('status.done'); }, statuses: ['done'], tone: 'finished', paged: true, searchable: true },
   { key: 'cancelled', get label() { return tr('status.cancelled'); }, statuses: ['cancelled'], tone: 'cancelled', paged: true },
 ];
 
-export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
+export function BoardView({ pid, selIid }: { pid: number; selIid?: IssueId }) {
   const [project, setProject] = useState<Project | null>(null);
   const [issues, setIssues] = useState<Issue[] | null>(null);
   const [err, setErr] = useState('');
@@ -188,7 +189,7 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
   const toggleGroup = (key: string): void => setCollapsed((c) => ({ ...c, [key]: !(c[key] ?? false) }));
 
   // 置顶/取消置顶（仅 pending 有效）：改完刷新列表，行按新顺序重排
-  const pinIssue = async (iid: number, pinned: boolean): Promise<void> => {
+  const pinIssue = async (iid: IssueId, pinned: boolean): Promise<void> => {
     try {
       await api(`/api/projects/${pid}/issues/${iid}/pin`, 'POST', { pinned });
       toast.success(pinned ? tr('board.pinned') : tr('board.unpinned'));
@@ -322,20 +323,20 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: number }) {
             <button class="btn sm" onClick={() => nav(`/p/${pid}/chat`)}>
               {tr('view.conversation')}
             </button>
+            <button class="btn sm" onClick={() => nav(`/p/${pid}/rooms`)}>
+              {tr('rooms.rooms')}
+            </button>
             <button class="btn sm" onClick={toggleSub} disabled={subscribed === null}>
               {subscribed ? tr('board.subscribedLabel') : tr('board.subscribe')}
             </button>
-            <button class="btn sm" onClick={() => nav(`/p/${pid}/files`)}>
-              {tr('view.files')}
+            <button class="btn sm" onClick={() => nav(`/p/${pid}/workspace`)}>
+              {tr('ws.title')}
             </button>
             <button class="btn sm" onClick={() => nav(`/p/${pid}/skills`)}>
               {tr('board.skills')}
             </button>
             <button class="btn sm" onClick={() => nav(`/p/${pid}/term`)}>
               {tr('view.nativeBash')}
-            </button>
-            <button class="btn sm" onClick={() => nav(`/p/${pid}/git`)}>
-              Git
             </button>
             <button class="btn sm" onClick={() => nav(`/p/${pid}/settings`)}>
               {tr('projectSettings.title')}

@@ -49,6 +49,7 @@ export interface ProjectSettingsFields {
   goal: string;
   /** 门禁命令（#279）：一行一条，参数空格分隔；空文本 = 未配置（按 package.json 探测） */
   validationCommands: string;
+  validationPolicy?: 'required' | 'optional' | 'none';
 }
 
 /**
@@ -86,13 +87,14 @@ function normalizedProjectSettings(fields: ProjectSettingsFields): ProjectSettin
     name: fields.name.trim(),
     goal: fields.goal.trim(),
     validationCommands: formatValidationCommandLines(parseValidationCommandLines(fields.validationCommands)),
+    validationPolicy: fields.validationPolicy ?? 'optional',
   };
 }
 
 export function projectSettingsDirty(saved: ProjectSettingsFields, current: ProjectSettingsFields): boolean {
   const a = normalizedProjectSettings(saved);
   const b = normalizedProjectSettings(current);
-  return a.name !== b.name || a.goal !== b.goal || a.validationCommands !== b.validationCommands;
+  return a.name !== b.name || a.goal !== b.goal || a.validationCommands !== b.validationCommands || a.validationPolicy !== b.validationPolicy;
 }
 
 /** 空 token 不进入请求，避免界面把脱敏摘要或空值误当成新凭据覆盖后端。 */
@@ -245,6 +247,7 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
   const [name, setName] = useState('');
   const [goal, setGoal] = useState('');
   const [validationCommands, setValidationCommands] = useState('');
+  const [validationPolicy, setValidationPolicy] = useState<'required' | 'optional' | 'none'>('optional');
   const [remotes, setRemotes] = useState<ExternalIssueRemote[]>([]);
   const [source, setSource] = useState<ExternalIssueSourceSummary | null>(null);
   const [sourceForm, setSourceForm] = useState<ExternalIssueSourceForm>({
@@ -270,11 +273,13 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
       name: next.name,
       goal: next.goal ?? '',
       validationCommands: formatValidationCommandLines(next.validationCommands),
+      validationPolicy: next.validationPolicy ?? 'optional',
     };
     setProject(next);
     setName(fields.name);
     setGoal(fields.goal);
     setValidationCommands(fields.validationCommands);
+    setValidationPolicy(fields.validationPolicy);
     setSavedFields(fields);
   };
   const applySource = (next: ExternalIssueSourceSummary | null, candidates = remotes): void => {
@@ -314,7 +319,7 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
   };
   useEffect(load, [pid]);
 
-  const currentFields = { name, goal, validationCommands };
+  const currentFields = { name, goal, validationCommands, validationPolicy };
   const dirty = Boolean(savedFields && projectSettingsDirty(savedFields, currentFields));
 
   useEffect(() => {
@@ -342,6 +347,7 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
         goal: currentFields.goal.trim() || null,
         // 留空 = null = 未配置（后端按 package.json 探测），与「显式不跑门禁」不是一回事
         validationCommands: parseValidationCommandLines(currentFields.validationCommands),
+        validationPolicy: currentFields.validationPolicy,
       });
       applyProject(result.project);
       toast.success(t('projectSettings.saved'));
@@ -453,6 +459,14 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
                 />
                 <span class="small mut">{t('projectSettings.validationCommandsHelp')}</span>
               </label>
+              <label class="field">{t('projectSettings.validationPolicy')}
+                <select value={validationPolicy} disabled={!canManage} onChange={(e) => setValidationPolicy(e.currentTarget.value as 'required' | 'optional' | 'none')}>
+                  <option value="required">{t('projectSettings.validationRequired')}</option>
+                  <option value="optional">{t('projectSettings.validationOptional')}</option>
+                  <option value="none">{t('projectSettings.validationNone')}</option>
+                </select>
+                <span class="small mut">{t('projectSettings.validationPolicyHelp')}</span>
+              </label>
             </div>
             <div class="ps-summary">
               <div class="ps-summary-head"><b>{t('projectSettings.readmeSummary')}</b><SummaryButton status={project.summaryStatus} busy={summarizing} onPick={(mode) => void updateSummary(mode)} renderLabel={(_, busy) => busy || project.summaryStatus === 'running' ? t('action.generating') : t('projectSettings.manualUpdate')} models={SUMMARY_MODELS.filter((item) => item.mode === 'llm' || supportedAgents.includes(item.mode as AgentKind))} /></div>
@@ -484,6 +498,9 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
                     <span class="ps-executor-mark" aria-hidden="true" />
                     <div><strong>{executor.name}</strong><span class="mono">#{executor.id}</span></div>
                     {executor.isSystemLocal && <span class="badge b-amber">{t('admin.systemLocal')}</span>}
+                    <span class={`badge ${project.executionIsolation === 'dedicated-ssh' ? 'b-blue' : 'b-gray'}`}>
+                      {t(project.executionIsolation === 'dedicated-ssh' ? 'projectSettings.isolationDedicated' : 'projectSettings.isolationShared')}
+                    </span>
                   </div>
                   <div class="ps-executor-agents">
                     <span>{t('admin.availableAgents')}</span>

@@ -24,6 +24,53 @@ function setup() {
 }
 
 describe('协作文件持久化 outbox', () => {
+  test('在途旧代成功或失败都不能清除或推迟新代任务', async () => {
+    const db = setup();
+    for (const failOld of [false, true]) {
+      let entered!: () => void;
+      let release!: () => void;
+      const started = new Promise<void>((resolve) => { entered = resolve; });
+      const waiting = new Promise<void>((resolve) => { release = resolve; });
+      const writes: string[] = [];
+      const outbox = new ProjectDataPersistenceOutbox(db, new Map([['project', {
+        async persist(job) {
+          writes.push(job.action);
+          if (writes.length === 1) {
+            entered();
+            await waiting;
+            if (failOld) throw new Error('old write failed');
+          }
+        },
+      }]]), () => 10_000);
+      outbox.enqueue(1, 'project', '1', 'upsert');
+      const old = outbox.drain();
+      await started;
+      const oldGeneration = outbox.pending()[0]!.generation;
+      outbox.enqueue(1, 'project', '1', 'archive');
+      expect(outbox.pending()[0]!.generation).toBe(oldGeneration + 1);
+      release();
+      await old;
+      expect(outbox.pending()).toMatchObject([{
+        action: 'archive', generation: oldGeneration + 1, attemptCount: 0, nextAttemptTs: 0,
+      }]);
+      await outbox.drain();
+      expect(writes).toEqual(['upsert', 'archive']);
+      expect(outbox.pending()).toEqual([]);
+    }
+    db.close();
+  });
+
+  test('业务表触发器在更新同实体时提升待投影代数', () => {
+    const db = setup();
+    db.run("UPDATE projects SET name = 'first' WHERE id = 1");
+    const before = new ProjectDataPersistenceOutbox(db, new Map()).pending()[0]!;
+    db.run("UPDATE projects SET name = 'second' WHERE id = 1");
+    const after = new ProjectDataPersistenceOutbox(db, new Map()).pending()[0]!;
+    expect(after.id).toBe(before.id);
+    expect(after.generation).toBe(before.generation + 1);
+    db.close();
+  });
+
   test('各长期领域变更在业务事务内合并登记，归档覆盖待写操作', () => {
     const db = setup();
     db.transaction(() => {

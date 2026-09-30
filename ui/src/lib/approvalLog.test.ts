@@ -9,7 +9,7 @@ import type { IssueEvent } from './types';
 let seq = 0;
 function ev(kind: string, data: Record<string, unknown>): IssueEvent {
   seq++;
-  return { id: seq, issueId: 7, kind, dataJson: JSON.stringify(data), ts: 1_700_000_000_000 + seq };
+  return { id: seq, issueId: '7', kind, dataJson: JSON.stringify(data), ts: 1_700_000_000_000 + seq };
 }
 
 describe('toApprovalLog', () => {
@@ -67,9 +67,9 @@ describe('toApprovalLog', () => {
 
   test('脏数据不崩：dataJson 为 null / 非 JSON / 非对象都按空处理', () => {
     const rows = toApprovalLog([
-      { id: 1, issueId: 7, kind: 'menu_auto', dataJson: null, ts: 1 },
-      { id: 2, issueId: 7, kind: 'menu_auto', dataJson: '不是 JSON', ts: 2 },
-      { id: 3, issueId: 7, kind: 'menu_auto', dataJson: '"字符串"', ts: 3 },
+      { id: 1, issueId: '7', kind: 'menu_auto', dataJson: null, ts: 1 },
+      { id: 2, issueId: '7', kind: 'menu_auto', dataJson: '不是 JSON', ts: 2 },
+      { id: 3, issueId: '7', kind: 'menu_auto', dataJson: '"字符串"', ts: 3 },
     ]);
     expect(rows.length).toBe(3);
     expect(rows.every((r) => r.detail === '已自动选择')).toBe(true);

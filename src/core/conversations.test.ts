@@ -113,6 +113,53 @@ describe('dedTmux：project 维度命名（弃 hashCwd）', () => {
 });
 
 describe('ConversationManager', () => {
+  test('同 cwd 双执行机的 chat 生命周期只操作所绑定的执行机', async () => {
+    const { db, driver: primary, cwd } = setup();
+    const remote = new RecDriver();
+    db.run(`INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir)
+      VALUES ('remote', 'remote', 22, 'root', 'k', '/same', '/same/.claude')`);
+    db.run('INSERT INTO projects (name, executor_id, cwd, owner_user_id, created_ts) VALUES (?, 2, ?, 1, 1)', ['remote', cwd]);
+    const manager = new ConversationManager(db, primary, { locate: async () => null }, {
+      executionForProject: (projectId) => {
+        if (projectId === 1) return { driver: primary, locator: { locate: async () => null } };
+        if (projectId === 2) return { driver: remote, locator: { locate: async () => null } };
+        throw new Error('executor unavailable');
+      },
+    });
+    const chat = manager.create(2, 'remote chat', 'claude', 'chat');
+    await manager.activate(chat.id);
+    expect(remote.created).toEqual([{ name: chatTmux(chat.id), cwd }]);
+    expect(remote.sent[0]?.text).toContain(`--session-id ${chat.id}`);
+    expect(primary.created).toHaveLength(0);
+    expect(primary.sent).toHaveLength(0);
+    await manager.archive(chat.id);
+    expect(remote.killed).toContain(chatTmux(chat.id));
+    expect(primary.killed).toHaveLength(0);
+    expect(() => manager.create(3, 'missing')).toThrow('executor unavailable');
+    db.close();
+  });
+
+  test('执行机变更后旧主机对话管理器拒绝创建、激活和归档', async () => {
+    const { db, driver } = setup();
+    const locator = { locate: async () => null };
+    const unguarded = new ConversationManager(db, driver, locator);
+    const existing = unguarded.create(1, 'old', 'claude', 'chat');
+    db.run("INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir) VALUES ('second', '127.0.0.2', 22, 'root', 'k', '/same', '/same/.claude')");
+    // Corrupt the binding deliberately to verify the manager's last-resort guard.
+    db.run('DROP TRIGGER projects_executor_identity_immutable');
+    db.run('UPDATE projects SET executor_id = 2 WHERE id = 1');
+    const guarded = new ConversationManager(db, driver, locator, {
+      executionUnavailable: (projectId) => projectId === 1 ? 'wrong executor' : null,
+    });
+    expect(() => guarded.create(1, 'new')).toThrow('wrong executor');
+    await expect(guarded.activate(existing.id)).rejects.toThrow('wrong executor');
+    await expect(guarded.archive(existing.id)).rejects.toThrow('wrong executor');
+    expect(guarded.get(existing.id)?.archived).toBe(false);
+    expect(driver.created).toHaveLength(0);
+    expect(driver.killed).toHaveLength(0);
+    db.close();
+  });
+
   test('managed workspace maps, owns a unique tmux name, and never falls back when missing', async () => {
     const { db, driver, cwd } = setup();
     migrateDesigns(db);
@@ -523,14 +570,14 @@ describe('ConversationManager chat 独立对话（009）', () => {
 });
 
 describe('ConversationManager codex 代理', () => {
-  test('fresh 启动：bypass 参数 + launch_ts 锚点入库', async () => {
+  test('fresh 启动：工作区沙箱与自动审查参数 + launch_ts 锚点入库', async () => {
     const { db, driver, convs } = setup();
     const c = convs.create(1, 'cx', 'codex');
     expect(c.agent).toBe('codex');
     const before = Date.now();
     await convs.activate(c.id);
     expect(driver.sent[0]!.text).toBe(
-      `codex -c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort="medium"`,
+      `codex -c check_for_update_on_startup=false --approve-for-me -c model_reasoning_effort="medium"`,
     );
     const row = db
       .query<{ agent_launch_ts: number | null }, [string]>(
@@ -546,7 +593,7 @@ describe('ConversationManager codex 代理', () => {
     db.query('UPDATE conversations SET agent_session_id = ? WHERE id = ?').run('sid-123', c.id);
     await convs.activate(c.id);
     expect(driver.sent[0]!.text).toBe(
-      `codex -c check_for_update_on_startup=false resume sid-123 --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort="medium"`,
+      `codex -c check_for_update_on_startup=false resume sid-123 --approve-for-me -c model_reasoning_effort="medium"`,
     );
 
     const cc = convs.create(1, 'cl'); // 默认 claude
@@ -616,7 +663,7 @@ describe('ConversationManager codex 代理', () => {
     const before = Date.now();
     await convs.activate(c.id);
     expect(driver.sent[0]!.text).toBe(
-      `codex -c check_for_update_on_startup=false resume sid-9 --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort="medium"`,
+      `codex -c check_for_update_on_startup=false resume sid-9 --approve-for-me -c model_reasoning_effort="medium"`,
     );
     const row = db
       .query<{ agent_jsonl_path: string | null; agent_launch_ts: number }, [string]>(

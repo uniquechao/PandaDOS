@@ -86,7 +86,7 @@ describe('pushFailureState（#272 / B-02）', () => {
   let seq = 0;
   const ev = (kind: string, data?: Record<string, unknown>): IssueEvent => ({
     id: ++seq,
-    issueId: 1,
+    issueId: '1',
     kind,
     dataJson: data ? JSON.stringify(data) : null,
     ts: 1_700_000_000_000 + seq,
@@ -134,7 +134,7 @@ describe('pushFailureState（#272 / B-02）', () => {
 
   test('旧事件缺字段/坏 JSON 时降级成空串，不炸也不显示 undefined', () => {
     expect(pushFailureState([ev('auto_push_failed')])).toEqual({ branch: '', detail: '' });
-    expect(pushFailureState([{ id: 9, issueId: 1, kind: 'auto_push_failed', dataJson: '{坏', ts: 0 }]))
+    expect(pushFailureState([{ id: 9, issueId: '1', kind: 'auto_push_failed', dataJson: '{坏', ts: 0 }]))
       .toEqual({ branch: '', detail: '' });
   });
 });

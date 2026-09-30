@@ -334,7 +334,7 @@ function mkEvents() {
     id += 1;
     const e: IssueEvent = {
       id,
-      issueId: 1,
+      issueId: '1',
       kind,
       dataJson: data ? JSON.stringify(data) : null,
       ts: 1_000_000 + id * 1000,

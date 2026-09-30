@@ -68,8 +68,11 @@ export interface ConversationsRoutesDeps {
   mutex: KeyedMutex;
   /** 当前模型探测（读会话 jsonl，见 core/model-probe）；缺省 = model 恒 null（前端不显示） */
   models?: ConvModelPort;
+  modelsForProject?(project: Project): ConvModelPort;
   /** 项目所在执行机的只读 Driver；本地历史查询/导入使用。缺省时相关端点返回 503。 */
   driverForProject?(project: Project): AgentHistoryReader & HistoryArchiveFs;
+  /** Legacy fail-closed guard when modelsForProject is absent. */
+  executionUnavailable?(project: Project): string | null;
 }
 
 async function readBody(req: Request): Promise<Record<string, unknown>> {
@@ -386,12 +389,19 @@ export function conversationsRoutes(deps: ConversationsRoutesDeps): RouteDef[] {
       auth: 'project-access',
       handler: async ({ params }) => {
         const pid = Number(params.projectId);
+        const project = getProject(db, pid);
+        if (!project) return json({ ok: false, error: '项目不存在' }, 404);
+        if (!deps.modelsForProject) {
+          const unavailable = deps.executionUnavailable?.(project);
+          if (unavailable) return json(apiError('executor.chat_unavailable', unavailable, 409), 409);
+        }
         const c = convs.get(params.convId ?? '');
         if (!c || c.projectId !== pid) {
           return json({ ok: false, error: '无此对话' }, 404);
         }
         if (designBound(c.id)) return designReserved(c.id);
-        const model = models ? await models.modelOf(c.id).catch(() => null) : null;
+        const probe = deps.modelsForProject?.(project) ?? models;
+        const model = probe ? await probe.modelOf(c.id).catch(() => null) : null;
         return json({ ok: true, agent: c.agent, model });
       },
     },

@@ -178,6 +178,16 @@ describe('行级 timestamp → ts（毫秒，供执行流算耗时）', () => {
 });
 
 describe('tailConversation（字节 offset + 保留未完成尾行 + 轮转重置）', () => {
+  test('引擎模式保留超过气泡上限的完整完成报告', async () => {
+    const f = path.join(dir, 'tail-report.jsonl');
+    const message = `ISSUE_READY:388:1\nREPORT_BEGIN\n{"version":1,"objective":"${'测试'.repeat(2500)}"}\nREPORT_END`;
+    await fsp.writeFile(f, asst(message) + '\n');
+    const bubble = await tailConversation(driver, f, 0, 0);
+    expect(bubble.msgs[0]?.text).not.toBe(message);
+    const protocol = await tailConversation(driver, f, 0, 0, { fullAssistantText: true });
+    expect(protocol.msgs[0]?.text).toBe(message);
+  });
+
   test('增量消费：只吃完整行，半行留给下一轮', async () => {
     const f = path.join(dir, 'tail-1.jsonl');
     await fsp.writeFile(f, asst('第一条') + '\n');

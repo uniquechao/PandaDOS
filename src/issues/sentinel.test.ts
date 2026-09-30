@@ -1,3 +1,4 @@
+import { parseNeedPlan } from './sentinel';
 import { describe, expect, test } from 'bun:test';
 import type { ChatMessage } from '../core/jsonl';
 import {
@@ -16,7 +17,7 @@ import {
   parseSubtasksBlock,
 } from './sentinel';
 
-const ID = 42;
+const ID = '42';
 
 describe('哨兵矩阵：STAGE_DONE 整行匹配 + 核 id + 核 stage', () => {
   test('正例：整行命中（允许首尾空白/宽容分隔空格）', () => {
@@ -243,5 +244,43 @@ describe('完成报告块 REPORT_BEGIN / REPORT_END（#275 / I-05）', () => {
   test('超长块直接拒收，避免把整屏日志当 JSON 解', () => {
     const fat = JSON.stringify({ ...report, objective: 'x'.repeat(40_000) });
     expect(parseCompletionReportBlock(wrap(fat))).toBeNull();
+  });
+});
+
+describe('#307 新格式编号 YYYYMMDD-xxxxxxx', () => {
+  const NEW_ID = '20260917-a3f9e4f';
+
+  test('各哨兵整行命中新编号', () => {
+    expect(findStageDone(`STAGE_DONE:${NEW_ID}:implementing`, NEW_ID, 'implementing')).toBe(true);
+    expect(countSubtaskDone(`SUBTASK_DONE:${NEW_ID}\nSUBTASK_DONE:${NEW_ID}`, NEW_ID)).toBe(2);
+    expect(findTestsFailed(`TESTS_FAILED:${NEW_ID} 单测挂了`, NEW_ID)).toEqual({ note: '单测挂了' });
+    expect(findTestsFailed(`TESTS_FAILED:${NEW_ID}-单测挂了`, NEW_ID)).toEqual({ note: '单测挂了' });
+    expect(findBlocked(`ISSUE_BLOCKED:${NEW_ID} 在做什么｜卡在哪｜要我做什么`, NEW_ID))
+      .toEqual({ note: '在做什么｜卡在哪｜要我做什么' });
+    expect(findNeedClarify(`NEED_CLARIFY:${NEW_ID}`, NEW_ID)).toBe(true);
+  });
+
+  test('编号不一致或被截断 = 拒', () => {
+    expect(findStageDone('STAGE_DONE:20260917-a3f9e40:implementing', NEW_ID, 'implementing')).toBe(false);
+    expect(findNeedClarify('NEED_CLARIFY:20260917', NEW_ID)).toBe(false);
+    expect(findBlocked('ISSUE_BLOCKED:20260917-a3f9 原因', NEW_ID)).toBeNull();
+    expect(findBlocked(`ISSUE_BLOCKED:${NEW_ID}0 原因`, NEW_ID)).toBeNull();
+  });
+});
+
+// #386：理由不能跨 assistant 回复借用；ID/attempt 必须完整匹配。
+describe('NEED_PLAN 规划升级协议', () => {
+  test('同行、制表符、CRLF 与独占行理由', () => {
+    for (const separator of [' ', '\t', '\n\n', '\r\n\r\n']) {
+      expect(parseNeedPlan(`  NEED_PLAN:386:7776${separator}需要确定迁移边界  `, '386', 7776))
+        .toEqual({ kind: 'valid', reason: '需要确定迁移边界' });
+    }
+  });
+  test('拒绝缺理由、跨 issue、过期轮次及轮次前缀匹配', () => {
+    for (const text of ['NEED_PLAN:386:7776', 'NEED_PLAN:385:7776 原因',
+      'NEED_PLAN:386:7775 原因', 'NEED_PLAN:386:77760 原因', 'NEED_PLAN:386:7776原因']) {
+      expect(parseNeedPlan(text, '386', 7776)).toEqual({ kind: 'invalid' });
+    }
+    expect(parseNeedPlan('解释 NEED_PLAN:386:7776 原因', '386', 7776)).toBeNull();
   });
 });

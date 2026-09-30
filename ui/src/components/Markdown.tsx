@@ -10,50 +10,168 @@
  *    折成空格，但聊天里的断行是作者有意排的版，折掉了读起来完全变样。
  *  - **表格一律套横向滚动容器**。手机窄屏放不下 5 列表格，不套容器整个气泡会被撑宽、
  *    连带把消息流顶出横向滚动条。
+ *
+ * 文件路径链接（issue #310）：传了 `paths={{ pid, cwd }}` 时，正文/行内代码/链接目标里落在项目
+ * cwd 内的路径会变成文件页深链（点一下直接在「文件」页打开并预览那个文件）。判定见 lib/pathlink，
+ * 这里只负责建节点：**不改一个字符**——链接的可见文本永远是原文里那串路径。
+ * 有意用 props 逐层透传而不是 context：本组件全是纯函数，单测直接调用即可展开（见 Markdown.test）。
  */
 import type { JSX } from 'preact';
 import { parseMarkdown, type MdBlock, type MdInline, type MdRow } from '../lib/markdown';
+import {
+  filesHref,
+  isLikelyPath,
+  looksLikeFsPath,
+  resolveProjectPath,
+  splitPathChunks,
+  type PathTarget,
+} from '../lib/pathlink';
+import { tr } from '../i18n/runtime';
 
-function Inlines({ nodes }: { nodes: MdInline[] }): JSX.Element {
+/** 正文里做路径链接所需的项目上下文；null/缺省 = 不做链接（如技能页的 SKILL.md） */
+export interface ProjectPaths {
+  pid: number;
+  cwd: string;
+}
+
+type Paths = ProjectPaths | null | undefined;
+
+function targetOf(raw: string, paths: Paths): PathTarget | null {
+  if (!paths || !paths.cwd) return null;
+  return resolveProjectPath(raw, paths.cwd);
+}
+
+/** 一个可点的路径：跳到文件页并打开它 */
+function PathAnchor({
+  paths,
+  target,
+  raw,
+  children,
+}: {
+  paths: ProjectPaths;
+  target: PathTarget;
+  raw: string;
+  children: JSX.Element | string;
+}): JSX.Element {
+  return (
+    <a
+      class="md-path"
+      href={filesHref(paths.pid, target)}
+      title={tr('ui.openInFiles', { path: raw })}
+    >
+      {children}
+    </a>
+  );
+}
+
+/**
+ * 一段纯文本：切出疑似路径的片段做成链接，其余原样。
+ * 没有项目上下文、或一个路径都没认出来时原样返回，连包装节点都不多加。
+ */
+export function LinkedText({ text, paths }: { text: string; paths?: Paths }): JSX.Element {
+  if (!paths || !paths.cwd || !text) return <>{text}</>;
+  const chunks = splitPathChunks(text);
+  if (!chunks.some((c) => c.path && resolveProjectPath(c.path, paths.cwd))) return <>{text}</>;
+  return (
+    <>
+      {chunks.map((c, i) => {
+        const target = c.path ? targetOf(c.path, paths) : null;
+        return target && c.path ? (
+          <PathAnchor key={i} paths={paths} target={target} raw={c.path}>
+            {c.text}
+          </PathAnchor>
+        ) : (
+          c.text
+        );
+      })}
+    </>
+  );
+}
+
+/**
+ * 行内代码：整段恰好是一条项目内路径时让它可点（`src/web/routes/files.ts` 这种写法在
+ * AI 正文里比裸路径还常见）。不是路径就还是普通 `<code>`，样式一个字不变。
+ */
+function CodeInline({ text, paths }: { text: string; paths?: Paths }): JSX.Element {
+  const raw = text.trim();
+  const target = raw && isLikelyPath(raw) ? targetOf(raw, paths) : null;
+  const code = <code>{text}</code>;
+  return target && paths ? (
+    <PathAnchor paths={paths} target={target} raw={raw}>
+      {code}
+    </PathAnchor>
+  ) : (
+    code
+  );
+}
+
+/**
+ * markdown 链接。`[清单](/home/…/audit.html)` 这种「拿本机绝对路径当 href」的写法是 AI 常态：
+ *  - 落在项目 cwd 内 → 改指文件页深链（站内跳转，不开新标签页）；
+ *  - 看着是本机路径但不在本项目里 → 摘掉 href 只留文字：原样渲染只会得到一个必然 404 的站内链接。
+ * 其余（http(s)/mailto/站内路由）照旧。
+ */
+function LinkInline({ node, paths }: { node: Extract<MdInline, { type: 'link' }>; paths?: Paths }): JSX.Element {
+  const kids = <Inlines nodes={node.children} paths={paths} />;
+  const target = targetOf(node.href, paths);
+  if (target && paths) {
+    return (
+      <PathAnchor paths={paths} target={target} raw={node.href}>
+        {kids}
+      </PathAnchor>
+    );
+  }
+  // 没有项目上下文（技能页等）就判不出「在不在项目里」，此时保持原样，不擅自摘链接
+  if (paths?.cwd && looksLikeFsPath(node.href)) {
+    return (
+      <span class="md-path off" title={tr('ui.pathOutsideProject', { path: node.href })}>
+        {kids}
+      </span>
+    );
+  }
+  return (
+    <a href={node.href} target="_blank" rel="noopener noreferrer">
+      {kids}
+    </a>
+  );
+}
+
+function Inlines({ nodes, paths }: { nodes: MdInline[]; paths?: Paths }): JSX.Element {
   return (
     <>
       {nodes.map((n, i) => {
         switch (n.type) {
           case 'text':
-            return n.text;
+            return <LinkedText key={i} text={n.text} paths={paths} />;
           case 'code':
-            return <code key={i}>{n.text}</code>;
+            return <CodeInline key={i} text={n.text} paths={paths} />;
           case 'strong':
             return (
               <strong key={i}>
-                <Inlines nodes={n.children} />
+                <Inlines nodes={n.children} paths={paths} />
               </strong>
             );
           case 'em':
             return (
               <em key={i}>
-                <Inlines nodes={n.children} />
+                <Inlines nodes={n.children} paths={paths} />
               </em>
             );
           case 'del':
             return (
               <del key={i}>
-                <Inlines nodes={n.children} />
+                <Inlines nodes={n.children} paths={paths} />
               </del>
             );
           case 'link':
-            return (
-              <a key={i} href={n.href} target="_blank" rel="noopener noreferrer">
-                <Inlines nodes={n.children} />
-              </a>
-            );
+            return <LinkInline key={i} node={n} paths={paths} />;
         }
       })}
     </>
   );
 }
 
-function Cells({ row, align, head }: { row: MdRow; align: (string | null)[]; head?: boolean }): JSX.Element {
+function Cells({ row, align, head, paths }: { row: MdRow; align: (string | null)[]; head?: boolean; paths?: Paths }): JSX.Element {
   return (
     <>
       {row.map((cell, i) => {
@@ -61,11 +179,11 @@ function Cells({ row, align, head }: { row: MdRow; align: (string | null)[]; hea
         const style = a ? { textAlign: a as 'left' | 'center' | 'right' } : undefined;
         return head ? (
           <th key={i} style={style}>
-            <Inlines nodes={cell} />
+            <Inlines nodes={cell} paths={paths} />
           </th>
         ) : (
           <td key={i} style={style}>
-            <Inlines nodes={cell} />
+            <Inlines nodes={cell} paths={paths} />
           </td>
         );
       })}
@@ -73,10 +191,10 @@ function Cells({ row, align, head }: { row: MdRow; align: (string | null)[]; hea
   );
 }
 
-function Block({ block }: { block: MdBlock }): JSX.Element {
+function Block({ block, paths }: { block: MdBlock; paths?: Paths }): JSX.Element {
   switch (block.type) {
     case 'heading': {
-      const kids = <Inlines nodes={block.children} />;
+      const kids = <Inlines nodes={block.children} paths={paths} />;
       // 气泡里不该出现真正的 h1 巨标题，层级靠 CSS 收；语义仍按原级别给
       if (block.level === 1) return <h1>{kids}</h1>;
       if (block.level === 2) return <h2>{kids}</h2>;
@@ -88,7 +206,7 @@ function Block({ block }: { block: MdBlock }): JSX.Element {
     case 'paragraph':
       return (
         <p>
-          <Inlines nodes={block.children} />
+          <Inlines nodes={block.children} paths={paths} />
         </p>
       );
     case 'list': {
@@ -97,7 +215,7 @@ function Block({ block }: { block: MdBlock }): JSX.Element {
           {it.checked !== undefined && (
             <input type="checkbox" checked={it.checked} disabled aria-hidden="true" tabIndex={-1} />
           )}
-          <Blocks blocks={it.blocks} tight />
+          <Blocks blocks={it.blocks} paths={paths} tight />
         </li>
       ));
       return block.ordered ? <ol start={block.start}>{items}</ol> : <ul>{items}</ul>;
@@ -111,7 +229,7 @@ function Block({ block }: { block: MdBlock }): JSX.Element {
     case 'quote':
       return (
         <blockquote>
-          <Blocks blocks={block.blocks} />
+          <Blocks blocks={block.blocks} paths={paths} />
         </blockquote>
       );
     case 'hr':
@@ -124,14 +242,14 @@ function Block({ block }: { block: MdBlock }): JSX.Element {
             {block.head && (
               <thead>
                 <tr>
-                  <Cells row={block.head} align={block.align} head />
+                  <Cells row={block.head} align={block.align} paths={paths} head />
                 </tr>
               </thead>
             )}
             <tbody>
               {block.rows.map((r, i) => (
                 <tr key={i}>
-                  <Cells row={r} align={block.align} />
+                  <Cells row={r} align={block.align} paths={paths} />
                 </tr>
               ))}
             </tbody>
@@ -139,31 +257,46 @@ function Block({ block }: { block: MdBlock }): JSX.Element {
         </div>
       );
     case 'text':
-      // 解析层判不准时的退化块：原样纯文本（换行/缩进都留着）
-      return <div class="md-raw">{block.text}</div>;
+      // 解析层判不准时的退化块：原样纯文本（换行/缩进都留着），路径照样可点
+      return (
+        <div class="md-raw">
+          <LinkedText text={block.text} paths={paths} />
+        </div>
+      );
   }
 }
 
-function Blocks({ blocks, tight }: { blocks: MdBlock[]; tight?: boolean }): JSX.Element {
+function Blocks({ blocks, paths, tight }: { blocks: MdBlock[]; paths?: Paths; tight?: boolean }): JSX.Element {
   return (
     <>
       {blocks.map((b, i) =>
         // 列表条目里的独段不另起 <p>，否则每条都多一层行距、列表会变得很松
         tight && b.type === 'paragraph' && blocks.length === 1 ? (
-          <Inlines key={i} nodes={b.children} />
+          <Inlines key={i} nodes={b.children} paths={paths} />
         ) : (
-          <Block key={i} block={b} />
+          <Block key={i} block={b} paths={paths} />
         ),
       )}
     </>
   );
 }
 
-/** 渲染一段 markdown。`className` 追加在 `.md` 之后，便于按场景调排版。 */
-export function Markdown({ text, className }: { text: string; className?: string }): JSX.Element {
+/**
+ * 渲染一段 markdown。`className` 追加在 `.md` 之后，便于按场景调排版；
+ * `paths` 给了才做文件路径链接（对话气泡传，技能页等不传）。
+ */
+export function Markdown({
+  text,
+  className,
+  paths,
+}: {
+  text: string;
+  className?: string;
+  paths?: Paths;
+}): JSX.Element {
   return (
     <div class={className ? `md ${className}` : 'md'}>
-      <Blocks blocks={parseMarkdown(text)} />
+      <Blocks blocks={parseMarkdown(text)} paths={paths} />
     </div>
   );
 }

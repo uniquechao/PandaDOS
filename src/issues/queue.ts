@@ -8,6 +8,7 @@
  * 不再像 v1 那样必须人工发起对齐（评审 M9 的 aligning 手动起点已被状态机吸收）。
  */
 import type { IssueState } from '../core/types';
+import { compareIssueIds, type IssueId } from '../../shared/issue-id';
 
 /** 「驱动中」状态：占用项目唯一 cc 进程 / 流水线的状态（卡点等待也算占用，防并行分支流打架）；
  *  clarifying 仅存量兼容（v2 澄清前置到创建时、pending 期间后台分析，引擎不再进入该态） */
@@ -22,7 +23,7 @@ export const BUSY_STATES: readonly IssueState[] = [
 ];
 
 export interface QueueIssue {
-  id: number;
+  id: IssueId;
   status: IssueState;
   module: string;
   /** 正式模块 id；缺省/null = 旧库或旧测试（此时模块身份回落到 module 文本）。 */
@@ -71,7 +72,7 @@ function pickPendingCandidate<T extends QueueIssue>(cands: readonly T[], preferM
     const apin = a.pinnedTs ?? 0;
     const bpin = b.pinnedTs ?? 0;
     if ((apin > 0) !== (bpin > 0)) return apin > 0 ? -1 : 1;
-    if (apin > 0 && bpin > 0) return bpin - apin || a.id - b.id;
+    if (apin > 0 && bpin > 0) return bpin - apin || compareIssueIds(a.id, b.id);
     // 非置顶层：preferModuleKey → 模块排位 → 模块键（稳定序）→ 组内 FIFO
     const ak = moduleKeyOf(a);
     const bk = moduleKeyOf(b);
@@ -82,7 +83,7 @@ function pickPendingCandidate<T extends QueueIssue>(cands: readonly T[], preferM
     const br = moduleRank.get(bk)!;
     if (ar !== br) return ar - br;
     if (ak !== bk) return ak < bk ? -1 : 1;
-    return a.createdTs - b.createdTs || a.id - b.id;
+    return a.createdTs - b.createdTs || compareIssueIds(a.id, b.id);
   })[0];
 }
 
@@ -122,7 +123,7 @@ export function groupPendingByModule<T extends QueueIssue>(issues: T[]): Array<[
     (groups.get(key) ?? groups.set(key, []).get(key)!).push(i);
   }
   const out = [...groups.entries()];
-  for (const [, list] of out) list.sort((a, b) => a.createdTs - b.createdTs || a.id - b.id);
+  for (const [, list] of out) list.sort((a, b) => a.createdTs - b.createdTs || compareIssueIds(a.id, b.id));
   out.sort((a, b) => (a[1][0]!.createdTs - b[1][0]!.createdTs) || (a[0] < b[0] ? -1 : 1));
   return out;
 }

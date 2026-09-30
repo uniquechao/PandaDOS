@@ -1,3 +1,7 @@
+import { roomMemberMessages } from '../domains/rooms-members';
+import { roomChatMessages } from '../domains/rooms-chat';
+import { roomExtraMessages } from '../domains/rooms-extra';
+import { roomMessages } from '../domains/rooms';
 import { feishuChatMessages } from '../domains/feishu-chat';
 import { feishuLoginMessages } from '../domains/feishu-login';
 import type { MessageCatalog } from '../messages';
@@ -9,6 +13,7 @@ import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
 import { projectSettingsMessages } from '../domains/project-settings';
 import { externalImportMessages } from '../domains/external-import';
+import { workspaceMessages } from '../domains/workspace';
 import { designWorkbenchMessages } from '../domains/design-workbench';
 import { designWorkbenchAdvancedMessages } from '../domains/design-workbench-advanced';
 import { designAssetsUiMessages } from '../domains/design-assets-ui';
@@ -19,12 +24,16 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const esCatalog = {
+  ...roomMemberMessages["es"],
+  ...roomChatMessages["es"],
+  ...roomExtraMessages["es"],
+  ...roomMessages["es"],
   ...feishuChatMessages["es"],
   ...feishuLoginMessages["es"],
   ...shellMessages.es,
   ...actionMessages.es,
   ...commonUiMessages.es,
-  'issue.validation': 'Comprobaciones', 'issue.validationTargeted': 'dirigidas ({files} archivos)', 'issue.validationFull': 'completas', 'issue.validationPassed': 'superadas', 'issue.validationFailed': 'fallidas ({label}, código de salida {code})', 'issue.validationSkipped': 'omitidas', 'issue.validationPending': 'aún sin ejecutar', 'issue.pushFailedTitle':'Completada, pero los cambios no se enviaron al remoto','issue.pushFailedHint':'Los cambios están confirmados localmente. Envíalos manualmente y vuelve a comprobarlo.','issue.pushFailedBranch':'Rama {branch}',
+  'issue.validation': 'Comprobaciones', 'issue.validationTargeted': 'dirigidas ({files} archivos)', 'issue.validationFull': 'completas', 'issue.validationPassed': 'superadas', 'issue.validationFailed': 'fallidas ({label}, código de salida {code})', 'issue.validationSkipped': 'omitidas', 'issue.validationPending': 'aún sin ejecutar', 'issue.validationUnavailable': 'verificaciones no disponibles', 'issue.validationExempt': 'exención explícita', 'issue.validationNoCommands': 'sin comprobaciones configuradas', 'issue.validationDisabled': 'comprobaciones obligatorias desactivadas', 'issue.deliveryLocalComplete': 'Trabajo local completado', 'issue.deliveryPushPushed': 'Enviado al remoto', 'issue.deliveryPushFailed': 'Error al enviar', 'issue.deliveryPushSkipped': 'Envío omitido', 'issue.deliveryPushNotAttempted': 'Aún sin enviar', 'issue.deliveryMergeUnmanaged': 'Fusión no gestionada', 'issue.deliveryDeployUnmanaged': 'Despliegue no gestionado', 'issue.pushFailedTitle':'Completada, pero los cambios no se enviaron al remoto','issue.pushFailedHint':'Los cambios están confirmados localmente. Envíalos manualmente y vuelve a comprobarlo.','issue.pushFailedBranch':'Rama {branch}',
   'issue.completionReport':'Informe de finalización','issue.reportOutcomeComplete':'Objetivos logrados','issue.reportOutcomePartial':'Completada parcialmente','issue.reportOutcomeBlocked':'Bloqueada','issue.reportOutcomeUnverified':'Resumen histórico sin verificar','issue.reportObjective':'Objetivo de implementación','issue.reportImplementation':'Solución implementada','issue.reportAdvantages':'Ventajas','issue.reportDisadvantages':'Desventajas y compromisos','issue.reportVerification':'Evidencia de verificación','issue.reportCompletion':'Estado de finalización','issue.reportUnmetGoals':'Objetivos pendientes','issue.reportRemainingWork':'Acciones posteriores necesarias','issue.reportAttentionTitle':'Esta issue todavía no está completamente terminada','issue.reportLegacyWarningTitle':'Este cierre no se verificó de forma estructurada','issue.reportLegacyWarning':'El registro histórico solo contiene un resumen libre, por lo que PandaDOS no puede confirmar que se lograron todos los objetivos ni que no quedan acciones necesarias.','issue.continueProcessing':'Continuar el trabajo','issue.continueProcessingTitle':'Corregir el cierre y continuar','issue.continueProcessingWarningTitle':'Esta acción volverá a abrir la issue','issue.continueProcessingWarning':'Indica qué falta. La issue volverá a planificación y puede iniciarse de inmediato.','issue.continueGuidance':'Objetivo pendiente o instrucciones posteriores','issue.continueGuidancePlaceholder':'Describe qué objetivo falta y qué debe completarse a continuación…','issue.continueGuidanceRequired':'Indica el objetivo pendiente o la acción necesaria antes de continuar.','issue.confirmContinueProcessing':'Volver a abrir y continuar',
   'issue.recoveryLength':'{current} / {max} caracteres',
   'issue.recoveryTitle':'Resolver bloqueo','issue.recoveryReason':'Motivo por el que se detuvo la ejecución','issue.recoveryHelp':'Añade instrucciones concretas o corrige el issue y la subtarea bloqueada antes de continuar. Guardar cambios no reanuda la ejecución.','issue.recoveryGuidance':'Indicaciones adicionales o método de recuperación','issue.recoveryGuidancePlaceholder':'Describe qué debe cambiar, qué enfoque usar o cómo eliminar el bloqueo…','issue.recoveryGuidanceRequired':'Introduce indicaciones adicionales o un método de recuperación antes de continuar.','issue.editBlockedIssue':'Editar issue','issue.editBlockedIssueHint':'Modificar título, detalles, ajustes o imágenes','issue.editBlockedSubtask':'Editar subtarea bloqueada','issue.editBlockedSubtaskHint':'Corrige el paso bloqueado antes de continuar','issue.noEditableBlockedSubtask':'No hay subtareas pendientes que se puedan editar','issue.recoveryQueueHint':'Tras confirmar, el issue continúa desde la etapa en la que se detuvo. Si no hay contexto de recuperación, vuelve de forma segura a la planificación.','issue.confirmRecovery':'Enviar indicaciones y continuar','issue.mergedFrom': 'Fusionada desde varias issues', 'issue.unmerge': 'Deshacer la fusión', 'issue.unmergeLocked': 'Ya está en ejecución: la fusión ya no se puede deshacer.', 'issue.unblockQueued': 'En cola: se reanudará automáticamente cuando termine la tarea actual.', 'issue.unblockQueuedCancel': 'Cancelar la reanudación en cola', 'issue.openRecovery':'Resolver bloqueo',
@@ -33,6 +42,7 @@ export const esCatalog = {
   ...notifyMessages.es,
   ...projectSettingsMessages.es,
   ...externalImportMessages.es,
+  ...workspaceMessages.es,
   ...designWorkbenchMessages.es,
   ...designWorkbenchAdvancedMessages.es,
   ...designAssetsUiMessages.es,

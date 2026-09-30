@@ -48,6 +48,7 @@ import type {
   DesignTaskStatus,
   SaveDesignRevision,
 } from './types';
+import { compareIssueIds, type IssueId } from '../../shared/issue-id';
 
 export class DesignRevisionConflictError extends Error {
   readonly code = 'DESIGN_REVISION_CONFLICT';
@@ -254,7 +255,7 @@ interface DesignIssueLinkRow {
   design_task_id: number;
   project_id: number;
   node_id: string;
-  issue_id: number;
+  issue_id: IssueId;
   source_revision: number;
   last_synced_revision: number;
   original_impl_mode: string;
@@ -263,7 +264,7 @@ interface DesignIssueLinkRow {
   sync_state: string;
   sync_error: string | null;
   next_retry_ts: number | null;
-  parent_issue_id: number | null;
+  parent_issue_id: IssueId | null;
   parent_link_id: number | null;
   created_ts: number;
   updated_ts: number;
@@ -325,7 +326,7 @@ interface DesignPublishConfirmationRow {
 
 export interface DesignPublicationLinkInput {
   nodeId: string;
-  issueId: number;
+  issueId: IssueId;
   implMode: 'direct' | 'team';
   baselineContract: DesignIssueBaselineContract;
   baselineContractDigest: string;
@@ -367,7 +368,7 @@ export interface MarkDesignIssueSyncInput {
 
 export interface CreateDesignSupplementLinkInput {
   parentLinkId: number;
-  issueId: number;
+  issueId: IssueId;
   targetRevision: number;
   baselineContract: DesignIssueBaselineContract;
   baselineContractDigest: string;
@@ -389,7 +390,7 @@ interface DesignGraphNodeRow {
   ordinal: number;
   title: string;
   detail_json: string | null;
-  issue_id: number | null;
+  issue_id: IssueId | null;
   last_synced_revision: number | null;
 }
 
@@ -548,10 +549,21 @@ function mapRevision(row: DesignRevisionRow): DesignRevision {
     documentJson: parseJson(row.document_json),
     documentMarkdown: row.document_markdown,
     readiness: row.readiness,
-    graph: parseJson(row.graph_json) as DesignGraph,
+    graph: normalizeGraphIssueIds(parseJson(row.graph_json) as DesignGraph),
     actor: row.actor,
     reason: row.reason,
     createdTs: row.created_ts,
+  };
+}
+
+/** #307：075 之前落库的图里 issueId 是数字，读侧统一成文本编号。 */
+function normalizeGraphIssueIds(graph: DesignGraph): DesignGraph {
+  if (!graph || !Array.isArray(graph.nodes)) return graph;
+  return {
+    ...graph,
+    nodes: graph.nodes.map((node) => (typeof node.issueId === 'number'
+      ? { ...node, issueId: String(node.issueId) }
+      : node)),
   };
 }
 
@@ -2007,13 +2019,13 @@ export class DesignStore {
     if (!this.getRevision(parent.designTaskId, input.targetRevision)) {
       throw new Error('design supplement revision disappeared');
     }
-    const issue = this.db.query<{ project_id: number }, [number]>(
+    const issue = this.db.query<{ project_id: number }, [IssueId]>(
       'SELECT project_id FROM issues WHERE id = ?',
     ).get(input.issueId);
     if (!issue || issue.project_id !== parent.projectId) throw new Error('design supplement Issue scope mismatch');
     const row = this.db.query<DesignIssueLinkRow, [
-      number, number, number, string, number, number, number, string, string, string,
-      number, number, number, number, number, number,
+      number, number, number, string, IssueId, number, number, string, string, string,
+      IssueId, number, number, number, number, number,
     ]>(
       `INSERT INTO design_issue_links
          (publication_id, design_task_id, project_id, node_id, issue_id, link_kind,
@@ -2188,7 +2200,7 @@ export class DesignStore {
     );
     if (consumed.changes !== 1) throw new Error('design publish confirmation changed before commit');
 
-    const issueIds = input.links.map((link) => link.issueId).sort((left, right) => left - right);
+    const issueIds = input.links.map((link) => link.issueId).sort(compareIssueIds);
     for (const link of input.links) {
       this.db.query(
         `INSERT INTO design_issue_links
@@ -2379,7 +2391,7 @@ export class DesignStore {
     this.db.query('DELETE FROM design_graph_nodes WHERE design_task_id = ?').run(id);
     for (const node of normalized.nodes) {
       this.db
-        .query<unknown, [number, string, number, string, string | null, number | null, number | null, number, number]>(
+        .query<unknown, [number, string, number, string, string | null, IssueId | null, number | null, number, number]>(
           `INSERT INTO design_graph_nodes (
              design_task_id, node_id, ordinal, title, detail_json, issue_id, last_synced_revision,
              created_ts, updated_ts

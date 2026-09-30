@@ -6,7 +6,9 @@ import { LocalDriver } from '../executor/local';
 import {
   ensureArtifactSkill,
   ensureCompatSkills,
+  ensurePandaIssueInboxSkill,
   ensurePandaIssueSkill,
+  PANDA_ISSUE_INBOX_SCRIPT,
   ensureModuleGuideBlocks,
   ensureProjectBridge,
 } from './agent-compat';
@@ -87,6 +89,26 @@ describe('ensurePandaIssueSkill', () => {
     await expect(fsp.stat(path.join(claudeHome, 'skills/mando-issue'))).rejects.toThrow();
     expect(await fsp.readFile(path.join(codexHome, 'skills/mando-issue/SKILL.md'), 'utf8')).toBe('# 人工版本');
     expect(await ensurePandaIssueSkill(driver, { claudeHome, codexHome })).toHaveLength(0);
+  });
+});
+
+describe('ensurePandaIssueInboxSkill', () => {
+  test('双侧安装技能 + 可执行助手脚本，幂等、升级覆盖生成版、不动人工修改', async () => {
+    const claudeHome = path.join(dir, 'i1', '.claude');
+    const codexHome = path.join(dir, 'i1', '.codex');
+    expect(await ensurePandaIssueInboxSkill(driver, { claudeHome, codexHome })).toHaveLength(4);
+    const skill = await fsp.readFile(path.join(claudeHome, 'skills/panda-issue-inbox/SKILL.md'), 'utf8');
+    expect(skill).toContain('name: panda-issue-inbox');
+    expect(skill).toContain('只读');
+    const script = path.join(codexHome, 'skills/panda-issue-inbox/panda-issues.sh');
+    expect((await fsp.stat(script)).mode & 0o111).not.toBe(0);
+    expect(await fsp.readFile(script, 'utf8')).toBe(PANDA_ISSUE_INBOX_SCRIPT);
+    expect(await ensurePandaIssueInboxSkill(driver, { claudeHome, codexHome })).toHaveLength(0);
+
+    await fsp.writeFile(script, '#!/bin/sh\n# 旧版（panda 自动生成）\n');
+    expect(await ensurePandaIssueInboxSkill(driver, { claudeHome, codexHome })).toEqual([script]);
+    await fsp.writeFile(script, '#!/bin/sh\n# 人工版本\n');
+    expect(await ensurePandaIssueInboxSkill(driver, { claudeHome, codexHome })).toHaveLength(0);
   });
 });
 

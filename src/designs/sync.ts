@@ -25,6 +25,7 @@ import type {
   DesignIssueSyncState,
   DesignTask,
 } from './types';
+import { compareIssueIds, type IssueId } from '../../shared/issue-id';
 
 /** Issue-owned projection used for revision sync. Rich design details remain losslessly represented by body. */
 export interface DesignIssueSyncContract {
@@ -153,15 +154,15 @@ export interface DesignSyncListItem extends DesignIssueSyncResult {
 }
 
 export interface IssueDesignSyncPort {
-  getDesignSyncSnapshot(issueId: number): IssueDesignSyncSnapshot | null;
+  getDesignSyncSnapshot(issueId: IssueId): IssueDesignSyncSnapshot | null;
   updateFromDesign<Result>(
     input: IssueDesignSyncUpdate,
     afterUpdate: (updated: IssueDesignSyncSnapshot) => SynchronousCallbackResult<Result>,
   ): Result;
-  requestLatestExecutionSync(issueId: number, input: IssueExecutionSyncRequest): IssueExecutionSync;
-  latestExecutionSync(issueId: number, sourceKind: string, sourceKey: string): IssueExecutionSync | null;
+  requestLatestExecutionSync(issueId: IssueId, input: IssueExecutionSyncRequest): IssueExecutionSync;
+  latestExecutionSync(issueId: IssueId, sourceKind: string, sourceKey: string): IssueExecutionSync | null;
   getExecutionSync(syncId: number): IssueExecutionSync | null;
-  holdExecutionSyncBoundary(issueId: number, boundaryKind: string, deferredAction: unknown): IssueExecutionSync | null;
+  holdExecutionSyncBoundary(issueId: IssueId, boundaryKind: string, deferredAction: unknown): IssueExecutionSync | null;
   decideExecutionSync(syncId: number, decision: IssueExecutionSyncDecision, actor: number): IssueExecutionSync;
   resumeExecutionSync<T>(
     syncId: number,
@@ -180,7 +181,7 @@ export interface IssueDesignSyncPort {
     limit?: number,
   ): { examined: number; resumed: number };
   drainExecutionSyncEffectOutbox(limit?: number): Promise<{ examined: number; delivered: number }>;
-  hasUnresolvedExecutionSyncEffect(issueId: number): boolean;
+  hasUnresolvedExecutionSyncEffect(issueId: IssueId): boolean;
   listUncertainExecutionSyncEffects(limit?: number): readonly {
     resumeKey: string;
     syncId: number;
@@ -202,7 +203,7 @@ export interface IssueDesignSyncPort {
     dependencies: readonly PreparedIssueDependency[],
     onCreatedInTransaction: (issuesByNodeId: ReadonlyMap<string, EngineIssue>) => SynchronousCallbackResult<Result>,
   ): readonly EngineIssue[];
-  completeDesignBatch(projectId: number, issueIds: readonly number[]): Promise<void>;
+  completeDesignBatch(projectId: number, issueIds: readonly IssueId[]): Promise<void>;
 }
 
 export interface DesignSyncCoordinatorDeps {
@@ -228,7 +229,7 @@ interface PersistedDesignSyncDiff {
   designId: number;
   linkId: number;
   nodeId: string;
-  issueId: number;
+  issueId: IssueId;
   targetRevision: number;
   issueStatus: IssueState;
   base: DesignIssueSyncContract;
@@ -611,7 +612,7 @@ export class DesignSyncCoordinator {
   ): DesignIssueSyncResult {
     const baseline = payload.incomingBaseline;
     if (!baseline) throw new DesignSyncError('DESIGN_SYNC_NOT_ACTIONABLE', 'removed node has no incoming contract');
-    let supplementIssueId: number | null = null;
+    let supplementIssueId: IssueId | null = null;
     if (decision === 'apply') {
       const fresh = this.deps.issues.getDesignSyncSnapshot(link.issueId);
       if (!fresh) throw new Error('linked Issue disappeared');
@@ -636,7 +637,7 @@ export class DesignSyncCoordinator {
         const issueId = issueByNode.get(nodeId);
         if (!issueId) throw new DesignSyncError('DESIGN_SYNC_CONFLICT', `dependency node is not published: ${nodeId}`);
         return issueId;
-      }).sort((a, b) => a - b);
+      }).sort(compareIssueIds);
       const expected = {
         issueId: fresh.issueId,
         projectId: fresh.projectId,
@@ -645,7 +646,7 @@ export class DesignSyncCoordinator {
         moduleId: fresh.moduleId,
         agent: fresh.agent,
         implMode: fresh.implMode,
-        dependencyIssueIds: [...fresh.dependencyIssueIds].sort((a, b) => a - b),
+        dependencyIssueIds: [...fresh.dependencyIssueIds].sort(compareIssueIds),
       };
       this.deps.issues.updateFromDesign({
         issueId: fresh.issueId,
@@ -722,8 +723,8 @@ export class DesignSyncCoordinator {
     targetRevision: number,
     link: DesignIssueLink,
     node: DesignGraphNode | null,
-    nodeByIssue: ReadonlyMap<number, string>,
-    issueByNode: ReadonlyMap<string, number>,
+    nodeByIssue: ReadonlyMap<IssueId, string>,
+    issueByNode: ReadonlyMap<string, IssueId>,
     requestedBy: number | null,
   ): DesignIssueSyncResult {
     if (targetRevision < link.lastSyncedRevision) {
@@ -776,7 +777,7 @@ export class DesignSyncCoordinator {
         const issueId = issueByNode.get(nodeId);
         if (!issueId) throw new DesignSyncError('DESIGN_SYNC_CONFLICT', `dependency node is not published: ${nodeId}`);
         return issueId;
-      }).sort((a, b) => a - b);
+      }).sort(compareIssueIds);
       const expected = {
         issueId: issue.issueId,
         projectId: issue.projectId,
@@ -785,7 +786,7 @@ export class DesignSyncCoordinator {
         moduleId: issue.moduleId,
         agent: issue.agent,
         implMode: issue.implMode,
-        dependencyIssueIds: [...issue.dependencyIssueIds].sort((a, b) => a - b),
+        dependencyIssueIds: [...issue.dependencyIssueIds].sort(compareIssueIds),
       };
       try {
         const updated = this.deps.issues.updateFromDesign({
@@ -912,7 +913,7 @@ export class DesignSyncCoordinator {
     link: DesignIssueLink,
     targetRevision: number,
     executionSyncId: number | null,
-    supplementIssueId: number | null,
+    supplementIssueId: IssueId | null,
     repeated: boolean,
   ): DesignIssueSyncResult {
     return {

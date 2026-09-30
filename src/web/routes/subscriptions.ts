@@ -13,10 +13,11 @@
  */
 import type { Database } from 'bun:sqlite';
 import { ProjectMemberStore } from '../../core/members';
-import type { SubscriptionScope } from '../../core/types';
+import type { SubscriptionScope, SubscriptionTargetId } from '../../core/types';
 import type { UserStore } from '../../core/users';
 import { userByFeishuOpenid, type SubscriptionStore } from '../../notify/router';
 import { json, type RouteDef } from '../middleware';
+import { parseIssueId } from '../../../shared/issue-id';
 
 /** 飞书绑定验证的最小接口（FeishuChannel 结构兼容，直接传实例即可） */
 export interface FeishuBindVerifier {
@@ -40,10 +41,11 @@ async function readBody(req: Request): Promise<Record<string, unknown>> {
 }
 
 /** 解析并校验 {scope,targetId}；非法返回 null */
-function parseSubTarget(b: Record<string, unknown>): { scope: SubscriptionScope; targetId: number } | null {
+function parseSubTarget(b: Record<string, unknown>): { scope: SubscriptionScope; targetId: SubscriptionTargetId } | null {
   const scope = b.scope === 'project' || b.scope === 'issue' ? b.scope : null;
-  const targetId =
-    typeof b.targetId === 'number' && Number.isInteger(b.targetId) && b.targetId > 0
+  const targetId = scope === 'issue'
+    ? parseIssueId(b.targetId)
+    : typeof b.targetId === 'number' && Number.isInteger(b.targetId) && b.targetId > 0
       ? b.targetId
       : null;
   if (!scope || !targetId) return null;
@@ -58,7 +60,7 @@ function parseSubTarget(b: Record<string, unknown>): { scope: SubscriptionScope;
 function resolveTarget(
   db: Database,
   scope: SubscriptionScope,
-  targetId: number,
+  targetId: SubscriptionTargetId,
 ): { projectId: number; owner: number } | undefined {
   const row =
     scope === 'project'
@@ -66,13 +68,13 @@ function resolveTarget(
           .query<{ id: number; owner_user_id: number }, [number]>(
             'SELECT id, owner_user_id FROM projects WHERE id = ?',
           )
-          .get(targetId)
+          .get(Number(targetId))
       : db
-          .query<{ id: number; owner_user_id: number }, [number]>(
+          .query<{ id: number; owner_user_id: number }, [string]>(
             `SELECT p.id, p.owner_user_id FROM issues i JOIN projects p ON p.id = i.project_id
              WHERE i.id = ?`,
           )
-          .get(targetId);
+          .get(String(targetId));
   return row ? { projectId: row.id, owner: row.owner_user_id } : undefined;
 }
 
@@ -86,7 +88,7 @@ export function subscriptionsRoutes(deps: SubscriptionsRoutesDeps): RouteDef[] {
       auth: 'user',
       handler: async ({ req, user }) => {
         const t = parseSubTarget(await readBody(req));
-        if (!t) return json({ ok: false, error: '需要 scope(project|issue) 与正整数 targetId' }, 400);
+        if (!t) return json({ ok: false, error: '需要 scope(project|issue) 与合法 targetId' }, 400);
         const target = resolveTarget(db, t.scope, t.targetId);
         if (target === undefined) {
           // 不存在：admin 见 404，普通用户统一 403（middleware 同约定）
@@ -111,7 +113,7 @@ export function subscriptionsRoutes(deps: SubscriptionsRoutesDeps): RouteDef[] {
       auth: 'user',
       handler: async ({ req, user }) => {
         const t = parseSubTarget(await readBody(req));
-        if (!t) return json({ ok: false, error: '需要 scope(project|issue) 与正整数 targetId' }, 400);
+        if (!t) return json({ ok: false, error: '需要 scope(project|issue) 与合法 targetId' }, 400);
         // 退订只动自己的行，无需可见性校验（目标已易主/已删也允许清掉自己的订阅）
         return json({ ok: true, removed: subs.remove(user!.id, t.scope, t.targetId) });
       },

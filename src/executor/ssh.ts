@@ -49,6 +49,7 @@ import {
   MAX_INJECT_CHARS,
   sanitizeInjectText,
   sendTextWithStableSubmit,
+  pasteTextWithTmux,
   tmuxNewSessionArgs,
   tmuxResizeWindowArgs,
   tmuxScrollPaneArgs,
@@ -90,11 +91,6 @@ export const SSH_MAX_INJECT_CHARS: number = MAX_INJECT_CHARS;
  * LocalDriver / SshDriver 净化行为完全一致。
  */
 export const sanitizeSendText: (text: string) => string = sanitizeInjectText;
-
-/** 构造字面量文本注入命令；提交时序由 sendTextWithStableSubmit 统一控制。 */
-export function buildSendTextCmd(session: string, cleanText: string): string {
-  return `tmux send-keys -t ${shq(session)} -l -- ${shq(cleanText)}`;
-}
 
 /** 构造 sendKey 的远端命令（键名语义，不带 -l）。白名单校验在调用方。 */
 export function buildSendKeyCmd(session: string, key: string): string {
@@ -196,8 +192,14 @@ function sftpChmod(sftp: SftpLike, path: string, mode: number): Promise<void> {
 }
 
 function sftpRename(sftp: SftpLike, oldPath: string, newPath: string): Promise<void> {
-  if (typeof sftp.rename !== 'function') throw new Error('executor secure replace capability unavailable');
-  return new Promise((resolve, reject) => sftp.rename!(oldPath, newPath, (error) => error ? reject(error) : resolve()));
+  // Standard SFTP rename commonly refuses to overwrite an existing target (OpenSSH returns
+  // SSH_FX_FAILURE). Never unlink the target first: a failed publish must leave the old file
+  // intact. Require OpenSSH's atomic POSIX rename extension for CAS replacement.
+  if (typeof sftp.ext_openssh_rename !== 'function') {
+    throw new Error('executor atomic overwrite capability unavailable');
+  }
+  return new Promise((resolve, reject) =>
+    sftp.ext_openssh_rename!(oldPath, newPath, (error) => error ? reject(error) : resolve()));
 }
 
 function sftpUnlink(sftp: SftpLike, path: string): Promise<void> {
@@ -341,10 +343,7 @@ export class SshDriver implements ExecutorDriver {
     await sendTextWithStableSubmit({
       inputText: clean,
       capturePane: () => this.capturePane(session),
-      sendText: async () => {
-        const result = await this.conn.exec(buildSendTextCmd(session, clean), this.tmuxTimeoutMs);
-        if (result.code !== 0) throw new Error(`tmux send-keys 失败: ${result.err || result.out}`);
-      },
+      sendText: () => pasteTextWithTmux(args => this.exec('tmux', args), session, clean),
       sendEnter: async () => {
         const result = await this.conn.exec(buildSendKeyCmd(session, 'Enter'), this.tmuxTimeoutMs);
         if (result.code !== 0) throw new Error(`tmux send-keys 失败: ${result.err || result.out}`);

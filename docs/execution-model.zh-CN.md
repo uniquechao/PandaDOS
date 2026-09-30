@@ -1,5 +1,9 @@
 # 执行模型：issue · 对话 · tmux · 执行代理 · 终端
 
+> 本页保留早期 V2 实施记录，部分细节已被后续执行策略取代。当前行为以
+> [英文执行模型](execution-model.md)、[Issue 执行与完成策略](issue-execution-policy.md)
+> 和实际代码为准：普通任务默认直执行；模块 issue 通常轮换对话；`done` 不代表已合并或部署。
+
 [English](execution-model.md)
 
 > 本文讲清 PandaDOS v2 里最容易混淆的一组概念——**issue / 模块 / 对话 / tmux 会话 / 执行代理 / 终端**——各自是什么、谁归谁、以什么节拍互动、出故障怎么自愈。
@@ -26,7 +30,7 @@ issue → (模块) → 对话(session-id，持久)
 | --- | --- | --- | --- |
 | 项目 | 一个 cwd + 一台执行机 | `projects` 表 | 控制面不碰本地 fs，一切经 `ExecutorDriver` |
 | issue | 需求单 + 状态机 | `issues` / `issue_events` / `gates` | 自己不持有进程，只持有 `conv_id` |
-| 模块 | 项目内共享资产，固定一种代理 | `project_modules` | 永久绑定唯一一条对话（`conversation_id`），同模块 issue 顺序复用 |
+| 模块 | 项目内共享资产，固定一种代理 | `project_modules` | `conversation_id` 指向当前对话；新 issue 通常轮换，知识写入 `MODULE.md` |
 | 对话 | 逻辑会话 = CLI 的 session-id | `conversations` + `project_active_conv` | claude 用 convId 当 session-id；codex 事后发现回填 |
 | tmux 会话 | 运行容器，前台进程即执行代理 | 执行机 | 可随时 kill/重建；名字由控制面算出，不猜 |
 
@@ -66,7 +70,7 @@ issue → (模块) → 对话(session-id，持久)
    - `chat`：会话活着即幂等短路（不打断在跑的对话），只在不在时启动。codex 例外——tmux 活着 ≠ codex 在跑，走 `ensureCodexChatLive` 抓屏真检测。
 3. **buildCommand** —— 组装启动命令：
    - claude：jsonl 已落地 → `claude --resume <convId>`，否则 `claude --session-id <convId>`；顺手清 `agent_jsonl_path` 覆盖，防继续 tail 死文件。
-   - codex：已发现 session id → `codex resume <sid>`，否则 fresh 启动；两种情况都重盖 `agent_launch_ts` 并清 path 缓存（issue #48：旧绑定粘连是卡死元凶）。启动带 `-c check_for_update_on_startup=false`（顶层键才有效，`[tui]` 那个只关横幅）+ `--dangerously-bypass-approvals-and-sandbox`（无人守屏时审批弹窗滞留即卡死）。
+   - codex：已发现 session id → `codex resume <sid>`，否则 fresh 启动；两种情况都重盖 `agent_launch_ts` 并清 path 缓存。当前默认使用 `--sandbox workspace-write --approve-for-me`；显式覆盖只适用于具备相应隔离的受信任执行机。
 4. **launchInto** —— 预置 cwd 信任（`~/.claude.json` / `~/.codex/config.toml`，best-effort，兜底是 PM 自动同意弹窗）→ 装兼容层技能与项目桥 → 确保 cwd 存在 → kill 旧 → `createSession` → `sendKeys(cmd)`。
 5. **sleepIssue** —— 模块按需休眠：只回收 tmux 进程，保留 conversation 与 session id，下次 resume 接上。
 6. **archive / closeChat** —— 归档顺手 kill chat 独立会话；`closeChat` 只 kill 不改 archived（下次 activate 会 `--resume` 复活）。

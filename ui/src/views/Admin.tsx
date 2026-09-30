@@ -29,6 +29,7 @@ import { AgentLogo } from '../components/AgentLogo';
 import { AgentPicker } from '../components/AgentPicker';
 import { DirPicker } from '../components/DirPicker';
 import { runtimeI18n, tr } from '../i18n/runtime';
+import type { IssueId } from '../../../shared/issue-id';
 
 export type AdminTab = 'users' | 'execs' | 'llm' | 'feishu' | 'owner' | 'overview' | 'personaMarkets' | 'cost';
 
@@ -931,7 +932,7 @@ interface UsageTotalsView {
 }
 interface UsageBucketView extends UsageTotalsView { projectId: number; projectName: string; costUsd: number }
 interface IssueCostView {
-  issueId: number; projectId: number; projectName: string; title: string; status: string; createdTs: number;
+  issueId: IssueId; projectId: number; projectName: string; title: string; status: string; createdTs: number;
   usage: UsageTotalsView; testRetries: number; nudges: number; judged: number; clarifies: number;
   validationMs: number; validationRuns: number; costUsd: number;
 }

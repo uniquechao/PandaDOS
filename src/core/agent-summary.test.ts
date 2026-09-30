@@ -214,7 +214,7 @@ describe('AgentSummaryRunner.run', () => {
     expect(driver.files.has(p.done)).toBe(false);
   });
 
-  test('codex：起 codex 并带 bypass 参数', async () => {
+  test('codex：起 codex 并带工作区沙箱参数', async () => {
     const driver = new FakeDriver();
     const cwd = '/repo/proj';
     const p = summaryPaths(cwd);
@@ -232,7 +232,7 @@ describe('AgentSummaryRunner.run', () => {
     expect(r.ok).toBe(true);
     expect(driver.created.map((c) => c.name)).toEqual(['sum-2']);
     expect(driver.sent[0]!.text).toContain('codex');
-    expect(driver.sent[0]!.text).toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(driver.sent[0]!.text).toContain('--approve-for-me');
   });
 
   test('超时：done 标记始终不出现 → reason=timeout，仍清理', async () => {

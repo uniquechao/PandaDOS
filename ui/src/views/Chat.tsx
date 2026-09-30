@@ -29,6 +29,7 @@ import { readChatAgent, writeChatAgent, readChatConversation, writeChatConversat
 import { useListWidth } from '../lib/listwidth';
 import { pollProjectSummary } from '../lib/pollSummary';
 import { extOf, isImageExt, isImagePath, previewKind } from '../lib/preview';
+import { workspacePath } from '../lib/workspaceRoute';
 import { nav } from '../lib/router';
 import { MEMORY_MODELS, memoryBtnLabel, type SummaryMode } from '../lib/summaryModes';
 import { toast } from '../lib/toast';
@@ -453,7 +454,7 @@ export function ChatView({ pid, cid }: { pid: number; cid?: string }) {
             <button
               class={'btn sm' + (wide && showFiles ? ' primary' : '')}
               title={t('view.filesPreview')}
-              onClick={() => (wide ? setShowFiles((v) => !v) : nav(`/p/${pid}/files`))}
+              onClick={() => (wide ? setShowFiles((v) => !v) : nav(`/p/${pid}/workspace`))}
             >
               {t('view.files')}
             </button>
@@ -1011,7 +1012,7 @@ function FilePreview({ pid, path, onBack }: { pid: number; path: string; onBack:
         <button
           class="btn sm"
           title={tr('view.openFullFiles')}
-          onClick={() => nav(`/p/${pid}/files`)}
+          onClick={() => nav(workspacePath(pid, { view: 'files', path }))}
         >
           {tr('ui.expand')}
         </button>

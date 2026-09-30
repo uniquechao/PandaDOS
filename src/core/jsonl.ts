@@ -92,6 +92,8 @@ function parseTs(v: unknown): number | undefined {
 export interface ParseOpts {
   full?: boolean;
   toolHint?: string;
+  /** 引擎读取协议时保留 assistant 原文，避免 REPORT_BEGIN/END 被气泡截断破坏。 */
+  fullAssistantText?: boolean;
 }
 
 /** 正文字段落地：非 full 走 brief 头尾截断，full 只 trim（与 brief 的 trim 语义保持一致） */
@@ -137,7 +139,7 @@ function parseEntry(e: any, seqStart: number, toolNames?: Map<string, string>, o
   if (e.type === 'assistant' && Array.isArray(e.message?.content)) {
     for (const c of e.message.content) {
       if (c.type === 'text' && c.text?.trim()) {
-        out.push({ seq: seq++, role: 'assistant', text: cut(c.text, MAX_TEXT, opts) });
+        out.push({ seq: seq++, role: 'assistant', text: cut(c.text, MAX_TEXT, opts?.fullAssistantText ? { full: true } : opts) });
       } else if (c.type === 'thinking' || c.type === 'redacted_thinking') {
         const t = c.thinking ?? c.text ?? '（已隐去的思考）';
         if (String(t).trim()) out.push({ seq: seq++, role: 'thinking', text: cut(t, MAX_TEXT, opts) });
@@ -206,7 +208,7 @@ function parseEntry(e: any, seqStart: number, toolNames?: Map<string, string>, o
       case 'message': {
         const text = codexContentText(p.content);
         if (p.role === 'assistant' && text.trim()) {
-          out.push({ seq: seq++, role: 'assistant', text: cut(text, MAX_TEXT, opts) });
+          out.push({ seq: seq++, role: 'assistant', text: cut(text, MAX_TEXT, opts?.fullAssistantText ? { full: true } : opts) });
         } else if (p.role === 'user' && text.trim() && !CODEX_SYNTH_RE.test(text.trim())) {
           // codex 把 <environment_context>/<permissions …> 等合成消息记成 user——不进气泡
           out.push({ seq: seq++, role: 'user', text: cut(text, MAX_TEXT, opts) });
@@ -302,6 +304,7 @@ function parseChunkWithOffsets(
   bytes: Uint8Array,
   startByte: number,
   startSeq: number,
+  opts?: ParseOpts,
 ): { msgs: ChatMessage[]; nextSeq: number } {
   const msgs: ChatMessage[] = [];
   const toolNames = new Map<string, string>();
@@ -313,7 +316,7 @@ function parseChunkWithOffsets(
       if (i > lineStart) {
         const ln = dec.decode(bytes.subarray(lineStart, i));
         if (ln.trim()) {
-          const got = parseLine(ln, seq, toolNames);
+          const got = parseLine(ln, seq, toolNames, opts);
           let k = 0;
           for (const m of got) {
             m.off = startByte + lineStart + k;
@@ -394,6 +397,7 @@ export async function tailConversation(
   jsonl: string,
   offset: number,
   seqStart: number,
+  opts?: ParseOpts,
 ): Promise<{ msgs: ChatMessage[]; offset: number; nextSeq: number }> {
   const st = await r.statPath(jsonl).catch(() => null);
   if (!st) return { msgs: [], offset, nextSeq: seqStart };
@@ -419,7 +423,7 @@ export async function tailConversation(
   if (lastNl < 0) return { msgs: [], offset, nextSeq: seqStart }; // 还没写完一整行
   const consumed = chunk.subarray(0, lastNl + 1);
   // 字节层解析并挂 off（源行绝对字节 = 本轮起始 offset + 行在 chunk 内的字节位置）
-  const { msgs, nextSeq } = parseChunkWithOffsets(consumed, offset, seqStart);
+  const { msgs, nextSeq } = parseChunkWithOffsets(consumed, offset, seqStart, opts);
   return { msgs, offset: offset + consumed.length, nextSeq };
 }
 

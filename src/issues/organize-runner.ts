@@ -24,6 +24,7 @@ import type { AgentKind } from '../core/types';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
 import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/language';
 import { normalizeModuleSlug } from './modules';
+import { parseIssueId, type IssueId } from '../../shared/issue-id';
 
 /** runner 需要的 Driver 子集 = clarify-runner 同款（tmux + 受限文件） */
 export type OrganizeDriver = AgentArtifactDriver;
@@ -62,7 +63,7 @@ export type OrganizeAction =
   | { kind: 'merge'; targetId: number; sourceIds: number[]; reason: string }
   | {
       kind: 'move';
-      issueIds: number[];
+      issueIds: IssueId[];
       /** 挪去已有模块（moduleId）或本方案 create 的新模块（slug） */
       to: { moduleId: number } | { slug: string };
       reason: string;
@@ -71,7 +72,7 @@ export type OrganizeAction =
 /** 清洗上下文：库内当时事实（active 模块、全部 slug 含归档、全部 issue 投影） */
 export interface OrganizePlanContext {
   modules: Array<{ id: number; slug: string; agent: AgentKind; active: boolean }>;
-  issues: Array<{ id: number; status: string; moduleId: number | null }>;
+  issues: Array<{ id: IssueId; status: string; moduleId: number | null }>;
 }
 
 // ---------- task.md / prompt 组装 ----------
@@ -86,7 +87,7 @@ export interface OrganizeModuleInfo {
 }
 
 export interface OrganizeIssueInfo {
-  id: number;
+  id: IssueId;
   title: string;
   body: string | null;
   status: string;
@@ -270,8 +271,9 @@ export function parseOrganizePlan(text: string | null | undefined, ctx: Organize
       const issueIds = [
         ...new Set(
           (Array.isArray(g.issueIds) ? g.issueIds : [])
-            .map((s) => Number(s))
-            .filter((id) => {
+            .map((s) => parseIssueId(s))
+            .filter((id): id is IssueId => {
+              if (id === null) return false;
               const i = issueById.get(id);
               if (!i) return false;
               if (!['pending', 'done', 'blocked', 'cancelled'].includes(i.status)) return false;

@@ -6,8 +6,9 @@
  * #/p/:pid/chat        对话视图
  * #/p/:pid/chat/:cid    对话视图（钉住某条对话；cid = conversations.id，也是 tmux chat-<cid>）
  * #/p/:pid/term        终端
- * #/p/:pid/files       文件浏览
- * #/p/:pid/git         git 提交图
+ * #/p/:pid/workspace[/…]  工作区（文件 + Git 合一，#388；子状态见 lib/workspaceRoute）
+ * #/p/:pid/files[/:path]  旧文件页深链 → 工作区「全部文件」同一目标（对话里已发出的链接不失效）
+ * #/p/:pid/git            旧 Git 页 → 工作区「当前改动」
  * #/p/:pid/skills      技能（全局/项目 + 市场）
  * #/p/:pid/settings    项目配置
  * #/p/:pid/workflows   工作流模板维护
@@ -17,19 +18,23 @@
  */
 import { useEffect, useState } from 'preact/hooks';
 import { pushRecent } from './recent';
+import { parseIssueId, type IssueId } from '../../../shared/issue-id';
+import { legacyFilesLoc, parseWorkspaceParts, type WorkspaceLoc } from './workspaceRoute';
 
+export type RoomPanelRoute = 'goal' | 'artifacts' | 'sources' | 'budget' | 'team';
 export type Route =
   | { name: 'projects' }
   | { name: 'settings' }
   | { name: 'admin'; section?: 'llm' | 'feishu' }
   | { name: 'board'; pid: number }
-  | { name: 'issue'; pid: number; iid: number }
+  | { name: 'issue'; pid: number; iid: IssueId }
   | { name: 'designs'; pid: number }
   | { name: 'design'; pid: number; did: number }
+  | { name: 'rooms'; pid: number }
+  | { name: 'room'; pid: number; rid: string; artifactId?: string; artifactVersion?: number; memberId?: string; panel?: RoomPanelRoute }
   | { name: 'chat'; pid: number; cid?: string }
   | { name: 'term'; pid: number }
-  | { name: 'files'; pid: number }
-  | { name: 'git'; pid: number }
+  | { name: 'workspace'; pid: number; loc: WorkspaceLoc }
   | { name: 'skills'; pid: number }
   | { name: 'external-issues'; pid: number }
   | { name: 'workflows'; pid: number }
@@ -49,7 +54,8 @@ function decodeSegment(raw: string | undefined): string {
 }
 
 export function parseHash(hash: string): Route {
-  const parts = hash.replace(/^#/, '').split('/').filter((s) => s.length > 0);
+  const [pathname, query = ''] = hash.replace(/^#/, '').split('?');
+  const parts = pathname.split('/').filter((s) => s.length > 0);
   if (parts[0] === 'settings') return { name: 'settings' };
   if (parts[0] === 'admin') {
     return parts[1] === 'llm' || parts[1] === 'feishu'
@@ -60,8 +66,8 @@ export function parseHash(hash: string): Route {
     const pid = Number(parts[1]);
     if (Number.isInteger(pid) && pid > 0) {
       if (parts[2] === 'issue' && parts[3]) {
-        const iid = Number(parts[3]);
-        if (Number.isInteger(iid) && iid > 0) return { name: 'issue', pid, iid };
+        const iid = parseIssueId(decodeURIComponent(parts[3]));
+        if (iid !== null) return { name: 'issue', pid, iid };
       }
       if (parts[2] === 'designs') {
         if (parts[3]) {
@@ -70,14 +76,31 @@ export function parseHash(hash: string): Route {
         }
         return { name: 'designs', pid };
       }
+      if (parts[2] === 'rooms') {
+        const rid = decodeSegment(parts[3]);
+        if (!CONV_ID_RE.test(rid)) return { name: 'rooms', pid };
+        const params = new URLSearchParams(query);
+        const artifactId = params.get('artifact');
+        const memberId = params.get('member');
+        const panel = params.get('panel');
+        const version = Number(params.get('version'));
+        return {
+          name: 'room', pid, rid,
+          ...(artifactId && CONV_ID_RE.test(artifactId) ? { artifactId, ...(Number.isSafeInteger(version) && version > 0 ? { artifactVersion: version } : {}) } : {}),
+          ...(!artifactId && memberId && CONV_ID_RE.test(memberId) ? { memberId } : {}),
+          ...(!artifactId && !memberId && panel && ['goal', 'artifacts', 'sources', 'budget', 'team'].includes(panel) ? { panel: panel as RoomPanelRoute } : {}),
+        };
+      }
       if (parts[2] === 'chat') {
         // cid 只做形状校验：真正的存在性由 ChatView 按对话列表核对，认不出就回退到默认选中项
         const cid = decodeSegment(parts[3]);
         return CONV_ID_RE.test(cid) ? { name: 'chat', pid, cid } : { name: 'chat', pid };
       }
       if (parts[2] === 'term') return { name: 'term', pid };
-      if (parts[2] === 'files') return { name: 'files', pid };
-      if (parts[2] === 'git') return { name: 'git', pid };
+      if (parts[2] === 'workspace') return { name: 'workspace', pid, loc: parseWorkspaceParts(parts.slice(3)) };
+      // 旧深链：path 是整体转义过的一段（斜杠是 %2F），所以不会被上面的 split('/') 拆开
+      if (parts[2] === 'files') return { name: 'workspace', pid, loc: legacyFilesLoc(parts[3]) };
+      if (parts[2] === 'git') return { name: 'workspace', pid, loc: { view: 'changes' } };
       if (parts[2] === 'external-issues') return { name: 'external-issues', pid };
       if (parts[2] === 'workflows') return { name: 'workflows', pid };
       if (parts[2] === 'settings') return { name: 'project-settings', pid };
@@ -98,10 +121,65 @@ export function nav(path: string, opts?: { replace?: boolean }): void {
   else location.hash = '#' + path;
 }
 
+/**
+ * 离开保护（#388）：页面持有未保存内容时登记守卫。hash 变化先经守卫结算——返回 true 表示拦下：
+ * 地址栏换回原 hash、路由不变，由守卫自己弹「保存 / 放弃 / 继续编辑」，确认后调用 proceed() 放行。
+ * 覆盖全局导航（项目导航、面包屑、任意 `<a href="#…">`、浏览器前进后退），不只是页面内部动作。
+ */
+export type LeaveGuard = (to: Route, proceed: () => void) => boolean;
+
+interface HashLocation {
+  hash: string;
+  pathname: string;
+  search: string;
+  replace(url: string): void;
+}
+
+let leaveGuard: LeaveGuard | null = null;
+let acceptedHash: string | null = null;
+let bypassHash: string | null = null;
+
+/** 登记离开守卫；返回注销函数（只注销自己，防卸载顺序把新守卫清掉） */
+export function setLeaveGuard(guard: LeaveGuard): () => void {
+  leaveGuard = guard;
+  return () => {
+    if (leaveGuard === guard) leaveGuard = null;
+  };
+}
+
+/** 结算当前 hash：放行返回 true；被守卫拦下则把地址栏换回上一个已接受的 hash 并返回 false */
+export function admitHash(loc: HashLocation = location): boolean {
+  const h = loc.hash;
+  if (acceptedHash === null || h === acceptedHash || h === bypassHash || !leaveGuard) {
+    acceptedHash = h;
+    bypassHash = null;
+    return true;
+  }
+  const prev = acceptedHash;
+  const proceed = (): void => {
+    bypassHash = h;
+    loc.hash = h;
+  };
+  if (!leaveGuard(parseHash(h), proceed)) {
+    acceptedHash = h;
+    return true;
+  }
+  loc.replace(loc.pathname + loc.search + prev);
+  return false;
+}
+
+/** 测试用：清空模块级结算状态 */
+export function resetLeaveGuardForTest(): void {
+  leaveGuard = null;
+  acceptedHash = null;
+  bypassHash = null;
+}
+
 export function useRoute(): Route {
   const [route, setRoute] = useState<Route>(() => parseHash(location.hash));
   useEffect(() => {
     const on = (): void => {
+      if (!admitHash()) return;
       const r = parseHash(location.hash);
       if ('pid' in r) pushRecent(r.pid); // 进某项目即记一次「最近访问」（直链/刷新也算）
       setRoute(r);

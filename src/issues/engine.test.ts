@@ -7,7 +7,7 @@ import { migrate } from '../core/migrate';
 import { UserStore } from '../core/users';
 import { ConversationManager } from '../core/conversations';
 import { LocalDriver } from '../executor/local';
-import type { CommandResult } from '../executor/driver';
+import { InputSubmitUnconfirmedError, type CommandResult } from '../executor/driver';
 import { gitLockKey, KeyedMutex, tmuxLockKey } from './mutex';
 import { ModuleManager, ModuleStore } from './modules';
 import { MAX_TEST_FAILURES, transition } from './machine';
@@ -39,7 +39,10 @@ import {
   type PreparedDesignBatch,
 } from './engine';
 import { workflowNodePaths } from './workflow-node-runner';
+import { GitDeliveryService } from './git-delivery-service';
+import { IssueEffectJournal } from './effect-journal';
 import { validateWorkflowGraph, WorkflowTemplateStore } from './workflows';
+import { compareIssueIds, type IssueId } from '../../shared/issue-id';
 
 // ---------- 假 Driver：文件/git 走真 fs（LocalDriver），tmux 进内存录制 ----------
 
@@ -51,7 +54,9 @@ class FakeDriver extends LocalDriver {
     ['claude', 'claude'],
     ['codex', 'codex'],
   ]);
-  pane = '';
+  /** null = 测试默认模拟 Claude composer；显式 '' = 抓到空屏。 */
+  pane: string | null = null;
+  defaultPanes = new Map<string, string>();
   /** 每会话的 #{pane_current_command}（不设 = 老实现/解析失败，判活退化成只看屏） */
   paneCommands = new Map<string, string>();
   gitCalls: Array<{ cwd: string; args: string[] }> = [];
@@ -115,8 +120,9 @@ class FakeDriver extends LocalDriver {
   override async sendKey(session: string, key: string) {
     this.keys.push({ session, key });
   }
-  override async capturePane(_session: string) {
-    return this.pane;
+  override async capturePane(session: string) {
+    if (!this.tmuxSessions.has(session)) return '';
+    return this.pane ?? this.defaultPanes.get(session) ?? '❯ ';
   }
   prompts(): string[] {
     return this.sent.map((s) => s.text).filter((t) => !t.startsWith('claude '));
@@ -183,6 +189,30 @@ describe('issue 引擎迁移', () => {
   });
 });
 
+test('执行位置身份由数据库约束，凭据轮换与能力更新仍可用', () => {
+  const db = openDb(':memory:');
+  migrate(db);
+  migrateIssueEngine(db);
+  db.run("INSERT INTO users (id, username, token_hash, role, created_ts) VALUES (1, 'owner', 'x', 'admin', 1)");
+  db.run("INSERT INTO executors (id, name, host, port, ssh_user, key_ref, workspace_root, claude_dir) VALUES (1, 'a', 'a.example', 22, 'a', 'old', '/work', '/home/a/.claude/projects')");
+  db.run("INSERT INTO executors (id, name, host, port, ssh_user, key_ref, workspace_root, claude_dir) VALUES (2, 'b', 'b.example', 22, 'b', 'key', '/work', '/home/b/.claude/projects')");
+  db.run("INSERT INTO projects (id, name, executor_id, cwd, owner_user_id, created_ts) VALUES (1, 'same-path', 1, '/work/app', 1, 1)");
+
+  expect(() => db.run('UPDATE projects SET executor_id = 2 WHERE id = 1')).toThrow('project executor identity is immutable');
+  for (const sql of [
+    "UPDATE executors SET host = 'other.example' WHERE id = 1",
+    'UPDATE executors SET port = 2222 WHERE id = 1',
+    "UPDATE executors SET ssh_user = 'other' WHERE id = 1",
+    "UPDATE executors SET workspace_root = '/other' WHERE id = 1",
+  ]) expect(() => db.run(sql)).toThrow('referenced executor location is immutable');
+  db.run("UPDATE executors SET key_ref = 'rotated', supports_codex = 0 WHERE id = 1");
+  expect(db.query<{ key_ref: string; supports_codex: number }, []>('SELECT key_ref, supports_codex FROM executors WHERE id = 1').get())
+    .toEqual({ key_ref: 'rotated', supports_codex: 0 });
+  db.run("UPDATE executors SET host = 'other.example' WHERE id = 2");
+  expect(db.query<{ host: string }, []>('SELECT host FROM executors WHERE id = 2').get()?.host).toBe('other.example');
+  db.close();
+});
+
 async function setup(opts: {
   clarify?: (project: Project, input: EngineClarifyInput) => Promise<EngineClarifyResult>;
   organize?: EngineDeps['organize'];
@@ -191,6 +221,7 @@ async function setup(opts: {
   onNotify?: (event: EngineNotifyEvent) => void | Promise<void>;
   executionWorkspaces?: EngineDeps['executionWorkspaces'];
   flushProjectData?: EngineDeps['flushProjectData'];
+  executionUnavailable?: EngineDeps['executionUnavailable'];
 } = {}) {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-engine-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
@@ -262,7 +293,7 @@ async function setup(opts: {
     failureCalls: 0,
     /** 测试注入的合并计划：id 组 → 合并后 title/body（默认不合并） */
     merges: [] as EngineMergeGroup[],
-    mergeCalls: [] as Array<{ module: string; ids: number[] }>,
+    mergeCalls: [] as Array<{ module: string; ids: string[] }>,
     async judgeDone() {
       pm.judgeCalls++;
       return pm.judgement;
@@ -304,6 +335,7 @@ async function setup(opts: {
     driver,
     convs,
     locator,
+    ...(opts.executionUnavailable ? { executionUnavailable: opts.executionUnavailable } : {}),
     ...(opts.executionWorkspaces ? { executionWorkspaces: opts.executionWorkspaces } : {}),
     pmFor: () => pm,
     notify,
@@ -318,11 +350,13 @@ async function setup(opts: {
   });
 
   /** 给 issue 的 conv 建 jsonl 并登记 */
-  async function bindJsonl(issueId: number): Promise<string> {
-    const convId = engine.store.get(issueId)!.convId!;
+  async function bindJsonl(issueId: IssueId): Promise<string> {
+    const issue = engine.store.get(issueId)!;
+    const convId = issue.convId!;
     const p = path.join(dir, `${convId}.jsonl`);
     await fsp.writeFile(p, '');
     jsonl.set(convId, p);
+    driver.defaultPanes.set(convs.tmuxName(issue.projectId, convId), issue.agent === 'codex' ? '› ' : '❯ ');
     return p;
   }
   async function appendOutput(jsonlPath: string, ...lines: string[]) {
@@ -331,6 +365,63 @@ async function setup(opts: {
 
   return { dir, db, users, admin, repo, driver, convs, jsonl, locator, pm, notifications, clock, engine, mutex, projectId, setManualReview, bindJsonl, appendOutput, g };
 }
+
+describe('状态迁移事务', () => {
+  test('进程重启发现终端输入无回执：标 uncertain 并拒绝重灌', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: '恢复输入' });
+    await s.bindJsonl(issue.id);
+    await s.engine.tick();
+    const initial = s.driver.prompts().length;
+    expect(initial).toBeGreaterThan(0);
+    s.db.query("UPDATE issue_effect_journal SET status = 'running' WHERE issue_id = ? AND operation_key LIKE 'kickoff:%'").run(issue.id);
+    s.db.query("DELETE FROM issue_events WHERE issue_id = ? AND kind = 'injected'").run(issue.id);
+    s.engine.start();
+    expect(s.db.query<{ status: string }, [IssueId]>(
+      "SELECT status FROM issue_effect_journal WHERE issue_id = ? AND operation_key LIKE 'kickoff:%'",
+    ).get(issue.id)?.status).toBe('uncertain');
+    await s.engine.tick();
+    expect(s.driver.prompts()).toHaveLength(initial);
+    expect(s.engine.store.listEvents(issue.id).some(e => e.kind === 'effect_uncertain')).toBe(true);
+    await s.engine.stop();
+  });
+
+  test('通知回执丢失后无关事件不会换键重发', async () => {
+    let deliveries = 0;
+    const s = await setup({ onNotify: async () => { deliveries++; throw new Error('provider timeout after delivery'); } });
+    const issue = await s.engine.createIssue(s.projectId, { title: '通知恢复' }, false);
+    const event: EngineNotifyEvent = {
+      kind: 'status_change', projectId: s.projectId, issueId: issue.id,
+      from: 'pending', to: 'planning', summaryCode: 'status_transition',
+      summaryParams: { title: issue.title },
+    };
+    const notify = s.engine as unknown as { notifySafe: (ev: EngineNotifyEvent) => Promise<void> };
+    await notify.notifySafe(event);
+    const first = deliveries;
+    s.engine.store.logEvent(issue.id, 'unrelated_progress', {});
+    await notify.notifySafe(event);
+    expect(deliveries).toBe(first);
+    expect(s.db.query<{ count: number }, [IssueId]>(
+      "SELECT COUNT(*) AS count FROM issue_effect_journal WHERE issue_id = ? AND operation_key LIKE 'notify:%' AND status = 'uncertain'",
+    ).get(issue.id)?.count).toBeGreaterThan(0);
+  });
+
+  test('事件写入失败时状态、完成时间和通知均不得提前生效', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: 'transaction failure' }, false);
+    const before = s.engine.store.listEvents(issue.id).length;
+    s.db.run(`CREATE TRIGGER fail_transition_event BEFORE INSERT ON issue_events
+      WHEN NEW.kind = 'transition' BEGIN SELECT RAISE(ABORT, 'injected event failure'); END`);
+    await expect(s.engine.applyEvent(issue.id, 'block', { note: 'external dependency' }))
+      .rejects.toThrow('injected event failure');
+    expect(s.engine.store.get(issue.id)?.status).toBe('pending');
+    expect(s.engine.store.listEvents(issue.id)).toHaveLength(before);
+    expect(s.notifications).toEqual([]);
+    s.db.run('DROP TRIGGER fail_transition_event');
+    expect((await s.engine.applyEvent(issue.id, 'block', { note: 'external dependency' })).ok).toBe(true);
+    expect(s.engine.store.get(issue.id)?.status).toBe('blocked');
+  });
+});
 
 describe('design execution workspace port', () => {
   test('managed issues reuse a run/module conversation without mutating the permanent module binding', async () => {
@@ -378,7 +469,7 @@ describe('design execution workspace port', () => {
     expect(s.driver.gitCalls.filter((call) => call.args[0] === 'checkout')).toEqual([]);
     expect(s.driver.gitCalls.some((call) => call.cwd === workspace && call.args[0] === 'symbolic-ref')).toBe(true);
 
-    const finish = async (issueId: number) => {
+    const finish = async (issueId: IssueId) => {
       expect((await s.engine.applyEvent(issueId, 'plan_ready')).ok).toBe(true);
       expect(s.engine.store.get(issueId)?.status).toBe('implementing');
       expect((await s.engine.applyEvent(issueId, 'impl_done')).ok).toBe(true);
@@ -409,9 +500,38 @@ describe('design execution workspace port', () => {
   });
 });
 
+test('第二执行机同路径项目不得由主执行机代跑', async () => {
+  const s = await setup({
+    executionUnavailable: (project) => project.executorId === 1 ? null : '执行机尚未接入 issue 引擎',
+  });
+  const issue = await s.engine.createIssue(s.projectId, { title: '原执行机任务' }, false);
+  const oldConversation = s.convs.create(s.projectId, '原主机上已存在的对话');
+  s.db.run("INSERT INTO executors (name, host, port, ssh_user, key_ref, workspace_root, claude_dir) VALUES ('other', '127.0.0.2', 22, 'root', 'k', '/same', '/same/.claude')");
+  // Simulate an externally corrupted legacy database despite the location-identity trigger.
+  s.db.run('DROP TRIGGER projects_executor_identity_immutable');
+  s.db.query('UPDATE projects SET executor_id = 2 WHERE id = ?').run(s.projectId);
+  const gitCalls = s.driver.gitCalls.length;
+  const sessions = s.driver.tmuxSessions.size;
+  expect(await s.engine.startIssue(issue.id)).toMatchObject({ ok: false, error: '执行机尚未接入 issue 引擎' });
+  await expect(s.engine.createIssue(s.projectId, { title: '不得新建' })).rejects.toThrow('执行机尚未接入 issue 引擎');
+  expect(s.driver.gitCalls).toHaveLength(gitCalls);
+  expect(s.driver.tmuxSessions.size).toBe(sessions);
+  expect(s.engine.store.get(issue.id)?.status).toBe('pending');
+
+  // Simulate a pre-existing driving issue whose executor binding changed outside the engine.
+  // It must pause without finalization accidentally reading Git on the former primary machine.
+  s.db.query("UPDATE issues SET status = 'planning', conv_id = ? WHERE id = ?").run(oldConversation.id, issue.id);
+  await s.engine.tick();
+  expect(s.engine.store.get(issue.id)?.status).toBe('paused');
+  expect(s.driver.gitCalls).toHaveLength(gitCalls);
+  expect(s.driver.tmuxSessions.size).toBe(sessions);
+});
+
 describe('工作流 issue 生命周期接线', () => {
-  test('无需原 issue 对话即可推进，并保持现有 merge_review 卡点', async () => {
+  test('无需原 issue 对话即可推进，但最终工作区必须通过门禁', async () => {
     const s = await setup();
+    s.engine.store.setValidationCommands(s.projectId, [{ label: 'ci', argv: ['make', 'ci'] }]);
+    s.driver.onRunCommand = () => ({ code: 0, out: 'passed' });
     const graph: WorkflowGraphSnapshot = {
       schemaVersion: 1,
       entryNodeKey: 'issue',
@@ -459,6 +579,23 @@ describe('工作流 issue 生命周期接线', () => {
     expect(s.engine.store.get(issue.id)!.status).toBe('merge_review');
     expect(s.engine.store.listGates(issue.id).map((gate) => gate.kind)).toEqual(['merge_review']);
     expect(s.engine.store.listEvents(issue.id).map((event) => event.kind)).toContain('workflow_completed');
+    expect(s.driver.runCalls.map((call) => call.argv)).toContainEqual(['make', 'ci']);
+    expect(s.engine.store.countEvents(issue.id, 'validation_passed')).toBe(1);
+    expect(s.engine.store.get(issue.id)?.completionReport).toMatchObject({
+      outcome: 'complete', implementation: ['code: 实现完成'],
+    });
+
+    s.db.query("UPDATE issues SET status = 'testing' WHERE id = ?").run(issue.id);
+    s.driver.onRunCommand = () => ({ code: 2, err: 'integrated workspace failed' });
+    await s.engine.tick();
+    expect(s.engine.store.get(issue.id)!.status).toBe('paused');
+    expect(s.engine.store.countEvents(issue.id, 'validation_failed')).toBe(1);
+    expect(s.engine.store.get(issue.id)?.completionReport).toMatchObject({ outcome: 'partial' });
+    s.driver.onRunCommand = () => ({ code: 0, out: 'repaired' });
+    expect(await s.engine.unblockIssue(issue.id, '已修复集成工作区，重新验证')).toMatchObject({ ok: true });
+    expect(s.engine.store.get(issue.id)?.status).toBe('merge_review');
+    expect(s.engine.store.get(issue.id)?.completionReport).toMatchObject({ outcome: 'complete' });
+    expect(s.engine.store.countEvents(issue.id, 'validation_passed')).toBe(2);
 
     s.db.query("UPDATE issues SET status = 'testing' WHERE id = ?").run(issue.id);
     s.db.query("UPDATE issue_workflows SET status = 'failed' WHERE issue_id = ?").run(issue.id);
@@ -472,6 +609,67 @@ describe('工作流 issue 生命周期接线', () => {
       deferral: 'project-busy', // #283：正常排队，不是故障
     });
   });
+});
+
+test('提交回车兜底失败后暂停并保留阶段，后续 tick 不重灌 prompt', async () => {
+  const s = await setup({ config: { directExecution: true } });
+  s.setManualReview(false);
+  const issue = await s.engine.createIssue(s.projectId, {
+    title: '检查回车提交', body: '确认注入结果', createdBy: s.admin.id,
+  });
+  expect(s.engine.store.get(issue.id)!.status).toBe('implementing');
+  await s.bindJsonl(issue.id);
+  let injections = 0;
+  s.driver.sendKeys = async () => {
+    injections++;
+    throw new InputSubmitUnconfirmedError();
+  };
+  await s.engine.tick();
+  const paused = s.engine.store.get(issue.id)!;
+  expect(paused.status).toBe('paused');
+  expect(s.engine.store.lastEnterInfo(issue.id, 'paused')?.resumeState).toBe('implementing');
+  expect(paused.convId).toBe(issue.convId);
+  expect(s.engine.store.hasInjectedSince(issue.id, 'implementing', 0)).toBe(false);
+  await s.engine.tick();
+  expect(injections).toBe(1);
+});
+
+test('#386 提交未确认时保留模块终端，同模块后续不得接管', async () => {
+  let selected: ProjectModule = { id: 12, projectId: 1, slug: 'submit-recovery', displayName: '提交恢复',
+    agent: 'codex', source: 'manual', status: 'active', conversationId: null, syncStatus: 'ready',
+    syncError: null, createdBy: 1, createdTs: 1, lastUsedTs: null };
+  const s = await setup({
+    config: { directExecution: true, resultSummaryTimeoutMs: 0 },
+    modulesFor: () => ({ resolve: async () => selected, recordIssue: async () => {} }),
+  });
+  s.setManualReview(false);
+  s.db.query(`INSERT INTO project_modules (id, project_id, slug, display_name, agent, source, created_by, created_ts)
+    VALUES (12, ?, 'submit-recovery', '提交恢复', 'codex', 'manual', ?, 1)`).run(s.projectId, s.admin.id);
+  const first = await s.engine.createIssue(s.projectId, { title: '输入现场', moduleId: 12 });
+  await s.bindJsonl(first.id);
+  const next = await s.engine.createIssue(s.projectId, { title: '后续任务', moduleId: 12 }, false);
+  let injections = 0;
+  const originalSendKeys = s.driver.sendKeys.bind(s.driver);
+  s.driver.sendKeys = async () => { injections++; throw new InputSubmitUnconfirmedError(); };
+  await s.engine.tick();
+  expect(s.engine.store.get(first.id)?.status).toBe('paused');
+  expect(s.driver.tmuxSessions.has('cc-1-m-submit-recovery')).toBe(true);
+  expect(s.engine.store.countEvents(first.id, 'module_sleep')).toBe(0);
+  expect(s.engine.store.get(next.id)?.status).toBe('pending');
+  expect(await s.engine.startIssue(next.id)).toMatchObject({ ok: false, deferral: 'project-busy' });
+  await s.engine.tick();
+  await s.engine.scheduleNext(s.projectId);
+  expect(injections).toBe(1);
+  expect(s.engine.store.get(next.id)?.status).toBe('pending');
+  expect(s.convs.currentConv(s.projectId)).toBeUndefined();
+  // 其它模块仍能运行，且切换激活会话不能杀掉保留的输入现场。
+  selected = { ...selected, id: 13, slug: 'other-module' };
+  s.db.query(`INSERT INTO project_modules (id, project_id, slug, display_name, agent, source, created_by, created_ts)
+    VALUES (13, ?, 'other-module', '其它模块', 'codex', 'manual', ?, 1)`).run(s.projectId, s.admin.id);
+  s.driver.sendKeys = originalSendKeys;
+  const other = await s.engine.createIssue(s.projectId, { title: '其它模块工作', moduleId: 13 });
+  expect(s.engine.store.get(other.id)?.status).toBe('implementing');
+  expect(s.driver.tmuxSessions.has('cc-1-m-submit-recovery')).toBe(true);
 });
 
 // ---------- 全链路 ----------
@@ -768,6 +966,28 @@ describe('testing 失败回退计数（≤3 回 implementing，超限 blocked）
     expect(recovery).not.toContain('已完成步骤');
     expect(s.engine.store.get(issue.id)!.subIndex).toBe(1);
   });
+
+  test('普通子任务推进先登记耐久注入，并用实施轮次与索引标识动作', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: '子任务注入记账' });
+    const jl = await s.bindJsonl(issue.id);
+    s.engine.store.setSubtasks(issue.id, ['第一步', '第二步']);
+    await s.engine.applyEvent(issue.id, 'plan_ready');
+    await s.engine.applyEvent(issue.id, 'plan_approved');
+    await s.engine.tick();
+
+    await s.appendOutput(jl, asst(`SUBTASK_DONE:${issue.id}`));
+    await s.engine.tick();
+
+    const row = s.db.query<{ operation_key: string; status: string }, [IssueId]>(
+      "SELECT operation_key, status FROM issue_effect_journal WHERE issue_id = ? AND operation_key LIKE 'subtask:%'",
+    ).get(issue.id);
+    expect(row).toEqual({
+      operation_key: `subtask:${s.engine.store.lastEnterEventId(issue.id, 'implementing')}:1`,
+      status: 'confirmed',
+    });
+    expect(s.driver.prompts().filter((text) => text.includes('【实施 子任务 2/2】'))).toHaveLength(1);
+  });
 });
 
 describe('默认自动流：manual_review 关闭时计划卡点自动放行', () => {
@@ -948,6 +1168,121 @@ describe('默认自动流：manual_review 关闭时计划卡点自动放行', ()
     const localHead = (await s.g(['rev-parse', 'HEAD'])).out.trim();
     const remoteHead = (await s.driver.git(origin, ['rev-parse', 'main'])).out.trim();
     expect(remoteHead).toBe(localHead);
+  });
+
+  test('commit 已写入但回执丢失：HEAD 前进后按精确 marker 和 tree 对账，不重复提交', async () => {
+    const s = await setup();
+    s.setManualReview(false);
+    const issue = await s.engine.createIssue(s.projectId, { title: '提交回执丢失', module: 'auto' });
+    await s.bindJsonl(issue.id);
+    s.engine.store.setSubtasks(issue.id, ['做完']);
+    await s.engine.applyEvent(issue.id, 'plan_ready');
+    await fsp.writeFile(path.join(s.repo, 'committed.ts'), 'export const committed = true;\n');
+    await s.engine.applyEvent(issue.id, 'impl_done');
+    const real = s.driver.git.bind(s.driver);
+    let lost = false;
+    s.driver.git = async (cwd, args) => {
+      const result = await real(cwd, args);
+      if (args[0] === 'commit' && result.code === 0 && !lost) {
+        lost = true;
+        throw new Error('commit receipt lost');
+      }
+      return result;
+    };
+    await s.engine.applyEvent(issue.id, 'tests_passed');
+    expect(s.engine.store.get(issue.id)?.status).toBe('blocked');
+    const markerKey = `git-commit:${s.engine.store.lastEnterEventId(issue.id, 'merge_review')}`;
+    expect(s.db.query<{ status: string }, [IssueId, string]>(
+      'SELECT status FROM issue_effect_journal WHERE issue_id = ? AND operation_key = ?',
+    ).get(issue.id, markerKey)?.status).toBe('uncertain');
+    await fsp.writeFile(path.join(s.repo, 'later.ts'), 'export const later = true;\n');
+    expect((await s.g(['add', '-A'])).code).toBe(0);
+    expect((await s.g(['commit', '-m', 'later work'])).code).toBe(0);
+    const before = s.driver.gitCalls.filter(({ args }) => args[0] === 'commit').length;
+    const recover = new GitDeliveryService({
+      store: s.engine.store, journal: new IssueEffectJournal(s.db),
+      driverForProject: () => s.driver, ownerUsername: () => null,
+    });
+    expect(await recover.deliverLocked(getProject(s.db, s.projectId)!, s.engine.store.get(issue.id)!,
+      { cwd: s.repo, kind: 'project', branch: null, runId: null })).toBeNull();
+    expect(s.driver.gitCalls.filter(({ args }) => args[0] === 'commit')).toHaveLength(before);
+    expect(s.db.query<{ status: string }, [IssueId, string]>(
+      'SELECT status FROM issue_effect_journal WHERE issue_id = ? AND operation_key = ?',
+    ).get(issue.id, markerKey)?.status).toBe('confirmed');
+  });
+
+  test('push 已到远端但回执丢失：通过远端 ref 对账且不二次推送', async () => {
+    const s = await setup();
+    s.setManualReview(false);
+    const origin = path.join(s.dir, 'origin-lost-receipt.git');
+    await s.driver.git(s.dir, ['init', '--bare', origin]);
+    await s.g(['remote', 'add', 'origin', origin]);
+    const issue = await s.engine.createIssue(s.projectId, { title: '推送回执丢失', module: 'auto' });
+    await s.bindJsonl(issue.id);
+    s.engine.store.setSubtasks(issue.id, ['做完']);
+    await s.engine.applyEvent(issue.id, 'plan_ready');
+    await fsp.writeFile(path.join(s.repo, 'pushed.ts'), 'export const pushed = true;\n');
+    await s.engine.applyEvent(issue.id, 'impl_done');
+    const real = s.driver.git.bind(s.driver);
+    let lost = false;
+    s.driver.git = async (cwd, args) => {
+      const result = await real(cwd, args);
+      if (args[0] === 'push' && result.code === 0 && !lost) {
+        lost = true;
+        throw new Error('push receipt lost');
+      }
+      return result;
+    };
+    await s.engine.applyEvent(issue.id, 'tests_passed');
+    expect(s.engine.store.get(issue.id)?.status).toBe('done');
+    const key = `git-push:${s.engine.store.lastEnterEventId(issue.id, 'merge_review')}`;
+    expect(s.db.query<{ status: string }, [IssueId, string]>(
+      'SELECT status FROM issue_effect_journal WHERE issue_id = ? AND operation_key = ?',
+    ).get(issue.id, key)?.status).toBe('uncertain');
+    const before = s.driver.gitCalls.filter(({ args }) => args[0] === 'push').length;
+    const recover = new GitDeliveryService({
+      store: s.engine.store, journal: new IssueEffectJournal(s.db),
+      driverForProject: () => s.driver, ownerUsername: () => null,
+    });
+    expect(await recover.deliverLocked(getProject(s.db, s.projectId)!, s.engine.store.get(issue.id)!,
+      { cwd: s.repo, kind: 'project', branch: null, runId: null })).toBeNull();
+    expect(s.driver.gitCalls.filter(({ args }) => args[0] === 'push')).toHaveLength(before);
+    expect(s.db.query<{ status: string }, [IssueId, string]>(
+      'SELECT status FROM issue_effect_journal WHERE issue_id = ? AND operation_key = ?',
+    ).get(issue.id, key)?.status).toBe('confirmed');
+  });
+
+  test('set-upstream 推送回执丢失后参数变化：仍按同一语义键对账', async () => {
+    const s = await setup();
+    const origin = path.join(s.dir, 'origin-upstream-receipt.git');
+    await s.driver.git(s.dir, ['init', '--bare', origin]);
+    await s.g(['remote', 'add', 'origin', origin]);
+    const issue = await s.engine.createIssue(s.projectId, { title: '上游回执丢失' }, false);
+    await fsp.writeFile(path.join(s.repo, 'upstream.ts'), 'export const upstream = true;\n');
+    const real = s.driver.git.bind(s.driver);
+    let lost = false;
+    s.driver.git = async (cwd, args) => {
+      const result = await real(cwd, args);
+      if (args[0] === 'push' && result.code === 0 && !lost) {
+        lost = true;
+        throw new Error('set-upstream receipt lost');
+      }
+      return result;
+    };
+    const recover = new GitDeliveryService({
+      store: s.engine.store, journal: new IssueEffectJournal(s.db),
+      driverForProject: () => s.driver, ownerUsername: () => null,
+    });
+    const workspace = { cwd: s.repo, kind: 'design-worktree' as const, branch: 'main', runId: 'test' };
+    const project = getProject(s.db, s.projectId)!;
+    expect((await recover.deliverLocked(project, s.engine.store.get(issue.id)!, workspace))?.where).toBe('auto_push');
+    expect((await s.g(['rev-parse', '--abbrev-ref', '@{upstream}'])).out.trim()).toBe('origin/main');
+    const before = s.driver.gitCalls.filter(({ args }) => args[0] === 'push').length;
+    expect(await recover.deliverLocked(project, s.engine.store.get(issue.id)!, workspace)).toBeNull();
+    expect(s.driver.gitCalls.filter(({ args }) => args[0] === 'push')).toHaveLength(before);
+    expect(s.db.query<{ status: string }, [IssueId, string]>(
+      'SELECT status FROM issue_effect_journal WHERE issue_id = ? AND operation_key = ?',
+    ).get(issue.id, 'git-push:0')?.status).toBe('confirmed');
   });
 
   // ---- #272：自动提交/推送的自愈与重试 ----
@@ -1302,7 +1637,7 @@ describe('正式模块绑定', () => {
   });
 
   test('创建写 module_id 且采用模块固定代理；只有 pending 能换模块', async () => {
-    const recorded: Array<{ moduleId: number; issueId: number; title: string; body: string | null }> = [];
+    const recorded: Array<{ moduleId: number; issueId: IssueId; title: string; body: string | null }> = [];
     let selected = mod(11, 'export-tools', 'codex');
     const s = await setup({
       modulesFor: () => ({
@@ -1519,7 +1854,7 @@ describe('正式模块绑定', () => {
       await fsp.writeFile(path.join(repo, '.claude', 'skills', name, 'SKILL.md'), `# ${name}\n`);
     }
   };
-  const mountEvent = (s: { engine: { store: { listEvents: (id: number) => Array<{ kind: string; dataJson: string | null }> } } }, issueId: number) => {
+  const mountEvent = (s: { engine: { store: { listEvents: (id: string) => Array<{ kind: string; dataJson: string | null }> } } }, issueId: IssueId) => {
     const ev = s.engine.store.listEvents(issueId).find((e) => e.kind === 'skill_visibility');
     return ev ? (JSON.parse(ev.dataJson ?? '{}') as Record<string, unknown>) : null;
   };
@@ -1725,7 +2060,7 @@ describe('正式模块绑定', () => {
     const b = await mk('乙');
     const c = await mk('丙');
     const d = await mk('丁');
-    const setStatus = (id: number, st: string) =>
+    const setStatus = (id: string, st: string) =>
       s.db.query('UPDATE issues SET status = ? WHERE id = ?').run(st, id);
     setStatus(b.id, 'done');
     setStatus(c.id, 'implementing');
@@ -1738,7 +2073,7 @@ describe('正式模块绑定', () => {
 
     setStatus(c.id, 'done');
     const r = await s.engine.mergeModules(s.projectId, [source.id], target.id);
-    expect([...r.movedIssueIds].sort((x, y) => x - y)).toEqual([a.id, b.id, c.id, d.id]);
+    expect([...r.movedIssueIds].sort(compareIssueIds)).toEqual([a.id, b.id, c.id, d.id].sort(compareIssueIds));
     expect(r.target.id).toBe(target.id);
 
     // pending 未绑会话：两列重指 + 代理翻成目标模块代理
@@ -2310,7 +2645,7 @@ describe('ISSUE_BLOCKED 哨兵 / clarifying / 手动旁路封死', () => {
   });
 
   test('unblock 的 fallback 排队通知窗口也占项目启动权：并发 start 后仍只能单 active', async () => {
-    let deferredIssueId = 0;
+    let deferredIssueId = '';
     let releaseUnblockNotify!: () => void;
     let markUnblockNotifyEntered!: () => void;
     const unblockNotifyEntered = new Promise<void>((resolve) => {
@@ -2382,12 +2717,12 @@ describe('ISSUE_BLOCKED 哨兵 / clarifying / 手动旁路封死', () => {
 });
 
 describe('止损闸触发（#274 / I-06）', () => {
-  const stopLossEvent = (s: Awaited<ReturnType<typeof setup>>, id: number) => {
+  const stopLossEvent = (s: Awaited<ReturnType<typeof setup>>, id: string) => {
     const raw = s.engine.store.listEvents(id).find((e) => e.kind === 'stop_loss_triggered')?.dataJson;
     return raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
   };
   /** 最近一次 blocked 的 transition 事件数据 */
-  const lastBlocked = (s: Awaited<ReturnType<typeof setup>>, id: number) => {
+  const lastBlocked = (s: Awaited<ReturnType<typeof setup>>, id: string) => {
     const raw = s.engine.store.listEvents(id)
       .findLast((e) => e.kind === 'transition' && (e.dataJson ?? '').includes('"to":"paused"'))?.dataJson;
     return raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
@@ -2450,7 +2785,7 @@ describe('止损闸触发（#274 / I-06）', () => {
    * 把该 issue 的 transition 事件整体回拨，造出「已经跑了很久」的现场。
    * 不能用 clock.advance：事件 ts 走的是真实 Date.now()，止损时长也必须按同一基准算。
    */
-  const backdate = (s: Awaited<ReturnType<typeof setup>>, id: number, ms: number) =>
+  const backdate = (s: Awaited<ReturnType<typeof setup>>, id: string, ms: number) =>
     s.db.query("UPDATE issue_events SET ts = ts - ? WHERE issue_id = ? AND kind = 'transition'")
       .run(ms, id);
 
@@ -2499,7 +2834,7 @@ describe('止损闸触发（#274 / I-06）', () => {
 });
 
 describe('止损恢复通道（#274 / I-06）', () => {
-  const triggered = (s: Awaited<ReturnType<typeof setup>>, id: number) =>
+  const triggered = (s: Awaited<ReturnType<typeof setup>>, id: string) =>
     s.engine.store.countEvents(id, 'stop_loss_triggered');
 
   test('确认继续：回原阶段而不是重跑，并落新锚点', async () => {
@@ -2567,7 +2902,7 @@ describe('止损计数 stopLossStats（#274 / I-06）', () => {
   /** 直接写 transition 事件：logEvent 用真实 Date.now()，时长断言需要可控时间戳 */
   const trans = (
     s: Awaited<ReturnType<typeof setup>>,
-    issueId: number,
+    issueId: IssueId,
     to: string,
     ts: number,
     extra: Record<string, unknown> = {},
@@ -2624,7 +2959,7 @@ describe('止损计数 stopLossStats（#274 / I-06）', () => {
     const issue = await s.engine.createIssue(s.projectId, { title: '锚点' });
     trans(s, issue.id, 'blocked', 100);
     trans(s, issue.id, 'implementing', 200);
-    const anchor = (s.db.query<{ m: number }, [number]>(
+    const anchor = (s.db.query<{ m: number }, [IssueId]>(
       'SELECT MAX(id) m FROM issue_events WHERE issue_id = ?',
     ).get(issue.id))!.m;
     trans(s, issue.id, 'blocked', 300);
@@ -2651,7 +2986,7 @@ describe('止损计数 stopLossStats（#274 / I-06）', () => {
     trans(s, issue.id, 'implementing', 3_000);
     s.db.query('INSERT INTO issue_events (issue_id, kind, data_json, ts) VALUES (?, ?, ?, ?)')
       .run(issue.id, 'stop_loss_resumed', '{}', 3_000);
-    const anchor = (s.db.query<{ m: number }, [number]>(
+    const anchor = (s.db.query<{ m: number }, [IssueId]>(
       'SELECT MAX(id) m FROM issue_events WHERE issue_id = ?',
     ).get(issue.id))!.m;
 
@@ -2675,7 +3010,7 @@ describe('止损计数 stopLossStats（#274 / I-06）', () => {
 });
 
 describe('催办退避与封顶（#273 / B-03）', () => {
-  const nudges = (s: Awaited<ReturnType<typeof setup>>, id: number) =>
+  const nudges = (s: Awaited<ReturnType<typeof setup>>, id: string) =>
     s.engine.store.countEvents(id, 'nudged');
 
   /**
@@ -3097,7 +3432,8 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
     await engine.applyEvent(issue.id, 'plan_ready');
     await engine.applyEvent(issue.id, 'plan_approved');
     // pane 保持空（无 ❯/╭─）：即使注入后零增长也不该 reclaim——真会话可能根本没起来
-    await engine.tick(); // kickoff（ccReady 靠 jsonl 存在）
+    s.driver.pane = '';
+    await engine.tick(); // 无真实输入行，不 kickoff
     clock.advance(181_000);
     await engine.tick(); // nudge
     clock.advance(61_000);
@@ -3118,7 +3454,7 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
     st.logEvent(issue.id, 'judged', { stage: 'planning', result: 'done' });
     expect(st.consecutiveJudgedDone(issue.id, 0)).toBe(1);
     // 锚点在最后一条 done 之后 → 不计更早的
-    const maxId = (s.db.query<{ m: number }, [number]>(
+    const maxId = (s.db.query<{ m: number }, [IssueId]>(
       'SELECT MAX(id) m FROM issue_events WHERE issue_id = ?',
     ).get(issue.id))!.m;
     expect(st.consecutiveJudgedDone(issue.id, maxId)).toBe(0);
@@ -3144,7 +3480,7 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
     expect(st.consecutiveJudged(issue.id, 0)).toEqual({ result: 'clarify', streak: 1 });
 
     // 锚点截断：人工介入之后从头数
-    const maxId = (s.db.query<{ m: number }, [number]>(
+    const maxId = (s.db.query<{ m: number }, [IssueId]>(
       'SELECT MAX(id) m FROM issue_events WHERE issue_id = ?',
     ).get(issue.id))!.m;
     expect(st.consecutiveJudged(issue.id, maxId)).toEqual({ result: null, streak: 0 });
@@ -3384,7 +3720,7 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
   /** 驱动中的 issue：kickoff 已发，静默到该催办的时刻——此后每 tick 都会想注入点什么 */
   async function drivingIssue(title: string): Promise<{
     s: Awaited<ReturnType<typeof setup>>;
-    issueId: number;
+    issueId: IssueId;
     convId: string;
     session: string;
   }> {
@@ -3500,7 +3836,7 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
     await engine.tick();
     expect(s.driver.listCalls).toBeGreaterThan(0); // 可疑 → 花了一次核对
     expect(engine.store.countEvents(issueId, 'agent_down')).toBe(0);
-    expect(engine.store.countEvents(issueId, 'nudged')).toBe(1); // 照常催办
+    expect(engine.store.countEvents(issueId, 'nudged')).toBe(0); // 活着但正忙，无输入区时不盲发
   });
 
   test('拿不到前台命令且屏面说不清 → unknown，保守不动（issue #97）', async () => {
@@ -3510,7 +3846,7 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
     clock.advance(181_000);
     await engine.tick();
     expect(engine.store.countEvents(issueId, 'agent_down')).toBe(0);
-    expect(engine.store.countEvents(issueId, 'nudged')).toBe(1);
+    expect(engine.store.countEvents(issueId, 'nudged')).toBe(0); // 证据不足且无输入区，保守不发
   });
 
   test('重启必须无条件：换成 activate 那种「会话还在就短路」修不好这种壳（issue #97）', async () => {
@@ -3671,7 +4007,7 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
   });
 
   test('planning 判 done 死循环出口：前两次注入重输出指令并允许再催，第三次转 blocked', async () => {
-    const s = await setup();
+    const s = await setup({ config: { sessionStaleMs: 0 } });
     const { engine, clock } = s;
     const issue = await engine.createIssue(s.projectId, { title: '规划死循环' });
     const jl = await s.bindJsonl(issue.id);
@@ -3773,7 +4109,7 @@ describe('三级完成判定：nudge(180s) → PM 保守判(360s)；limit 与解
     expect(stuck.kind).toBe('choice_waiting');
     expect(engine.store.get(issue.id)!.status).not.toBe('blocked');
     // 菜单消失后恢复 kickoff
-    s.driver.pane = '';
+    s.driver.pane = '❯ ';
     await engine.tick();
     expect(s.driver.prompts().length).toBeGreaterThan(before);
   });
@@ -3990,18 +4326,127 @@ describe('I3 activate 与注入互斥（project→tmux 嵌套锁）', () => {
 });
 
 describe('I4 kickoff 就绪真检测', () => {
-  test('jsonl 未落地且无输入框特征 → 不 kickoff；jsonl 落地后 kickoff', async () => {
+  test('旧 jsonl 已存在但输入行未出现 → 不 kickoff；输入行出现后才投递', async () => {
     const s = await setup();
     const issue = await s.engine.createIssue(s.projectId, { title: '等就绪' });
+    s.driver.pane = '';
     await s.engine.tick(); // 未就绪（locate=null，pane 空）
     expect(s.driver.prompts().length).toBe(0);
 
-    await s.bindJsonl(issue.id); // jsonl 落地 = CC 已启动
+    await s.bindJsonl(issue.id);
+    s.driver.pane = 'OpenAI Codex\nLoading session…';
+    await s.engine.tick();
+    expect(s.driver.prompts().length).toBe(0);
+
+    s.driver.pane = '❯ ';
     await s.engine.tick();
     expect(s.driver.prompts().some((t) => t.includes('SUBTASKS_BEGIN'))).toBe(true);
   });
 
-  test('pane 出现 CC 输入框特征（❯/╭─）即视为就绪（jsonl 尚未定位到也 kickoff）', async () => {
+  test('Codex --resume 冷启动仍是原生 bash 时零注入，composer 出现后只投递一次', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: 'Codex 冷启动', agent: 'codex' });
+    await s.bindJsonl(issue.id); // 模拟历史 rollout 已存在
+    const session = s.convs.tmuxName(s.projectId, s.engine.store.get(issue.id)!.convId);
+    s.driver.pane = `[root@VM repo]# codex resume ${s.engine.store.get(issue.id)!.convId}\n[root@VM repo]#`;
+    s.driver.paneCommands.set(session, 'bash');
+
+    const before = s.driver.prompts().length;
+    await s.engine.tick();
+    expect(s.driver.prompts()).toHaveLength(before);
+
+    s.driver.pane = '╭─ OpenAI Codex ─╮\n›\n  gpt-5.6-sol · ~/repo';
+    s.driver.paneCommands.set(session, 'codex');
+    await s.engine.tick();
+    await s.engine.tick();
+    expect(s.driver.prompts().filter((text) => text.includes('SUBTASKS_BEGIN'))).toHaveLength(1);
+  });
+
+  test('子任务完成先于 composer 重绘时延后接力，输入行恢复后幂等补发', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: '顺序接力' });
+    await s.bindJsonl(issue.id);
+    s.engine.store.setSubtasks(issue.id, ['第一个子任务', '第二个子任务']);
+    await s.engine.applyEvent(issue.id, 'plan_ready');
+    const gate = s.engine.store.listGates(issue.id).find((item) => item.kind === 'plan')!;
+    await s.engine.decideGate(gate.id, s.admin.id, 'approve');
+    await s.engine.tick();
+    const session = s.convs.tmuxName(s.projectId, s.engine.store.get(issue.id)!.convId);
+    const before = s.driver.prompts().filter((text) => text.includes('第二个子任务')).length;
+
+    await s.engine.ingest(issue.id, [{ seq: 1, role: 'assistant', text: `SUBTASK_DONE:${issue.id}` }], null, session, false);
+    expect(s.engine.store.get(issue.id)!.subIndex).toBe(1);
+    expect(s.driver.prompts().filter((text) => text.includes('第二个子任务'))).toHaveLength(before);
+
+    await s.engine.tick();
+    await s.engine.tick();
+    expect(s.driver.prompts().filter((text) => text.includes('第二个子任务'))).toHaveLength(before + 1);
+  });
+
+  test('合并后的澄清与延后接力始终使用项目绑定的执行器', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: '项目执行器隔离' });
+    await s.bindJsonl(issue.id);
+    s.engine.store.setSubtasks(issue.id, ['第一步', '项目执行器的第二步']);
+    await s.engine.applyEvent(issue.id, 'plan_ready');
+    const gate = s.engine.store.listGates(issue.id).find((item) => item.kind === 'plan')!;
+    await s.engine.decideGate(gate.id, s.admin.id, 'approve');
+    await s.engine.tick();
+
+    let fallbackCalls = 0;
+    const fallback = new FakeDriver();
+    fallback.capturePane = async () => { fallbackCalls++; return ''; };
+    fallback.sendKeys = async () => { fallbackCalls++; throw new Error('wrong executor'); };
+    const engine = new IssueEngine({
+      db: s.db,
+      driver: fallback,
+      locator: { locate: async () => { fallbackCalls++; return null; } },
+      convs: s.convs,
+      executionForProject: (project) => {
+        expect(project.id).toBe(s.projectId);
+        return { driver: s.driver, locator: s.locator };
+      },
+      pmFor: () => s.pm,
+      notify: { dispatch: async () => {} },
+      mutex: s.mutex,
+      config: { directExecution: false, kickoffMinBootMs: 0, now: s.clock.now, resultSummaryTimeoutMs: 0 },
+    });
+    cleanups.push(() => engine.stop());
+    expect((await engine.clarify(issue.id, '保留项目执行器')).ok).toBe(true);
+    const session = s.convs.tmuxName(s.projectId, engine.store.get(issue.id)!.convId);
+    expect(s.driver.sent.some((item) => item.session === session && item.text === '【澄清答复】保留项目执行器')).toBe(true);
+
+    await engine.ingest(issue.id, [{ seq: 1, role: 'assistant', text: `SUBTASK_DONE:${issue.id}` }], null, session, false);
+    expect(engine.store.get(issue.id)!.subIndex).toBe(1);
+    await engine.tick();
+    await engine.tick();
+    expect(s.driver.prompts().filter((text) => text.includes('项目执行器的第二步'))).toHaveLength(1);
+    expect(fallbackCalls).toBe(0);
+  });
+
+  test('完成报告补发在输入区未就绪时留待后续 tick，不把报告指令发给 shell', async () => {
+    const s = await setup({ config: { directExecution: true, resultSummaryTimeoutMs: 1 } });
+    s.setManualReview(false);
+    const issue = await s.engine.createIssue(s.projectId, { title: '报告补发', agent: 'codex' });
+    const jl = await s.bindJsonl(issue.id);
+    s.driver.pane = '╭─ OpenAI Codex ─╮\n›';
+    await s.engine.tick();
+    const attempt = s.engine.store.lastEnterEventId(issue.id, 'implementing');
+    s.driver.pane = 'Starting Codex…';
+    await s.appendOutput(jl, asst(`ISSUE_READY:${issue.id}:${attempt}`));
+    const before = s.driver.prompts().length;
+    await s.engine.tick();
+    expect(s.engine.store.countEvents(issue.id, 'completion_report_deferred')).toBe(1);
+    expect(s.engine.store.countEvents(issue.id, 'completion_report_retry')).toBe(0);
+    expect(s.driver.prompts()).toHaveLength(before);
+
+    s.driver.pane = '╭─ OpenAI Codex ─╮\n›';
+    await s.engine.tick();
+    expect(s.engine.store.countEvents(issue.id, 'completion_report_retry')).toBe(1);
+    expect(s.driver.prompts().length).toBe(before + 1);
+  });
+
+  test('pane 出现真实 CC 输入行即视为就绪（jsonl 尚未定位到也 kickoff）', async () => {
     const s = await setup();
     await s.engine.createIssue(s.projectId, { title: '看屏就绪' });
     s.driver.pane = '╭───────────────╮\n│ ❯ 试试 "fix lint errors" │\n╰───────────────╯';
@@ -4009,9 +4454,10 @@ describe('I4 kickoff 就绪真检测', () => {
     expect(s.driver.prompts().some((t) => t.includes('SUBTASKS_BEGIN'))).toBe(true);
   });
 
-  test('超时（默认 120s）仍未就绪 → block（note: CC 启动超时）', async () => {
+  test('超时（默认 120s）仍未就绪 → paused（note: CC 启动超时）', async () => {
     const s = await setup();
     const issue = await s.engine.createIssue(s.projectId, { title: '起不来' });
+    s.driver.pane = '';
     await s.engine.tick();
     expect(s.engine.store.get(issue.id)!.status).toBe('planning'); // 未超时先等
     s.clock.advance(121_000);
@@ -4360,7 +4806,7 @@ describe('规划前的 git 身份预检（#272 / B-01）', () => {
     };
   }
 
-  const identityEvent = (s: Awaited<ReturnType<typeof setup>>, issueId: number) => {
+  const identityEvent = (s: Awaited<ReturnType<typeof setup>>, issueId: IssueId) => {
     const raw = s.engine.store.listEvents(issueId).find((e) => e.kind === 'git_identity')?.dataJson;
     return raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
   };
@@ -5160,7 +5606,7 @@ describe('同模块智能合并（调度前 LLM 归并）', () => {
     // 快照：含宿主自己那条，字段齐全（拆回全靠它）
     const merged = engine.store.listEvents(b.id).find((e) => e.kind === 'tasks_merged')!;
     const data = JSON.parse(merged.dataJson!) as {
-      snapshot: Array<{ id: number; title: string; body: string; clarifyFeedback: string | null }>;
+      snapshot: Array<{ id: string; title: string; body: string; clarifyFeedback: string | null }>;
     };
     expect(data.snapshot.map((x) => x.id).sort()).toEqual([b.id, c.id].sort());
     const hostSnap = data.snapshot.find((x) => x.id === b.id)!;
@@ -5190,7 +5636,7 @@ describe('同模块智能合并（调度前 LLM 归并）', () => {
     expect(host.body).toContain('见 tasks_merged 事件快照');
     // 快照不受正文上限影响：拆回要的是全文
     const merged = engine.store.listEvents(b.id).find((e) => e.kind === 'tasks_merged')!;
-    const data = JSON.parse(merged.dataJson!) as { snapshot: Array<{ id: number; body: string }> };
+    const data = JSON.parse(merged.dataJson!) as { snapshot: Array<{ id: string; body: string }> };
     expect(data.snapshot.find((x) => x.id === c.id)!.body).toBe(long);
   });
 
@@ -5246,7 +5692,7 @@ describe('同模块智能合并（调度前 LLM 归并）', () => {
     // 没有合并记录的普通 issue 同样拒绝
     const plain = await engine.createIssue(s.projectId, { title: 'P' }, false);
     expect(await engine.unmergeIssues(plain.id)).toMatchObject({ ok: false });
-    expect(await engine.unmergeIssues(999999)).toMatchObject({ ok: false, error: '无此 issue' });
+    expect(await engine.unmergeIssues('999999')).toMatchObject({ ok: false, error: '无此 issue' });
   });
 
   test('拆回一次之后不再重复拆（否则会把手工改过的正文又覆盖回旧快照）', async () => {
@@ -5422,7 +5868,7 @@ describe('同模块智能合并（调度前 LLM 归并）', () => {
   });
 
   test('自动合并落地期间串行 pending Git 编辑，不能在重验后改出跨分支合并', async () => {
-    let foldedId = 0;
+    let foldedId = '';
     let markFoldNotify!: () => void;
     const foldNotify = new Promise<void>((resolve) => {
       markFoldNotify = resolve;
@@ -5483,7 +5929,7 @@ describe('同模块智能合并（调度前 LLM 归并）', () => {
   });
 
   test('三成员自动合并取消途中并发 start 不形成 issue-meta/transition 锁反转', async () => {
-    let pausedId = 0;
+    let pausedId = '';
     let markPaused!: () => void;
     const paused = new Promise<void>((resolve) => {
       markPaused = resolve;
@@ -5842,6 +6288,108 @@ describe('执行中澄清：NEED_CLARIFY 检测 + 停催停判 + 超时自动继
   });
 });
 
+describe('澄清锁内守卫与停机屏障', () => {
+  // 观察真实 mutex 入队，不能只在 authorize 中挂起：后者测不到锁外检查的竞态。
+  async function holdTmux(mutex: KeyedMutex, session: string) {
+    let unlock!: () => void;
+    let entered!: () => void;
+    let queued!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const queuedPromise = new Promise<void>((resolve) => { queued = resolve; });
+    const gate = new Promise<void>((resolve) => { unlock = resolve; });
+    const key = tmuxLockKey(session);
+    const held = mutex.runExclusive(key, async () => { entered(); await gate; });
+    await enteredPromise;
+    const original = mutex.runExclusive;
+    mutex.runExclusive = <T>(nextKey: string, fn: () => T | Promise<T>): Promise<T> => {
+      const result = original.call(mutex, nextKey, fn) as Promise<T>;
+      if (nextKey === key) queued();
+      return result;
+    };
+    return {
+      queued: queuedPromise,
+      async release() { mutex.runExclusive = original; unlock(); await held; },
+    };
+  }
+
+  async function awaitingAnswer(shell = false) {
+    const s = await setup();
+    const issue = await s.engine.createIssue(s.projectId, { title: '锁等待期间答复失效' });
+    await s.bindJsonl(issue.id);
+    await s.engine.tick();
+    s.engine.store.logEvent(issue.id, 'clarify_questions', { questions: ['选择哪个库？'], source: 'exec', stage: 'planning' });
+    const questionId = s.engine.store.lastEventId(issue.id, 'clarify_questions');
+    const convId = s.engine.store.get(issue.id)!.convId!;
+    const session = s.convs.tmuxName(s.projectId, convId);
+    s.driver.paneCommands.set(session, shell ? 'bash' : 'claude');
+    if (shell) { s.driver.pane = '[root@VM p]#'; s.clock.advance(61_000); }
+    return { ...s, issue, questionId, session };
+  }
+
+  for (const shell of [false, true]) {
+    for (const change of ['authorization', 'conversation', 'status'] as const) {
+      test(`澄清锁内守卫：${shell ? 'shell 重启' : '答复注入'}等待时 ${change} 改变，不发送或启动`, async () => {
+        const s = await awaitingAnswer(shell);
+        const held = await holdTmux(s.mutex, s.session);
+        let authorized = true;
+        let checks = 0;
+        const revoked = new Error('test authorization revoked');
+        const sentBefore = [...s.driver.sent];
+        const keysBefore = [...s.driver.keys];
+        const sessionsBefore = [...s.driver.tmuxSessions];
+        const delivery = s.engine.clarify(s.issue.id, '使用 fetch', {
+          questionId: s.questionId, requestKey: `lock-${shell}-${change}`, actorUserId: s.admin.id,
+          authorize() { checks++; if (!authorized) throw revoked; },
+        }).then((result) => ({ result, error: null }), (error: unknown) => ({ result: null, error }));
+        try {
+          await held.queued;
+          const checksBefore = checks;
+          expect(checksBefore).toBeGreaterThan(0);
+          if (change === 'authorization') authorized = false;
+          else if (change === 'conversation') s.engine.store.setConv(s.issue.id, s.convs.create(s.projectId, '替代会话').id);
+          else s.db.query("UPDATE issues SET status = 'paused' WHERE id = ?").run(s.issue.id);
+          await held.release();
+          const outcome = await delivery;
+          expect(checks).toBeGreaterThan(checksBefore);
+          if (change === 'authorization') expect(outcome.error).toBe(revoked);
+          else expect(outcome.result).toEqual({ ok: false, error: 'clarification_not_delivered' });
+          expect(s.driver.sent).toEqual(sentBefore);
+          expect(s.driver.keys).toEqual(keysBefore);
+          expect([...s.driver.tmuxSessions]).toEqual(sessionsBefore);
+          expect(s.engine.store.countEvents(s.issue.id, 'clarified')).toBe(0);
+          expect(s.engine.store.countEvents(s.issue.id, 'clarification_delivery_rejected')).toBe(1);
+          expect(s.engine.store.clarifyPendingOf(s.issue.id)).toBe(true);
+          expect(s.db.query("SELECT COUNT(*) AS count FROM issue_effect_journal WHERE issue_id = ? AND operation_key LIKE 'clarify-answer:%'").get(s.issue.id)).toEqual({ count: 0 });
+        } finally { await held.release(); await delivery; }
+      });
+    }
+  }
+
+  test('澄清锁内守卫：stop 等待锁中 delivery 归还且拒绝新答复', async () => {
+    const s = await awaitingAnswer();
+    const held = await holdTmux(s.mutex, s.session);
+    const sentBefore = [...s.driver.sent];
+    const delivery = s.engine.clarify(s.issue.id, '使用 fetch', {
+      questionId: s.questionId, requestKey: 'stop-delivery', actorUserId: s.admin.id,
+    });
+    let stopped = false;
+    let stopping: Promise<void> | undefined;
+    try {
+      await held.queued;
+      stopping = s.engine.stop().then(() => { stopped = true; });
+      await flushMicrotasks();
+      expect(stopped).toBe(false);
+      expect(await s.engine.clarify(s.issue.id, '不能新增')).toEqual({ ok: false, error: 'clarification_delivery_stopped' });
+      await held.release();
+      expect(await delivery).toEqual({ ok: false, error: 'clarification_not_delivered' });
+      await stopping;
+      expect(stopped).toBe(true);
+      expect(s.driver.sent).toEqual(sentBefore);
+      expect(s.engine.store.countEvents(s.issue.id, 'clarified')).toBe(0);
+    } finally { await held.release(); await delivery; await stopping; }
+  });
+});
+
 describe('创建时澄清：后台分析不占队列不改状态', () => {
   /** 可编程澄清 stub：记录调用、并发峰值，支持 gate 挂起（竞态测试用） */
   function mkClarify() {
@@ -5880,6 +6428,39 @@ describe('创建时澄清：后台分析不占队列不改状态', () => {
       await new Promise((r) => setTimeout(r, 2));
     }
   }
+
+  test('澄清停机屏障：pending 答复派生分析完成前 stop 不归还，排队分析不再启动', async () => {
+    const clar = mkClarify();
+    const s = await setup({ clarify: clar.fn });
+    await s.engine.createIssue(s.projectId, { title: '占住项目' });
+    const pending = await s.engine.createIssue(s.projectId, { title: '等待补充的需求' });
+    await s.engine.waitClarify();
+    let release!: () => void;
+    clar.gate = new Promise<void>((resolve) => { release = resolve; });
+    const answer = await s.engine.clarify(pending.id, '补充约束', {
+      questionId: s.engine.store.lastEventId(pending.id, 'clarify_questions'),
+      requestKey: 'derived-analysis', actorUserId: s.admin.id,
+    });
+    expect(answer).toMatchObject({ ok: true, from: 'pending', to: 'pending' });
+    await untilCalls(clar, 2);
+    expect(clar.inflight).toBe(1);
+    s.engine.scheduleClarify(pending.id); // 在正在执行的派生分析后再排一项。
+    let stopped = false;
+    const stopping = s.engine.stop().then(() => { stopped = true; });
+    try {
+      await flushMicrotasks();
+      expect(stopped).toBe(false);
+      expect(clar.inflight).toBe(1);
+      s.engine.scheduleClarify(pending.id); // 停机后连新队列项也不得产生。
+      release();
+      await stopping;
+      expect(stopped).toBe(true);
+      expect(clar.inflight).toBe(0);
+      expect(clar.calls).toHaveLength(2);
+      expect(clar.calls[1]!.input.body).toContain('补充约束');
+      expect(s.engine.store.countEvents(pending.id, 'clarify_done')).toBe(2);
+    } finally { release(); await stopping; }
+  });
 
   test('排队中的 issue 触发分析：反馈落库 + clarify_questions 事件 + 通知；状态仍 pending', async () => {
     const clar = mkClarify();
@@ -6014,7 +6595,7 @@ describe('创建时澄清：后台分析不占队列不改状态', () => {
   // 故障必须自己喊出来。
   describe('创建时澄清成功率告警', () => {
     /** 直接往事件表里造历史终局，避免为了凑窗口跑十几次分析 */
-    const seed = (s: Awaited<ReturnType<typeof setup>>, issueId: number, outcomes: Array<'ok' | 'fail'>) => {
+    const seed = (s: Awaited<ReturnType<typeof setup>>, issueId: IssueId, outcomes: Array<'ok' | 'fail'>) => {
       for (const o of outcomes) {
         if (o === 'ok') s.engine.store.logEvent(issueId, 'clarify_done', { questions: 0 });
         else s.engine.store.logEvent(issueId, 'error', { where: 'clarify', reason: 'timeout' });
@@ -6392,7 +6973,7 @@ describe('start() 恢复扫描：被重启打断的创建时澄清', () => {
     await fsp.writeFile(path.join(aScratch, 'task.md'), 'x');
 
     // 重启后进程：同 DB 新引擎实例，带 clarify 依赖，start() 触发恢复扫描
-    const calls: number[] = [];
+    const calls: string[] = [];
     const engine2 = new IssueEngine({
       db: s.db,
       driver: s.driver,
@@ -6451,7 +7032,7 @@ describe('模块知识增量：segment 结束时由引擎确定性写入（#277 
     source: 'manual', status: 'active', conversationId: null,
     syncStatus: 'ready', syncError: null, createdBy: 1, createdTs: 1, lastUsedTs: null,
   };
-  type Entry = { issueId: number; status: string; title: string; note?: string };
+  type Entry = { issueId: IssueId; status: string; title: string; note?: string };
 
   /** 建一条已绑模块、已开 segment 的 issue，返回收到的知识条目数组 */
   const withModule = async (opts: { fail?: boolean } = {}) => {
@@ -6512,6 +7093,26 @@ describe('模块知识增量：segment 结束时由引擎确定性写入（#277 
     expect(written[0]!.note).toContain('缺少凭据');
   });
 
+  test('受阻后恢复原会话补开分段，继续阶段流转不重复开段', async () => {
+    const { s } = await withModule();
+    s.setManualReview(false);
+    const issue = await startWithModule(s, '恢复对话可见性');
+    const bound = s.engine.store.get(issue.id)!;
+    await s.engine.applyEvent(issue.id, 'block', { note: '等待补充资料' });
+    expect(s.engine.store.countEvents(issue.id, 'conversation_segment_ended')).toBe(1);
+    expect((await s.engine.unblockIssue(issue.id, '资料已补充，继续')).ok).toBe(true);
+    const resumed = s.engine.store.get(issue.id)!;
+    expect(resumed.status).toBe('planning');
+    expect(resumed.convId).toBe(bound.convId);
+    const starts = s.engine.store.listEvents(issue.id).filter(event => event.kind === 'conversation_segment_started');
+    expect(starts).toHaveLength(2);
+    expect(JSON.parse(starts[1]!.dataJson!)).toMatchObject({ convId: bound.convId, moduleId: 31, agent: bound.agent });
+    s.engine.store.setSubtasks(issue.id, ['继续实现']);
+    await s.engine.applyEvent(issue.id, 'plan_ready');
+    expect(s.engine.store.get(issue.id)!.status).toBe('implementing');
+    expect(s.engine.store.countEvents(issue.id, 'conversation_segment_started')).toBe(2);
+  });
+
   test('cancelled 不写：「这版不做了」沉淀进模块知识只会误导下一条', async () => {
     const { s, written } = await withModule();
     const issue = await startWithModule(s, '不做了');
@@ -6546,7 +7147,7 @@ describe('模块知识增量：segment 结束时由引擎确定性写入（#277 
 
 describe('收尾摘要：确定性拼装（#275 / I-05）', () => {
   /** 最近一次进入 blocked 的 transition note（issues.note 不由 applyEvent 写） */
-  const blockedNote = (s: Awaited<ReturnType<typeof setup>>, id: number) => {
+  const blockedNote = (s: Awaited<ReturnType<typeof setup>>, id: string) => {
     const raw = s.engine.store.listEvents(id)
       .findLast((e) => e.kind === 'transition' && (e.dataJson ?? '').includes('"to":"blocked"'))?.dataJson;
     return raw ? String((JSON.parse(raw) as { note?: string }).note ?? '') : '';
@@ -6554,7 +7155,7 @@ describe('收尾摘要：确定性拼装（#275 / I-05）', () => {
   /** 跑到 blocked 并返回摘要文本 */
   const blockAndRead = async (
     s: Awaited<ReturnType<typeof setup>>,
-    issueId: number,
+    issueId: IssueId,
     note: string,
   ) => {
     await s.engine.applyEvent(issueId, 'block', { note });
@@ -6825,7 +7426,7 @@ describe('reopenIssue：取消的 issue 改完需求重新运行', () => {
 
   test('cancelled 可直接复活；done 必须附带继续处理说明', async () => {
     const s = await setup();
-    expect((await s.engine.reopenIssue(9999)).ok).toBe(false);
+    expect((await s.engine.reopenIssue('9999')).ok).toBe(false);
 
     const a = await s.engine.createIssue(s.projectId, { title: '待办的', module: 'm' });
     // 建完即开跑（全自动流），先断言非 cancelled 一律被拒
@@ -7599,7 +8200,7 @@ describe('门禁在会话外跑（#279 / I-03）', () => {
     expect(s.engine.store.get(issue.id)!.status).toBe('testing');
     return { issue, jl };
   };
-  const evt = (s: Awaited<ReturnType<typeof setup>>, id: number, kind: string) =>
+  const evt = (s: Awaited<ReturnType<typeof setup>>, id: string, kind: string) =>
     s.engine.store.listEvents(id).find((e) => e.kind === kind);
 
   test('通过：STAGE_DONE 之后引擎跑门禁，全绿才 tests_passed', async () => {
@@ -7659,6 +8260,42 @@ describe('门禁在会话外跑（#279 / I-03）', () => {
 
     expect(s.driver.runCalls).toHaveLength(0);
     expect(evt(s, issue.id, 'validation_skipped')?.dataJson).toContain('no-commands');
+    expect(['merge_review', 'merging', 'done']).toContain(s.engine.store.get(issue.id)!.status);
+  });
+
+  test('required 项目缺少门禁命令时暂停，不能记录 tests_passed', async () => {
+    const s = await setup({ config: { validationTimeoutMs: 60_000 } });
+    const { issue, jl } = await atTesting(s);
+    s.db.query("UPDATE projects SET validation_policy = 'required' WHERE id = ?").run(s.projectId);
+    await s.appendOutput(jl, asst(`STAGE_DONE:${issue.id}:testing`));
+    await s.engine.tick();
+
+    expect(s.engine.store.get(issue.id)!.status).toBe('paused');
+    expect(evt(s, issue.id, 'validation_error')?.dataJson).toContain('required-no-commands');
+    expect(evt(s, issue.id, 'tests_passed')).toBeUndefined();
+  });
+
+  test('required 项目在门禁执行被关闭时仍不得自动完成', async () => {
+    const s = await setup({ config: { validationTimeoutMs: 0 } });
+    const { issue, jl } = await atTesting(s, { scripts: { test: 'bun test' } });
+    s.db.query("UPDATE projects SET validation_policy = 'required' WHERE id = ?").run(s.projectId);
+    await s.appendOutput(jl, asst(`STAGE_DONE:${issue.id}:testing`));
+    await s.engine.tick();
+
+    expect(s.engine.store.get(issue.id)!.status).toBe('paused');
+    expect(evt(s, issue.id, 'validation_error')?.dataJson).toContain('required-gate-disabled');
+    expect(evt(s, issue.id, 'tests_passed')).toBeUndefined();
+  });
+
+  test('none 项目明确豁免验证并记录原因', async () => {
+    const s = await setup({ config: { validationTimeoutMs: 60_000 } });
+    const { issue, jl } = await atTesting(s, { scripts: { test: 'bun test' } });
+    s.db.query("UPDATE projects SET validation_policy = 'none' WHERE id = ?").run(s.projectId);
+    await s.appendOutput(jl, asst(`STAGE_DONE:${issue.id}:testing`));
+    await s.engine.tick();
+
+    expect(s.driver.runCalls).toHaveLength(0);
+    expect(evt(s, issue.id, 'validation_skipped')?.dataJson).toContain('policy-none');
     expect(['merge_review', 'merging', 'done']).toContain(s.engine.store.get(issue.id)!.status);
   });
 
@@ -7782,7 +8419,7 @@ describe('issue 成本视图数据（#282 / I-08）', () => {
 });
 
 describe('调度事件降噪与来源标记（#283 / B-10）', () => {
-  const eventsOf = (s: Awaited<ReturnType<typeof setup>>, id: number, kind: string) =>
+  const eventsOf = (s: Awaited<ReturnType<typeof setup>>, id: string, kind: string) =>
     s.engine.store.listEvents(id).filter((e) => e.kind === kind);
 
   test('项目忙时踢接力：既不落 error，也不落 deferred（pickNext 早就短路了）', async () => {
@@ -7805,7 +8442,7 @@ describe('调度事件降噪与来源标记（#283 / B-10）', () => {
     const queued = await s.engine.createIssue(s.projectId, { title: '排队的' });
 
     expect(await s.engine.startIssue(queued.id)).toMatchObject({ ok: false, deferral: 'project-busy' });
-    expect(await s.engine.startIssue(999999)).toMatchObject({ ok: false, deferral: 'issue-gone' });
+    expect(await s.engine.startIssue('999999')).toMatchObject({ ok: false, deferral: 'issue-gone' });
     // 已经在跑的再开一次 = 被抢先，同样是正常竞态
     const running = s.engine.store.listByProject(s.projectId).find((i) => i.status === 'planning')!;
     expect(await s.engine.startIssue(running.id)).toMatchObject({ ok: false, deferral: 'not-pending' });
@@ -7893,7 +8530,7 @@ describe('受阻解除自动排队（#283 / B-10）', () => {
     expect(s.engine.store.get(blocked.id)!.status).toBe('blocked');
     return { s, blocked, running };
   };
-  const kinds = (s: Awaited<ReturnType<typeof setup>>, id: number) =>
+  const kinds = (s: Awaited<ReturnType<typeof setup>>, id: string) =>
     s.engine.store.listEvents(id).map((e) => e.kind);
 
   test('项目忙时不再拒绝：落 unblock_requested 并返回 queued', async () => {
@@ -8008,7 +8645,7 @@ describe('受阻解除自动排队（#283 / B-10）', () => {
     const { s, blocked, running } = await busyWithBlocked();
     expect(await s.engine.unblockIssue(blocked.id, '   ')).toMatchObject({ ok: false });
     expect(await s.engine.unblockIssue(running.id, '在跑的不能解除')).toMatchObject({ ok: false });
-    expect(await s.engine.unblockIssue(999999, 'x')).toMatchObject({ ok: false });
+    expect(await s.engine.unblockIssue('999999', 'x')).toMatchObject({ ok: false });
   });
 });
 
@@ -8064,6 +8701,57 @@ describe('direct execution contract', () => {
     const manual = await s.engine.createIssue(s.projectId, { title: '手动评审', executionMode: 'direct' }, false);
     expect(manual.executionMode).toBe('planned');
   });
+  test('#386 换行规划理由、错误诊断、重复报告和后续阶段接续', async () => {
+    const s = await setup({ config: { directExecution: true, resultSummaryTimeoutMs: 0 } });
+    s.setManualReview(false);
+    const issue = await s.engine.createIssue(s.projectId, { title: '规划接续回归' });
+    const jl = await s.bindJsonl(issue.id);
+    await s.engine.tick();
+    const attempt = s.engine.store.lastEnterEventId(issue.id, 'implementing');
+    for (const text of [`NEED_PLAN:${issue.id}:${attempt - 1} 旧轮次`,
+      `NEED_PLAN:999999:${attempt} 其他任务`, `NEED_PLAN:${issue.id}:${attempt}`]) {
+      await s.appendOutput(jl, asst(text));
+      await s.engine.tick();
+      expect(s.engine.store.get(issue.id)?.status).toBe('implementing');
+    }
+    expect(s.engine.store.listEvents(issue.id).filter(e => e.kind === 'error' &&
+      JSON.parse(e.dataJson!).where === 'need-plan')).toHaveLength(3);
+    const plan = `NEED_PLAN:${issue.id}:${attempt}\n\n需要确定迁移边界`;
+    await s.appendOutput(jl, asst(plan));
+    await s.engine.tick();
+    expect(s.engine.store.get(issue.id)).toMatchObject({ status: 'planning', executionMode: 'planned' });
+    await s.engine.tick();
+    const count = s.driver.sent.length;
+    await s.appendOutput(jl, asst(plan));
+    await s.engine.tick();
+    expect(s.driver.sent.length).toBe(count);
+    await s.appendOutput(jl, asst('SUBTASKS_BEGIN\n1. 完成端到端修复及验证\nSUBTASKS_END'));
+    await s.engine.tick();
+    await s.engine.tick();
+    expect(s.engine.store.get(issue.id)?.status).toBe('implementing');
+    expect(s.driver.sent.length).toBeGreaterThan(count);
+    expect(s.engine.store.listEvents(issue.id).filter(e => e.kind === 'execution_route' &&
+      JSON.parse(e.dataJson!).reason === '需要确定迁移边界')).toHaveLength(1);
+  });
+  test('#306 上一条 paused 后接力开工的直执行 issue 必须接管激活对话并被驱动', async () => {
+    const s = await setup({ config: { directExecution: true } });
+    s.setManualReview(false);
+    const first = await s.engine.createIssue(s.projectId, { title: '先跑后暂停' });
+    await s.bindJsonl(first.id);
+    const second = await s.engine.createIssue(s.projectId, { title: '接力开工' });
+    await s.engine.tick();
+    expect(s.engine.store.get(first.id)?.status).toBe('implementing');
+    expect(s.engine.store.get(second.id)?.status).toBe('pending');
+    await s.engine.applyEvent(first.id, 'pause', { note: '止损' });
+    expect(s.engine.store.get(first.id)?.status).toBe('paused');
+    const next = s.engine.store.get(second.id)!;
+    expect(next.status).toBe('implementing');
+    expect(s.convs.currentConv(s.projectId)).toBe(next.convId!);
+    await s.bindJsonl(second.id);
+    await s.engine.tick();
+    expect(s.engine.store.countEvents(second.id, 'conv_displaced')).toBe(0);
+    expect(s.engine.store.countEvents(second.id, 'injected')).toBeGreaterThan(0);
+  });
   test('missing direct report repairs once, then pauses and retains testing recovery', async () => {
     const s = await setup({ config: { directExecution: true, resultSummaryTimeoutMs: 100, validationTimeoutMs: 0 } });
     s.setManualReview(false);
@@ -8086,6 +8774,23 @@ describe('direct execution contract', () => {
 });
 
 describe('validation execution integrity',()=>{
+ test('a successful check cannot certify a working tree it changed',async()=>{
+  const s=await setup({config:{validationTimeoutMs:100}});
+  const issue=await s.engine.createIssue(s.projectId,{title:'验证期间变更'});const jl=await s.bindJsonl(issue.id);
+  s.engine.store.setValidationCommands(s.projectId,[{label:'test',argv:['bun','test']}]);
+  s.engine.store.setSubtasks(issue.id,['修改']);await s.engine.applyEvent(issue.id,'plan_ready');await s.engine.applyEvent(issue.id,'plan_approved');await s.engine.applyEvent(issue.id,'impl_done');
+  let identity='a'.repeat(64);
+  s.driver.onRunCommand=(argv)=>{
+   if(argv[1]==='-e')return {code:0,out:'PANDA_VALIDATION_ID:'+identity,err:'',timedOut:false,durationMs:1};
+   identity='b'.repeat(64);
+   return {code:0,out:'ok',err:'',timedOut:false,durationMs:1};
+  };
+  await s.appendOutput(jl,asst(`STAGE_DONE:${issue.id}:testing`));await s.engine.tick();
+  expect(s.engine.store.get(issue.id)?.status).toBe('paused');
+  expect(s.engine.store.countEvents(issue.id,'validation_passed')).toBe(0);
+  expect(s.engine.store.countEvents(issue.id,'validation_invalidated')).toBe(1);
+  expect(s.engine.store.countEvents(issue.id,'validation_error')).toBe(1);
+ });
  test('executor failure pauses instead of reporting a successful skip',async()=>{
   const s=await setup({config:{validationTimeoutMs:100}});
   const issue=await s.engine.createIssue(s.projectId,{title:'验证异常'});const jl=await s.bindJsonl(issue.id);

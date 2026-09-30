@@ -8,6 +8,7 @@
  */
 import { describe, expect, it } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
@@ -17,7 +18,6 @@ import { ENSURE_GIT_SCRIPT, KEY_WHITELIST } from './driver';
 import { shq } from './shq';
 import {
   buildSendKeyCmd,
-  buildSendTextCmd,
   sanitizeSendText,
   SSH_ALLOWED_KEYS,
   SSH_MAX_INJECT_CHARS,
@@ -134,22 +134,6 @@ describe('SSH_ALLOWED_KEYS 白名单', () => {
 });
 
 describe('send-keys 命令构造', () => {
-  it('文本命令只做字面量注入，Enter 由稳定提交时序单独发送', () => {
-    const cmd = buildSendTextCmd('cc-a b', 'hello 世界');
-    expect(cmd).toBe(`tmux send-keys -t 'cc-a b' -l -- 'hello 世界'`);
-    expect(cmd.match(/send-keys/g)).toHaveLength(1);
-    expect(cmd).not.toContain('Enter');
-  });
-  it('恶意文本留在引号内，不成为 shell 语法', () => {
-    const evil = `'; rm -rf / #`;
-    const cmd = buildSendTextCmd('s', evil);
-    const out = execFileSync('bash', ['-c', `printf '%s\\n' ${cmd.slice('tmux '.length)}`], {
-      encoding: 'utf8',
-    });
-    const words = out.split('\n');
-    expect(words.slice(0, 5)).toEqual(['send-keys', '-t', 's', '-l', '--']);
-    expect(words[5]).toBe(evil);
-  });
   it('sendKey 命令构造（键名语义，无 -l）', () => {
     expect(buildSendKeyCmd('s1', 'C-c')).toBe(`tmux send-keys -t 's1' 'C-c'`);
   });
@@ -264,6 +248,7 @@ class MockSftp implements SftpLike {
   chmodCalls: Array<[string, number]> = [];
   maxChunk = Number.POSITIVE_INFINITY;
   readCalls = 0;
+  posixRenameCalls = 0;
 
   open(path: string, _flags: string, cb: (err: Error | null | undefined, handle: unknown) => void): void {
     if (_flags === 'wx' && !this.files.has(path) && !this.modes.has(path)) {
@@ -355,6 +340,21 @@ class MockSftp implements SftpLike {
   chmod(path: string, mode: number, cb: (err: Error | null | undefined) => void): void {
     this.chmodCalls.push([path, mode]);
     this.modes.set(path, 0o100000 | mode);
+    cb(null);
+  }
+  ext_openssh_rename(oldPath: string, newPath: string, cb: (err: Error | null | undefined) => void): void {
+    this.posixRenameCalls++;
+    const bytes = this.files.get(oldPath);
+    if (!bytes) { cb(Object.assign(new Error('No such file'), { code: 2 })); return; }
+    this.files.set(newPath, bytes);
+    this.modes.set(newPath, this.modes.get(oldPath) ?? 0o100644);
+    this.files.delete(oldPath);
+    this.modes.delete(oldPath);
+    cb(null);
+  }
+  unlink(path: string, cb: (err: Error | null | undefined) => void): void {
+    this.files.delete(path);
+    this.modes.delete(path);
     cb(null);
   }
 }
@@ -469,18 +469,71 @@ describe('SshDriver（mock ssh2）', () => {
     const { driver, clients } = mkDriver({
       onExec: (cmd, _opts, stream) => {
         if (cmd.includes("'capture-pane'")) respond(stream, { out: pane });
-        else if (cmd.includes(' -l -- ')) { pane = '› line1 line2 tail'; respond(stream, {}); }
+        else if (cmd.includes("'set-buffer'")) respond(stream, {});
+        else if (cmd.includes("'paste-buffer'")) { pane = '› line1 line2 tail'; respond(stream, {}); }
         else if (cmd.endsWith("'Enter'")) { enters++; pane = '• Working'; respond(stream, {}); }
         else respond(stream, { code: 127, err: `unexpected ${cmd}` });
       },
     });
     await driver.sendKeys('cc-main', 'line1\nline2\ttail');
     expect(clients).toHaveLength(1);
-    expect(clients[0]!.execCalls.some((call) => call.cmd ===
-      buildSendTextCmd('cc-main', sanitizeSendText('line1\nline2\ttail')))).toBe(true);
+    const calls = clients[0]!.execCalls.map(call => call.cmd);
+    expect(calls.some(cmd => cmd.includes("'set-buffer'") && cmd.endsWith("'line1 line2 tail'"))).toBe(true);
+    expect(calls.some(cmd => cmd.includes("'paste-buffer'") && cmd.includes("'-d' '-p' '-t' 'cc-main'"))).toBe(true);
     expect(enters).toBe(1);
     await driver.close();
   });
+
+  it('sendKeys：SSH 折叠输入补交后复查，持续滞留上抛且不重注入文本', async () => {
+    let pane = '› ';
+    let enters = 0;
+    let texts = 0;
+    const { driver } = mkDriver({
+      onExec: (cmd, _opts, stream) => {
+        if (cmd.includes("'capture-pane'")) respond(stream, { out: pane });
+        else if (cmd.includes("'set-buffer'")) respond(stream, {});
+        else if (cmd.includes("'paste-buffer'")) { texts++; pane = '› [Pasted text #1 +20 lines]'; respond(stream, {}); }
+        else if (cmd.endsWith("'Enter'")) { enters++; pane += '\n'; respond(stream, {}); }
+        else respond(stream, { code: 127, err: `unexpected ${cmd}` });
+      },
+    });
+    try {
+      await expect(driver.sendKeys('cc-main', '执行当前 issue')).rejects.toThrow('PANDA_INPUT_SUBMIT_UNCONFIRMED');
+      expect(enters).toBe(2);
+      expect(texts).toBe(1);
+    } finally {
+      await driver.close();
+    }
+  });
+
+  for (const outcome of ['运行', '未知', '抓屏失败', '滞留'] as const) {
+    it(`sendKeys：SSH 长输入中段与补交结果：${outcome}`, async () => {
+      const prompt = Array.from({ length: 80 }, (_, i) => `第${i}项检查提交状态。`).join('');
+      let pane = '› ';
+      let enters = 0;
+      let texts = 0;
+      const { driver } = mkDriver({ onExec: (cmd, _opts, stream) => {
+        if (cmd.includes("'capture-pane'")) {
+          respond(stream, outcome === '抓屏失败' ? { code: 1, err: '抓屏失败' } : { out: pane });
+        } else if (cmd.includes("'set-buffer'")) respond(stream, {});
+        else if (cmd.includes("'paste-buffer'")) {
+          texts++; pane = `› ${prompt.slice(250, 264)}\n  ${prompt.slice(264, 278)}`; respond(stream, {});
+        } else if (cmd.endsWith("'Enter'")) {
+          enters++;
+          if (enters === 2 && outcome === '运行') pane = '◦ Working (1s • esc to interrupt)';
+          if (outcome === '未知') pane = '重绘中';
+          respond(stream, {});
+        } else respond(stream, { code: 127 });
+      } });
+      try {
+        const run = driver.sendKeys('测试', prompt);
+        if (outcome === '运行') await run;
+        else await expect(run).rejects.toThrow('PANDA_INPUT_SUBMIT_UNCONFIRMED');
+        expect(texts).toBe(1);
+        expect(enters).toBe(outcome === '未知' || outcome === '抓屏失败' ? 1 : 2);
+      } finally { await driver.close(); }
+    });
+  }
 
   it('sendKey：白名单外直接抛错且不产生任何 exec；白名单键正常发送', async () => {
     const { driver, clients } = mkDriver({ onExec: (_c, _o, s) => respond(s, { code: 0 }) });
@@ -612,6 +665,34 @@ describe('SshDriver（mock ssh2）', () => {
     await expect(driver.writeFileNoFollowWithin(
       '/project', '.panda/personas/link/PERSONA.md', 'x',
     )).rejects.toThrow(/rejects links/);
+    await driver.close();
+  });
+
+  it('CAS replace uses POSIX atomic overwrite and preserves the old target without the extension', async () => {
+    const sftp = new MockSftp();
+    sftp.modes.set('/project', 0o040755);
+    sftp.modes.set('/project/.panda', 0o040755);
+    const target = '/project/.panda/project.json';
+    sftp.files.set(target, Buffer.from('old'));
+    sftp.modes.set(target, 0o100644);
+    const digest = createHash('sha256').update('old').digest('hex');
+    const { driver } = mkDriver({ sftp });
+    expect(await driver.replaceFileNoFollowWithin('/project', '.panda/project.json', Buffer.from('new'), digest)).toBe('written');
+    expect(sftp.posixRenameCalls).toBe(1);
+    expect(sftp.files.get(target)?.toString()).toBe('new');
+
+    sftp.ext_openssh_rename = undefined as unknown as MockSftp['ext_openssh_rename'];
+    const newDigest = createHash('sha256').update('new').digest('hex');
+    await expect(driver.replaceFileNoFollowWithin('/project', '.panda/project.json', Buffer.from('later'), newDigest))
+      .rejects.toThrow('executor atomic overwrite capability unavailable');
+    expect(sftp.files.get(target)?.toString()).toBe('new');
+    sftp.ext_openssh_rename = (_oldPath, _newPath, cb) => cb(new Error('unsupported extension'));
+    await expect(driver.replaceFileNoFollowWithin('/project', '.panda/project.json', Buffer.from('later'), newDigest))
+      .rejects.toThrow('unsupported extension');
+    expect(sftp.files.get(target)?.toString()).toBe('new');
+    sftp.modes.set('/project/.panda/link.json', 0o120777);
+    await expect(driver.replaceFileNoFollowWithin('/project', '.panda/link.json', Buffer.from('x'), newDigest))
+      .rejects.toThrow(/rejects links/);
     await driver.close();
   });
 

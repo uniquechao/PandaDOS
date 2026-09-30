@@ -22,6 +22,7 @@ export const ALL_MIGRATION_DIRS: readonly string[] = [
   join(import.meta.dir, '..', 'agents', 'migrations'),
   join(import.meta.dir, '..', 'designs', 'migrations'),
   join(import.meta.dir, '..', 'notify', 'migrations'),
+  join(import.meta.dir, '..', 'rooms', 'migrations'),
 ];
 
 export interface Migration {
@@ -153,8 +154,38 @@ export function migrationStatus(db: Database): MigrationStatus {
 /** Rebuild only the issue status constraint, preserving installed columns, indexes and triggers.
  * Foreign keys are disabled outside the transaction; checked before committing and restored.
  */
+/** A rebuild can assign new rowids even when the same broken legacy reference survives.
+ * Compare the child row's values instead, with numeric IDs normalized across INTEGER→TEXT.
+ */
+function foreignKeyViolationCounts(db: Database): Map<string, number> {
+  const counts = new Map<string, number>();
+  const violations = db.query<{ table: string; rowid: number | null; parent: string; fkid: number }, []>(
+    'PRAGMA foreign_key_check',
+  ).all();
+  for (const violation of violations) {
+    const row = violation.rowid === null ? null : db.query<Record<string, unknown>, [number]>(
+      `SELECT * FROM ${quoteIdent(violation.table)} WHERE rowid = ?`,
+    ).get(violation.rowid);
+    const values = row && Object.entries(row).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [
+      key,
+      typeof value === 'number' || typeof value === 'bigint' ? String(value)
+        : value instanceof Uint8Array ? Array.from(value) : value,
+    ]);
+    const fingerprint = JSON.stringify([violation.table, violation.parent, violation.fkid, values]);
+    counts.set(fingerprint, (counts.get(fingerprint) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function hasNewForeignKeyViolations(db: Database, before: ReadonlyMap<string, number>): boolean {
+  for (const [fingerprint, count] of foreignKeyViolationCounts(db)) {
+    if (count > (before.get(fingerprint) ?? 0)) return true;
+  }
+  return false;
+}
+
 function addPausedIssueState(db: Database): void {
-  const existingViolations=new Set(db.query('PRAGMA foreign_key_check').all().map(row=>JSON.stringify(row)));
+  const existingViolations = foreignKeyViolationCounts(db);
   const sequence=db.query<{seq:number},[]>("SELECT seq FROM sqlite_sequence WHERE name='issues'").get()?.seq ?? 0;
   const row = db.query<{ sql: string }, []>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'issues'").get();
   if (!row) throw new Error('issues table missing');
@@ -173,7 +204,97 @@ function addPausedIssueState(db: Database): void {
   db.run('ALTER TABLE issues_rebuild RENAME TO issues');
   for (const object of objects) db.run(object.sql);
   db.run("UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name='issues'",[sequence]);
-  if (db.query('PRAGMA foreign_key_check').all().some(row=>!existingViolations.has(JSON.stringify(row)))) throw new Error('issue rebuild introduces a foreign key violation');
+  if (hasNewForeignKeyViolations(db, existingViolations)) throw new Error('issue rebuild introduces a foreign key violation');
+}
+
+// ---------- #307：issue 主键改文本编号 ----------
+
+/** 不带外键、但同样存放 issue 编号的列（0 / 项目 id 等哨兵值使外键不可用）。 */
+export const ISSUE_ID_EXTRA_COLUMNS: Readonly<Record<string, readonly string[]>> = {
+  subscriptions: ['target_id'],
+  usage_daily: ['issue_id'],
+  skill_policies: ['issue_id'],
+};
+
+/** 新建行未显式给编号时的兜底默认值（生产代码走 core/issue-id 的生成器，带机器段）。 */
+const ISSUE_ID_SQL_DEFAULT =
+  "(strftime('%Y%m%d','now','localtime') || '-' || substr(lower(hex(randomblob(4))),1,7))";
+
+function quoteIdent(name: string): string {
+  return '"' + name.replaceAll('"', '""') + '"';
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function declaredType(db: Database, table: string, column: string): string | null {
+  const col = db.query<{ name: string; type: string }, []>(`PRAGMA table_info(${quoteIdent(table)})`)
+    .all().find((c) => c.name === column);
+  return col ? col.type.toUpperCase() : null;
+}
+
+/** 按原 CREATE 语句重建表（保留列、索引、触发器），`transform` 改写建表 SQL。 */
+function rebuildTable(db: Database, table: string, transform: (sql: string) => string): void {
+  const row = db.query<{ sql: string }, [string]>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+  if (!row) return;
+  const tmp = `${table}__rebuild307`;
+  const sql = transform(row.sql).replace(
+    new RegExp(`^CREATE TABLE\\s+["\`]?${escapeRegExp(table)}["\`]?`, 'i'),
+    `CREATE TABLE ${quoteIdent(tmp)}`,
+  );
+  if (sql === row.sql) throw new Error(`rebuild ${table}: CREATE TABLE header not recognized`);
+  const objects = db.query<{ sql: string }, [string]>(
+    "SELECT sql FROM sqlite_master WHERE tbl_name = ? AND type IN ('index','trigger') AND sql IS NOT NULL",
+  ).all(table);
+  const columns = db.query<{ name: string }, []>(`PRAGMA table_info(${quoteIdent(table)})`).all()
+    .map((c) => quoteIdent(c.name)).join(',');
+  db.run(sql);
+  db.run(`INSERT INTO ${quoteIdent(tmp)} (${columns}) SELECT ${columns} FROM ${quoteIdent(table)}`);
+  db.run(`DROP TABLE ${quoteIdent(table)}`);
+  db.run(`ALTER TABLE ${quoteIdent(tmp)} RENAME TO ${quoteIdent(table)}`);
+  for (const object of objects) db.run(object.sql);
+}
+
+/** 把建表 SQL 里某列的声明类型 INTEGER 改成 TEXT。 */
+function columnToText(sql: string, column: string): string {
+  const re = new RegExp(`([(,]\\s*["\`]?${escapeRegExp(column)}["\`]?\\s+)INTEGER\\b`, 'i');
+  if (!re.test(sql)) throw new Error(`column ${column} declaration not recognized`);
+  return sql.replace(re, '$1TEXT');
+}
+
+/**
+ * #307：issues.id 改 `TEXT PRIMARY KEY`，所有存放 issue 编号的列改 TEXT。
+ * 幂等：已是 TEXT 的表跳过，故 issues（074）与 designs（075）两个目录可各跑一次，
+ * 覆盖「全新库上 designs 表晚于 issues 迁移才建出来」的顺序。存量数字编号原样转成文本。
+ */
+function convertIssueIdsToText(db: Database): void {
+  const existingViolations = foreignKeyViolationCounts(db);
+  if (declaredType(db, 'issues', 'id') === 'INTEGER') {
+    rebuildTable(db, 'issues', (sql) => {
+      const re = /([(,]\s*["`]?id["`]?\s+)INTEGER\s+PRIMARY\s+KEY(\s+AUTOINCREMENT)?/i;
+      if (!re.test(sql)) throw new Error('issues.id declaration not recognized');
+      return sql.replace(re, `$1TEXT PRIMARY KEY NOT NULL DEFAULT ${ISSUE_ID_SQL_DEFAULT}`);
+    });
+    db.run("DELETE FROM sqlite_sequence WHERE name = 'issues'");
+  }
+  const tables = db.query<{ name: string }, []>(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'issues'",
+  ).all().map((r) => r.name);
+  for (const table of tables) {
+    const fkColumns = db.query<{ table: string; from: string }, []>(`PRAGMA foreign_key_list(${quoteIdent(table)})`)
+      .all().filter((fk) => fk.table === 'issues').map((fk) => fk.from);
+    // 复合外键 (issue_id, project_id) 里的 project 列不是 issue 编号
+    const issueColumns = fkColumns.filter((c) => !/project_id$/.test(c));
+    const columns = [...new Set([...issueColumns, ...(ISSUE_ID_EXTRA_COLUMNS[table] ?? [])])]
+      .filter((c) => declaredType(db, table, c) === 'INTEGER');
+    if (columns.length === 0) continue;
+    rebuildTable(db, table, (sql) => columns.reduce((acc, c) => columnToText(acc, c), sql)
+      .replace(/(issue_id\s+TEXT\s+NOT\s+NULL\s+DEFAULT\s+)0\b/gi, "$1'0'"));
+  }
+  if (hasNewForeignKeyViolations(db, existingViolations)) {
+    throw new Error('issue id conversion introduces a foreign key violation');
+  }
 }
 
 /** 应用所有未执行的迁移；重复调用幂等。返回执行后的状态。 */
@@ -183,12 +304,18 @@ export function migrate(db: Database, dir: string = DEFAULT_MIGRATIONS_DIR): Mig
   const pending = loadMigrations(dir).filter((m) => !done.has(m.id));
 
   for (const m of pending) {
-    const rebuild = m.sql.includes('-- panda:add-paused-issue-state');
+    const pausedRebuild = m.sql.includes('-- panda:add-paused-issue-state');
+    const textIdRebuild = m.sql.includes('-- panda:issue-text-id');
+    const rebuild = pausedRebuild || textIdRebuild;
     const fk = db.query<{ foreign_keys: number }, []>('PRAGMA foreign_keys').get()!.foreign_keys;
     const legacy = db.query<{ legacy_alter_table: number }, []>('PRAGMA legacy_alter_table').get()!.legacy_alter_table;
     const apply = db.transaction(() => {
-      if (rebuild) addPausedIssueState(db);
-      for (const stmt of splitStatements(m.sql)) db.run(stmt);
+      if (pausedRebuild) addPausedIssueState(db);
+      if (textIdRebuild) convertIssueIdsToText(db);
+      // SQLite trigger bodies contain semicolons. Let SQLite parse the trusted
+      // migration file as a script instead of splitting it at those semicolons.
+      if (/\bCREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER\b/i.test(m.sql)) db.exec(m.sql);
+      else for (const stmt of splitStatements(m.sql)) db.run(stmt);
       db.run('INSERT INTO schema_migrations (id, name, applied_ts) VALUES (?, ?, ?)', [
         m.id,
         m.name,

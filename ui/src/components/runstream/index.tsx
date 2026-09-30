@@ -3,10 +3,14 @@
  * 把对话 ChatMessage[] 归约成 RunEvent[]（lib/runstream），逐条按事件种类选独立组件：
  *  思考摘要 / 工具调用 / 命令 / 普通消息（结果·异常并入工具·命令的展开区）。
  * 替代旧 ChatPane 的 Bubble/ToolBubble（一律气泡）——不同事件不同组件、工具默认折叠带状态·耗时。
+ *
+ * 顺带把「项目 cwd」取进来（issue #310）：消息气泡里的文件路径要换算成文件页深链。
+ * cwd 走 lib/projectCwd 的进程内缓存，消息流挂多少份都只发一次请求；取不到就不做链接。
  */
 import { useMemo } from 'preact/hooks';
 import type { ChatMessage } from '../../lib/types';
 import { toRunEvents } from '../../lib/runstream';
+import { useProjectCwd } from '../../lib/projectCwd';
 import { ThinkingEvent } from './ThinkingEvent';
 import { MessageEvent } from './MessageEvent';
 import { ToolEvent } from './ToolEvent';
@@ -23,6 +27,8 @@ export function RunStream({
   onOpenImage?: (path: string) => void;
 }) {
   const events = useMemo(() => toRunEvents(msgs), [msgs]);
+  const cwd = useProjectCwd(pid);
+  const paths = useMemo(() => (pid !== undefined && cwd ? { pid, cwd } : null), [pid, cwd]);
   return (
     <>
       {events.map((ev) => {
@@ -42,6 +48,7 @@ export function RunStream({
                 ts={ev.ts}
                 off={ev.off}
                 pid={pid}
+                paths={paths}
                 onOpenImage={onOpenImage}
               />
             );

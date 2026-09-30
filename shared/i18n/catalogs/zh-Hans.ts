@@ -1,3 +1,7 @@
+import { roomMemberMessages } from '../domains/rooms-members';
+import { roomChatMessages } from '../domains/rooms-chat';
+import { roomExtraMessages } from '../domains/rooms-extra';
+import { roomMessages } from '../domains/rooms';
 import { feishuChatMessages } from '../domains/feishu-chat';
 import { feishuLoginMessages } from '../domains/feishu-login';
 import type { MessageCatalog } from '../messages';
@@ -9,6 +13,7 @@ import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
 import { projectSettingsMessages } from '../domains/project-settings';
 import { externalImportMessages } from '../domains/external-import';
+import { workspaceMessages } from '../domains/workspace';
 import { designWorkbenchMessages } from '../domains/design-workbench';
 import { designWorkbenchAdvancedMessages } from '../domains/design-workbench-advanced';
 import { designAssetsUiMessages } from '../domains/design-assets-ui';
@@ -19,12 +24,16 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const zhHansCatalog = {
+  ...roomMemberMessages["zh-Hans"],
+  ...roomChatMessages["zh-Hans"],
+  ...roomExtraMessages["zh-Hans"],
+  ...roomMessages["zh-Hans"],
   ...feishuChatMessages["zh-Hans"],
   ...feishuLoginMessages["zh-Hans"],
   ...shellMessages['zh-Hans'],
   ...actionMessages['zh-Hans'],
   ...commonUiMessages['zh-Hans'],
-  'issue.validation': '门禁', 'issue.validationTargeted': '定向（{files} 个文件）', 'issue.validationFull': '全量', 'issue.validationPassed': '通过', 'issue.validationFailed': '未通过（{label}，退出码 {code}）', 'issue.validationSkipped': '已跳过', 'issue.validationPending': '本轮待跑', 'issue.pushFailedTitle':'已完成，但改动未推送到远端','issue.pushFailedHint':'改动已在本地提交，请手动推送后再确认。','issue.pushFailedBranch':'分支 {branch}',
+  'issue.validation': '门禁', 'issue.validationTargeted': '定向（{files} 个文件）', 'issue.validationFull': '全量', 'issue.validationPassed': '通过', 'issue.validationFailed': '未通过（{label}，退出码 {code}）', 'issue.validationSkipped': '已跳过', 'issue.validationPending': '本轮待跑', 'issue.validationUnavailable': '验证不可用', 'issue.validationExempt': '已明确豁免', 'issue.validationNoCommands': '未配置验证命令', 'issue.validationDisabled': '必需验证已关闭', 'issue.deliveryLocalComplete': '本地任务已完成', 'issue.deliveryPushPushed': '已推送', 'issue.deliveryPushFailed': '推送失败', 'issue.deliveryPushSkipped': '已跳过推送', 'issue.deliveryPushNotAttempted': '尚未推送', 'issue.deliveryMergeUnmanaged': '未托管合并', 'issue.deliveryDeployUnmanaged': '未托管部署', 'issue.pushFailedTitle':'已完成，但改动未推送到远端','issue.pushFailedHint':'改动已在本地提交，请手动推送后再确认。','issue.pushFailedBranch':'分支 {branch}',
   'issue.completionReport':'完成报告','issue.reportOutcomeComplete':'目标已达成','issue.reportOutcomePartial':'部分完成','issue.reportOutcomeBlocked':'已受阻','issue.reportOutcomeUnverified':'历史总结未验证','issue.reportObjective':'实现目标','issue.reportImplementation':'实现方案','issue.reportAdvantages':'优势','issue.reportDisadvantages':'劣势与取舍','issue.reportVerification':'验证证据','issue.reportCompletion':'完成情况','issue.reportUnmetGoals':'未达目标','issue.reportRemainingWork':'必要后续动作','issue.reportAttentionTitle':'此 issue 尚未全部完成','issue.reportLegacyWarningTitle':'这条完成记录未经结构化验证','issue.reportLegacyWarning':'历史记录只有自由文本总结，PandaDOS 无法确认原始目标是否全部达成，也无法确认是否仍有必要后续动作。','issue.continueProcessing':'继续处理','issue.continueProcessingTitle':'纠正完成状态并继续','issue.continueProcessingWarningTitle':'此操作会重新打开 issue','issue.continueProcessingWarning':'请说明尚未完成的内容。issue 将返回规划阶段，并可能立即开始运行。','issue.continueGuidance':'未达目标或后续处理说明','issue.continueGuidancePlaceholder':'说明哪些目标尚未达成，以及下一步必须完成什么…','issue.continueGuidanceRequired':'继续前请填写未达目标或必要后续动作。','issue.confirmContinueProcessing':'重新打开并继续',
   'issue.recoveryLength':'已输入 {current} / {max} 字',
   'issue.recoveryTitle':'解除阻塞','issue.recoveryReason':'执行受阻原因','issue.recoveryHelp':'请补充明确的处理意见，或先修改 issue 与受阻子任务。保存编辑不会自动继续运行。','issue.recoveryGuidance':'补充意见或解除方法','issue.recoveryGuidancePlaceholder':'说明需要改什么、采用哪种方案，或如何解除当前阻塞…','issue.recoveryGuidanceRequired':'请先填写补充意见或解除方法。','issue.editBlockedIssue':'编辑 issue 内容','issue.editBlockedIssueHint':'修改标题、详情、设置或截图','issue.editBlockedSubtask':'编辑受阻子任务','issue.editBlockedSubtaskHint':'继续运行前修正当前受阻步骤','issue.noEditableBlockedSubtask':'没有可编辑的未完成子任务','issue.recoveryQueueHint':'确认后 issue 将从受阻前的阶段继续；仅在恢复信息不可用时安全返回规划阶段。','issue.confirmRecovery':'提交意见并继续运行','issue.mergedFrom': '由多条 issue 合并而来', 'issue.unmerge': '拆回', 'issue.unmergeLocked': '已开跑，合并不能再拆回了。', 'issue.unblockQueued': '已排队：当前任务结束后会自动继续运行。', 'issue.unblockQueuedCancel': '撤销排队', 'issue.openRecovery':'处理阻塞',
@@ -33,6 +42,7 @@ export const zhHansCatalog = {
   ...notifyMessages['zh-Hans'],
   ...projectSettingsMessages['zh-Hans'],
   ...externalImportMessages['zh-Hans'],
+  ...workspaceMessages['zh-Hans'],
   ...designWorkbenchMessages['zh-Hans'],
   ...designWorkbenchAdvancedMessages['zh-Hans'],
   ...designAssetsUiMessages['zh-Hans'],

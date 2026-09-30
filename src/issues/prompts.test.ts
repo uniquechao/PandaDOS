@@ -15,12 +15,12 @@ import {
   sentinelBoundary,
 } from './prompts';
 
-const issue = { id: 42, title: '加导出功能', body: '支持 CSV 和 JSON' };
+const issue = { id: '42', title: '加导出功能', body: '支持 CSV 和 JSON' };
 
 describe('prompt 模板与哨兵协议配套', () => {
   test('Issue #149 执行冒烟：需求不足时保留规划与纯文字澄清协议', () => {
     const p = buildPlanningPrompt({
-      issue: { id: 149, title: '测试issue执行能力', body: '测试issue执行能力' },
+      issue: { id: '149', title: '测试issue执行能力', body: '测试issue执行能力' },
     });
     expect(p).toContain('SUBTASKS_BEGIN');
     expect(p).toContain('SUBTASKS_END');
@@ -160,7 +160,7 @@ describe('prompt 模板与哨兵协议配套', () => {
 describe('NEED_CLARIFY / ISSUE_BLOCKED 边界说明（#275 / B-08）', () => {
 
   test('三件事都要讲到：互斥、怎么选、混发会怎样', () => {
-    const zh = sentinelBoundary(42, 'zh-Hans');
+    const zh = sentinelBoundary('42', 'zh-Hans');
     expect(zh).toContain('互斥');
     expect(zh).toContain('我回答就能解开');   // 怎么选：判据是「我答了能不能解开」
     expect(zh).toContain('必须我亲自动手才算受阻');
@@ -168,7 +168,7 @@ describe('NEED_CLARIFY / ISSUE_BLOCKED 边界说明（#275 / B-08）', () => {
     expect(zh).toContain('NEED_CLARIFY:42');
     expect(zh).toContain('ISSUE_BLOCKED:42');
 
-    const en = sentinelBoundary(42, 'en');
+    const en = sentinelBoundary('42', 'en');
     expect(en).toContain('at most one of these two markers');
     expect(en).toContain('NEED_CLARIFY:42');
     expect(en).toContain('ISSUE_BLOCKED:42');
@@ -177,11 +177,11 @@ describe('NEED_CLARIFY / ISSUE_BLOCKED 边界说明（#275 / B-08）', () => {
 
   // #301：受阻只有一句话时用户看不出「要不要我动手」，边界说明再多担两件事
   test('三分（告知不发标记）与受阻原因三段格式，中英都写进同一段措辞', () => {
-    const zh = sentinelBoundary(42, 'zh-Hans');
+    const zh = sentinelBoundary('42', 'zh-Hans');
     expect(zh).toContain('一个标记都别发');     // 纯告知：别占队列，也别要人工解锁
     expect(zh).toContain('在做什么｜卡在哪｜要我做什么');
 
-    const en = sentinelBoundary(42, 'en');
+    const en = sentinelBoundary('42', 'en');
     expect(en).toContain('emit no marker and keep going');
     expect(en).toContain('what you were doing | where you are stuck | what I must do');
   });
@@ -195,7 +195,7 @@ describe('NEED_CLARIFY / ISSUE_BLOCKED 边界说明（#275 / B-08）', () => {
       buildTestingPrompt({ issue, branch, locale: 'zh-Hans' }),
     ];
     for (const p of prompts) {
-      expect(p).toContain(sentinelBoundary(42, 'zh-Hans'));
+      expect(p).toContain(sentinelBoundary('42', 'zh-Hans'));
       expect(p.length).toBeLessThanOrEqual(MAX_INJECT_CHARS);
     }
   });
@@ -218,7 +218,7 @@ describe('NEED_CLARIFY / ISSUE_BLOCKED 边界说明（#275 / B-08）', () => {
 
 describe('注入预算联动（评审 H7：哨兵指令绝不被截）', () => {
   test('超长 issue 正文居中截断，哨兵指令保住，总长不破 MAX_INJECT_CHARS', () => {
-    const long = { id: 7, title: 'x'.repeat(3000), body: 'y'.repeat(5000) };
+    const long = { id: '7', title: 'x'.repeat(3000), body: 'y'.repeat(5000) };
     const p = buildPlanningPrompt({ issue: long, goal: 'g'.repeat(3000) });
     expect(p.length).toBeLessThanOrEqual(MAX_INJECT_CHARS);
     expect(p).toContain('SUBTASKS_END');
@@ -241,7 +241,7 @@ describe('注入预算联动（评审 H7：哨兵指令绝不被截）', () => {
 });
 
 describe('模块文档规则内联（#277 / I-02）', () => {
-  const fat = { id: 42, title: 'T'.repeat(3000), body: 'B'.repeat(5000) };
+  const fat = { id: '42', title: 'T'.repeat(3000), body: 'B'.repeat(5000) };
 
   test('五条规则中英各覆盖一遍：定位入口、读什么、记什么、回写什么、不许干什么', () => {
     const zh = moduleDocsRule('zh-Hans');
@@ -326,7 +326,7 @@ describe('模块文档规则内联（#277 / I-02）', () => {
 
   test('压缩顺序：先砍项目目标，issue 正文垫底不会被先牺牲', () => {
     const p = buildPlanningPrompt({
-      issue: { id: 42, title: '标题'.repeat(50), body: '正文'.repeat(200) },
+      issue: { id: '42', title: '标题'.repeat(50), body: '正文'.repeat(200) },
       goal: 'G'.repeat(3000),
       feedback: 'F'.repeat(3000),
       moduleName: '模块'.repeat(30),
@@ -383,7 +383,7 @@ describe('按交付组织工作，避免人为拆轮次', () => {
 
 test('direct prompt preserves the bound report protocol within the injection budget', () => {
   for (const locale of ['en','zh-Hans','ru'] as const) {
-    const p=buildDirectPrompt({issue:{id:9007199254740991,title:'x'.repeat(500),body:'x'.repeat(8000)},
+    const p=buildDirectPrompt({issue:{id:'9007199254740991',title:'x'.repeat(500),body:'x'.repeat(8000)},
       branch:'b'.repeat(250),docPath:'d'.repeat(160),feedback:'f'.repeat(5000),attempt:9007199254740991,locale});
     expect(p.length).toBeLessThanOrEqual(MAX_INJECT_CHARS);
     expect(p).toContain('ISSUE_READY:9007199254740991:9007199254740991');

@@ -38,7 +38,7 @@ class FakeDriver extends LocalDriver {
   }
   override async sendKeys() {}
   override async capturePane() {
-    return '';
+    return '❯ ';
   }
 }
 
@@ -93,7 +93,7 @@ async function setup(opts: {
   const pm = {
     questions: null as string[] | null,
     /** #289 的拆回用例要真的走一次智能合并 */
-    merges: [] as Array<{ members: number[]; title: string; body: string }>,
+    merges: [] as Array<{ members: string[]; title: string; body: string }>,
     async judgeDone() {
       return 'not_done' as const;
     },
@@ -126,7 +126,7 @@ async function setup(opts: {
     ...(opts.organize ? { organize: opts.organize } : {}),
   });
   // waiting_input 派生标记：测试里用集合模拟（生产由审批管道/引擎菜单观测提供）
-  const waitingSet = new Set<number>();
+  const waitingSet = new Set<string>();
   const messages = new MessageCounter(db);
   const dispatch = createDispatcher(
     issuesRoutes({
@@ -332,6 +332,26 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     ).toBe(409);
   });
 
+  test('issue 列表支持 since/status 过滤，供本地代理拉取新增 issue（#368）', async () => {
+    const s = await setup();
+    const a = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: '甲' })));
+    const b = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: '乙' })));
+    const aTs = a.body.issue.createdTs as number;
+    s.db.query('UPDATE issues SET created_ts = ? WHERE id = ?').run(aTs + 5, b.body.issue.id);
+
+    const all = await j(s.dispatch(req('GET', '/api/projects/1/issues', s.alice.token)));
+    expect(all.body.map((x: any) => x.title).sort()).toEqual(['乙', '甲']);
+    const fresh = await j(s.dispatch(req('GET', `/api/projects/1/issues?since=${aTs}`, s.alice.token)));
+    expect(fresh.body.map((x: any) => x.title)).toEqual(['乙']);
+    const byStatus = await j(
+      s.dispatch(req('GET', `/api/projects/1/issues?status=${b.body.issue.status},nope`, s.alice.token)),
+    );
+    expect(byStatus.body.map((x: any) => x.id)).toContain(b.body.issue.id);
+    const none = await j(s.dispatch(req('GET', '/api/projects/1/issues?status=nope', s.alice.token)));
+    expect(none.body).toEqual([]);
+    expect((await j(s.dispatch(req('GET', '/api/projects/1/issues?since=abc', s.alice.token)))).status).toBe(400);
+  });
+
   test('模块列表按项目返回，供选择器记忆复用', async () => {
     const s = await setup();
     s.db.query(
@@ -360,7 +380,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
       ),
     );
     expect(created.status).toBe(200);
-    const iid = created.body.issue.id as number;
+    const iid = created.body.issue.id as string;
     expect(created.body.issue.status).toBe('planning');
 
     // clarify：缺答案 400；已开跑（planning，驱动态）→ 200，答复注入实时会话、不迁移状态
@@ -376,7 +396,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
       s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: '排队任务', body: '原始' })),
     );
     expect(queued.body.issue.status).toBe('pending');
-    const qid = queued.body.issue.id as number;
+    const qid = queued.body.issue.id as string;
     // 创建时澄清提了问题 → 列表/详情下发 clarifyPending=true（澄清待答角标）
     s.engine.store.logEvent(qid, 'clarify_questions', { questions: ['要不要鉴权？'] });
     const withQ = await j(s.dispatch(req('GET', '/api/projects/1/issues', s.alice.token)));
@@ -462,7 +482,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     const created = await j(
       s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: 'A', module: 'web' })),
     );
-    const iid = created.body.issue.id as number;
+    const iid = created.body.issue.id as string;
     expect(created.body.issue.status).toBe('planning'); // 空闲 → 自动开跑
 
     // detail 带 subtasks/gates；跨项目取 → 404
@@ -479,7 +499,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     const created2 = await j(
       s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: 'B', module: 'web' })),
     );
-    const iid2 = created2.body.issue.id as number;
+    const iid2 = created2.body.issue.id as string;
     expect(created2.body.issue.status).toBe('pending');
     const patched = await j(
       s.dispatch(
@@ -567,7 +587,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     const s = await setup();
     // #1 建完即开跑（驱动态），#2 留在 pending
     const running = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: '占位' })));
-    const runId = running.body.issue.id as number;
+    const runId = running.body.issue.id as string;
     expect(running.body.issue.status).toBe('planning');
 
     // 驱动中：拒
@@ -635,7 +655,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     const c2 = await j(
       s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: 'B', body: '原始' })),
     );
-    const iid = c2.body.issue.id as number;
+    const iid = c2.body.issue.id as string;
     expect(c2.body.issue.status).toBe('pending');
     await s.engine.waitClarify();
     expect(calls.length).toBe(1);
@@ -673,10 +693,10 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     s.pm.questions = null;
     // #1 空闲开跑 → planning；#2 项目忙 → pending
     const c1 = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: 'A' })));
-    const iid1 = c1.body.issue.id as number;
+    const iid1 = c1.body.issue.id as string;
     expect(c1.body.issue.status).toBe('planning');
     const c2 = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: 'B' })));
-    const iid2 = c2.body.issue.id as number;
+    const iid2 = c2.body.issue.id as string;
     expect(c2.body.issue.status).toBe('pending');
 
     // 置顶 #2（pending）→ 200 + pinnedTs 落值（项目忙，仅调顺序不抢跑）
@@ -705,7 +725,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     const s = await setup();
     s.pm.questions = null;
     const c = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: 'A' })));
-    const iid = c.body.issue.id as number;
+    const iid = c.body.issue.id as string;
     expect(c.body.issue.autoApprove).toBe('medium'); // issue 默认 = 现有审批行为
 
     const set = await j(
@@ -744,7 +764,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     );
     expect(auto.status).toBe(200);
     expect(auto.body.issue.autoApprove).toBe('auto');
-    expect(s.engine.store.get(auto.body.issue.id as number)!.autoApprove).toBe('auto');
+    expect(s.engine.store.get(auto.body.issue.id as string)!.autoApprove).toBe('auto');
 
     const cautious = await j(
       s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: '谨慎的', autoApprove: 'cautious' })),
@@ -766,7 +786,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     const s = await setup();
     s.pm.questions = null;
     const c = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: 'A' })));
-    const iid = c.body.issue.id as number;
+    const iid = c.body.issue.id as string;
 
     // 受阻仍可改——重试前调档正是它的用法，别顺手锁掉
     expect((await s.engine.blockIssue(iid, '卡住了', s.alice.user.id)).ok).toBe(true);
@@ -788,7 +808,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
 
     // 已取消 → 409
     const c2 = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: 'B' })));
-    const iid2 = c2.body.issue.id as number;
+    const iid2 = c2.body.issue.id as string;
     expect((await s.engine.cancelIssue(iid2, s.alice.user.id)).ok).toBe(true);
     expect(
       (await j(
@@ -800,7 +820,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
   test('#93 复活重跑：POST /reopen 取消的 → pending 并开跑；非 cancelled 409；跨项目 404；无权限 403', async () => {
     const s = await setup();
     const c1 = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: 'A' })));
-    const iid1 = c1.body.issue.id as number;
+    const iid1 = c1.body.issue.id as string;
     expect(c1.body.issue.status).toBe('planning');
 
     // 非 cancelled（驱动中）→ 409 且文案说清为什么
@@ -845,7 +865,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
   test('POST /reopen 退回历史 done 时必须提供 guidance', async () => {
     const s = await setup();
     const created = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: '误标完成' })));
-    const iid = created.body.issue.id as number;
+    const iid = created.body.issue.id as string;
     s.db.query("UPDATE issues SET status = 'done' WHERE id = ?").run(iid);
     expect((await j(s.dispatch(req('POST', `/api/projects/1/issues/${iid}/reopen`, s.alice.token)))).status).toBe(409);
     const reopened = await j(s.dispatch(req('POST', `/api/projects/1/issues/${iid}/reopen`, s.alice.token, {
@@ -860,23 +880,23 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     const created = await j(
       s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: '弹窗任务' })),
     );
-    const iid = created.body.issue.id as number;
+    const iid = created.body.issue.id as string;
 
     // 默认不在等人工
     const list0 = await j(s.dispatch(req('GET', '/api/projects/1/issues', s.alice.token)));
-    expect(list0.body.find((i: { id: number }) => i.id === iid).waitingInput).toBe(false);
+    expect(list0.body.find((i: { id: string }) => i.id === iid).waitingInput).toBe(false);
 
     // 数据源标记后：列表 + 详情都亮
     s.waitingSet.add(iid);
     const list1 = await j(s.dispatch(req('GET', '/api/projects/1/issues', s.alice.token)));
-    expect(list1.body.find((i: { id: number }) => i.id === iid).waitingInput).toBe(true);
+    expect(list1.body.find((i: { id: string }) => i.id === iid).waitingInput).toBe(true);
     const detail = await j(s.dispatch(req('GET', `/api/projects/1/issues/${iid}`, s.alice.token)));
     expect(detail.body.issue.waitingInput).toBe(true);
 
     // 处理完（消费/菜单消失）→ 恢复 false
     s.waitingSet.delete(iid);
     const list2 = await j(s.dispatch(req('GET', '/api/projects/1/issues', s.alice.token)));
-    expect(list2.body.find((i: { id: number }) => i.id === iid).waitingInput).toBe(false);
+    expect(list2.body.find((i: { id: string }) => i.id === iid).waitingInput).toBe(false);
   });
 
   // #275 / I-07：把 blocked 这个统一出口按原因拆开，列表与详情都要出这个字段
@@ -885,10 +905,10 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     const created = await j(
       s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: '分层任务' })),
     );
-    const iid = created.body.issue.id as number;
+    const iid = created.body.issue.id as string;
     const inList = async () => {
       const r = await j(s.dispatch(req('GET', '/api/projects/1/issues', s.alice.token)));
-      return r.body.find((i: { id: number }) => i.id === iid).attentionKind;
+      return r.body.find((i: { id: string }) => i.id === iid).attentionKind;
     };
     const inDetail = async () => {
       const r = await j(s.dispatch(req('GET', `/api/projects/1/issues/${iid}`, s.alice.token)));
@@ -923,7 +943,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     const created = await j(
       s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: '样式优化', category: 'design' })),
     );
-    const iid = created.body.issue.id as number;
+    const iid = created.body.issue.id as string;
     expect(created.body.issue.status).toBe('planning');
     // create 响应是裸 issue（派生字段只在 GET 列表/详情下发）→ 从详情读初始态
     const init = (await j(s.dispatch(req('GET', `/api/projects/1/issues/${iid}`, s.alice.token)))).body.issue;
@@ -933,7 +953,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     // 执行中澄清（source=exec）→ 列表/详情 awaitingClarify=true & clarifyPending=true
     s.engine.store.logEvent(iid, 'clarify_questions', { source: 'exec', stage: 'planning', questions: ['用哪个库？'] });
     const row = (await j(s.dispatch(req('GET', '/api/projects/1/issues', s.alice.token)))).body.find(
-      (x: { id: number }) => x.id === iid,
+      (x: { id: string }) => x.id === iid,
     );
     expect(row.awaitingClarify).toBe(true);
     expect(row.clarifyPending).toBe(true);
@@ -1008,7 +1028,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
       targetBranch: 'feature/issue-85',
       sourceRef: 'refs/remotes/origin/main',
     });
-    const iid = created.body.issue.id as number;
+    const iid = created.body.issue.id as string;
     expect(s.engine.store.get(iid)).toMatchObject({
       targetBranch: 'feature/issue-85',
       sourceRef: 'refs/remotes/origin/main',
@@ -1204,7 +1224,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     // #1 开跑占住项目 → #2 停 pending（可直接改内容）
     await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: 'A' })));
     const c2 = await j(s.dispatch(req('POST', '/api/projects/1/issues', s.alice.token, { title: 'B' })));
-    const iid = c2.body.issue.id as number;
+    const iid = c2.body.issue.id as string;
     expect(c2.body.issue.status).toBe('pending');
 
     // 存图：合法 rel 保留，非上传目录 / 越界 / 非字符串被丢弃
@@ -1269,7 +1289,7 @@ describe('issues 路由：CRUD + 卡点 + 时间线 + 权限', () => {
     expect(created.status).toBe(200);
     expect(created.body.issue.createdBy).toBe(s.alice.user.id);
     expect(created.body.issue.createdByName).toBe('alice');
-    const iid = created.body.issue.id as number;
+    const iid = created.body.issue.id as string;
 
     // 列表回显
     const list = await j(s.dispatch(req('GET', '/api/projects/1/issues', s.alice.token)));
@@ -1434,10 +1454,10 @@ describe('模块管理路由：智能整理 / 执行合并 / 改名归档', () =
   });
 
   test('编辑来源标记（#283 / B-11）：只有用户编辑才重新澄清，同步回写不触发', async () => {
-    const clarified: number[] = [];
+    const clarified: string[] = [];
     const s = await setup({ modules: true });
     const original = s.engine.scheduleClarify.bind(s.engine);
-    s.engine.scheduleClarify = (id: number) => { clarified.push(id); original(id); };
+    s.engine.scheduleClarify = (id: string) => { clarified.push(id); original(id); };
 
     const issue = await s.engine.createIssue(1, { title: '原标题', body: '原正文' }, false);
     const url = `/api/projects/1/issues/${issue.id}`;
@@ -1595,6 +1615,9 @@ describe('模块管理路由：智能整理 / 执行合并 / 改名归档', () =
     // 还没跑过：两项都是 null，但字段必须在（前端据此判断「有没有门禁信息」）
     let detail = await j(s.dispatch(req('GET', url, s.alice.token)));
     expect(detail.body.validation).toEqual({ scope: null, last: null });
+    expect(detail.body.delivery).toMatchObject({
+      implementation: 'incomplete', push: 'not_attempted', merge: 'not_managed', deploy: 'not_managed',
+    });
 
     s.engine.store.setValidationScope(issue.id, {
       kind: 'targeted', files: ['src/a.test.ts'], reason: '按改动文件推导',
@@ -1615,6 +1638,13 @@ describe('模块管理路由：智能整理 / 执行合并 / 改名归档', () =
     s.engine.store.logEvent(issue.id, 'validation_passed', { scope: 'full', durationMs: 9000 });
     detail = await j(s.dispatch(req('GET', url, s.alice.token)));
     expect(detail.body.validation.last).toMatchObject({ outcome: 'passed', scope: 'full', durationMs: 9000 });
+
+    s.engine.store.logEvent(issue.id, 'validation_skipped', { reason: 'policy-none' });
+    detail = await j(s.dispatch(req('GET', url, s.alice.token)));
+    expect(detail.body.validation.last).toMatchObject({ outcome: 'skipped', reason: 'policy-none' });
+    s.engine.store.logEvent(issue.id, 'validation_error', { reason: 'required-no-commands' });
+    detail = await j(s.dispatch(req('GET', url, s.alice.token)));
+    expect(detail.body.validation.last).toMatchObject({ outcome: 'error', reason: 'required-no-commands' });
   });
 
   test('PATCH skills：未配置 = 沿用项目默认，显式数组落库，null 清回默认（#277 / I-02）', async () => {

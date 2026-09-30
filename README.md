@@ -152,16 +152,18 @@ You define outcomes and priorities
 ![PandaDOS issue workflow](docs/images/panda-issue-workflow-en.png)
 
 Each issue is a traceable unit of work. Independent projects can run separately; work sharing one
-repository is serialized to reduce conflicting edits. A module can keep one assigned agent and
-reuse a long-lived logical conversation across sequential issues.
+repository is serialized to reduce conflicting edits. A module can keep one assigned agent.
+Issue conversations normally rotate; module knowledge in `MODULE.md`
+provides continuity across issues, while an unfinished conversation can be resumed.
 
 ### Approval and safety model
 
 - **Cautious** minimizes automatic approval.
 - **Balanced** automatically accepts common safe and reversible development actions.
 - **Automatic** lets routine work continue with minimal interruption.
-- Destructive data loss, history rewrites, production operations, secrets, shutdowns, and ambiguous
-  choices remain protected regardless of convenience settings.
+- Approval policies escalate destructive or ambiguous agent menus. The effective boundary also
+  depends on the CLI sandbox and executor account. Browser terminal access grants that account's
+  shell privileges; isolate untrusted projects with separate executor accounts or machines.
 
 PandaDOS exposes the native agent session instead of inventing a second execution engine. You can
 inspect and intervene at any time.

@@ -16,6 +16,7 @@
 import { MAX_INJECT_CHARS } from '../executor/driver';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
 import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/language';
+import type { IssueId } from '../../shared/issue-id';
 
 // ---------- 预算（总和 + 固定措辞 ≤ MAX_INJECT_CHARS=2000，哨兵指令必达） ----------
 // 集成收敛：注入截断统一回 v1 的 2000（driver.sanitizeInjectText），各预算随之联动缩减，
@@ -55,7 +56,7 @@ export const BUDGET_SUBTASK = 500; // 单条子任务（v1 平移）
  * 2. **受阻原因写成三段**「在做什么｜卡在哪｜要我做什么」，代理顺手写、零额外调用；
  *    读端是 `shared/blocked.ts:parseBlockedNote`，UI 据此拆三行展示，两头要改一起改。
  */
-export function sentinelBoundary(issueId: number, locale: SupportedLocale | undefined): string {
+export function sentinelBoundary(issueId: IssueId, locale: SupportedLocale | undefined): string {
   const zh = `两个协议标记互斥、一次最多发一个：只是同步进展、列可选后续、你自己能接着干的 → 一个标记都别发，直接继续；` +
     `我回答就能解开的（需要拍板或补充信息）→ 先按编号列出问题，再单独输出一行 NEED_CLARIFY:${issueId}，然后停下等我；` +
     `仅限当前目标内、你无法自行解除且必须我亲自动手才算受阻（如账号授权或线下操作）→ 单独输出一行 ` +
@@ -75,7 +76,7 @@ export function sentinelBoundary(issueId: number, locale: SupportedLocale | unde
  * 而这段内容代理此刻本来就在脑子里。字段清单与 completion-report.ts 的 schema 必须对齐，
  * 两头一起改；解析不通过时引擎会静默忽略并退回确定性拼装，所以这里不必吓唬代理。
  */
-export function completionReportHint(issueId: number, locale: SupportedLocale | undefined): string {
+export function completionReportHint(issueId: IssueId, locale: SupportedLocale | undefined): string {
   const zh = `输出 STAGE_DONE:${issueId}:testing 的同一条回复里，再附一段完成报告块：` +
     `单独一行 REPORT_BEGIN，中间一段 JSON，再单独一行 REPORT_END（不要写文件，也不要加代码围栏）。` +
     `JSON 字段：version(固定 1)、outcome(complete|partial|blocked)、objective、` +
@@ -199,7 +200,7 @@ export { imageReadHint } from '../core/uploads';
 // ---------- 各阶段模板 ----------
 
 export interface PromptIssueLike {
-  id: number;
+  id: IssueId;
   title: string;
   body: string | null;
 }
@@ -528,11 +529,11 @@ export function buildDirectPrompt(opts: {
   const parts = { task: issueText(opts.issue), feedback: midTruncate(opts.feedback ?? '', 250) };
   const render = (p: typeof parts) => composePrompt(opts.locale,
     `直接完成 #${id}：${p.task}\n使用系统已准备的分支，不要切换或合并。沿用已有进度。${p.feedback}\n` +
-    `先结合必要代码判断整体复杂度，明确任务连续完成，不生成子任务，不默认用 superpowers。仅遇实质架构取舍或复杂依赖时，输出 NEED_PLAN:${id}:${opts.attempt} 升级理由，交系统规划。定向验证即可，最终门禁由系统执行，不重复跑。\n` +
+    `先结合必要代码判断整体复杂度，明确任务连续完成，不生成子任务，不默认用 superpowers。仅遇实质架构取舍或复杂依赖时，输出 NEED_PLAN:${id}:${opts.attempt} 升级理由（理由可同行或在同一回复下一段，编号和轮次必须原样保留），交系统规划。定向验证即可，最终门禁由系统执行，不重复跑。\n` +
     moduleDocsRule(opts.locale) + ` 过程页：${doc}\n` +
     sentinelBoundary(id, opts.locale) + '\n' + report,
     `Complete #${id} directly: ${p.task}\nUse the prepared branch; do not switch/merge. Preserve progress. ${p.feedback}\n` +
-    `Assess complexity in context. No subtasks or default superpowers. For real design tradeoffs emit NEED_PLAN:${id}:${opts.attempt} and reason; await planning. Targeted checks only; system runs final gates.\n` +
+    `No subtasks/default superpowers. For real tradeoffs emit NEED_PLAN:${id}:${opts.attempt} with reason inline or next paragraph in this reply; keep ID/attempt. Await planning. Targeted checks; system runs final gates.\n` +
     `Read .panda/modules/INDEX.md, module MODULE.md and process page: ${doc}. Keep decisions/evidence there; promote durable knowledge. Stop on conflicting facts.\n` +
     sentinelBoundary(id, opts.locale) + '\n' + report);
   return appendImgHint(assertBudget(fitParts(parts, [['task', 40], ['feedback', 0]], render)), opts.imgHint);

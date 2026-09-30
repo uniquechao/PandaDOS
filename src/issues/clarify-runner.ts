@@ -22,6 +22,7 @@ import {
 import type { AgentKind, IssueCategory } from '../core/types';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
 import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/language';
+import type { IssueId } from '../../shared/issue-id';
 
 /** runner 需要的 Driver 子集 = agent-summary 同款（tmux + 受限文件） */
 export type ClarifyDriver = AgentArtifactDriver;
@@ -36,7 +37,7 @@ export const MAX_QUESTIONS = 5;
 const MAX_QUESTION_CHARS = 300;
 
 /** 给 cwd + issueId 算出各 scratch 绝对路径 */
-export function clarifyPaths(cwd: string, issueId: number): {
+export function clarifyPaths(cwd: string, issueId: IssueId): {
   scratch: string;
   task: string;
   feedback: string;
@@ -54,7 +55,7 @@ export function clarifyPaths(cwd: string, issueId: number): {
 }
 
 /** 独立澄清会话名（issue 维度；与驱动项目的 cc-<pid> / 总结的 sum-<pid> 互不干扰） */
-export function clarifySessionName(issueId: number): string {
+export function clarifySessionName(issueId: IssueId): string {
   return `clr-${issueId}`;
 }
 
@@ -110,7 +111,7 @@ export function buildClarifyTaskMd(input: {
  */
 export function buildClarifyPrompt(
   agent: AgentKind,
-  issueId: number,
+  issueId: IssueId,
   opts: { allowQuestions?: boolean } = {},
   locale: SupportedLocale = 'zh-Hans',
 ): string {
@@ -175,7 +176,7 @@ export interface ClarifyRunnerDeps {
 }
 
 export interface RunClarifyInput {
-  issueId: number;
+  issueId: IssueId;
   cwd: string;
   agent: AgentKind;
   title: string;

@@ -1,10 +1,11 @@
 import type { Database } from 'bun:sqlite';
 import type { AgentKind } from './types';
 import type { SkillInfo } from './skills';
+import type { IssueId } from '../../shared/issue-id';
 
 export type SkillMode = 'auto' | 'manual' | 'disabled';
 export type SkillPolicy = Record<string, SkillMode>;
-export interface SkillPolicyScope { projectId: number; moduleId?: number; issueId?: number }
+export interface SkillPolicyScope { projectId: number; moduleId?: number; issueId?: IssueId }
 export function normalizeSkillPolicy(value: unknown): SkillPolicy {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid skill policy');
   const entries = Object.entries(value);
@@ -17,16 +18,16 @@ export function normalizeSkillPolicy(value: unknown): SkillPolicy {
   return result;
 }
 export function readSkillPolicy(db: Database, scope: SkillPolicyScope): SkillPolicy {
-  const row = db.query<{ policy_json: string }, [number,number,number]>(
+  const row = db.query<{ policy_json: string }, [number,number,IssueId]>(
     'SELECT policy_json FROM skill_policies WHERE project_id=? AND module_id=? AND issue_id=?',
-  ).get(scope.projectId,scope.moduleId ?? 0,scope.issueId ?? 0);
+  ).get(scope.projectId,scope.moduleId ?? 0,scope.issueId ?? '0');
   return row ? normalizeSkillPolicy(JSON.parse(row.policy_json)) : {};
 }
 export function saveSkillPolicy(db: Database, scope: SkillPolicyScope, value: unknown): SkillPolicy {
   const policy = normalizeSkillPolicy(value);
   db.run(`INSERT INTO skill_policies(project_id,module_id,issue_id,policy_json) VALUES(?,?,?,?)
     ON CONFLICT(project_id,module_id,issue_id) DO UPDATE SET policy_json=excluded.policy_json`,
-    [scope.projectId,scope.moduleId ?? 0,scope.issueId ?? 0,JSON.stringify(policy)]);
+    [scope.projectId,scope.moduleId ?? 0,scope.issueId ?? '0',JSON.stringify(policy)]);
   return policy;
 }
 export function effectiveSkillPolicy(db: Database, scope: SkillPolicyScope): SkillPolicy {

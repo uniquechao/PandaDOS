@@ -31,6 +31,7 @@ import {
   MAX_COMMAND_OUTPUT_CHARS,
   sanitizeInjectText,
   sendTextWithStableSubmit,
+  pasteTextWithTmux,
   tmuxNewSessionArgs,
   tmuxResizeWindowArgs,
   tmuxScrollPaneArgs,
@@ -261,10 +262,7 @@ export class LocalDriver implements ExecutorDriver {
     await sendTextWithStableSubmit({
       inputText: clean,
       capturePane: () => this.capturePane(session),
-      sendText: async () => {
-        const result = await this.tmux(['send-keys', '-t', session, '-l', '--', clean]);
-        if (result.code !== 0) throw new Error(`tmux send-keys failed: ${result.err || result.out}`);
-      },
+      sendText: () => pasteTextWithTmux(args => this.tmux(args), session, clean),
       sendEnter: async () => {
         const result = await this.tmux(['send-keys', '-t', session, 'Enter']);
         if (result.code !== 0) throw new Error(`tmux send-keys Enter failed: ${result.err || result.out}`);

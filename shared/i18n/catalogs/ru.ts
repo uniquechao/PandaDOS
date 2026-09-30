@@ -1,3 +1,7 @@
+import { roomMemberMessages } from '../domains/rooms-members';
+import { roomChatMessages } from '../domains/rooms-chat';
+import { roomExtraMessages } from '../domains/rooms-extra';
+import { roomMessages } from '../domains/rooms';
 import { feishuChatMessages } from '../domains/feishu-chat';
 import { feishuLoginMessages } from '../domains/feishu-login';
 import type { MessageCatalog } from '../messages';
@@ -9,6 +13,7 @@ import { errorMessages } from '../domains/errors';
 import { notifyMessages } from '../domains/notify';
 import { projectSettingsMessages } from '../domains/project-settings';
 import { externalImportMessages } from '../domains/external-import';
+import { workspaceMessages } from '../domains/workspace';
 import { designWorkbenchMessages } from '../domains/design-workbench';
 import { designWorkbenchAdvancedMessages } from '../domains/design-workbench-advanced';
 import { designAssetsUiMessages } from '../domains/design-assets-ui';
@@ -19,12 +24,16 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const ruCatalog = {
+  ...roomMemberMessages["ru"],
+  ...roomChatMessages["ru"],
+  ...roomExtraMessages["ru"],
+  ...roomMessages["ru"],
   ...feishuChatMessages["ru"],
   ...feishuLoginMessages["ru"],
   ...shellMessages.ru,
   ...actionMessages.ru,
   ...commonUiMessages.ru,
-  'issue.validation': 'Проверки', 'issue.validationTargeted': 'выборочные ({files} файлов)', 'issue.validationFull': 'полные', 'issue.validationPassed': 'пройдены', 'issue.validationFailed': 'не пройдены ({label}, код выхода {code})', 'issue.validationSkipped': 'пропущены', 'issue.validationPending': 'ещё не запускались', 'issue.pushFailedTitle':'Завершено, но изменения не отправлены в удалённый репозиторий','issue.pushFailedHint':'Изменения зафиксированы локально. Отправьте их вручную и проверьте ещё раз.','issue.pushFailedBranch':'Ветка {branch}',
+  'issue.validation': 'Проверки', 'issue.validationTargeted': 'выборочные ({files} файлов)', 'issue.validationFull': 'полные', 'issue.validationPassed': 'пройдены', 'issue.validationFailed': 'не пройдены ({label}, код выхода {code})', 'issue.validationSkipped': 'пропущены', 'issue.validationPending': 'ещё не запускались', 'issue.validationUnavailable': 'проверки недоступны', 'issue.validationExempt': 'явно освобождено', 'issue.validationNoCommands': 'проверки не настроены', 'issue.validationDisabled': 'обязательные проверки отключены', 'issue.deliveryLocalComplete': 'Локальная работа завершена', 'issue.deliveryPushPushed': 'Отправлено', 'issue.deliveryPushFailed': 'Ошибка отправки', 'issue.deliveryPushSkipped': 'Отправка пропущена', 'issue.deliveryPushNotAttempted': 'Отправка не выполнена', 'issue.deliveryMergeUnmanaged': 'Слияние не управляется', 'issue.deliveryDeployUnmanaged': 'Развёртывание не управляется', 'issue.pushFailedTitle':'Завершено, но изменения не отправлены в удалённый репозиторий','issue.pushFailedHint':'Изменения зафиксированы локально. Отправьте их вручную и проверьте ещё раз.','issue.pushFailedBranch':'Ветка {branch}',
   'issue.completionReport':'Отчёт о завершении','issue.reportOutcomeComplete':'Цели достигнуты','issue.reportOutcomePartial':'Выполнено частично','issue.reportOutcomeBlocked':'Заблокировано','issue.reportOutcomeUnverified':'Непроверенное историческое резюме','issue.reportObjective':'Цель реализации','issue.reportImplementation':'Способ реализации','issue.reportAdvantages':'Преимущества','issue.reportDisadvantages':'Недостатки и компромиссы','issue.reportVerification':'Подтверждение проверки','issue.reportCompletion':'Степень выполнения','issue.reportUnmetGoals':'Недостигнутые цели','issue.reportRemainingWork':'Необходимые дальнейшие действия','issue.reportAttentionTitle':'Эта задача ещё не завершена полностью','issue.reportLegacyWarningTitle':'Это завершение не прошло структурированную проверку','issue.reportLegacyWarning':'История содержит только свободное резюме, поэтому PandaDOS не может подтвердить достижение всех целей и отсутствие обязательных дальнейших действий.','issue.continueProcessing':'Продолжить работу','issue.continueProcessingTitle':'Исправить завершение и продолжить','issue.continueProcessingWarningTitle':'Задача будет открыта снова','issue.continueProcessingWarning':'Укажите, что осталось сделать. Задача вернётся к планированию и может запуститься сразу.','issue.continueGuidance':'Недостигнутая цель или дальнейшие указания','issue.continueGuidancePlaceholder':'Опишите недостигнутую цель и следующие обязательные действия…','issue.continueGuidanceRequired':'Перед продолжением укажите недостигнутую цель или обязательное действие.','issue.confirmContinueProcessing':'Открыть снова и продолжить',
   'issue.recoveryLength':'{current} / {max} символов',
   'issue.recoveryTitle':'Устранить блокировку','issue.recoveryReason':'Причина остановки выполнения','issue.recoveryHelp':'Добавьте конкретные указания или исправьте задачу и заблокированный этап перед продолжением. Сохранение изменений не возобновляет выполнение.','issue.recoveryGuidance':'Дополнительные указания или способ устранения','issue.recoveryGuidancePlaceholder':'Опишите, что изменить, какой подход использовать или как снять блокировку…','issue.recoveryGuidanceRequired':'Перед продолжением введите дополнительные указания или способ устранения.','issue.editBlockedIssue':'Изменить issue','issue.editBlockedIssueHint':'Изменить заголовок, описание, настройки или изображения','issue.editBlockedSubtask':'Изменить заблокированную подзадачу','issue.editBlockedSubtaskHint':'Исправить заблокированный этап перед продолжением','issue.noEditableBlockedSubtask':'Нет незавершённых подзадач, доступных для изменения','issue.recoveryQueueHint':'После подтверждения задача продолжится с этапа остановки. Если контекст восстановления недоступен, она безопасно вернётся к планированию.','issue.confirmRecovery':'Отправить указания и продолжить','issue.mergedFrom': 'Объединена из нескольких задач', 'issue.unmerge': 'Отменить объединение', 'issue.unmergeLocked': 'Уже выполняется — объединение больше нельзя отменить.', 'issue.unblockQueued': 'В очереди: возобновится автоматически, когда завершится текущая задача.', 'issue.unblockQueuedCancel': 'Отменить ожидающее возобновление', 'issue.openRecovery':'Устранить блокировку',
@@ -33,6 +42,7 @@ export const ruCatalog = {
   ...notifyMessages.ru,
   ...projectSettingsMessages.ru,
   ...externalImportMessages.ru,
+  ...workspaceMessages.ru,
   ...designWorkbenchMessages.ru,
   ...designWorkbenchAdvancedMessages.ru,
   ...designAssetsUiMessages.ru,

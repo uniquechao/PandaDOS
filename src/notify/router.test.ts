@@ -16,6 +16,7 @@ import {
   type NotifyEvent,
   type NotifyTarget,
 } from './router';
+import type { IssueId } from '../../shared/issue-id';
 
 // ---------- 种子 ----------
 
@@ -41,20 +42,20 @@ function addProject(db: Database, ownerId: number, name = `p${Math.random()}`): 
   );
 }
 
-function addIssue(db: Database, projectId: number): number {
+function addIssue(db: Database, projectId: number): IssueId {
   return (
     db
-      .query<{ id: number }, [number, number]>(
+      .query<{ id: IssueId }, [number, number]>(
         `INSERT INTO issues (project_id, title, created_ts) VALUES (?, 'T', ?) RETURNING id`,
       )
       .get(projectId, Date.now())!.id
   );
 }
 
-function addGate(db: Database, issueId: number): number {
+function addGate(db: Database, issueId: IssueId): number {
   return (
     db
-      .query<{ id: number }, [number]>(
+      .query<{ id: number }, [IssueId]>(
         `INSERT INTO gates (issue_id, kind, payload_json) VALUES (?, 'plan', '{}') RETURNING id`,
       )
       .get(issueId)!.id
@@ -78,7 +79,7 @@ class FakeChannel implements NotifyChannel {
   }
 }
 
-function statusEvent(projectId: number, issueId: number, summary = 's'): NotifyEvent {
+function statusEvent(projectId: number, issueId: IssueId, summary = 's'): NotifyEvent {
   return { kind: 'status_change', projectId, issueId, from: 'planning', to: 'plan_review', summary };
 }
 
@@ -142,7 +143,7 @@ describe('SubscriptionStore', () => {
     subs.ensureOwnerSubscription(pid, a.id);
     subs.ensureOwnerSubscription(pid, a.id);
     expect(subs.listByUser(a.id)).toHaveLength(1);
-    expect(subs.subscriberIds(pid, 0)).toEqual([a.id]);
+    expect(subs.subscriberIds(pid, '0')).toEqual([a.id]);
   });
 });
 
@@ -281,7 +282,7 @@ describe('NotifyRouter.dispatch', () => {
     await router.dispatch(statusEvent(pid, iid)); // 无订阅
     expect(ch.texts).toHaveLength(0);
     const bare = new NotifyRouter(makeDb()); // 无通道
-    await bare.dispatch(statusEvent(1, 1)); // 不炸
+    await bare.dispatch(statusEvent(1, '1')); // 不炸
   });
 
   test('节流：窗口内聚合，窗口到期一次发出；窗口外直发', async () => {
@@ -464,12 +465,12 @@ describe('NotifyRouter.routeInbound', () => {
 describe('formatEventText', () => {
   test('四类事件确定性渲染', () => {
     const i18n = userI18n(makeDb(), 0);
-    expect(formatEventText({ kind: 'status_change', projectId: 1, issueId: 2, from: 'planning', to: 'testing' }, i18n)).toContain(
+    expect(formatEventText({ kind: 'status_change', projectId: 1, issueId: '2', from: 'planning', to: 'testing' }, i18n)).toContain(
       'Planning → Testing',
     );
-    expect(formatEventText({ kind: 'issue_done', projectId: 1, issueId: 2, summary: 'T' }, i18n)).toContain('Done');
-    expect(formatEventText({ kind: 'issue_blocked', projectId: 1, issueId: 2 }, i18n)).toContain('Blocked');
-    expect(formatEventText({ kind: 'gate_waiting', projectId: 1, issueId: 2 }, i18n)).toContain('awaiting confirmation');
+    expect(formatEventText({ kind: 'issue_done', projectId: 1, issueId: '2', summary: 'T' }, i18n)).toContain('Done');
+    expect(formatEventText({ kind: 'issue_blocked', projectId: 1, issueId: '2' }, i18n)).toContain('Blocked');
+    expect(formatEventText({ kind: 'gate_waiting', projectId: 1, issueId: '2' }, i18n)).toContain('awaiting confirmation');
   });
 
   test('结构化业务摘要按收件人语言最终渲染', () => {
@@ -478,7 +479,7 @@ describe('formatEventText', () => {
     const event = {
       kind: 'gate_waiting' as const,
       projectId: 1,
-      issueId: 2,
+      issueId: '2',
       summaryCode: 'plan_review' as const,
       summaryParams: { title: 'OAuth login' },
     };
@@ -493,7 +494,7 @@ describe('formatEventText', () => {
     const text = formatEventText({
       kind: 'status_change',
       projectId: 1,
-      issueId: 2,
+      issueId: '2',
       from: 'planning',
       to: 'testing',
       summaryCode: 'status_transition',
@@ -506,12 +507,12 @@ describe('formatEventText', () => {
   test('进度回复提示与人工选择说明本地化，AI/CLI 原文保持不变', () => {
     const ja = createI18n({ locale: 'ja', timeZone: 'UTC', catalog: catalogs.ja });
     const progress = formatEventText({
-      kind: 'status_change', projectId: 1, issueId: 2,
+      kind: 'status_change', projectId: 1, issueId: '2',
       summaryCode: 'progress_needs_reply',
       summaryParams: { emoji: '💬', headline: 'Raw AI headline' },
     }, ja);
     const approval = formatEventText({
-      kind: 'status_change', projectId: 1, issueId: 2,
+      kind: 'status_change', projectId: 1, issueId: '2',
       summaryCode: 'approval_selection',
       summaryParams: { context: 'rm -rf build?' },
     }, ja);
@@ -523,7 +524,7 @@ describe('formatEventText', () => {
   // #275 / B-07：弹窗等人选不是「受阻」，两种通知的前缀与语气必须分开
   test('choice_waiting 用「等你选择」的文案，与 issue_blocked 明确区分', () => {
     const zh = createI18n({ locale: 'zh-Hans', timeZone: 'UTC', catalog: catalogs['zh-Hans'] });
-    const base = { projectId: 1, issueId: 7, summaryCode: 'menu_stuck' as const,
+    const base = { projectId: 1, issueId: '7', summaryCode: 'menu_stuck' as const,
       summaryParams: { minutes: 5, context: 'rm -rf build?' } };
 
     const choice = formatEventText({ kind: 'choice_waiting', ...base }, zh);
@@ -541,7 +542,7 @@ describe('formatEventText', () => {
   test('止损暂停：三种触发原因分别渲染，并说清「没失败也没取消」', () => {
     const zh = createI18n({ locale: 'zh-Hans', timeZone: 'UTC', catalog: catalogs['zh-Hans'] });
     const render = (reason: string, params: Record<string, string | number>) => formatEventText({
-      kind: 'issue_blocked', projectId: 1, issueId: 2,
+      kind: 'issue_blocked', projectId: 1, issueId: '2',
       summaryCode: 'stop_loss_paused',
       summaryParams: { title: '导出功能', reason, blocks: 0, reentries: 0, hours: 0, ...params },
     }, zh);
@@ -563,7 +564,7 @@ describe('formatEventText', () => {
     const zh = createI18n({ locale: 'zh-Hans', timeZone: 'UTC', catalog: catalogs['zh-Hans'] });
     const en = createI18n({ locale: 'en', timeZone: 'UTC', catalog: catalogs.en });
     const event = {
-      kind: 'status_change' as const, projectId: 1, issueId: 9,
+      kind: 'status_change' as const, projectId: 1, issueId: '9',
       summaryCode: 'clarify_success_low' as const,
       summaryParams: { project: 'panda', ok: 1, total: 10 },
     };
@@ -579,7 +580,7 @@ describe('formatEventText', () => {
     const zh = createI18n({ locale: 'zh-Hans', timeZone: 'UTC', catalog: catalogs['zh-Hans'] });
     const en = createI18n({ locale: 'en', timeZone: 'UTC', catalog: catalogs.en });
     const event = {
-      kind: 'issue_blocked' as const, projectId: 1, issueId: 42,
+      kind: 'issue_blocked' as const, projectId: 1, issueId: '42',
       summaryCode: 'regression_failed' as const,
       summaryParams: { project: 'panda', label: 'bun run test', code: 1 },
     };
@@ -599,12 +600,12 @@ describe('formatEventText', () => {
   test('自动重试到顶：reason 选词与 count 复数按语言渲染，issue 标题保持原文', () => {
     const zh = createI18n({ locale: 'zh-Hans', timeZone: 'UTC', catalog: catalogs['zh-Hans'] });
     const nudge = formatEventText({
-      kind: 'status_change', projectId: 1, issueId: 2,
+      kind: 'status_change', projectId: 1, issueId: '2',
       summaryCode: 'auto_retry_exhausted',
       summaryParams: { title: '导出功能', reason: 'nudge', count: 5 },
     }, zh);
     const judge = formatEventText({
-      kind: 'status_change', projectId: 1, issueId: 2,
+      kind: 'status_change', projectId: 1, issueId: '2',
       summaryCode: 'auto_retry_exhausted',
       summaryParams: { title: '导出功能', reason: 'judge', count: 10 },
     }, zh);
@@ -616,12 +617,12 @@ describe('formatEventText', () => {
     // 俄语复数走 ICU few/many，不是把英文数量拼进去
     const ru = createI18n({ locale: 'ru', timeZone: 'UTC', catalog: catalogs.ru });
     const one = formatEventText({
-      kind: 'status_change', projectId: 1, issueId: 2,
+      kind: 'status_change', projectId: 1, issueId: '2',
       summaryCode: 'auto_retry_exhausted',
       summaryParams: { title: 'Экспорт', reason: 'nudge', count: 1 },
     }, ru);
     const many = formatEventText({
-      kind: 'status_change', projectId: 1, issueId: 2,
+      kind: 'status_change', projectId: 1, issueId: '2',
       summaryCode: 'auto_retry_exhausted',
       summaryParams: { title: 'Экспорт', reason: 'nudge', count: 5 },
     }, ru);

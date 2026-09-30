@@ -22,6 +22,7 @@ import {
 import type { DesignStore } from '../../designs/store';
 import { apiError } from '../errors';
 import { json, type RouteDef } from '../middleware';
+import { parseIssueId, type IssueId } from '../../../shared/issue-id';
 
 export interface DesignsRoutesDeps {
   db: Database;
@@ -448,7 +449,7 @@ function graphInput(value: unknown): DesignGraphDraft | null {
       || typeof node.title !== 'string'
       || !node.title.trim()
       || (node.ordinal !== undefined && (!Number.isSafeInteger(node.ordinal) || (node.ordinal as number) < 0))
-      || (node.issueId !== undefined && node.issueId !== null && strictPositiveInt(node.issueId) === null)
+      || (node.issueId !== undefined && node.issueId !== null && parseIssueId(node.issueId) !== node.issueId)
       || (
         node.lastSyncedRevision !== undefined
         && node.lastSyncedRevision !== null
@@ -521,7 +522,7 @@ export function designsRoutes(deps: DesignsRoutesDeps): RouteDef[] {
     const syncs = sync.listSyncs(task.id);
     const syncByLink = new Map(syncs.map((item) => [item.linkId, item]));
     const linkedIssues = store.listPrimaryIssueLinks(task.id).map((link) => {
-      const issue = db.query<{ title: string; status: string }, [number, number]>(
+      const issue = db.query<{ title: string; status: string }, [IssueId, number]>(
         'SELECT title, status FROM issues WHERE id = ? AND project_id = ?',
       ).get(link.issueId, task.projectId);
       const latestSync = syncByLink.get(link.id);

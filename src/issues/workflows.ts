@@ -22,6 +22,7 @@ import type {
   WorkflowNodeExecutionMode,
   WorkflowNodeKind,
 } from '../core/types';
+import type { IssueId } from '../../shared/issue-id';
 
 export const MAX_WORKFLOW_NAME_LENGTH = 80;
 export const MAX_WORKFLOW_DESCRIPTION_LENGTH = 500;
@@ -88,7 +89,7 @@ interface VersionRow {
 
 interface IssueWorkflowRow {
   id: number;
-  issue_id: number;
+  issue_id: IssueId;
   template_id: number | null;
   template_version_id: number | null;
   template_name: string;
@@ -615,14 +616,14 @@ export class WorkflowTemplateStore {
     return detail?.template.status === 'active' ? detail : null;
   }
 
-  issueWorkflow(issueId: number): IssueWorkflowSnapshot | null {
+  issueWorkflow(issueId: IssueId): IssueWorkflowSnapshot | null {
     const row = this.db
-      .query<IssueWorkflowRow, [number]>('SELECT * FROM issue_workflows WHERE issue_id = ?')
+      .query<IssueWorkflowRow, [IssueId]>('SELECT * FROM issue_workflows WHERE issue_id = ?')
       .get(issueId);
     return row ? mapIssueWorkflow(row) : null;
   }
 
-  issueWorkflowRuntime(issueId: number): IssueWorkflowRuntime | null {
+  issueWorkflowRuntime(issueId: IssueId): IssueWorkflowRuntime | null {
     const workflow = this.issueWorkflow(issueId);
     if (!workflow) return null;
     const runs = this.db
@@ -648,7 +649,7 @@ export class WorkflowTemplateStore {
 
   /** 必须与 issues 行在同一数据库事务内调用。 */
   attachIssue(
-    issueId: number,
+    issueId: IssueId,
     detail: WorkflowTemplateDetail,
     context: IssueWorkflowSharedContext,
   ): IssueWorkflowSnapshot {

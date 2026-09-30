@@ -28,7 +28,7 @@ import type { DesignFilesService } from '../../designs/files';
 import type { DesignAssetService } from '../../designs/assets';
 import type { ExecutorDriver } from '../../executor/driver';
 import type { SummaryTarget } from '../../core/agent-summary';
-import type { EngineIssue, IssueEngine } from '../../issues/engine';
+import { getProject, type EngineIssue, type IssueEngine } from '../../issues/engine';
 import type { KeyedMutex } from '../../issues/mutex';
 import type { ModuleStore } from '../../issues/modules';
 import type { SubscriptionStore } from '../../notify/router';
@@ -54,15 +54,19 @@ import { externalIssuesRoutes } from './external-issues';
 import { feishuOauthRoutes } from './feishu-oauth';
 import { filesRoutes, type FilesDriver } from './files';
 import { gitRoutes, type GitDriver } from './git';
+import { gitWorkspaceRoutes, type GitWorkspaceDriver } from './git-workspace';
+import type { PreviewService } from '../preview';
 import { greetingRoutes } from './greeting';
 import { issuesRoutes } from './issues';
 import { llmStatusRoutes } from './llm-status';
+import { roomsRoutes, type RoomsRoutesDeps } from './rooms';
 import { meRoutes } from './me';
 import { projectsRoutes, type CwdMigrateDriver } from './projects';
 import { skillsRoutes } from './skills';
 import { subscriptionsRoutes, type FeishuBindVerifier } from './subscriptions';
 import { uploadsRoutes } from './uploads';
 import { workflowsRoutes } from './workflows';
+import type { IssueId } from '../../../shared/issue-id';
 
 /** 聚合所有路由工厂需要的依赖全集（server.ts 装配后传入） */
 export interface ApiDeps {
@@ -93,9 +97,12 @@ export interface ApiDeps {
    * 按项目取 Driver（files/git 浏览、技能安装、cwd 迁移用；executor 缺失回退主 Driver，
    * server.ts 同名函数）。生产传完整 ExecutorDriver，结构交集天然满足。
    */
-  driverForProject(project: Project): FilesDriver & GitDriver & SkillsDriver & CwdMigrateDriver;
+  driverForProject(project: Project): FilesDriver & GitDriver & GitWorkspaceDriver & SkillsDriver & CwdMigrateDriver;
+  /** 完整网页预览隔离服务（#388）：提供签发端点；缺省不注册 */
+  preview?: PreviewService;
   /** LLM 客户端（技能市场 驱动大模型 富化用；与 PM 池共享并发闸） */
   llm: LlmClient;
+  rooms?: Omit<RoomsRoutesDeps, 'db'>;
   /** M5：执行机登记变更/删除后回调（server 据此失效 Driver 池缓存，热加载不重启） */
   onExecutorChanged?(executorId: number): void;
   /**
@@ -104,10 +111,12 @@ export interface ApiDeps {
    * 仍只用其中的 create（结构子集，天然满足）。
    */
   convs?: ConvManagerPort;
+  executionUnavailable?(project: Project): string | null;
   /** tmux 注入锁（对话模式 activate/archive 用；与引擎/PM/act/WS 同一实例才有互斥意义） */
   mutex?: KeyedMutex;
   /** 对话当前模型探测（core/model-probe.ModelProbe）；缺省 = model 接口恒 null */
   models?: ConvModelPort;
+  modelsForProject?(project: Project): ConvModelPort;
   /** 订阅存储（NotifyRouter.subscriptions） */
   subs: SubscriptionStore;
   /** 飞书通道（未配置传 null → 绑定接口 503，其余照常） */
@@ -128,7 +137,7 @@ export interface ApiDeps {
   messages?: MessageBumper;
   projectDataSync?: { sync(project: Project): Promise<unknown>; status(projectId: number): ProjectDataSyncStatus };
   /** 在等人工输入的 issue id 集合（projects summary 把它们补进待确认角标）；缺省不补 */
-  waitingIssueIds?(): Set<number>;
+  waitingIssueIds?(): Set<IssueId>;
   /** 「Agent 认知总结/记忆」后台任务编排（core/summary-orchestrator；缺省 = claude/codex 模式 503） */
   summaryOrchestrator?: {
     start(
@@ -145,6 +154,7 @@ export function allRoutes(deps: ApiDeps): RouteDef[] {
     ...authRoutes({ users: deps.users }),
     ...meRoutes({ users: deps.users }),
     ...llmStatusRoutes({ db: deps.db }),
+    ...(deps.rooms ? roomsRoutes({ db: deps.db, ...deps.rooms }) : []),
     ...greetingRoutes({ db: deps.db, llm: deps.llm }),
     ...adminRoutes({
       db: deps.db,
@@ -214,11 +224,28 @@ export function allRoutes(deps: ApiDeps): RouteDef[] {
           convs: deps.convs,
           mutex: deps.mutex,
           driverForProject: deps.driverForProject,
+          ...(deps.executionUnavailable ? { executionUnavailable: deps.executionUnavailable } : {}),
           ...(deps.models ? { models: deps.models } : {}),
+          ...(deps.modelsForProject ? { modelsForProject: deps.modelsForProject } : {}),
         })
       : []),
-    ...uploadsRoutes({ db: deps.db, driver: deps.driver }),
+    ...uploadsRoutes({ db: deps.db, driver: deps.driver, driverForProject: deps.driverForProject }),
     ...filesRoutes({ db: deps.db, driverForProject: deps.driverForProject }),
+    ...(deps.preview ? deps.preview.routes() : []),
+    ...gitWorkspaceRoutes({
+      db: deps.db,
+      driverForProject: deps.driverForProject,
+      ...(deps.mutex ? { mutex: deps.mutex } : {}),
+      // worktree 登记的关联项目与手动新建项目同等待遇：属主自动订阅 + .panda 同步
+      onProjectRegistered: async (project) => {
+        try { deps.notify?.ensureOwnerSubscription(project.id, project.ownerUserId); } catch { /* 不阻塞登记 */ }
+        await deps.projectDataSync?.sync(project).catch(() => {});
+      },
+      syncProjectData: async (id: number) => {
+        const project = getProject(deps.db, id);
+        if (project) await deps.projectDataSync?.sync(project);
+      },
+    }),
     ...gitRoutes({
       db: deps.db,
       driverForProject: deps.driverForProject,
