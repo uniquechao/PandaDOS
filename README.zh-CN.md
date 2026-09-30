@@ -54,18 +54,27 @@ SSH 执行机连接 Claude Code/Codex。这样即使合上笔记本，Agent 仍�
 把下面这段 prompt 直接贴给准备安装 PandaDOS 的机器上的 Claude Code 或 Codex：
 
 ```text
-请帮我安装 PandaDOS，仓库地址是 https://github.com/uniquechao/PandaDOS.git。
+请帮我从 https://github.com/uniquechao/PandaDOS/releases 安装最新稳定版 PandaDOS。
 
 修改任何内容前：
 1. 检查操作系统、当前用户、可用端口、Bun、Git、tmux、Claude Code、Codex、systemd
    和现有反向代理。
-2. 克隆仓库后先阅读 README.zh-CN.md 与 DEPLOY.zh-CN.md，并以它们为准。
-3. 先说明完整安装方案；删除文件、修改防火墙、移除软件包、覆盖现有服务或代理配置前
+2. 查询最新的非 draft、非 prerelease GitHub Release，并检测机器架构。只选择一个完全
+   匹配的制品：macOS arm64 -> macos-arm64、macOS x86_64 -> macos-x64、
+   Linux aarch64/arm64 -> linux-arm64、Linux x86_64/amd64 -> linux-x64。不得使用其他
+   操作系统或架构的制品代替。
+3. 从同一个 Release 下载匹配的 `PandaDOS-v*-<platform>.tar.gz` 与 `SHA256SUMS`，解压前
+   按对应条目核对归档文件的 SHA-256。
+4. 解压后阅读 ARTIFACT.md、README.zh-CN.md 与 DEPLOY.zh-CN.md，并以它们为准。
+5. 先说明完整安装方案；删除文件、修改防火墙、移除软件包、覆盖现有服务或代理配置前
    必须向我确认。
 
 然后：
-- 将 PandaDOS 克隆或更新到独立目录。
-- 安装依赖，依次运行国际化检查、类型检查、测试和 UI 构建。
+- 将校验通过的运行包安装到独立的版本目录，并使用 `./bin/pandados` 启动。
+- 升级时保留已有的 `~/.panda/`、服务配置、反向代理和 tmux 中正在运行的 Agent 进程。
+- 运行包已经包含预构建 UI 和生产依赖，但仍需要 Bun、Git、tmux，以及已登录的
+  Claude Code 或 Codex CLI；只安装缺少的前置依赖。
+- 如果没有兼容的 Release 制品，停止并说明原因；回退到克隆源码和完整构建前先征得同意。
 - 保持 PandaDOS 只监听 127.0.0.1:8802。
 - 启动服务并验证 /healthz。
 - 如果系统支持 systemd，参考 DEPLOY.zh-CN.md 安装自动重启服务，并确保重启控制面时
@@ -76,6 +85,9 @@ SSH 执行机连接 Claude Code/Codex。这样即使合上笔记本，Agent 仍�
 - 最后给出登录地址、服务状态、健康检查结果，以及仍需手动完成的 Claude Code/Codex
   登录步骤。
 ```
+
+Release 运行包包含预构建 UI 和对应平台的生产依赖，但不包含 Bun、Git、tmux、
+Claude Code 或 Codex。
 
 ### 手动安装
 

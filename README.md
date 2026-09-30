@@ -61,18 +61,30 @@ recommended for clarification, PM decisions, summaries, and approval explanation
 Paste this prompt into Claude Code or Codex on the machine where you want PandaDOS to run:
 
 ```text
-Install PandaDOS for me from https://github.com/uniquechao/PandaDOS.git.
+Install the latest stable PandaDOS release for me from
+https://github.com/uniquechao/PandaDOS/releases.
 
 Before changing anything:
 1. Inspect the operating system, current user, available ports, Bun, Git, tmux, Claude Code, Codex,
    systemd, and any existing reverse proxy.
-2. Read README.md and DEPLOY.md in the repository and use them as the source of truth.
-3. Explain the exact installation plan and ask before any destructive change, firewall change,
+2. Query the latest non-draft, non-prerelease GitHub Release and detect the machine architecture.
+   Select exactly one matching asset: macOS arm64 -> macos-arm64, macOS x86_64 -> macos-x64,
+   Linux aarch64/arm64 -> linux-arm64, or Linux x86_64/amd64 -> linux-x64. Never substitute an
+   asset built for another operating system or architecture.
+3. Download the matching `PandaDOS-v*-<platform>.tar.gz` and `SHA256SUMS` from the same Release.
+   Verify the archive against its exact SHA-256 entry before extracting it.
+4. After extraction, read ARTIFACT.md, README.md, and DEPLOY.md and use them as the source of truth.
+5. Explain the exact installation plan and ask before any destructive change, firewall change,
    package removal, or replacement of an existing service or proxy configuration.
 
 Then:
-- Clone or update PandaDOS in a dedicated directory.
-- Install dependencies, run the localization check, type check, tests, and UI build.
+- Install the verified bundle in a dedicated versioned directory and start it with `./bin/pandados`.
+- Preserve an existing `~/.panda/`, service definition, reverse proxy, and active tmux agent processes
+  when upgrading.
+- The bundle already contains the prebuilt UI and production dependencies. It still requires Bun,
+  Git, tmux, and an authenticated Claude Code or Codex CLI; install only missing prerequisites.
+- If no compatible Release asset exists, stop and explain why. Ask before falling back to cloning
+  the source repository and running the full build.
 - Keep PandaDOS bound to 127.0.0.1:8802.
 - Start it and verify /healthz.
 - If systemd is available, install a restart-on-failure service using the DEPLOY.md example and
@@ -83,6 +95,9 @@ Then:
 - Finish with the login URL, service status, health-check result, and any manual steps still needed
   to authenticate Claude Code or Codex.
 ```
+
+Release bundles contain the prebuilt UI and target-specific production dependencies. They do not
+bundle Bun, Git, tmux, Claude Code, or Codex.
 
 ### Install manually
 
