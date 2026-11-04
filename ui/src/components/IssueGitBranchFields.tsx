@@ -15,8 +15,10 @@ export function IssueGitBranchFields({
   value,
   onChange,
   onLoadingChange,
+  legacy = false,
 }: {
   pid: number;
+  legacy?: boolean;
   value: IssueGitBranchValue;
   onChange: (value: IssueGitBranchValue) => void;
   onLoadingChange?: (loading: boolean) => void;
@@ -39,6 +41,7 @@ export function IssueGitBranchFields({
   };
 
   useEffect(() => {
+    if (!legacy) { setLoading(false); onLoadingChangeRef.current?.(false); if(valueRef.current.targetBranch || valueRef.current.sourceRef) emit({targetBranch:'',sourceRef:''}); return; }
     let alive = true;
     targetTouched.current = false;
     setBranches(null);
@@ -86,6 +89,7 @@ export function IssueGitBranchFields({
     ? branches.local.length + branches.remote.length
     : 0;
 
+  if (!legacy) return <p class="small mut">{t('moduleWorkspace.fixedTarget')}</p>;
   return (
     <div class="issue-git-fields">
       <label class="field">

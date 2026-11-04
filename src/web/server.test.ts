@@ -10,6 +10,7 @@ import { promises as fsp, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { openDb } from '../core/db';
+import { worktreeTmux } from '../core/conversations';
 import { importableHistorySessions } from '../core/conversation-history';
 import { migrate, splitStatements } from '../core/migrate';
 import { migrateDesigns, DesignStore } from '../designs/store';
@@ -61,6 +62,7 @@ function png(width = 1024, height = 1024): Uint8Array {
 /** tmux 面全部 stub 成内存实现（测试机不真起 tmux/claude）；文件/git 面保持真 LocalDriver */
 class FakeDriver extends LocalDriver {
   sessions = new Set<string>();
+  environments = new Map<string,Record<string,string>|undefined>();
   sent: Array<{ session: string; text: string }> = [];
   gitCalls: Array<{ cwd: string; args: string[] }> = [];
   override async git(cwd: string, args: string[]) {
@@ -73,7 +75,8 @@ class FakeDriver extends LocalDriver {
   override async listSessions() {
     return [...this.sessions].map((name) => ({ name, createdTs: 0, attached: false }));
   }
-  override async createSession(name: string) {
+  override async createSession(name: string, _cwd?: string, env?:Record<string,string>) {
+    this.environments.set(name,env);
     this.sessions.add(name);
   }
   override async killSession(name: string) {
@@ -313,7 +316,7 @@ describe('server 集成冒烟（完整装配）', () => {
   // host's normal sshd/tmux namespace (project ids would otherwise collide with live sessions).
   const sshIssueTest = process.env.PANDA_R3_SSH_KEY && process.env.PANDA_R3_SSH_PORT
     && process.env.PANDA_R3_SSH_TMUX_DIR && Bun.which('cc') ? test : test.skip;
-  sshIssueTest('真实 SSH 回环：远端 Issue 开工、重启恢复、验证和 Git 收尾', async () => {
+  sshIssueTest('真实 SSH 回环：存量 legacy Issue 开工、重启恢复、验证和 Git 收尾', async () => {
     const local = new FakeDriver();
     let fakeAgent = '';
     const sshConfig = {
@@ -329,9 +332,14 @@ describe('server 集成冒烟（完整装配）', () => {
         (name, host, port, ssh_user, key_ref, workspace_root, claude_dir, codex_dir)
         SELECT 'ssh-test', '127.0.0.1', ?, ?, 'test-key', workspace_root,
           claude_dir, codex_dir FROM executors WHERE id = 1`).run(sshConfig.port, sshConfig.username);
+
     }, local, { driverFactory: (executor) => executor.id === 2 ? remote : local,
       engineConfig: { tickMs: 3_600_000, resultSummaryTimeoutMs: 0, kickoffMinBootMs: 0 },
     });
+    // Exercise legacy projects alongside the separate module-worktree lifecycle tests.
+    ctx.server.db.run(`CREATE TEMP TRIGGER routing_test_legacy_issue AFTER INSERT ON issues BEGIN
+      UPDATE issues SET workspace_mode = 'legacy' WHERE rowid = NEW.rowid;
+    END`);
     expect((await remote.runCommand('/', ['sh', '-c', 'printf %s "$TMUX_TMPDIR"'], 5_000)).out)
       .toBe(process.env.PANDA_R3_SSH_TMUX_DIR!);
     const source = path.join(ctx.dir, 'fake-agent.c');
@@ -403,6 +411,7 @@ describe('server 集成冒烟（完整装配）', () => {
     const pending = await recovered.engine.createIssue(pid, {
       title: 'offline SSH issue', category: 'debug',
     }, false);
+    recovered.db.query("UPDATE issues SET workspace_mode = 'legacy' WHERE id = ?").run(pending.id);
     await recoveredDriver.killSession(session).catch(() => {});
     await recoveredDriver.close();
     expect(await recovered.engine.startIssue(pending.id)).toMatchObject({ ok: true, to: 'paused' });
@@ -410,7 +419,7 @@ describe('server 集成冒烟（完整装配）', () => {
     expect(local.gitCalls).toHaveLength(localGitBefore);
     expect(local.sessions.size).toBe(0);
   }, 60_000);
-  test('第二执行机同 cwd 的 Issue 自动启动、重启恢复与离线失败均不落到主执行机', async () => {
+  test('第二执行机同 cwd 的存量 legacy Issue 自动启动、重启恢复与离线失败均不落到主执行机', async () => {
     const local = new FakeDriver();
     const remote = new SwitchableExecutorDriver();
     const ctx = await boot(undefined, (db) => {
@@ -418,7 +427,12 @@ describe('server 集成冒烟（完整装配）', () => {
         (name, host, port, ssh_user, key_ref, workspace_root, claude_dir, codex_dir)
         SELECT 'remote', 'remote.example', 22, 'agent', 'test-key', workspace_root,
           claude_dir, codex_dir FROM executors WHERE id = 1`);
+
     }, local, { driverFactory: (executor) => executor.id === 2 ? remote : local });
+    // Exercise legacy projects alongside the separate module-worktree lifecycle tests.
+    ctx.server.db.run(`CREATE TEMP TRIGGER routing_test_legacy_issue AFTER INSERT ON issues BEGIN
+      UPDATE issues SET workspace_mode = 'legacy' WHERE rowid = NEW.rowid;
+    END`);
     const token = (await fsp.readFile(ctx.tokenFile, 'utf8')).trim();
     const cwd = path.join(ctx.ws, 'same-cwd');
     const primaryProject = await api(ctx, 'POST', '/api/projects', token, {
@@ -439,7 +453,7 @@ describe('server 集成冒烟（完整装配）', () => {
       title: 'remote issue', category: 'debug', body: 'run only on remote executor',
     });
     expect(issue.status).toBe(200);
-    expect(issue.body.issue.status).toBe('implementing');
+    expect(issue.body.issue.status, JSON.stringify(ctx.server.engine.store.listEvents(issue.body.issue.id))).toBe('implementing');
     expect(remote.gitCalls.some((call) => call.cwd === cwd)).toBe(true);
     expect(remote.sessions.has(`cc-${remoteId}-m-general-work`)).toBe(true);
     expect(remote.sent.length).toBeGreaterThan(0);
@@ -469,6 +483,7 @@ describe('server 集成冒烟（完整装配）', () => {
     const offlineIssue = await restarted.engine.createIssue(otherRemoteProject.body.project.id, {
       title: 'queued while offline', category: 'debug',
     }, false);
+    restarted.db.query("UPDATE issues SET workspace_mode = 'legacy' WHERE id = ?").run(offlineIssue.id);
     const start = await restarted.engine.startIssue(offlineIssue.id);
     expect(start).toMatchObject({ ok: true, to: 'paused' });
     expect(restarted.engine.store.get(offlineIssue.id)?.status).toBe('paused');
@@ -1189,8 +1204,8 @@ describe('server 集成冒烟（完整装配）', () => {
     const h = await api(ctx, 'GET', '/healthz');
     expect(h.status).toBe(200);
     expect(h.body.ok).toBe(true);
-    expect(h.body.db.latest).toBe(86);
-    expect(h.body.db.applied).toBe(80);
+    expect(h.body.db.latest).toBe(89);
+    expect(h.body.db.applied).toBe(83);
     expect(h.body.executors).toEqual([{ id: 1, name: 'local', status: 'online' }]);
     expect(h.body.engine.running).toBe(true);
     expect(h.body.feishu).toBe(false);
@@ -1287,8 +1302,11 @@ describe('server 集成冒烟（完整装配）', () => {
     expect((await api(ctx,'PUT',policyUrl,bob.body.token,{superpowers:'disabled'})).status).toBe(403);
     expect((await api(ctx,'PUT',policyUrl,alice.body.token,{superpowers:'invalid'})).status).toBe(400);
 
-    // 模块会话已（模拟）拉起：boot 已在测试 DB 禁用 LLM → 分类器必走确定性回退 general-work
-    expect(ctx.driver.sessions.has(`cc-${pid}-m-general-work`)).toBe(true);
+    // 新模式会话由工作区轮次绑定，不再依赖模块 slug 派生的共享 tmux。
+    const owned=ctx.server.db.query<{conversation_id:string;cwd:string},[string]>(`SELECT a.conversation_id,w.cwd FROM workspace_attempts a JOIN module_workspaces w ON w.current_attempt=a.id WHERE a.issue_id=?`).get(issue.body.issue.id)!;
+    expect(owned).toBeTruthy();
+    expect(owned.cwd).not.toBe(projectCwd);
+    expect(ctx.driver.sessions.has(worktreeTmux(pid,owned.conversation_id))).toBe(true);
     expect(ctx.driver.sent.some((s) => s.text.includes('claude --session-id') || s.text.includes('.panda/tmp/skill-sessions/'))).toBe(true);
 
     // ---- 列表可见 + 属主隔离：他人 403 / 未登录 401 / admin 恒过 ----
@@ -1725,4 +1743,67 @@ describe('装配纯函数', () => {
     expect(trustFileOf('/root/.claude/projects/')).toBe('/root/.claude.json');
     expect(trustFileOf('/data/claude-projects')).toBeUndefined();
   });
+});
+
+test('模块工作区完整装配：非主执行器启动及文件归属不回落主执行器',async()=>{
+ const primary=new FakeDriver(),secondary=new FakeDriver();
+ const ctx=await boot(undefined,db=>{
+  db.run(`INSERT INTO executors(name,host,ssh_user,key_ref,workspace_root,claude_dir)
+    SELECT 'secondary','127.0.0.2','test','test',workspace_root || '/second',claude_dir FROM executors WHERE id=1`);
+ },primary,{driverFactory:ex=>ex.id===1?primary:secondary});
+ const token=(await fsp.readFile(ctx.tokenFile,'utf8')).trim();
+ const created=await api(ctx,'POST','/api/projects',token,{name:'执行器隔离',executorId:2});
+ expect(created.status).toBe(200);const p=created.body.project;
+ await fsp.mkdir(p.cwd,{recursive:true});await fsp.writeFile(path.join(p.cwd,'README.md'),'隔离基线');
+ for(const args of [['init','-q'],['add','.'],['-c','user.name=测试','-c','user.email=test@example.invalid','commit','-qm','基线']])expect((await secondary.git(p.cwd,args)).code).toBe(0);
+ const result=await api(ctx,'POST',`/api/projects/${p.id}/issues`,token,{title:'执行器隔离验收',category:'debug'});
+ expect(result.status,JSON.stringify(result.body)).toBe(200);expect(result.body.issue.status).toBe('implementing');
+ const issue=result.body.issue,session=worktreeTmux(p.id,issue.convId);
+ expect(secondary.sessions.has(session)).toBe(true);expect(primary.sessions.has(session)).toBe(false);
+ expect(secondary.environments.get(session)?.PANDA_WORKSPACE_CWD).toBe(issue.workspace.cwd);
+ expect(secondary.environments.get(session)?.PANDA_WORKSPACE_ATTEMPT).toBe(issue.workspace.attempt);
+ expect(primary.sent.some(x=>x.session===session)).toBe(false);
+ await fsp.writeFile(path.join(issue.workspace.cwd,'归属.txt'),'第二执行器工作区');
+ const file=await api(ctx,'GET',`/api/projects/${p.id}/fs/file?issue=${issue.id}&path=${encodeURIComponent('归属.txt')}`,token);
+ expect(file.status).toBe(200);expect(JSON.stringify(file.body)).toContain('第二执行器工作区');
+});
+
+test('主执行机稳定门面透传模型目录、会话切换与实时抓屏', async () => {
+  const driver = new FakeDriver();
+  const discoveries: Array<{ cwd: string; env?: Record<string,string> }> = [];
+  const applies: Array<import('../../shared/agent-models').AgentModelApplyRequest> = [];
+  const selection = { model: 'live-model', effort: 'high' };
+  driver.discoverAgentModels = async (agent,cwd,env) => {
+    discoveries.push({cwd,env});
+    return {agent,fetchedAt:1,models:[{id:selection.model,name:selection.model,efforts:['high']}]};
+  };
+  driver.applyAgentModel = async request => { applies.push(request);return {state:'applied',...selection}; };
+  driver.listSessions = async () => [...driver.sessions].map(name => ({name,createdTs:0,attached:false,command:'codex'}));
+  let captures=0;
+  driver.capturePane = async () => ++captures===1 ? '• Working\n›\nesc to interrupt' : '›';
+  const ctx = await boot(undefined,undefined,driver);
+  const admin = (await fsp.readFile(ctx.tokenFile,'utf8')).trim();
+  const user = await api(ctx,'POST','/api/admin/users',admin,{username:'model-user'});
+  const token = user.body.token as string;
+  const project = await api(ctx,'POST','/api/projects',token,{name:'model-project',executorId:1});
+  const pid = project.body.project.id as number;
+  const conversation = await api(ctx,'POST',`/api/projects/${pid}/conversations`,token,{label:'模型回归',agent:'codex'});
+  const cid = conversation.body.conversation.id as string;
+  const session = `chat-${cid}`;
+  driver.sessions.add(session);
+  ctx.server.db.query('UPDATE conversations SET agent_session_id=? WHERE id=?').run('native-model-session',cid);
+  const base = `/api/projects/${pid}/conversations/${cid}`;
+  const catalog = await api(ctx,'GET',`${base}/model-options`,token);
+  expect(catalog.status).toBe(200);
+  expect(catalog.body.catalog.models[0].id).toBe(selection.model);
+  // 池内已有忙碌屏缓存，应用时必须穿过门面重新抓取实际空闲状态。
+  await ctx.server.drivers.get(1)!.capturePane(session);
+  const saved = await api(ctx,'PATCH',`${base}/model-settings`,token,{...selection,revision:0});
+  expect(saved.status).toBe(200);
+  expect(saved.body).toMatchObject({state:'applied',revision:1,actual:selection});
+  expect(applies).toHaveLength(1);
+  expect(applies[0]).toMatchObject({session,nativeSessionId:'native-model-session',cwd:project.body.project.cwd,...selection});
+  expect(discoveries[0]?.env?.CODEX_HOME).toBe(path.join(ctx.dir,'home','.codex'));
+  expect(captures).toBeGreaterThanOrEqual(2);
+  expect(driver.sent).toHaveLength(0);
 });

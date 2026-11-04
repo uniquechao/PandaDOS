@@ -16,6 +16,10 @@ import {
 
 const EXPECTED_TABLES = [
   'schema_migrations',
+  'agent_model_settings',
+  'local_issue_plan_publications',
+  'local_issue_plan_items',
+  'local_issue_plan_effects',
   'users',
   'user_settings',
   'executors',
@@ -44,7 +48,7 @@ const EXPECTED_TABLES = [
 ].sort();
 
 /** core/migrations 当前最新编号（新增迁移文件时同步 +1） */
-const LATEST_MIGRATION = 76;
+const LATEST_MIGRATION = 89;
 
 function tableNames(db: Database): string[] {
   return db

@@ -150,6 +150,21 @@ describe('PaneCacheDriver（M6 capturePane TTL 合并缓存）', () => {
     expect(PANE_CACHE_TTL_MS).toBe(300);
   });
 
+  test('idle probes pass through the pool wrapper and sleeping invalidates cached terminal output', async () => {
+    const f=makeFake();
+    const snapshot={name:'chat-test',sessionId:'$2',paneId:'%3',panePid:123,activityTs:1,createdTs:1,
+      attached:false,windows:1,panes:1,inMode:false,command:'codex',processesIdle:true};
+    f.inner.inspectIdleSession=async()=>snapshot;
+    f.inner.sleepSessionIfIdle=async()=>true;
+    const driver=withPaneCache(f.inner);
+    await driver.capturePane('chat-test');
+    expect(await driver.inspectIdleSession('chat-test')).toEqual(snapshot);
+    expect(await driver.sleepSessionIfIdle(snapshot)).toBe(true);
+    await driver.capturePane('chat-test');
+    expect(f.caps('chat-test')).toBe(2);
+    expect(await withPaneCache(makeFake().inner).inspectIdleSession('chat-test')).toBeNull();
+  });
+
   test('tmux 历史滚动原样透传到底层 Driver', async () => {
     const f = makeFake();
     await withPaneCache(f.inner).scrollPane('s1', 'up', 6);
@@ -188,4 +203,14 @@ describe('PaneCacheDriver（M6 capturePane TTL 合并缓存）', () => {
       '/root', '.panda/designs/design-1/DESIGN.md', 'a'.repeat(64),
     )).toBe('removed');
   });
+});
+
+test('工作区环境与停止确认完整透传缓存层',async()=>{
+ const f=makeFake(),observed:unknown[][]=[];
+ f.inner.createSession=async(...args)=>{observed.push(args);};
+ f.inner.runCommand=async(...args)=>{observed.push(args);return {code:0,out:'',err:'',timedOut:false,durationMs:0};};
+ f.inner.stopSessionConfirmed=async(...args)=>{observed.push(args);};
+ const d=withPaneCache(f.inner),env={PANDA_WORKSPACE_ATTEMPT:'测试轮次'};
+ await d.createSession('a','/workspace',env);await d.runCommand('/workspace',['true'],100,env);await d.stopSessionConfirmed('a','attempt',123);
+ expect(observed).toEqual([['a','/workspace',env],['/workspace',['true'],100,env],['a','attempt',123]]);
 });

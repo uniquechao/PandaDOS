@@ -1,3 +1,7 @@
+import { issueDiagnosticMessages } from '../domains/issue-diagnostics';
+import { localPlanMessages } from '../domains/local-plans';
+import { agentModelMessages } from '../domains/agent-models';
+import { moduleWorkspaceMessages } from '../domains/module-workspace';
 import { roomMemberMessages } from '../domains/rooms-members';
 import { roomChatMessages } from '../domains/rooms-chat';
 import { roomExtraMessages } from '../domains/rooms-extra';
@@ -24,6 +28,10 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const ptBrCatalog = {
+  ...issueDiagnosticMessages,
+  ...localPlanMessages["pt-BR"],
+  ...agentModelMessages,
+  ...moduleWorkspaceMessages["pt-BR"],
   ...roomMemberMessages["pt-BR"],
   ...roomChatMessages["pt-BR"],
   ...roomExtraMessages["pt-BR"],
@@ -175,4 +183,5 @@ export const ptBrCatalog = {
   'ui.moduleIssueCount':'{count, plural, one {# issue relacionada} other {# issues relacionadas}}','ui.organizeResultCreate':'Módulo “{name}” criado ({slug} · {agent})','ui.organizeResultRename':'Módulo renomeado para “{name}” ({slug})','ui.organizeResultMerge':'{count, plural, one {Mesclado em “{target}”; # issue movida} other {Mesclado em “{target}”; # issues movidas}}','ui.organizeResultMove':'{count, plural, one {# issue movida para “{target}”} other {# issues movidas para “{target}”}}',
   'ui.organizeFailureTimeout':'A última análise atingiu o tempo limite. Você pode executá-la novamente.','ui.organizeFailureNoOutput':'A última análise não retornou um plano de organização. Você pode executá-la novamente.','ui.organizeFailureError':'A última análise falhou. Você pode executá-la novamente.','ui.organizeFailureDetail':'Detalhes técnicos: {detail}',
   'git.imageBefore':'Antes','git.imageAfter':'Depois','git.openImage':'Abrir {name}','git.viewImage':'Ver imagem {name}','git.downloadImage':'Baixar {name}',
+  'admin.directoryRequired': "Preencha {field}. Digite um caminho absoluto ou escolha um diretório.",
 } as const satisfies MessageCatalog;

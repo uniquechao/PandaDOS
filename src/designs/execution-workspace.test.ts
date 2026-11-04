@@ -1,3 +1,4 @@
+import { WorkspaceExecutionDeferred } from '../issues/workspace-deferral';
 import { describe, expect, test } from 'bun:test';
 import type { Database } from 'bun:sqlite';
 import type { Project } from '../core/types';
@@ -57,4 +58,16 @@ describe('DesignExecutionWorkspaceAdapter', () => {
       expect((error as ExecutionWorkspaceError).code).toBe('RUN_UNHEALTHY');
     }
   });
+});
+
+test('a healthy prepared design waits for explicit execution without reporting environment failure', () => {
+  for (const active of [0, 1]) {
+    const adapter = new DesignExecutionWorkspaceAdapter({ db: dbReturning({
+      run_id: 'run-1', run_project_id: 4, run_design_id: 9, run_publication_id: 7,
+      execution_mode: 'worktree', lifecycle_state: 'ready', assignment_active: active,
+      worktree_cwd: '/managed/design-4-9', worktree_branch: 'codex/design-4-9',
+      observed_head_sha: 'a'.repeat(40), error_code: null,
+    }), conversations: {} as never });
+    expect(() => adapter.resolve(issue(11), project)).toThrow(WorkspaceExecutionDeferred);
+  }
 });

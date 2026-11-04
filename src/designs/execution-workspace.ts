@@ -1,3 +1,4 @@
+import { WorkspaceExecutionDeferred } from '../issues/workspace-deferral';
 import type { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
@@ -80,6 +81,15 @@ export class DesignExecutionWorkspaceAdapter implements EngineExecutionWorkspace
       WHERE link.issue_id = ? AND link.project_id = ?
     `).get(issue.id, project.id);
     if (!row || !row.run_id || row.execution_mode === 'current') return projectWorkspace(project);
+    // A healthy prepared assignment awaits the owner's Execute action. It must remain pending,
+    // without consuming environment-recovery budgets or acquiring an execution workspace.
+    if (row.execution_mode === 'worktree' && row.lifecycle_state === 'ready'
+      && !row.error_code && row.run_project_id === project.id && row.run_publication_id !== null
+      && row.worktree_branch === `codex/design-${project.id}-${row.run_design_id}`
+      && row.worktree_cwd && posix.isAbsolute(row.worktree_cwd) && row.observed_head_sha) {
+      throw new WorkspaceExecutionDeferred();
+    }
+
     // A publication-bound worktree decision is authoritative.  Until the owner has executed
     // the healthy assignment, linked Issues must stay pending instead of silently running in
     // the project checkout.

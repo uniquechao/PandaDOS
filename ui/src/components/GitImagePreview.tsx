@@ -22,7 +22,7 @@ export function gitImageUrls(
   const query = (side: 'new' | 'old'): string => {
     const q = new URLSearchParams({ path, side });
     if (oldPath) q.set('old', oldPath);
-    return `${endpoint}?${q}`;
+    return `${endpoint}${endpoint.includes('?') ? '&' : '?'}${q}`;
   };
   return {
     ...(status !== 'D' ? { new: query('new') } : {}),

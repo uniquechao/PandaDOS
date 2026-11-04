@@ -2548,8 +2548,10 @@ body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-sel
 
 .wb-issuelist { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .wb-list-hd { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
-.wb-list-t { font-size: 13px; font-weight: 650; color: var(--mut); letter-spacing: 0.02em; }
-.wb-list-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+.wb-list-t { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; font-weight: 650; color: var(--mut); letter-spacing: 0.02em; }
+.wb-list-actions { display: flex; flex: 0 0 auto; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: nowrap; }
+.wb-list-actions .wb-list-action { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; gap: 4px; min-width: 32px; min-height: 32px; padding: 5px 7px; white-space: nowrap; }
+.wb-list-action svg { width: 16px; height: 16px; flex-shrink: 0; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .wb-groups { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 6px 8px 24px; }
 
 /* 对话模式：多对话列表 */
@@ -3789,3 +3791,54 @@ body.row-resizing, body.row-resizing * { cursor: row-resize !important; user-sel
   .ft-more { width: 36px; height: 32px; }
 }
 @media (prefers-reduced-motion: reduce) { .am-pop { animation: none; } }
+
+/* 模块工作区使用当前主题变量；状态、路径与分支各自保持明确层级。 */
+.issue-workspace { min-width: 0; padding: 16px; margin: 12px 0 16px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--card); box-shadow: var(--sh-1); display: flex; flex-direction: column; gap: 12px; }
+.issue-workspace-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px 16px; min-width: 0; }
+.issue-workspace-title { display: flex; align-items: center; gap: 8px; font-size: 14px; line-height: 1.5; }
+.issue-workspace-title svg { flex: none; width: 20px; height: 20px; fill: none; stroke: var(--accent-2); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.issue-workspace-status { align-self: flex-start; max-width: 100%; padding: 4px 9px; border-radius: var(--r-pill); background: var(--fill); color: var(--mut); font-size: 12px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; }
+.issue-workspace.running .issue-workspace-status, .issue-workspace.complete .issue-workspace-status { color: var(--run-2); background: var(--run-weak); }
+.issue-workspace.attention .issue-workspace-status { color: var(--accent-2); background: var(--accent-weak); }
+.issue-workspace .mono { min-width: 0; overflow-wrap: anywhere; white-space: normal; font-size: 12px; line-height: 1.6; }
+.issue-workspace-path { padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel); color: var(--mut); }
+.issue-workspace-branches { margin: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--r-md); overflow: hidden; }
+.issue-workspace-branches > div { min-width: 0; padding: 10px 12px; }
+.issue-workspace-branches > div + div { border-left: 1px solid var(--line); }
+.issue-workspace-branches dt { margin-bottom: 4px; color: var(--mut); font-size: 12px; line-height: 1.5; }
+.issue-workspace-branches dd { margin: 0; color: var(--fg); }
+.issue-workspace-candidate { display: grid; gap: 5px; min-width: 0; font-size: 12px; line-height: 1.5; }
+.issue-workspace-diagnostic, .issue-workspace-error { margin: 0; padding: 10px 12px; border-radius: var(--r-md); background: var(--fill); font-size: 13px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 200px; overflow: auto; }
+.issue-workspace-error { color: var(--bad); background: rgba(220, 38, 38, .07); }
+.issue-workspace-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.issue-workspace-actions .btn { min-height: 44px; white-space: normal; text-align: left; }
+.issue-workspace-actions .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.issue-workspace-sha { padding-top: 10px; border-top: 1px solid var(--line); color: var(--mut); }
+@media (max-width: 600px) {
+  .issue-workspace { padding: 12px; gap: 10px; }
+  .issue-workspace-branches { grid-template-columns: minmax(0, 1fr); }
+  .issue-workspace-branches > div + div { border-left: 0; border-top: 1px solid var(--line); }
+  .issue-workspace-actions .btn { flex: 1 1 100%; }
+}
+
+/* 模型设置与审批共用紧凑入口，表单由 Modal 挂到 body，避免撑高或被工具栏裁剪。 */
+.agent-model-settings { flex: 0 0 auto; display: inline-flex; align-items: center; font-size: 12px; }
+.agent-model-fields { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.agent-model-fields label { display: flex; flex-direction: column; gap: 6px; color: var(--mut); font-size: 12px; }
+.agent-model-fields select { min-height: var(--ctl-h-lg); width: 100%; min-width: 0; color: var(--fg); }
+.agent-model-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+.agent-model-confirm { display: flex; gap: 8px; margin-left: auto; }
+.agent-model-actions .btn { min-height: var(--ctl-h-lg); }
+.agent-model-status { color: var(--mut); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.agent-model-status p { margin: 4px 0 0; }
+.agent-model-error { padding: 10px 12px; border-radius: var(--r-sm); background: rgba(220, 38, 38, 0.06); color: var(--bad); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.agent-model-error code { display: block; margin-top: 4px; }
+.agent-model-settings button:focus-visible, .agent-model-fields select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.issue-stop { margin: 0 12px 9px; padding: 10px 12px; border: 1px solid var(--line-2); border-radius: var(--r-md); background: var(--fill); overflow-wrap: anywhere; }
+.issue-stop p { margin: 6px 0; }
+.issue-stop summary, .stop-diagnostics summary { cursor: pointer; padding: 8px 0; min-height: 36px; }
+.issue-stop .btn { margin-top: 8px; min-height: 40px; }
+.stop-raw { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; max-height: 240px; overflow: auto; font-size: 12px; }
+.stop-diagnostics { max-height: 70dvh; overflow: auto; min-width: 0; }
+.stop-diagnostics .stop-raw { max-height: none; }
+@media (max-width: 480px) { .issue-stop { margin: 0 8px 8px; } .issue-stop .btn { width: 100%; } }

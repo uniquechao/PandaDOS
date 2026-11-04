@@ -1,3 +1,4 @@
+import { issueWorkspaceCwd } from '../core/workspace-ownership';
 /**
  * 并行写节点的 Git worktree 生命周期与汇合冲突恢复。
  *
@@ -203,7 +204,14 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
       )
       .get(workflowId);
     if (!row) throw new Error('workflow.worktree_workflow_missing');
+    row.cwd = issueWorkspaceCwd(this.deps.db,row.project_id,row.issue_id) ?? row.cwd;
     return row;
+  }
+
+  private gitKey(lookup: WorkflowLookupRow):string {
+    const cwd=issueWorkspaceCwd(this.deps.db,lookup.project_id,lookup.issue_id);
+    const row=cwd ? this.deps.db.query<{workspace_id:number},[string]>('SELECT workspace_id FROM workspace_attempts WHERE issue_id=? AND released_ts IS NULL').get(lookup.issue_id) : null;
+    return row ? `workspace-git:${row.workspace_id}` : gitLockKey(lookup.project_id);
   }
 
   async prepare(runId: number): Promise<string | null> {
@@ -218,13 +226,14 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
       )
       .get(runId);
     if (!lookup) throw new Error('workflow.worktree_run_missing');
+    lookup.cwd = issueWorkspaceCwd(this.deps.db,lookup.project_id,lookup.issue_id) ?? lookup.cwd;
     const graph = JSON.parse(lookup.graph_json) as WorkflowGraphSnapshot;
     const node = graph.nodes.find((candidate) => candidate.key === lookup.node_key);
     if (!node || node.executionMode !== 'write' || !lookup.parallel_group_key) return null;
     const existing = this.rowByRun(runId);
     if (existing?.status === 'active') return existing.path;
     if (existing?.status === 'preparing') {
-      return this.deps.mutex.runExclusive(gitLockKey(lookup.project_id), async () => {
+      return this.deps.mutex.runExclusive(this.gitKey(lookup), async () => {
         const valid = await this.driver(lookup.project_id).git(existing.path, ['rev-parse', '--is-inside-work-tree']);
         if (valid.code !== 0) {
           await this.driver(lookup.project_id).git(lookup.cwd, ['worktree', 'prune']);
@@ -254,7 +263,7 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
 
     const path = `${lookup.cwd.replace(/\/+$/, '')}/.worktrees/workflow-${lookup.issue_workflow_id}/run-${runId}`;
     const branch = `workflow/${lookup.issue_id}/${runId}-${safeNodeKey(lookup.node_key)}`;
-    return this.deps.mutex.runExclusive(gitLockKey(lookup.project_id), async () => {
+    return this.deps.mutex.runExclusive(this.gitKey(lookup), async () => {
       const baseRefResult = await this.driver(lookup.project_id).git(lookup.cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
       const baseShaResult = await this.driver(lookup.project_id).git(lookup.cwd, ['rev-parse', '--verify', 'HEAD']);
       if (baseShaResult.code !== 0) throw new Error(`workflow.worktree_base_missing:${diagnostic(baseShaResult.err)}`);
@@ -293,7 +302,7 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
     const worktree = this.rowByRun(run.id);
     if (!worktree || worktree.status === 'cleaned' || worktree.headSha) return { ok: true };
     const lookup = this.workflow(run.issueWorkflowId);
-    return this.deps.mutex.runExclusive(gitLockKey(lookup.project_id), async () => {
+    return this.deps.mutex.runExclusive(this.gitKey(lookup), async () => {
       await this.driver(lookup.project_id).git(worktree.path, ['reset', '--quiet', '--', '.panda/tmp']);
       const add = await this.driver(lookup.project_id).git(worktree.path, [
         'add', '-A', '--', '.', ':(exclude).panda/tmp', ':(exclude).panda/tmp/**',
@@ -324,7 +333,17 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
   }
 
   private async cleanup(worktree: IssueWorkflowWorktree, lookup: WorkflowLookupRow): Promise<boolean> {
-    const removed = await this.driver(lookup.project_id).git(lookup.cwd, ['worktree', 'remove', '--force', worktree.path]);
+    const managed=issueWorkspaceCwd(this.deps.db,lookup.project_id,lookup.issue_id);
+    if(managed && this.deps.db.query('SELECT 1 FROM workspace_attempts WHERE issue_id=? AND released_ts IS NULL AND stop_confirmed=0').get(lookup.issue_id)) {
+      this.deps.db.query("UPDATE issue_workflow_worktrees SET status='cleanup_pending' WHERE id=?").run(worktree.id);
+      return true; // Preserve children until all parent-attempt processes have stopped.
+    }
+    const head=await this.driver(lookup.project_id).git(lookup.cwd,['rev-parse',`refs/heads/${worktree.branch}`]);
+    if(head.code===0) {
+      const saved=await this.driver(lookup.project_id).git(lookup.cwd,['update-ref',`refs/panda/workflow-results/${worktree.id}`,head.out.trim()]);
+      if(saved.code!==0)return false;
+    }
+    const removed = await this.driver(lookup.project_id).git(lookup.cwd, ['worktree', 'remove', worktree.path]);
     if (removed.code !== 0) {
       const listed = await this.driver(lookup.project_id).git(lookup.cwd, ['worktree', 'list', '--porcelain']);
       if (listed.code !== 0 || listed.out.split('\n').some((line) => line === `worktree ${worktree.path}`)) {
@@ -334,7 +353,7 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
         return false;
       }
     }
-    const deleted = await this.driver(lookup.project_id).git(lookup.cwd, ['branch', '-D', worktree.branch]);
+    const deleted = await this.driver(lookup.project_id).git(lookup.cwd, ['update-ref', '-d', `refs/heads/${worktree.branch}`, head.out.trim()]);
     if (deleted.code !== 0) {
       const exists = await this.driver(lookup.project_id).git(lookup.cwd, ['show-ref', '--verify', '--quiet', `refs/heads/${worktree.branch}`]);
       if (exists.code === 0) {
@@ -426,6 +445,10 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
       resultContract: { resultPath: paths.resultRel, donePath: paths.doneRel, statusValues: ['resolved', 'blocked'] },
     };
     try {
+      this.deps.db.query(
+        `UPDATE issue_workflow_worktrees
+         SET status = 'resolving', resolution_conversation_id = ?, updated_ts = ? WHERE id = ?`,
+      ).run(conversation.id, this.now(), worktree.id);
       await this.driver(lookup.project_id).writeFile(paths.context, JSON.stringify(context, null, 2));
       const session = chatTmux(conversation.id);
       await this.deps.mutex.runExclusive(tmuxLockKey(session), async () => {
@@ -434,10 +457,6 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
         await this.driver(lookup.project_id).sendKeys(session, buildWorkflowConflictPrompt(agent, paths, locale));
       });
       this.ownedResolvers.add(worktree.id);
-      this.deps.db.query(
-        `UPDATE issue_workflow_worktrees
-         SET status = 'resolving', resolution_conversation_id = ?, updated_ts = ? WHERE id = ?`,
-      ).run(conversation.id, this.now(), worktree.id);
       this.deps.logEvent(lookup.issue_id, 'workflow_conflict_resolution_started', {
         workflowId: worktree.issueWorkflowId,
         worktreeId: worktree.id,
@@ -567,7 +586,7 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
         ).all(...unique).map(mapWorktree)
       : [];
     for (const row of rows) {
-      const result = await this.deps.mutex.runExclusive(gitLockKey(lookup.project_id), () =>
+      const result = await this.deps.mutex.runExclusive(this.gitKey(lookup), () =>
         this.mergeOne(row, lookup, locale),
       );
       if (result.state !== 'completed') return result;
@@ -588,7 +607,7 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
       .all(workflowId)
       .map(mapWorktree);
     for (const row of rows) {
-      await this.deps.mutex.runExclusive(gitLockKey(lookup.project_id), async () => {
+      await this.deps.mutex.runExclusive(this.gitKey(lookup), async () => {
         const cleaned = await this.cleanup(row, lookup);
         if (cleaned) {
           this.deps.logEvent(lookup.issue_id, 'workflow_worktree_failed_attempt_cleaned', {

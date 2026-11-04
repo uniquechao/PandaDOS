@@ -31,7 +31,12 @@ export function createProjectDataPersistence(
 ): ProjectDataPersistenceOutbox {
   const handler: ProjectDataOutboxHandler = {
     async persist(job) {
-      await mutex.runExclusive(gitLockKey(job.projectId), async () => {
+      const workspace = () => job.entityKind === 'issue' && db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_attempts'").get()
+        ? db.query<{workspace_id:number;cwd:string;result_sha:string|null},[string]>(`SELECT a.workspace_id,COALESCE(a.execution_cwd,w.cwd) cwd,a.result_sha FROM workspace_attempts a JOIN module_workspaces w ON w.id=a.workspace_id WHERE a.issue_id=? ORDER BY a.created_ts DESC,a.rowid DESC LIMIT 1`).get(job.entityId) : null;
+      const reservation=workspace();
+      await mutex.runExclusive(reservation ? `workspace-git:${reservation.workspace_id}` : gitLockKey(job.projectId), async () => {
+        const managed=workspace();
+        if(managed?.workspace_id!==reservation?.workspace_id)throw new Error('工作区投影归属变化，等待重新投影');
         const project = getProject(db, job.projectId);
         if (!project) return;
         const driver = driverForProject(project);
@@ -39,8 +44,13 @@ export function createProjectDataPersistence(
           throw new Error('执行机不支持协作文件原子持久化');
         }
         if (job.entityKind === 'attachment') return; // upload bytes are already the authoritative file.
+        if (managed?.result_sha) {
+          // Fixed result trees are immutable. Final runtime state is a DB-owned, ignored overlay.
+          await driver.writeFile(`${managed.cwd}/.panda/tmp/state/${job.entityId}.json`, JSON.stringify(issueDataState(db,job.entityId)));
+          return;
+        }
         if (job.entityKind === 'module' || job.entityKind === 'issue') {
-          await persistMarkdown(db, driver, project.cwd, job);
+          await persistMarkdown(db, driver, managed?.cwd ?? project.cwd, job, managed ? project.cwd : undefined);
           return;
         }
         const target = jsonProjection(db, job);
@@ -83,7 +93,7 @@ function jsonProjection(db: Database, job: ProjectDataOutboxJob): { path: string
 }
 
 async function persistMarkdown(
-  db: Database, driver: ExecutorDriver, cwd: string, job: ProjectDataOutboxJob,
+  db: Database, driver: ExecutorDriver, cwd: string, job: ProjectDataOutboxJob, sourceCwd?: string,
 ): Promise<void> {
   let path: string;
   let name: string;
@@ -100,16 +110,17 @@ async function persistMarkdown(
       `SELECT issue.id, issue.doc_path, issue.module_id, issue.title, issue.body, module.slug
        FROM issues issue LEFT JOIN project_modules module ON module.id = issue.module_id WHERE issue.id = ?`,
     ).get(job.entityId);
-    if (!row || !row.slug) return;
+    if (!row) return;
     issueContent = { id: row.id, title: row.title, body: row.body };
-    path = row.doc_path || moduleIssueRelPath(row.slug, row.id, row.title);
+    path = row.doc_path || moduleIssueRelPath(row.slug ?? 'unclassified', row.id, row.title);
     name = 'issue-meta'; body = issueMetaProjection(db, row.id);
     fallback = `# #${job.entityId} ${row.title}\n\n## 原始需求\n\n${row.body ?? ''}\n`;
   }
   const read = await driver.readFileNoFollowWithin!(cwd, path, 25 * 1024 * 1024).catch(() => null);
   // #307：换号后旧过程页还在 → 新路径没文件时沿用旧正文，写好新文件后删掉旧文件（重试也会补删）
   let movedFrom: { path: string; sha: string } | null = null;
-  let current = read ? new TextDecoder().decode(read.data) : fallback;
+  const source = !read && sourceCwd ? await driver.readFileNoFollowWithin!(sourceCwd,path,25*1024*1024).catch(()=>null) : null;
+  let current = read ? new TextDecoder().decode(read.data) : source ? new TextDecoder().decode(source.data) : fallback;
   if (issueContent) {
     const renumbered = lastRenumberFromDocPath(db, issueContent.id);
     if (renumbered && renumbered.fromDocPath !== path) {
@@ -131,4 +142,8 @@ async function persistMarkdown(
     const removed = await driver.removeFileNoFollowWithin(cwd, movedFrom.path, movedFrom.sha);
     if (removed === 'conflict') throw new Error(`协作文件并发冲突：${movedFrom.path}`);
   }
+}
+
+function issueDataState(db:Database,id:string):unknown {
+ return db.query('SELECT id,status,result_summary FROM issues WHERE id=?').get(id);
 }

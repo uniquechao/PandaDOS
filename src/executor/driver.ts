@@ -1,3 +1,4 @@
+import type { AgentModelApplyRequest, AgentModelApplyResult, AgentModelCatalog } from '../../shared/agent-models';
 /**
  * executor/driver —— ExecutorDriver 接口（spec §3）。
  * v2 最重要的边界：控制面对执行机的一切操作（tmux / 受限文件 / git / 终端流）只走这里。
@@ -5,6 +6,8 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { AgentKind } from '../core/types';
+import { workspaceEnvArgs } from './workspace-processes';
+import type { IdleSessionState } from './idle-session';
 
 // ---------- 载荷类型 ----------
 
@@ -101,6 +104,8 @@ export function absoluteExecutableFromOutput(output: string): string | null {
 // ---------- 接口 ----------
 
 export interface ExecutorDriver {
+  discoverAgentModels?(agent: AgentKind, cwd: string, env?: Record<string,string>): Promise<AgentModelCatalog>;
+  applyAgentModel?(request: AgentModelApplyRequest): Promise<AgentModelApplyResult>;
   /**
    * 受限探测固定 Agent 命令。实现只能接受 claude/codex 枚举，不提供任意 shell 入口。
    * 找到时返回绝对命令路径，未找到返回 null。
@@ -112,8 +117,16 @@ export interface ExecutorDriver {
   /** 列出执行机上的 tmux 会话；tmux server 未启动时返回 []。 */
   listSessions(): Promise<TmuxSession[]>;
 
+  /** Optional capability: missing/ambiguous idle evidence must preserve the session. */
+  inspectIdleSession?(name: string): Promise<IdleSessionState | null>;
+  /** Atomically reject changed/attached/replaced tmux containers; never delete native history. */
+  sleepSessionIfIdle?(snapshot: IdleSessionState): Promise<boolean>;
+
   /** 创建 detached 会话（new-session -d -s name -c cwd）。同名已存在则抛错。 */
-  createSession(name: string, cwd: string): Promise<void>;
+  createSession(name: string, cwd: string, env?: Record<string, string>): Promise<void>;
+
+  /** 停止本轮标记的进程并确认；无法确认时必须抛错，不得释放工作区。 */
+  stopSessionConfirmed?(session: string, attempt: string, executorStartTs: number): Promise<void>;
 
   /** 杀掉会话；会话不存在时抛错。 */
   killSession(name: string): Promise<void>;
@@ -129,6 +142,7 @@ export interface ExecutorDriver {
 
   /** 抓取当前窗格可见内容（capture-pane -p），供菜单/弹窗检测。 */
   capturePane(session: string): Promise<string>;
+  capturePaneFresh?(session: string): Promise<string>;
 
   /**
    * 设定会话窗口尺寸；null = 交还给附着客户端自动定尺（window-size latest）。
@@ -248,7 +262,7 @@ export interface ExecutorDriver {
    * - `argv[0]` 与其余参数必须来自控制面的白名单/项目配置，**不得由 Agent 输出或用户自由文本直接构成**；
    * - 输出按 `MAX_COMMAND_OUTPUT_CHARS` 截断（保尾——报错都在末尾），超时不抛错、按 `timedOut` 返回。
    */
-  runCommand(cwd: string, argv: string[], timeoutMs: number): Promise<CommandResult>;
+  runCommand(cwd: string, argv: string[], timeoutMs: number, env?: Record<string, string>): Promise<CommandResult>;
 
   // ---- 终端流 ----
 
@@ -376,9 +390,11 @@ export const MAX_TMUX_SCROLL_LINES = 100;
  * history-limit 保持默认 2000 不动：本改动会让 claude 会话新产生历史，2000 行封顶
  * 正好把内存增量约束住。
  */
-export function tmuxNewSessionArgs(name: string, cwd: string): string[] {
+export function tmuxNewSessionArgs(name: string, cwd: string, env?: Record<string, string>): string[] {
   return [
     'new-session', '-d', '-s', name, '-c', cwd, '-x', String(TMUX_WIN_COLS), '-y', String(TMUX_WIN_ROWS),
+    // 环境参数属于 new-session，必须放在首个命令分隔符之前。
+    ...workspaceEnvArgs(env).flatMap(value => ['-e', value]),
     ';', 'set-window-option', '-t', name, 'window-size', 'manual',
     ';', 'set-window-option', '-t', name, 'alternate-screen', 'off',
     ';', 'resize-window', '-t', name, '-x', String(TMUX_WIN_COLS), '-y', String(TMUX_WIN_ROWS),

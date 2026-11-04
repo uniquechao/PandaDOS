@@ -1,3 +1,4 @@
+import type { AgentModelApplyRequest } from '../../shared/agent-models';
 /**
  * executor/pane-cache —— capturePane 的 TTL 合并缓存包装器（M6，默认 300ms）。
  *
@@ -28,6 +29,7 @@ import type {
   TmuxSession,
 } from './driver';
 import type { AgentKind } from '../core/types';
+import type { IdleSessionState } from './idle-session';
 
 export const PANE_CACHE_TTL_MS = 300;
 
@@ -44,6 +46,17 @@ export class PaneCacheDriver implements ExecutorDriver {
     private readonly ttlMs: number = PANE_CACHE_TTL_MS,
     private readonly nowFn: () => number = Date.now,
   ) {}
+
+  discoverAgentModels(agent: AgentKind, cwd: string, env?: Record<string,string>) {
+    if (!this.inner.discoverAgentModels) throw new Error('model_discovery_unsupported');
+    return this.inner.discoverAgentModels(agent,cwd,env);
+  }
+  async applyAgentModel(request: AgentModelApplyRequest) {
+    if (!this.inner.applyAgentModel) throw new Error('model_switch_unsupported');
+    try { return await this.inner.applyAgentModel(request); }
+    finally { this.invalidate(request.session); }
+  }
+  capturePaneFresh(session: string) { return this.inner.capturePane(session); }
 
   /** 透传底层连接状态（SshDriver 有 status；LocalDriver 无 → undefined=本机恒在线） */
   get status(): unknown {
@@ -92,12 +105,17 @@ export class PaneCacheDriver implements ExecutorDriver {
     }
   }
 
-  async createSession(name: string, cwd: string): Promise<void> {
+  async createSession(name: string, cwd: string, env?:Record<string,string>): Promise<void> {
     try {
-      await this.inner.createSession(name, cwd);
+      await this.inner.createSession(name, cwd, env);
     } finally {
       this.invalidate(name);
     }
+  }
+
+  async stopSessionConfirmed(session:string,attempt:string,executorStartTs:number):Promise<void> {
+    if(!this.inner.stopSessionConfirmed)throw new Error('执行机不支持确认进程停止');
+    try {await this.inner.stopSessionConfirmed(session,attempt,executorStartTs);} finally {this.invalidate(session);}
   }
 
   async killSession(name: string): Promise<void> {
@@ -129,6 +147,16 @@ export class PaneCacheDriver implements ExecutorDriver {
 
   listSessions(): Promise<TmuxSession[]> {
     return this.inner.listSessions();
+  }
+
+  async inspectIdleSession(name: string): Promise<IdleSessionState | null> {
+    return this.inner.inspectIdleSession?.(name) ?? null;
+  }
+
+  async sleepSessionIfIdle(snapshot: IdleSessionState): Promise<boolean> {
+    const slept=await this.inner.sleepSessionIfIdle?.(snapshot) ?? false;
+    if(slept)this.cache.delete(snapshot.name);
+    return slept;
   }
 
   readFileRange(path: string, offset: number, limit: number): Promise<FileRange> {
@@ -225,8 +253,8 @@ export class PaneCacheDriver implements ExecutorDriver {
     return this.inner.readGitBlob(cwd, rev, path);
   }
 
-  runCommand(cwd: string, argv: string[], timeoutMs: number): Promise<CommandResult> {
-    return this.inner.runCommand(cwd, argv, timeoutMs); // 门禁输出不缓存：每次都要现跑
+  runCommand(cwd: string, argv: string[], timeoutMs: number, env?:Record<string,string>): Promise<CommandResult> {
+    return this.inner.runCommand(cwd, argv, timeoutMs, env); // 门禁输出不缓存：每次都要现跑
   }
 
   openPty(cmd: string, cols: number, rows: number): Promise<PtyChannel> {

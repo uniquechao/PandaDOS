@@ -1,3 +1,6 @@
+import { selectedModelForConversation, markModelLaunchPending } from './agent-model-settings';
+import type { ModelControlDriver } from './agent-model-settings';
+import { managedConversationOwned, managedConversationEnvironment, managedConversationKnown, managedExecutionConversationKnown } from './workspace-ownership';
 /**
  * core/conversations —— 对话管理（v1 conversations.ts activate/resume 平移改造）。
  *
@@ -15,6 +18,7 @@
  * 结构兼容的最小接口，调用方直接传 SshDriver/LocalDriver。
  */
 import type { Database } from 'bun:sqlite';
+import { ensurePandaIssuePlanSkill } from './issue-plan-skill';
 import {
   ensureArtifactSkill,
   ensureCompatSkills,
@@ -33,15 +37,17 @@ import type { IssueId } from '../../shared/issue-id';
 
 // ---------- Driver 最小接口（与 ExecutorDriver 结构兼容） ----------
 
-export interface ConvDriver {
+export interface ConvDriver extends Pick<ModelControlDriver, 'discoverAgentModels' | 'applyAgentModel' | 'capturePaneFresh'> {
   /** 只探测受支持的 Agent 命令；启动必须使用返回的实际路径，找不到则拒绝创建 tmux。 */
   findExecutable(agent: AgentKind): Promise<string | null>;
   /** command = tmux `#{pane_current_command}`（判「代理还在不在跑」的主证据，缺省则退化成只看屏） */
   listSessions(): Promise<Array<{ name: string; command?: string }>>;
-  createSession(name: string, cwd: string): Promise<void>;
+  createSession(name: string, cwd: string, env?: Record<string,string>): Promise<void>;
   killSession(name: string): Promise<void>;
+  stopSessionConfirmed?(session:string,attempt:string,executorStartTs:number):Promise<void>;
   sendKeys(session: string, text: string): Promise<void>;
   capturePane(session: string): Promise<string>;
+  mkdirp?(path:string):Promise<void>;
   statPath(path: string): Promise<{ size: number; isDirectory: boolean } | null>;
   readFileRange(path: string, offset: number, limit: number): Promise<{ data: Uint8Array; size: number }>;
   writeFile(path: string, data: Uint8Array | string, mode?: number): Promise<void>;
@@ -691,12 +697,29 @@ export class ConversationManager {
     return codexReasoningArg(resolved.effort);
   }
 
+  async modelContext(c: Conversation) {
+    const e = this.execution(c.projectId);
+    return { driver:e.driver, cwd:await this.conversationCwd(c), session:this.sessionName(c),
+      env:{ ...(e.codexHome ? { CODEX_HOME:e.codexHome } : {}), ...(e.claudeHome ? { CLAUDE_CONFIG_DIR:e.claudeHome } : {}) },
+      owned:() => c.kind === 'chat' ? !!this.get(c.id) && !this.get(c.id)?.archived && !this.get(c.id)?.sharedReadOnly : this.isExecutionConversation(c.projectId,c.id) };
+  }
+
   /** 按对话 agent 组装启动命令；codex fresh/resume 一律重盖 launch_ts 锚点并清 path 缓存（会话发现/重定位用） */
   private async buildCommand(c: Conversation): Promise<string> {
     const { driver, locator } = this.execution(c.projectId);
     const executable = await driver.findExecutable(c.agent);
     if (!executable) throw new AgentExecutableNotFoundError(c.agent);
-    const command = quoteShellWord(executable);
+    const chosen = selectedModelForConversation(this.db,c);
+    if (chosen) {
+      const context = await this.modelContext(c);
+      if (!driver.discoverAgentModels) throw new Error('model_discovery_unsupported');
+      const catalog = await driver.discoverAgentModels(c.agent,context.cwd,context.env);
+      const model = catalog.models.find(item => item.id === chosen.model);
+      if (!model || chosen.effort !== null && !model.efforts.includes(chosen.effort)) throw new Error('model_selection_invalid');
+    }
+    const modelArgs = chosen ? ` --model ${quoteShellWord(chosen.model)}${c.agent === 'claude' && chosen.effort ? ` --effort ${quoteShellWord(chosen.effort)}` : ''}` : '';
+    const command = quoteShellWord(executable) + (c.agent === 'claude' ? modelArgs : '');
+    markModelLaunchPending(this.db,c);
     const row = this.db
       .query<{ agent_session_id: string | null; agent_jsonl_path: string | null }, [string]>(
         'SELECT agent_session_id, agent_jsonl_path FROM conversations WHERE id = ?',
@@ -718,7 +741,7 @@ export class ConversationManager {
       const exists = (await locator.locate(c.id)) !== null;
       return exists ? `${command} --resume ${c.id}` : `${command} --session-id ${c.id}`;
     }
-    const args = [this.opts.codexArgs ?? DEFAULT_CODEX_ARGS, this.reasoningArg(c)]
+    const args = [this.opts.codexArgs ?? DEFAULT_CODEX_ARGS, chosen ? chosen.effort ? `-c ${quoteShellWord(`model_reasoning_effort=${JSON.stringify(chosen.effort)}`)}` : '' : this.reasoningArg(c), modelArgs]
       .filter((x) => x.length > 0)
       .join(' ');
     const sid = row?.agent_session_id;
@@ -749,6 +772,7 @@ export class ConversationManager {
       await ensureArtifactSkill(driver, homes); // 产物落 cwd 内置技能（缺失才写）
       await ensurePandaIssueSkill(driver, homes);
       await ensurePandaIssueInboxSkill(driver, homes);
+      await ensurePandaIssuePlanSkill(driver, homes);
       await ensureProjectBridge(driver, cwd);
       await ensureModuleGuideBlocks(driver, cwd);
     } catch {
@@ -797,13 +821,31 @@ export class ConversationManager {
       cmd = '/bin/sh ' + quoteShellWord(scriptPath);
     }
 
+    if(managedExecutionConversationKnown(this.db,c.id) && !managedConversationOwned(this.db,c.projectId,c.id))throw new Error('工作区会话归属已失效');
+    const managed = managedConversationKnown(this.db,c.id);
+    const launch = managed ? this.db.query<{id:string;launch_generation:number;launch_state:string;executor_start_ts:number;result_sha:string|null},[string]>(
+      'SELECT id,launch_generation,launch_state,executor_start_ts,result_sha FROM workspace_attempts WHERE conversation_id=? AND released_ts IS NULL').get(c.id) : null;
+    if (managed && (!launch || launch.result_sha || !managedConversationOwned(this.db,c.projectId,c.id))) throw new Error('工作区启动归属失效');
+    if (launch) {
+      if (launch.launch_state !== 'none') {
+        if (!driver.stopSessionConfirmed) throw new Error('执行机无法确认旧进程停止，保留启动现场');
+        await driver.stopSessionConfirmed(session,launch.id,launch.executor_start_ts);
+      }
+      const claimed = this.db.query("UPDATE workspace_attempts SET launch_generation=launch_generation+1,launch_state='running' WHERE id=? AND launch_generation=? AND released_ts IS NULL")
+        .run(launch.id,launch.launch_generation);
+      if (!claimed.changes) throw new Error('工作区启动轮次已变化');
+    }
     try {
       await driver.killSession(session);
     } catch {
       /* 会话不存在，正常 */
     }
-    await driver.createSession(session, cwd);
+    const environment=managedConversationEnvironment(this.db,c.id) ?? undefined;
+    if(environment && driver.mkdirp) for(const key of ['TMPDIR','TMUX_TMPDIR','PANDA_DATA_DIR','XDG_CACHE_HOME','PANDA_BUILD_DIR','BUN_INSTALL_CACHE_DIR']) await driver.mkdirp(environment[key]!);
+    await driver.createSession(session, cwd, environment);
     await driver.sendKeys(session, cmd);
+    if (launch) this.db.query("UPDATE workspace_attempts SET launch_state='confirmed' WHERE id=? AND launch_generation=? AND released_ts IS NULL")
+      .run(launch.id,launch.launch_generation+1);
   }
 
   /**
@@ -827,7 +869,13 @@ export class ConversationManager {
     if (!c) return null;
     this.assertExecutionProject(c.projectId);
     if (c.sharedReadOnly) throw new Error('共享归档对话为只读历史，不能启动或恢复 Agent 会话');
+    if(managedExecutionConversationKnown(this.db,c.id) && !managedConversationOwned(this.db,c.projectId,c.id))throw new Error('工作区会话归属已失效');
     const cwd = cwdOverride ?? await this.conversationCwd(c);
+    if(cwdOverride && this.hasWorkspaceCwd() && c.workspaceCwd!==cwdOverride) {
+      if(!cwdOverride.startsWith('/') || cwdOverride.includes('\0'))throw new Error('工作区目录无效');
+      this.db.query('UPDATE conversations SET workspace_cwd=? WHERE id=?').run(cwdOverride,c.id);
+      c.workspaceCwd=cwdOverride;
+    }
 
     if (c.kind === 'chat') {
       // 独立聊天会话：代理真在跑即幂等短路（不打断在跑的对话），否则启动/重启
@@ -836,6 +884,13 @@ export class ConversationManager {
       this.touch(id);
       return c;
     }
+
+    if (managedConversationOwned(this.db, c.projectId, c.id)) {
+      await this.ensureAgentLive(this.tmuxName(c.projectId, c.id), c, cwd);
+      this.touch(id);
+      return c;
+    }
+    if (managedConversationKnown(this.db, c.id)) throw new Error('工作区会话归属已失效');
 
     // issue：项目单活跃会话——切对话 = kill 旧起新
     const ded = this.tmuxName(c.projectId, c.id);
@@ -848,7 +903,7 @@ export class ConversationManager {
     const previousId = this.currentConv(c.projectId);
     if (previousId && previousId !== id) {
       const previous = this.tmuxName(c.projectId, previousId);
-      if (previous !== ded) await this.execution(c.projectId).driver.killSession(previous).catch(() => {});
+      if (previous !== ded && !managedConversationOwned(this.db, c.projectId, previousId)) await this.execution(c.projectId).driver.killSession(previous).catch(() => {});
     }
     await this.launchInto(ded, c, cwd);
     this.setActiveConv(c.projectId, id);
@@ -871,8 +926,12 @@ export class ConversationManager {
     if (c.sharedReadOnly) throw new Error('共享归档对话为只读历史，不能启动或恢复 Agent 会话');
     await this.launchInto(this.sessionName(c), c, await this.conversationCwd(c));
     if (c.kind === 'chat') this.touch(id);
-    else this.setActiveConv(c.projectId, id); // 重启后这条就是项目的当前对话（幂等）
+    else if (!managedConversationKnown(this.db,c.id)) this.setActiveConv(c.projectId, id); // 重启后这条就是项目的当前对话（幂等）
     return c;
+  }
+
+  isExecutionConversation(projectId:number,id:string):boolean {
+    return managedConversationKnown(this.db,id) ? managedConversationOwned(this.db,projectId,id) : this.currentConv(projectId)===id;
   }
 
   /** 项目 cwd（对话必须挂在存在的项目上，取不到是数据不一致，直接上抛） */

@@ -366,12 +366,86 @@ describe('admin 代编每用户设定', () => {
 });
 
 describe('执行机 CRUD', () => {
+  test('未检测的表单提交 null 时间戳可注册，省略和合法时间戳均可持久化', async () => {
+    const { dispatch, admin, db } = makeApp();
+    for (const capabilitiesCheckedTs of [undefined, null, 0, 1793620873182]) {
+      const response = await call(dispatch, 'POST', '/api/admin/executors', admin.token, {
+        ...EXEC_BODY,
+        name: `未检测注册-${String(capabilitiesCheckedTs)}`,
+        host: '127.0.0.1',
+        sshUser: 'openclaw',
+        supportsClaude: true,
+        supportsCodex: true,
+        codexDir: '/home/openclaw/.codex/sessions',
+        capabilitiesCheckedTs,
+      });
+      expect(response!.status).toBe(200);
+      const { executor } = (await response!.json()) as { executor: Executor };
+      expect(executor.capabilitiesCheckedTs).toBe(capabilitiesCheckedTs ?? null);
+      expect(
+        db.query<{ capabilities_checked_ts: number | null }, [number]>(
+          'SELECT capabilities_checked_ts FROM executors WHERE id = ?',
+        ).get(executor.id)?.capabilities_checked_ts,
+      ).toBe(capabilitiesCheckedTs ?? null);
+    }
+  });
+
+  test('新建和编辑保留已启用目录的绝对路径校验，关闭代理允许空目录', async () => {
+    const { dispatch, admin, db } = makeApp();
+    const valid = {
+      ...EXEC_BODY,
+      supportsClaude: true,
+      supportsCodex: true,
+      codexDir: '/root/.codex/sessions',
+    };
+    const created = await call(dispatch, 'POST', '/api/admin/executors', admin.token, valid);
+    expect(created!.status).toBe(200);
+    const { executor } = await created!.json() as { executor: Executor };
+    for (const key of ['workspaceRoot', 'claudeDir', 'codexDir']) {
+      for (const path of ['', '   ', 'relative/path', '~/sessions', '/root/../sessions']) {
+        const body = { ...valid, [key]: path };
+        expect((await call(dispatch, 'POST', '/api/admin/executors', admin.token, body))!.status).toBe(400);
+        // PATCH 空字符串沿用已有目录；其余非绝对或非规范化路径必须拒绝。
+        expect((await call(dispatch, 'PATCH', `/api/admin/executors/${executor.id}`, admin.token, body))!.status).toBe(path === '' ? 200 : 400);
+      }
+    }
+    expect(db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM executors').get()?.n).toBe(1);
+    const unchanged = await call(dispatch, 'GET', '/api/admin/executors', admin.token);
+    const rows = await unchanged!.json() as Executor[];
+    expect(rows[0]!.workspaceRoot).toBe(valid.workspaceRoot);
+    expect(rows[0]!.claudeDir).toBe(valid.claudeDir);
+    expect(rows[0]!.codexDir).toBe(valid.codexDir);
+    for (const enabled of ['claude', 'codex']) {
+      const body = {
+        ...valid,
+        supportsClaude: enabled === 'claude', supportsCodex: enabled === 'codex',
+        claudeDir: enabled === 'claude' ? valid.claudeDir : '',
+        codexDir: enabled === 'codex' ? valid.codexDir : '',
+      };
+      expect((await call(dispatch, 'POST', '/api/admin/executors', admin.token, { ...body, name: `目录回归-${enabled}` }))!.status).toBe(200);
+      expect((await call(dispatch, 'PATCH', `/api/admin/executors/${executor.id}`, admin.token, body))!.status).toBe(200);
+    }
+  });
+
+  test('注册拒绝非法能力检测时间戳且不写入执行机', async () => {
+    const { dispatch, admin, db } = makeApp();
+    for (const capabilitiesCheckedTs of [-1, 0.5, '123', true, {}, [], Number.MAX_SAFE_INTEGER + 1]) {
+      const response = await call(dispatch, 'POST', '/api/admin/executors', admin.token, {
+        ...EXEC_BODY,
+        capabilitiesCheckedTs,
+      });
+      expect(response!.status).toBe(400);
+      expect(JSON.stringify((await response!.json()).error)).toContain('capabilitiesCheckedTs');
+    }
+    expect(db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM executors').get()?.n).toBe(0);
+  });
+
   test('未保存的远程执行机可用草稿连接检测能力和浏览目录，且不写入 executors', async () => {
     class PreviewDriver extends LocalDriver {
       override async readFileRange(path: string): Promise<{ data: Uint8Array; size: number }> {
         const text =
           path === '/etc/passwd'
-            ? 'developer:x:1000:1000::/Users/developer:/bin/zsh\n'
+            ? 'xschao:x:1000:1000::/Users/xschao:/bin/zsh\n'
             : '';
         const data = new TextEncoder().encode(text);
         return { data, size: data.length };
@@ -381,9 +455,9 @@ describe('执行机 CRUD', () => {
       }
       override async statPath(path: string) {
         return [
-          '/Users/developer/workspace',
-          '/Users/developer/.claude/projects',
-          '/Users/developer/.codex/sessions',
+          '/Users/xschao/workspace',
+          '/Users/xschao/.claude/projects',
+          '/Users/xschao/.codex/sessions',
         ].includes(path)
           ? { size: 0, mtimeMs: 0, isDirectory: true, isFile: false, mode: 0o755 }
           : null;
@@ -413,11 +487,11 @@ describe('执行机 CRUD', () => {
       authDepsFromDb(app.db, app.users),
     );
     const connection = {
-      name: 'build-host',
-      host: 'build.example.com',
+      name: 'jimi',
+      host: 'host.example.com',
       port: 22,
-      sshUser: 'developer',
-      keyRef: '/Users/example/.ssh/id_ed25519',
+      sshUser: 'xschao',
+      keyRef: '/Users/developer/.ssh/id_ed25519',
     };
 
     const detected = await call(
@@ -429,7 +503,7 @@ describe('执行机 CRUD', () => {
     );
     expect(detected?.status).toBe(200);
     expect(((await detected!.json()) as any).detection.workspaceSuggestion).toBe(
-      '/Users/developer/workspace',
+      '/Users/xschao/workspace',
     );
 
     const browsed = await call(
@@ -437,7 +511,7 @@ describe('执行机 CRUD', () => {
       'POST',
       '/api/admin/executors/preview/fs',
       app.admin.token,
-      { ...connection, path: '/Users/developer/workspace' },
+      { ...connection, path: '/Users/xschao/workspace' },
     );
     expect(browsed?.status).toBe(200);
     expect(((await browsed!.json()) as any).dirs).toEqual(['alpha', 'beta']);

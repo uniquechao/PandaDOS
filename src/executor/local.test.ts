@@ -626,6 +626,20 @@ describe('本地 PTY 跨平台命令参数', () => {
 });
 
 describe('I6 建会话尺寸单一来源', () => {
+  test('会话环境只传给 new-session，不能落到 resize-window，非法环境提前拒绝', () => {
+    const args = tmuxNewSessionArgs('s1', '/tmp/工作 目录', {
+      PANDA_WORKSPACE_ATTEMPT: 'attempt-11376',
+      TMPDIR: "路径 ' $HOME",
+    });
+    const separator = args.indexOf(';');
+    expect(args.slice(0, separator)).toEqual([
+      'new-session', '-d', '-s', 's1', '-c', '/tmp/工作 目录', '-x', '220', '-y', '50',
+      '-e', 'PANDA_WORKSPACE_ATTEMPT=attempt-11376', '-e', "TMPDIR=路径 ' $HOME",
+    ]);
+    expect(args.slice(separator)).not.toContain('-e');
+    expect(() => tmuxNewSessionArgs('s1', '/tmp', { 'A;id': 'x' })).toThrow('invalid workspace environment');
+  });
+
   test('tmuxNewSessionArgs 带 -x 220 -y 50 + 锁 manual + 显式 resize（Local/Ssh 两实现共用本函数）', () => {
     // issue #95：只给 -x/-y 不够——window-size 默认 latest 会让新会话生在「服务器上最近
     // 使用的客户端」尺寸上（有人开着终端页时实测生成 114×26），故必须锁 manual 再 resize。

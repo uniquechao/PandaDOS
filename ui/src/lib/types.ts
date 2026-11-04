@@ -1,3 +1,4 @@
+import type { IssueWorkspaceView } from '../../../src/core/workspace-ownership';
 import type { SupportedLocale } from '../../../shared/i18n/locales';
 import type { IssueId } from '../../../shared/issue-id';
 
@@ -129,6 +130,8 @@ export interface Project {
   readmeSummary: string | null;
   /** 项目工作分支（兜底用；引擎默认在开发者当前所在分支上干活，不建/不切/不合并分支） */
   workBranch: string | null;
+  moduleConcurrency?: number;
+  integrationBranch?: string | null;
   /** Agent（claude/codex）读历史+代码库产出的项目认知长文（null = 尚未生成） */
   understanding: string | null;
   /** 生成该认知的 CLI 代理（null = 尚未生成） */
@@ -381,6 +384,7 @@ export type AttentionKind =
 
 /** EngineIssue（issues 路由返回的行） */
 export interface Issue {
+  workspace?: IssueWorkspaceView | null;
   id: IssueId;
   projectId: number;
   title: string;

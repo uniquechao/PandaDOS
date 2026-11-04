@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { Database } from 'bun:sqlite';
 import { openDb } from '../core/db';
-import { loadMigrations, migrate } from '../core/migrate';
+import { loadMigrations, migrate, migrationStatus } from '../core/migrate';
 import { RoomEngine } from './engine';
 import { RoomStore } from './store';
 import { migrateRooms, ROOM_MIGRATIONS_DIR } from './migrations';
@@ -206,12 +206,18 @@ test('085 to 086 upgrades a populated room without losing references, counters o
   accept({ message: 'Plan the introduction.', decision: 'continue' }); accept({ message: 'Use concrete examples.' });
   accept({ message: 'Artifact created.', artifact: { title: 'Original title', markdown: 'Preserve this artifact and author.' } }); command(room, 'pause');
   const before = current(room), bindings = store.all('SELECT * FROM room_runtime_bindings'), attempts = store.all('SELECT * FROM room_attempts');
-  expect(migrateRooms(db).latest).toBe(86); expect(current(room)).toEqual(before);
+  const previous = migrationStatus(db);
+  expect(previous.applied).not.toContain(86);
+  const upgraded = migrateRooms(db);
+  // 全模块共用迁移账本，核心迁移可能已有高于 086 的编号。
+  expect(upgraded.latest).toBe(Math.max(previous.latest ?? 0, 86));
+  expect(upgraded.applied).toEqual([...previous.applied, 86].sort((a, b) => a - b));
+  expect(current(room)).toEqual(before);
   expect(store.all('SELECT * FROM room_runtime_bindings')).toEqual(bindings); expect(store.all('SELECT * FROM room_attempts')).toEqual(attempts);
   expect(db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 }); expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
   expect(() => db.run('UPDATE room_members SET room_id=? WHERE id=?', ['foreign', room.members[0].id])).toThrow('room_member_scope_immutable');
   expect(() => db.run('DELETE FROM room_members WHERE id=?', [room.members[0].id])).toThrow('room_member_identity_retained');
   expect(() => db.run("UPDATE room_runtime_bindings SET runtime_key='another-key'")).toThrow('room_runtime_scope_immutable');
   expect(edit(room, [{ role: 'writer', displayName: 'New author' }]).members.filter(member => member.role === 'writer')).toHaveLength(2);
-  expect(migrateRooms(db).latest).toBe(86);
+  expect(migrateRooms(db)).toEqual(upgraded);
 });

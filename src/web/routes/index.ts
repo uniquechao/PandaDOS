@@ -1,3 +1,7 @@
+import { agentModelsRoutes } from './agent-models';
+import { localPlansRoutes } from './local-plans';
+import type { LocalPlanService } from '../local-plans';
+import type { AgentModelSettings } from '../../core/agent-model-settings';
 /**
  * web/routes —— 全部路由工厂的聚合点（集成接线，spec §9）。
  * 各域模块只 export 自己的 RouteDef[] 工厂；这里按 createDispatcher 约定统一编排：
@@ -70,6 +74,8 @@ import type { IssueId } from '../../../shared/issue-id';
 
 /** 聚合所有路由工厂需要的依赖全集（server.ts 装配后传入） */
 export interface ApiDeps {
+  localPlans?: LocalPlanService;
+  agentModels?: AgentModelSettings;
   db: Database;
   users: UserStore;
   engine: IssueEngine;
@@ -151,6 +157,7 @@ export interface ApiDeps {
 /** 全部 RouteDef 平铺（顺序即匹配顺序；路径互不冲突，顺序仅影响查找） */
 export function allRoutes(deps: ApiDeps): RouteDef[] {
   return [
+    ...(deps.localPlans ? localPlansRoutes(deps.localPlans) : []),
     ...authRoutes({ users: deps.users }),
     ...meRoutes({ users: deps.users }),
     ...llmStatusRoutes({ db: deps.db }),
@@ -229,8 +236,9 @@ export function allRoutes(deps: ApiDeps): RouteDef[] {
           ...(deps.modelsForProject ? { modelsForProject: deps.modelsForProject } : {}),
         })
       : []),
+    ...(deps.agentModels ? agentModelsRoutes(deps.agentModels) : []),
     ...uploadsRoutes({ db: deps.db, driver: deps.driver, driverForProject: deps.driverForProject }),
-    ...filesRoutes({ db: deps.db, driverForProject: deps.driverForProject }),
+    ...filesRoutes({ db: deps.db, driverForProject: deps.driverForProject, mutex: deps.mutex }),
     ...(deps.preview ? deps.preview.routes() : []),
     ...gitWorkspaceRoutes({
       db: deps.db,

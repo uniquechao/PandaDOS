@@ -120,6 +120,8 @@ export interface Project {
    * 分支与 MR 由开发者在 GitLab 侧管理）；此字段仅作兜底：读不到当前分支（detached HEAD）时用它当分支名。
    */
   workBranch: string | null;
+  moduleConcurrency?: number;
+  integrationBranch?: string | null;
   /** Agent（claude/codex）读历史会话+代码库产出的项目认知长文（007 迁移；null = 尚未生成） */
   understanding: string | null;
   /** 生成上面认知的 CLI 代理（007 迁移；null = 尚未生成） */

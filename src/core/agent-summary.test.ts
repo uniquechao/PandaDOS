@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   AgentSummaryRunner,
+  MEMORY_SUMMARY_TIMEOUT_MS,
   buildSummaryPrompt,
   isCodexUpdatePrompt,
   pickAffirmative,
@@ -235,7 +236,7 @@ describe('AgentSummaryRunner.run', () => {
     expect(driver.sent[0]!.text).toContain('--approve-for-me');
   });
 
-  test('超时：done 标记始终不出现 → reason=timeout，仍清理', async () => {
+  test('超时：保留诊断与现场，结束独立会话', async () => {
     const driver = new FakeDriver();
     const cwd = '/repo/proj';
     const p = summaryPaths(cwd);
@@ -247,7 +248,78 @@ describe('AgentSummaryRunner.run', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('timeout');
     expect(driver.killed).toContain('sum-3');
-    expect(driver.removed).toContain(p.scratch);
+    expect(driver.files.has(p.history)).toBe(true);
+    const failure = JSON.parse(driver.files.get(`${p.scratch}/failure.json`)!);
+    expect(failure.reason).toBe('timeout');
+    expect(failure.diagnostics.elapsedMs).toBeGreaterThanOrEqual(FAST.timeoutMs);
+    expect(!r.ok && r.diagnostics?.files.some((f) => f.name === 'history.md')).toBe(true);
+  });
+
+  test('记忆默认预算允许超过 8 分钟完成，简介仍使用共享预算', async () => {
+    for (const target of ['memory', 'readme'] as const) {
+      const driver = new FakeDriver();
+      const time = mkClock();
+      const p = summaryPaths('/repo/proj');
+      driver.onCapture = (_n, files) => {
+        if (time.now() >= 9 * 60 * 1000) {
+          files.set(p.understanding, '记忆概要');
+          files.set(p.done, 'ok');
+        }
+      };
+      const result = await runAgentSummary(
+        { driver, ...time },
+        { projectId: 8, cwd: '/repo/proj', agent: 'claude', historyDigest: 'h', target },
+        { pollIntervalMs: 60_000, readyDelayMs: 0 },
+      );
+      expect(result.ok).toBe(target === 'memory');
+      expect(time.now()).toBeLessThan(MEMORY_SUMMARY_TIMEOUT_MS);
+    }
+  });
+
+  test('记忆显式超时优先；已有概要但没有 done 仍判失败并保留概要', async () => {
+    const driver = new FakeDriver();
+    const p = summaryPaths('/repo/proj');
+    driver.onCapture = (_n, files) => files.set(p.understanding, '尚未完成');
+    const result = await runAgentSummary(
+      { driver, ...mkClock() },
+      { projectId: 8, cwd: '/repo/proj', agent: 'claude', historyDigest: 'h', target: 'memory' },
+      FAST,
+    );
+    expect(result).toMatchObject({ ok: false, reason: 'timeout' });
+    expect(driver.files.get(p.understanding)).toBe('尚未完成');
+    expect(JSON.parse(driver.files.get(`${p.scratch}/failure.json`)!).partial).toBe(true);
+    expect(!result.ok && result.diagnostics!.elapsedMs).toBeLessThan(MEMORY_SUMMARY_TIMEOUT_MS);
+  });
+
+  test('记忆默认预算耗尽后结束会话；重试清理旧现场并成功', async () => {
+    const driver = new FakeDriver();
+    const time = mkClock();
+    const p = summaryPaths('/repo/proj');
+    const input = { projectId: 8, cwd: '/repo/proj', agent: 'claude' as const, historyDigest: 'h', target: 'memory' as const };
+    const runner = new AgentSummaryRunner({ driver, ...time });
+    expect(await runner.run(input, { pollIntervalMs: 60_000, readyDelayMs: 0 }))
+      .toMatchObject({ ok: false, reason: 'timeout' });
+    expect(time.now()).toBe(MEMORY_SUMMARY_TIMEOUT_MS);
+    expect(driver.sessions.size).toBe(0);
+    driver.onCapture = (_n, files) => {
+      expect(files.has(`${p.scratch}/failure.json`)).toBe(false);
+      files.set(p.understanding, '已完成');
+      files.set(p.done, 'ok');
+    };
+    expect(await runner.run(input, FAST)).toEqual({ ok: true, understanding: '已完成' });
+    expect(driver.files.has(p.history)).toBe(false);
+  });
+
+  test('记忆提示词约束阅读范围、保留指令桥，并满足注入长度限制', () => {
+    for (const agent of ['claude', 'codex'] as const) {
+      for (const locale of ['zh-Hans', 'en'] as const) {
+        const prompt = buildSummaryPrompt(agent, '测试项目', 'memory', locale);
+        expect(prompt).toContain('10');
+        expect(prompt).toContain(`${SCRATCH_DIR}/done`);
+        expect(prompt.length).toBeLessThanOrEqual(2000);
+        expect(prompt).toContain(locale === 'en' ? 'instruction bridges' : '指令桥');
+      }
+    }
   });
 
   test('done 出现但 understanding 空 → reason=no-output', async () => {

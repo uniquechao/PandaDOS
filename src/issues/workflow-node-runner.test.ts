@@ -294,7 +294,10 @@ describe('工作流节点独立会话与结果协议', () => {
       nodeKey: 'code',
       tokenKey: 'root>branch-code',
       parallelGroupKey: '{"forkRunId":1}',
-      prepareRun: async () => worktree,
+      prepareRun: async runId => {
+        s.db.query(`INSERT INTO issue_workflow_worktrees(issue_workflow_id,node_run_id,path,branch,base_ref,created_ts,updated_ts) VALUES(?,?,?,'test-branch','HEAD',1,1)`).run(s.workflow.id,runId,worktree);
+        return worktree;
+      },
     });
     expect(s.conversations.activationCwds.at(-1)).toBe(worktree);
     expect(started.contextPath.startsWith(`${worktree}/`)).toBe(true);
@@ -302,6 +305,9 @@ describe('工作流节点独立会话与结果协议', () => {
       cwd: worktree,
       isolatedWorktree: true,
     });
+    await s.driver.writeFile(started.resultPath,JSON.stringify({schemaVersion:1,output:'子工作区成果',selectedEdgeKey:'code-review',routeReason:'完成'}));
+    await s.driver.writeFile(started.donePath,'ok');
+    expect(await s.runner.collect(started.run.id)).toMatchObject({state:'completed'});
   });
 
   test('done 后缺失结果或选择非候选连线会以稳定错误码失败', async () => {

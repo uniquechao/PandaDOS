@@ -1,4 +1,8 @@
 import { describe, expect, test } from 'bun:test';
+import { catalogs } from './i18n/catalogs';
+import { RELEASE_NOTE_KEYS } from './release-notes';
+import release from '../release.json';
+import pkg from '../package.json';
 
 describe('release metadata', () => {
   test('ships a dated product version and concise release notes', async () => {
@@ -6,17 +10,26 @@ describe('release metadata', () => {
     expect(await file.exists()).toBe(true);
     const release = await file.json();
     expect(release.version).toMatch(/^\d+\.\d+\.\d+-\d{4}\.\d{4}$/);
-    expect(release.version).toBe('2.4.1-2026.0929');
+    expect(release.version).toBe('2.6.0-2026.1104');
+    expect(release.version.split('-')[0]).toBe(pkg.version);
     expect(release.notes).toEqual([
-      'unified-workspace',
-      'issue-injection-recovery',
-      'validation-delivery-evidence',
-      'dedicated-ssh-isolation',
-      'agent-chatroom-workspace',
-      'local-session-member-models',
-      'agent-roster-editing',
-      'compact-member-contact-list',
-      'conversation-segment-resume',
+      'idle-chat-hibernation',
+      'local-plan-workspace',
+      'executor-environment-recovery',
+      'issue-stop-diagnostics',
+      'host-build-release',
     ]);
+  });
+
+  test('every published note resolves to translated copy in every locale', () => {
+    for (const note of release.notes) {
+      const key = RELEASE_NOTE_KEYS[note as keyof typeof RELEASE_NOTE_KEYS];
+      expect(key).toBeDefined();
+      for (const [locale, catalog] of Object.entries(catalogs)) {
+        expect(typeof catalog[key]).toBe('string');
+        expect(catalog[key].trim().length).toBeGreaterThan(0);
+        if (locale !== 'en') expect(catalog[key]).not.toBe(catalogs.en[key]);
+      }
+    }
   });
 });

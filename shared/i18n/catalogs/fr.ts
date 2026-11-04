@@ -1,3 +1,7 @@
+import { issueDiagnosticMessages } from '../domains/issue-diagnostics';
+import { localPlanMessages } from '../domains/local-plans';
+import { agentModelMessages } from '../domains/agent-models';
+import { moduleWorkspaceMessages } from '../domains/module-workspace';
 import { roomMemberMessages } from '../domains/rooms-members';
 import { roomChatMessages } from '../domains/rooms-chat';
 import { roomExtraMessages } from '../domains/rooms-extra';
@@ -24,6 +28,10 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const frCatalog = {
+  ...issueDiagnosticMessages,
+  ...localPlanMessages["fr"],
+  ...agentModelMessages,
+  ...moduleWorkspaceMessages["fr"],
   ...roomMemberMessages["fr"],
   ...roomChatMessages["fr"],
   ...roomExtraMessages["fr"],
@@ -160,4 +168,5 @@ export const frCatalog = {
   'ui.moduleIssueCount':'{count, plural, one {# issue associée} other {# issues associées}}','ui.organizeResultCreate':'Module « {name} » créé ({slug} · {agent})','ui.organizeResultRename':'Module renommé « {name} » ({slug})','ui.organizeResultMerge':'{count, plural, one {Fusion effectuée dans « {target} » ; # issue déplacée} other {Fusion effectuée dans « {target} » ; # issues déplacées}}','ui.organizeResultMove':'{count, plural, one {# issue déplacée dans « {target} »} other {# issues déplacées dans « {target} »}}',
   'ui.organizeFailureTimeout':'La dernière analyse a expiré. Vous pouvez la relancer.','ui.organizeFailureNoOutput':'La dernière analyse n’a renvoyé aucun plan d’organisation. Vous pouvez la relancer.','ui.organizeFailureError':'La dernière analyse a échoué. Vous pouvez la relancer.','ui.organizeFailureDetail':'Détails techniques : {detail}',
   'git.imageBefore':'Avant','git.imageAfter':'Après','git.openImage':'Ouvrir {name}','git.viewImage':'Afficher l’image {name}','git.downloadImage':'Télécharger {name}',
+  'admin.directoryRequired': "Renseignez {field}. Saisissez un chemin absolu ou choisissez un répertoire.",
 } as const satisfies MessageCatalog;

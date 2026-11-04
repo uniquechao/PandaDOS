@@ -611,6 +611,7 @@ export function adminRoutes(deps: AdminRoutesDeps): RouteDef[] {
         }
         if (
           b.capabilitiesCheckedTs !== undefined &&
+          b.capabilitiesCheckedTs !== null &&
           (typeof b.capabilitiesCheckedTs !== 'number' ||
             !Number.isSafeInteger(b.capabilitiesCheckedTs) ||
             b.capabilitiesCheckedTs < 0)

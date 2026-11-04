@@ -24,11 +24,12 @@ export function Modal({
   useEffect(() => {
     const panel = panelRef.current;
     if (!panel) return;
-    const focusable = Array.from(
+    const getFocusable = () => Array.from(
       panel.querySelectorAll<HTMLElement>(
         'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [href], [tabindex]:not([tabindex="-1"])',
       ),
     ).filter((element) => !element.hasAttribute('hidden'));
+    const focusable = getFocusable();
     focusable[0]?.focus();
 
     const onKeyDown = (event: KeyboardEvent): void => {
@@ -38,6 +39,8 @@ export function Modal({
         return;
       }
       if (event.key !== 'Tab') return;
+      // 异步加载后字段可能解除禁用，每次导航重新读取当前可聚焦控件。
+      const focusable = getFocusable();
       if (focusable.length === 0) {
         event.preventDefault();
         panel.focus();

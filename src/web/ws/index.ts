@@ -1,3 +1,4 @@
+import { managedConversationOwned, managedExecutionConversationKnown as managedConversationKnown } from '../../core/workspace-ownership';
 /**
  * web/ws —— WS 挂载点聚合：upgrade 前鉴权 + 按 kind 分发 open/message/close。
  *
@@ -47,6 +48,7 @@ import { parseIssueId, type IssueId } from '../../../shared/issue-id';
 export type WsData = TermWsData | ChatWsData;
 
 export interface WsDeps {
+  retainSession?(session: string): ()=>void;
   db: Database;
   users: UserStore;
   /** 登录会话查找（飞书扫码签发）；缺省不接 = 只认长期 token */
@@ -186,10 +188,10 @@ function resolveTermTarget(deps: WsDeps, projectId: number, url: URL, ded: strin
          FROM issues i
          JOIN conversations c ON c.id = i.conv_id AND c.project_id = i.project_id AND c.kind = 'issue'
          WHERE i.id = ? AND i.project_id = ?
-           AND i.status IN ('planning', 'implementing', 'testing')`,
+           AND i.status IN ('planning', 'implementing', 'testing', 'paused', 'blocked')`,
       )
       .get(issueId, projectId);
-    if (!issue || deps.convs.currentConv(projectId) !== issue.conv_id) {
+    if (!issue || (deps.convs.currentConv(projectId) !== issue.conv_id && !managedConversationOwned(deps.db, projectId, issue.conv_id))) {
       return targetDeny('issue 不在当前执行中', 409);
     }
     return {
@@ -208,6 +210,7 @@ function resolveTermTarget(deps: WsDeps, projectId: number, url: URL, ded: strin
     .get(convId);
   if (!scope) return targetDeny('对话不存在', 404);
   if (scope.project_id !== projectId) return targetDeny('对话不属于该项目', 403);
+  if(managedConversationKnown(deps.db,convId) && !managedConversationOwned(deps.db,projectId,convId))return targetDeny('工作区会话归属已失效',409);
   if (isDesignConversation(deps.db, convId)) return { deny: designConversationDeny(convId) };
   const conv = deps.db
     .query<{ kind: string }, [string, number]>('SELECT kind FROM conversations WHERE id = ? AND project_id = ?')
@@ -286,6 +289,7 @@ export async function handleWsUpgrade(
     if (!exists) return json({ ok: false, error: '会话不存在' }, 404);
     const data: TermWsData = {
       kind: 'term',
+      authorized: () => { const current=resolveTermTarget(deps,pid,url,ded); return !('deny' in current) && current.target.session===session; },
       session,
       cols: clampInt(url.searchParams.get('cols'), 120, 20, 400),
       rows: clampInt(url.searchParams.get('rows'), 30, 5, 200),
@@ -341,8 +345,15 @@ export async function handleWsUpgrade(
     projectId: pid,
     userId: user!.id, // authorize 已挡掉未登录（无 user 早已 401），到这里必有
     session,
-    cwd: project.cwd,
-    driver,
+    cwd: pinnedConv ? (deps.db.query<{workspace_cwd:string|null},[string]>('SELECT workspace_cwd FROM conversations WHERE id=?').get(pinnedConv)?.workspace_cwd ?? project.cwd) : project.cwd,
+    driver: pinnedConv && managedConversationKnown(deps.db,pinnedConv) ? new Proxy(driver, { get(target,key) {
+      const value = Reflect.get(target,key);
+      if (typeof value !== 'function') return value;
+      return (...args:unknown[]) => {
+        if ((key === 'sendKeys' || key === 'sendKey') && !managedConversationOwned(deps.db,pid,pinnedConv)) throw new Error('工作区输入归属失效');
+        return value.apply(target,args);
+      };
+    } }) : driver,
     ...(history ? { history } : {}),
     ...(pinnedAgent ? { agent: pinnedAgent } : {}),
     pinnedConv,
@@ -361,10 +372,12 @@ export async function handleWsUpgrade(
 
 /** Bun.serve 的 websocket 处理器（按 ws.data.kind 分发） */
 export function createWsHandlers(deps: WsDeps): WebSocketHandler<WsData> {
+  const releases=new WeakMap<object,()=>void>();
   const sharedChatDeps = {
     reader: deps.reader,
     locator: deps.locator,
     convs: deps.convs,
+    workspaceOwned: (projectId:number,convId:string) => managedConversationOwned(deps.db,projectId,convId),
     mutex: deps.mutex,
     ...(deps.approvals ? { approvals: deps.approvals } : {}),
     ...(deps.explain ? { explain: deps.explain } : {}),
@@ -379,6 +392,7 @@ export function createWsHandlers(deps: WsDeps): WebSocketHandler<WsData> {
   });
   return {
     open(ws) {
+      if(deps.retainSession)releases.set(ws,deps.retainSession(ws.data.session));
       if (ws.data.kind === 'term') void termOpen(ws as ServerWebSocket<TermWsData>);
       else void chatOpen(ws as ServerWebSocket<ChatWsData>, chatDeps(ws.data as ChatWsData));
     },
@@ -390,6 +404,8 @@ export function createWsHandlers(deps: WsDeps): WebSocketHandler<WsData> {
       else chatMessage(ws as ServerWebSocket<ChatWsData>, payload, chatDeps(ws.data as ChatWsData));
     },
     close(ws) {
+      releases.get(ws)?.();
+      releases.delete(ws);
       if (ws.data.kind === 'term') termClose(ws as ServerWebSocket<TermWsData>);
       else chatClose(ws as ServerWebSocket<ChatWsData>);
     },

@@ -1,3 +1,7 @@
+import { discoverAgentModels, applyAgentModel } from './agent-model-protocol';
+import type { AgentModelApplyRequest } from '../../shared/agent-models';
+import { STOP_WORKSPACE_PROCESSES, workspaceEnvArgs } from './workspace-processes';
+import { idleSessionProbeArgs, parseIdleSession, idleProcessTree, idleSessionStopArgs, type IdleSessionState } from './idle-session';
 /**
  * executor/local —— LocalDriver：在控制面本机直接执行 tmux/fs/git。
  * 双重身份：单测/集成测试的替身 + 验证 ExecutorDriver 接口设计是否落得下来。
@@ -195,6 +199,14 @@ export class LocalDriver implements ExecutorDriver {
     return runCommand('tmux', args, undefined, this.tmuxTimeoutMs);
   }
 
+  discoverAgentModels(agent: AgentKind, cwd: string, env?: Record<string,string>) {
+    return discoverAgentModels(this, agent, cwd, env);
+  }
+
+  applyAgentModel(request: AgentModelApplyRequest) {
+    return applyAgentModel(this, request);
+  }
+
   async findExecutable(agent: AgentKind): Promise<string | null> {
     if (agent !== 'claude' && agent !== 'codex') throw new Error('不支持的 Agent 命令');
     const direct = Bun.which(agent, { PATH: process.env.PATH ?? '' });
@@ -247,14 +259,37 @@ export class LocalDriver implements ExecutorDriver {
   }
 
   /** 建会话：尺寸参数与 SshDriver 同源（tmuxNewSessionArgs，I6 防 80×24 腰斩 CC 菜单回归） */
-  async createSession(name: string, cwd: string): Promise<void> {
-    const r = await this.tmux(tmuxNewSessionArgs(name, cwd));
+  async createSession(name: string, cwd: string, env?: Record<string, string>): Promise<void> {
+    const r = await this.tmux(tmuxNewSessionArgs(name, cwd, env));
     if (r.code !== 0) throw new Error(`tmux new-session failed: ${r.err || r.out}`);
+  }
+
+  async stopSessionConfirmed(session: string, attempt: string, executorStartTs: number): Promise<void> {
+    const stopped = await this.runCommand('/', ['python3', '-c', STOP_WORKSPACE_PROCESSES, attempt, String(executorStartTs)], 15_000);
+    if (stopped.code !== 0 || stopped.timedOut || stopped.out.trim() !== 'stopped') throw new Error('未能确认工作区进程已停止：'+(stopped.err||stopped.out).slice(0,500));
+    const killed = await this.tmux(['kill-session', '-t', session]);
+    if (killed.code !== 0 && !/can't find session|no server running|error connecting.*No such file/i.test(killed.err)) {
+      throw new Error('未能确认工作区终端已停止：' + killed.err);
+    }
   }
 
   async killSession(name: string): Promise<void> {
     const r = await this.tmux(['kill-session', '-t', name]);
     if (r.code !== 0) throw new Error(`tmux kill-session failed: ${r.err || r.out}`);
+  }
+
+  async inspectIdleSession(name: string): Promise<IdleSessionState | null> {
+    const result=await this.tmux(idleSessionProbeArgs(name));
+    const state=result.code===0 ? parseIdleSession(name,result.out) : null;
+    if (!state) return null;
+    const ps=await this.runCommand('/', ['ps','-axo','pid=,ppid=,comm='], this.tmuxTimeoutMs);
+    state.processesIdle=ps.code===0 && !ps.timedOut && idleProcessTree(state,ps.out);
+    return state;
+  }
+
+  async sleepSessionIfIdle(snapshot: IdleSessionState): Promise<boolean> {
+    const result=await this.tmux(idleSessionStopArgs(snapshot));
+    return result.code===0 && result.out.trim()==='panda-idle-slept';
   }
 
   async sendKeys(session: string, text: string): Promise<void> {
@@ -613,12 +648,13 @@ export class LocalDriver implements ExecutorDriver {
    * 想串两条命令就调两次。超时不抛错，按 `timedOut` 返回（底层 execFile 超时会 reject，
    * 那条路径拿不到半截输出，只能如实报空）。
    */
-  async runCommand(cwd: string, argv: string[], timeoutMs: number): Promise<CommandResult> {
+  async runCommand(cwd: string, argv: string[], timeoutMs: number, env?: Record<string,string>): Promise<CommandResult> {
+    workspaceEnvArgs(env);
     const [cmd, ...args] = argv;
     if (!cmd) throw new Error('runCommand 需要至少一个命令词');
     const started = Date.now();
     try {
-      const r = await runCommand(cmd, args, cwd, timeoutMs);
+      const r = await runCommand(cmd, args, cwd, timeoutMs, { ...process.env, ...env });
       return {
         code: r.code,
         out: truncateCommandOutput(r.out, MAX_COMMAND_OUTPUT_CHARS),

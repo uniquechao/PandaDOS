@@ -105,3 +105,24 @@ describe('IssueScheduler project flight', () => {
     ]);
   });
 });
+
+test('module flight skips one unavailable module and starts independent modules within the same flight', async () => {
+  const f = fixture([issue('1', 'pending', 1), issue('2', 'pending', 2), issue('3', 'pending', 3)]);
+  const started: string[] = [];
+  const scheduler = new IssueScheduler({
+    store: f.store, policy: f.policy, parallel: true, canSchedule: () => true,
+    pickIssue: (_projectId, _preferred, deferred) => f.issues.find(i => i.status === 'pending' && !deferred.has(i.id)),
+    applyUnblock: async () => ({ ok: false, error: 'unused' }),
+    mergeModule: async () => [], scheduleClarify: () => {},
+    startIssue: async (id) => {
+      started.push(id);
+      if (id === '1') return { ok: false, error: 'module occupied', deferral: 'project-busy' };
+      f.issues.find(i => i.id === id)!.status = 'implementing';
+      return { ok: true, from: 'pending', to: 'implementing' };
+    },
+  });
+  await scheduler.scheduleNext(7);
+  expect(started).toEqual(['1', '2', '3']);
+  expect(f.issues.map(i => i.status)).toEqual(['pending', 'implementing', 'implementing']);
+  expect(f.events.map(e => e.kind)).toEqual(['scheduling_deferred']);
+});

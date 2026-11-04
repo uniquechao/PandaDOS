@@ -30,3 +30,21 @@ describe('IssueSchedulingPolicy', () => {
     expect(policy.canConsumeUnblock(1, '1', 21)).toBe(false);
   });
 });
+
+test('module recovery may use free capacity while another module runs, with pin precedence preserved', () => {
+  const items = [issue('1', 'blocked', 1, 10), issue('2', 'implementing', 2), issue('3', 'pending', 3, 20)];
+  const store = {
+    listByProject: () => items,
+    listRunnableByProject: () => items.filter(i => i.status === 'pending'),
+    lastEnterInfo: () => null,
+  } as unknown as Pick<IssueStore, 'listByProject' | 'listRunnableByProject' | 'lastEnterInfo'>;
+  let available = true;
+  const policy = new IssueSchedulingPolicy(store, () => false, {
+    pick: candidates => candidates[0],
+    canStart: () => available,
+  });
+  expect(policy.canConsumeUnblock(1, '1', 10)).toBe(false);
+  expect(policy.canConsumeUnblock(1, '1', 21)).toBe(true);
+  available = false;
+  expect(policy.canConsumeUnblock(1, '1', 21)).toBe(false);
+});

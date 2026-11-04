@@ -1,3 +1,7 @@
+import { issueDiagnosticMessages } from '../domains/issue-diagnostics';
+import { localPlanMessages } from '../domains/local-plans';
+import { agentModelMessages } from '../domains/agent-models';
+import { moduleWorkspaceMessages } from '../domains/module-workspace';
 import { roomMemberMessages } from '../domains/rooms-members';
 import { roomChatMessages } from '../domains/rooms-chat';
 import { roomExtraMessages } from '../domains/rooms-extra';
@@ -24,6 +28,10 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const zhHansCatalog = {
+  ...issueDiagnosticMessages,
+  ...localPlanMessages["zh-Hans"],
+  ...agentModelMessages,
+  ...moduleWorkspaceMessages["zh-Hans"],
   ...roomMemberMessages["zh-Hans"],
   ...roomChatMessages["zh-Hans"],
   ...roomExtraMessages["zh-Hans"],
@@ -162,4 +170,5 @@ export const zhHansCatalog = {
   'ui.organizeDescriptionCreate':'新建模块“{name}”（{slug} · {agent}）','ui.organizeDescriptionRename':'“{name}”：{fromSlug} → {slug}','ui.organizeDescriptionRenameWithName':'“{name}”：{fromSlug} → {slug}（显示名 → “{displayName}”）','ui.organizeDescriptionMerge':'将 {sources} 合并到“{target}”','ui.organizeDescriptionMove':'将 {issues} 移入“{target}”',
   'ui.moduleIssueCount':'{count, plural, other {# 个 issue}}','ui.organizeResultCreate':'已创建模块“{name}”（{slug} · {agent}）','ui.organizeResultRename':'已将模块改名为“{name}”（{slug}）','ui.organizeResultMerge':'{count, plural, other {已合并到“{target}”，移入 # 个 issue}}','ui.organizeResultMove':'{count, plural, other {已将 # 个 issue 移入“{target}”}}',
   'ui.organizeFailureTimeout':'上次分析超时，可以重新运行。','ui.organizeFailureNoOutput':'上次分析未返回整理方案，可以重新运行。','ui.organizeFailureError':'上次分析失败，可以重新运行。','ui.organizeFailureDetail':'技术详情：{detail}',
+  'admin.directoryRequired': "请填写{field}。输入绝对路径，或选择目录。",
 } as const satisfies MessageCatalog;

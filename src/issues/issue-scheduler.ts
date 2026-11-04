@@ -1,5 +1,5 @@
 import type { IssueId } from '../../shared/issue-id';
-import type { ApplyResult, IssueStore, ScheduleNextOptions, ScheduleSource } from './engine';
+import type { ApplyResult, EngineIssue, IssueStore, ScheduleNextOptions, ScheduleSource } from './engine';
 import type { IssueSchedulingPolicy } from './scheduling-policy';
 import { isBusy, moduleKeyOf, pickNext } from './queue';
 
@@ -9,6 +9,8 @@ type ScheduleStore = Pick<IssueStore,
 export interface IssueSchedulerPorts {
   store: ScheduleStore;
   policy: IssueSchedulingPolicy;
+  parallel?: boolean;
+  pickIssue?: (projectId: number, preferred: string | undefined, deferred: Set<IssueId>) => EngineIssue | undefined;
   canSchedule: (projectId: number) => boolean;
   /** Implementations retain their existing issue-meta → transition → git lock order. */
   startIssue: (issueId: IssueId) => Promise<ApplyResult>;
@@ -33,6 +35,10 @@ export class IssueScheduler {
     if (this.scheduling.has(projectId)) return;
     this.scheduling.add(projectId);
     const mergedHosts: IssueId[] = [];
+    const deferred = new Set<IssueId>();
+    const pick = (preferred?: string) => this.ports.pickIssue
+      ? this.ports.pickIssue(projectId, preferred, deferred)
+      : pickNext(this.ports.policy.runnable(projectId).filter(i => !deferred.has(i.id)), preferred);
     try {
       let preferred = options.preferModuleKey;
       for (;;) {
@@ -40,12 +46,12 @@ export class IssueScheduler {
         if (await this.consumeUnblockRequest(projectId, source, preferred)) return;
         if (!this.ports.canSchedule(projectId)) return;
 
-        let next = pickNext(this.ports.policy.runnable(projectId), preferred);
+        let next = pick(preferred);
         if (!next) return;
         const pickedModule = moduleKeyOf(next);
         mergedHosts.push(...(await this.ports.mergeModule(projectId, pickedModule)));
         if (!this.ports.canSchedule(projectId)) return;
-        next = pickNext(this.ports.policy.runnable(projectId), pickedModule);
+        next = pick(pickedModule);
         if (!next) return;
 
         const beforeStatus = next.status;
@@ -60,11 +66,12 @@ export class IssueScheduler {
               where: 'scheduleNext', source, error: result.error,
             });
           }
+          if (this.ports.parallel) { deferred.add(next.id); continue; }
           return;
         }
 
         const projectIssues = this.ports.store.listByProject(projectId);
-        if (isBusy(projectIssues)) return;
+        if (!this.ports.parallel && isBusy(projectIssues)) return;
         const fresh = projectIssues.find((issue) => issue.id === next.id);
         if (!fresh || fresh.status === beforeStatus) {
           this.ports.store.logEvent(next.id, 'error', {

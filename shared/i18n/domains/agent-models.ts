@@ -1,0 +1,21 @@
+/** 本需求明确要求新增面向用户的文案统一使用简体中文。保留消息键和 ICU 契约。 */
+export const agentModelMessages = {
+  'models.settings': '模型设置',
+  'models.model': '模型',
+  'models.level': '推理强度',
+  'models.refresh': '刷新可选模型',
+  'models.save': '应用设置',
+  'models.close': '关闭',
+  'models.loading': '正在从执行机获取模型…',
+  'models.empty': '执行机未返回可选模型。',
+  'models.default': '由代理决定（未确认 level）',
+  'models.choose': '请选择模型',
+  'models.unset': '未设置',
+  'models.pending': '已选择，等待会话启动或安全切换时机',
+  'models.applying': '正在切换，等待确认',
+  'models.applied': '已确认生效',
+  'models.failed': '切换失败，请刷新后重试',
+  'models.actual': '已确认配置：{model} · {effort}',
+  'models.unknown': '未知',
+  'models.error': '获取或保存设置失败，请刷新后重试。',
+} as const;

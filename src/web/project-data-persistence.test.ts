@@ -17,6 +17,56 @@ afterEach(async () => {
 });
 
 describe('Issue Markdown 协作持久化', () => {
+  test('模块投影保留原 doc_path 与人工记录，等待提交锁后不改写固定成果', async () => {
+    const evidenceRoot = path.join(process.cwd(), '.private/workspace-tests');
+    await fsp.mkdir(evidenceRoot, { recursive: true });
+    const cwd = await fsp.mkdtemp(path.join(evidenceRoot, 'projection-'));
+    cleanups.push(cwd);
+    const db = openDb(':memory:');
+    try {
+      migrate(db); migrateIssueEngine(db);
+      db.run("INSERT INTO users(id,username,token_hash,role,created_ts) VALUES(1,'admin','x','admin',1)");
+      db.run("INSERT INTO executors(id,name,host,ssh_user,key_ref,workspace_root,claude_dir) VALUES(1,'local','localhost','local','',?,'')", [cwd]);
+      db.run("INSERT INTO projects(id,name,executor_id,cwd,owner_user_id,created_ts) VALUES(7,'投影回归',1,?,1,1)", [cwd]);
+      db.run("INSERT INTO project_modules(id,project_id,slug,display_name,agent,source,created_ts) VALUES(12,7,'module','模块','codex','manual',1)");
+      const original = '.panda/modules/module/issues/33-original.md';
+      const a = path.join(cwd, 'a'), b = path.join(cwd, 'b');
+      const source = '# #247 投影回归\n\n## 原始需求\n\n需求\n\n## 设计与实施\n\n人工记录\n';
+      for (const root of [cwd, a, b]) {
+        await fsp.mkdir(path.dirname(path.join(root, original)), { recursive: true });
+        await fsp.writeFile(path.join(root, original), source);
+      }
+      db.run("INSERT INTO issues(id,project_id,title,body,module_id,agent,status,sync_uid,doc_path,created_ts) VALUES('247',7,'投影回归','需求',12,'codex','pending','issue-uid',?,1)", [original]);
+      db.run("INSERT INTO module_workspaces(id,project_id,module_key,executor_id,cwd,branch,current_attempt,created_ts,updated_ts) VALUES(1,7,12,1,?,'module-branch','attempt-a',1,1)", [a]);
+      db.run("INSERT INTO workspace_attempts(id,workspace_id,issue_id,agent,created_ts,updated_ts) VALUES('attempt-a',1,'247','codex',1,1)");
+      db.run('DELETE FROM project_data_outbox');
+      const mutex = new KeyedMutex();
+      const outbox = createProjectDataPersistence(db, () => new LocalDriver(), mutex);
+      db.run("UPDATE issues SET status='implementing' WHERE id='247'");
+      expect((await outbox.drain()).failed).toBe(0);
+      const projected = await fsp.readFile(path.join(a, original), 'utf8');
+      expect(projected).toContain('人工记录');
+      expect(projected).toContain('sync_uid: issue-uid');
+      expect(projected).toContain('status: implementing');
+      let entered!: () => void, release!: () => void;
+      const acquired = new Promise<void>(resolve => { entered = resolve; });
+      const blocked = new Promise<void>(resolve => { release = resolve; });
+      const committing = mutex.runExclusive('workspace-git:1', async () => {
+        entered(); await blocked;
+        db.run("UPDATE workspace_attempts SET result_sha='fixed-result' WHERE id='attempt-a'");
+      });
+      await acquired;
+      db.run("UPDATE issues SET status='testing' WHERE id='247'");
+      const projecting = outbox.drain();
+      await Promise.resolve(); release(); await committing;
+      expect((await projecting).failed).toBe(0);
+      expect(await fsp.readFile(path.join(a, original), 'utf8')).toBe(projected);
+      expect(JSON.parse(await fsp.readFile(path.join(a, '.panda/tmp/state/247.json'), 'utf8')).status).toBe('testing');
+      for (const root of [cwd, b]) expect(await fsp.readFile(path.join(root, original), 'utf8')).toBe(source);
+      expect(await fsp.stat(path.join(a, moduleIssueRelPath('module', '247', '投影回归'))).catch(() => null)).toBeNull();
+    } finally { db.close(); }
+  });
+
   test('已导入 Issue 回写原 doc_path，不按数据库 ID 新建重复过程页', async () => {
     const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-issue-persist-'));
     cleanups.push(cwd);

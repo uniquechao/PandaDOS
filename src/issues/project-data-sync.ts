@@ -202,6 +202,7 @@ export function createIssueProjectDataAdapters(db: Database): PandaSyncAdapter[]
       const existing = db.query<{ id: IssueId; status: string }, [number, string]>(
         'SELECT id, status FROM issues WHERE project_id = ? AND sync_uid = ?',
       ).get(projectId, item.uid);
+      if (existing && db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_attempts'").get() && db.query('SELECT 1 FROM workspace_attempts WHERE issue_id=?').get(existing.id)) return;
       const fileStatus = typeof value.status === 'string' && ISSUE_STATES.has(value.status)
         ? value.status : 'pending';
       // 文件状态只参与首次导入；一旦入库，状态机就是唯一事实源。协作文件可能落后于
@@ -248,6 +249,7 @@ export function createIssueProjectDataAdapters(db: Database): PandaSyncAdapter[]
       ).get(projectId, item.uid);
       // 换号后过程页搬到了新路径：旧路径消失不代表 issue 被删
       if (existing?.doc_path && existing.doc_path !== item.path) return;
+      if (db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_attempts'").get() && db.query(`SELECT 1 FROM workspace_attempts a JOIN issues i ON i.id=a.issue_id WHERE i.project_id=? AND i.sync_uid=?`).get(projectId,item.uid)) return;
       if (existing && !BUSY_STATES.includes(existing.status as never)) {
         db.query(`UPDATE issues SET status = 'cancelled'
           WHERE project_id = ? AND sync_uid = ?`).run(projectId, item.uid);

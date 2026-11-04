@@ -1,3 +1,7 @@
+import { AgentModelSettings } from '../core/agent-model-settings';
+import { ensurePandaIssuePlanSkill } from '../core/issue-plan-skill';
+import { LocalPlanService } from './local-plans';
+import { ModuleWorkspaceService } from '../issues/module-workspaces';
 /**
  * web/server —— V2 控制面完整装配。
  *
@@ -102,6 +106,7 @@ import { createProjectDataPersistence } from './project-data-persistence';
 import { decidePoll, ProjectDataSyncCoordinator } from './project-data-sync';
 import { ApprovalPipeline } from './ws/approvals';
 import { ChatApprovalWatcher } from './ws/chat-approvals';
+import { ChatIdleReaper, chatIdleTimeoutFromMinutes } from './chat-idle-reaper';
 import { ProgressBridge } from './ws/progress';
 import { createPreviewService } from './preview';
 import { createWsHandlers, handleWsUpgrade, type WsData, type WsDeps } from './ws';
@@ -149,6 +154,9 @@ export interface ServerOptions {
   projectDataDebounceMs?: number;
   /** 对话侧自动批准巡检周期（issue #108）；缺省 3s */
   chatApprovalTickMs?: number;
+  /** Idle detached chats hibernate after 2h; <=0 disables. Tests may shorten the deadline. */
+  chatIdleTimeoutMs?: number;
+  chatIdleSweepMs?: number;
   /** 进度管道批处理窗口秒数（透传 ProgressReporter；缺省 30s） */
   progressThrottleSeconds?: number;
   /** 单条 publication post-commit recovery 的 deadline；缺省 5s。 */
@@ -209,6 +217,7 @@ export interface PandaServer {
   approvals: ApprovalPipeline;
   /** 对话侧自动批准巡检（issue #108；观测/测试用） */
   chatApprovals: ChatApprovalWatcher;
+  chatIdleReaper: ChatIdleReaper;
   /** 进度管道（Wave3；观测/测试用） */
   progress: ProgressBridge;
   feishuEnabled: boolean;
@@ -400,8 +409,25 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   /** 稳定门面：引擎/convs/locator/PM/上传装配期捕获它，实际调用永远打到池内当前实例 */
   const primaryDriver: ExecutorDriver = {
     findExecutable: (agent) => resolvePrimary().findExecutable(agent),
+    discoverAgentModels: (agent, cwd, env) => {
+      const driver = resolvePrimary();
+      if (!driver.discoverAgentModels) throw new Error('model_discovery_unsupported');
+      return driver.discoverAgentModels(agent, cwd, env);
+    },
+    applyAgentModel: (request) => {
+      const driver = resolvePrimary();
+      if (!driver.applyAgentModel) throw new Error('model_switch_unsupported');
+      return driver.applyAgentModel(request);
+    },
+    capturePaneFresh: (session) => {
+      const driver = resolvePrimary();
+      return driver.capturePaneFresh?.(session) ?? driver.capturePane(session);
+    },
     listSessions: () => resolvePrimary().listSessions(),
-    createSession: (name, cwd) => resolvePrimary().createSession(name, cwd),
+    inspectIdleSession: (name) => resolvePrimary().inspectIdleSession?.(name) ?? Promise.resolve(null),
+    sleepSessionIfIdle: (snapshot) => resolvePrimary().sleepSessionIfIdle?.(snapshot) ?? Promise.resolve(false),
+    createSession: (name, cwd, env) => resolvePrimary().createSession(name, cwd, env),
+    stopSessionConfirmed: (session, attempt, ts) => { const d=resolvePrimary(); if(!d.stopSessionConfirmed)throw new Error('执行机不支持确认进程停止');return d.stopSessionConfirmed(session,attempt,ts); },
     killSession: (name) => resolvePrimary().killSession(name),
     sendKeys: (session, text) => resolvePrimary().sendKeys(session, text),
     sendKey: (session, key) => resolvePrimary().sendKey(session, key),
@@ -453,7 +479,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     ensureGitAvailable: () => resolvePrimary().ensureGitAvailable(),
     git: (cwd, args) => resolvePrimary().git(cwd, args),
     readGitBlob: (cwd, rev, path) => resolvePrimary().readGitBlob(cwd, rev, path),
-    runCommand: (cwd, argv, timeoutMs) => resolvePrimary().runCommand(cwd, argv, timeoutMs),
+    runCommand: (cwd, argv, timeoutMs, env) => resolvePrimary().runCommand(cwd, argv, timeoutMs, env),
     openPty: (cmd, cols, rows) => resolvePrimary().openPty(cmd, cols, rows),
   };
   const claudeProjectsDir = primary?.claudeDir ?? join(homedir(), '.claude', 'projects');
@@ -629,6 +655,15 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     claudeHome: homes.claudeHome,
     codexHome: homes.codexHome,
   });
+  const agentModels = new AgentModelSettings(db, async target => {
+    if (target.conversation) return convs.modelContext(target.conversation);
+    const project = getProject(db,target.projectId);
+    if (!project) throw new Error('model_target_unavailable');
+    const execution = conversationExecutionForProject(target.projectId);
+    return { driver:execution.driver,cwd:project.cwd,session:null,
+      env:{ CODEX_HOME:execution.codexHome,CLAUDE_CONFIG_DIR:execution.claudeHome },owned:() => false };
+  }, id => convs.get(id), (key,action) => mutex.runExclusive(key,action));
+  const agentModelTimer = setInterval(() => void agentModels.tick().catch(() => {}),2_000);
   // 内置全局技能：产物一律落当前工作目录（图片/网页等能进项目文件列表被预览）——随服务启动装到
   // 主执行机 ~/.claude 与 ~/.codex 的 skills/（缺失才写，claude+codex 共用；best-effort 不阻塞启动）。
   // 仅在能从执行机 claude_dir 推出真实家目录时装；推不出（退化/测试装配）跳过，免污染兜底 homedir。
@@ -641,6 +676,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     );
     void ensurePandaIssueInboxSkill(primaryDriver, derivedHomes).catch((e) =>
       console.error(`[${PRODUCT_NAME}] 内置技能 panda-issue-inbox 安装失败（best-effort）:`, e),
+    );
+    void ensurePandaIssuePlanSkill(primaryDriver, derivedHomes).catch((e) =>
+      console.error(`[${PRODUCT_NAME}] panda-issue-plan installation failed:`, e),
     );
   }
 
@@ -739,10 +777,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     publicationHasBusyIssues: (publicationId) => Boolean(db.query<{ busy: number }, [number]>(`
       SELECT 1 AS busy FROM design_issue_links link
       JOIN issues issue ON issue.id = link.issue_id AND issue.project_id = link.project_id
-      WHERE link.publication_id = ? AND issue.status NOT IN ('done', 'cancelled') LIMIT 1
+      WHERE link.publication_id = ? AND (issue.status NOT IN ('done', 'cancelled') OR EXISTS (SELECT 1 FROM workspace_attempts a WHERE a.issue_id=issue.id AND a.released_ts IS NULL)) LIMIT 1
     `).get(publicationId)),
   });
-  const executionWorkspaces = createDesignExecutionWorkspaceAdapter({ db, conversations: convs });
+  const executionWorkspaces = new ModuleWorkspaceService({ db, mutex, driverForProject, conversations: convs,
+    legacy: createDesignExecutionWorkspaceAdapter({ db, conversations: convs }) });
 
   // 「Agent 认知总结」的历史读取和 runner 均绑定项目执行机；相同 cwd 不等于同一执行位置。
   const summaryOrchestrator = new SummaryOrchestrator({
@@ -823,6 +862,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     mutex,
     flushProjectData,
     executionWorkspaces,
+    moduleWorkspaces: executionWorkspaces,
     modulesFor,
     // 创建时澄清：clr-<issueId> 一次性独立会话（按项目所在执行机取 Driver）
     // #280：分析超时由引擎按 clarifyRunTimeoutMs 下发，这里必须真的传下去——
@@ -862,6 +902,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   const roomFeedback = new RoomIssueFeedbackService(db, engine);
   const roomCoordinator = new RoomCoordinator({ service: roomRuntimeAccess(db,roomEngine,attempt => { const scope={projectId:attempt.projectId,roomId:attempt.roomId};roomFeedback.sync(scope);return roomFeedback.list(scope).filter(item=>item.missionId===attempt.missionId); }), runtime: roomRuntime, maxConcurrent: 2 });
   const roomPublication = new RoomPublicationService({ db, rooms: roomEngine, issues: engine });
+  const localPlans = new LocalPlanService({ db, engine, driverForProject });
   const designEngine = new DesignEngine({
     store: designStore,
     scope: designScope,
@@ -1176,6 +1217,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
 
   const dispatch = createApiDispatcher({
     db,
+    localPlans,
     preview,
     users,
     engine,
@@ -1201,6 +1243,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     onExecutorChanged: invalidateDriver, // M5：admin 改/删执行机后热失效 Driver 池
     convs,
     mutex, // 对话模式 conversations 路由 activate/archive 用（与引擎/PM/act/WS 同一把锁）
+    agentModels,
     models: modelProbe, // 对话/issue 详情页显示「正在用哪个模型」
     modelsForProject: (project) => {
       const context = historyForProject(project);
@@ -1234,7 +1277,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   );
 
   // WS 挂载（Wave3 任务 A/B）：/ws/term/:projectId + /ws/chat/:projectId
+  const chatIdleReaper=new ChatIdleReaper({
+    db,mutex,
+    execution: project=>({driver:driverForProject(project),locate:id=>historyForProject(project).locator.locate(id)}),
+    idleMs:opts.chatIdleTimeoutMs??chatIdleTimeoutFromMinutes(process.env.PANDA_CHAT_IDLE_MINUTES),
+    ...(opts.chatIdleSweepMs!==undefined?{intervalMs:opts.chatIdleSweepMs}:{}),
+    onSleep: id=>console.info(`[${PRODUCT_NAME}] idle chat hibernated`,id),
+    onError: ()=>console.warn(`[${PRODUCT_NAME}] idle chat inspection skipped`),
+  });
   const wsDeps: WsDeps = {
+    retainSession: session=>chatIdleReaper.retain(session),
     db,
     users,
     sessions,
@@ -1365,10 +1417,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     },
     websocket: createWsHandlers(wsDeps),
   });
+  chatIdleReaper.start();
 
   const designCreationRecoveryAbort = new AbortController();
   roomCoordinator.start();
   roomPublication.start();
+  localPlans.start();
   const designCreationRecovery = designEngine.recoverIncompleteCreations({
     maxSagas: 25,
     attemptBudget: 25,
@@ -1384,8 +1438,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     if (stopped) return;
     stopped = true;
     server.stop(true);
+    await chatIdleReaper.stop();
     previewServer?.stop(true);
     clearInterval(statusTimer);
+    clearInterval(agentModelTimer);
+    await agentModels.stop();
     clearInterval(revisionSyncTimer);
     clearInterval(executionEffectTimer);
     clearInterval(projectDataTimer);
@@ -1403,10 +1460,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     const clarificationFlights = new ResourceDrain();
     clarificationFlights.track(engine.closeClarifications());
     clarificationFlights.track(roomMemberDesigner.stop());
-    const [coordinatorDrain, publicationDrain, clarificationDrain] = await Promise.all([
+    const [coordinatorDrain, publicationDrain, clarificationDrain, localPlansDrain] = await Promise.all([
       roomCoordinator.stop(opts.roomStopTimeoutMs),
       roomPublication.stop(opts.roomStopTimeoutMs),
       clarificationFlights.close(opts.roomStopTimeoutMs),
+      localPlans.stop(opts.roomStopTimeoutMs),
       designRuns.stop(opts.designRunStopTimeoutMs),
       designAssetsRuntime.service.shutdown(opts.designAssetShutdownTimeoutMs),
     ]);
@@ -1436,7 +1494,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
       }
       db.close();
     };
-    const resourceDrains = [coordinatorDrain, publicationDrain, clarificationDrain];
+    const resourceDrains = [coordinatorDrain, publicationDrain, clarificationDrain, localPlansDrain];
     if (resourceDrains.every(drain => drain.settled)) await finalizeResources();
     else {
       // A scheduler may be inside an uncancellable external call. The server is
@@ -1458,6 +1516,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     drivers,
     approvals,
     chatApprovals,
+    chatIdleReaper,
     progress,
     get feishuEnabled() { return feishuMessaging.current?.status().state === 'connected'; },
     stop,

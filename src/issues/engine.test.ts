@@ -560,7 +560,10 @@ describe('工作流 issue 生命周期接线', () => {
       body: '按节点执行',
       createdBy: s.admin.id,
       workflowTemplateId: template.template.id,
-    });
+    }, false);
+    // 此夹具未装配模块工作区服务，明确模拟存量执行；新模式不能缺少父轮次。
+    s.db.query("UPDATE issues SET workspace_mode='legacy' WHERE id=?").run(issue.id);
+    expect(await s.engine.startIssue(issue.id)).toMatchObject({ ok: true });
     expect(s.engine.store.get(issue.id)).toMatchObject({ status: 'implementing', convId: null });
     expect(s.engine.store.listDriving().map((row) => row.id)).toContain(issue.id);
     const workflow = s.engine.workflowSnapshot(issue.id)!;
@@ -568,6 +571,8 @@ describe('工作流 issue 生命周期接线', () => {
       "SELECT id FROM issue_workflow_node_runs WHERE issue_workflow_id = ? AND node_key = 'code'",
     ).get(workflow.id)!;
     const paths = workflowNodePaths(s.repo, workflow.id, run.id);
+    expect(s.engine.workflowRuntime(issue.id)!.runs.find(node => node.id === run.id)?.status).toBe('running');
+    expect(s.driver.tmuxSessions.size).toBe(1);
     await fsp.writeFile(paths.result, JSON.stringify({
       schemaVersion: 1,
       output: '实现完成',
@@ -8223,8 +8228,9 @@ describe('门禁在会话外跑（#279 / I-03）', () => {
   test('失败：不放行，落 validation_failed 并把输出尾部当返工意见打回 implementing', async () => {
     const s = await setup({ config: { validationTimeoutMs: 60_000 } });
     const { issue, jl } = await atTesting(s, { scripts: { typecheck: 'tsc', test: 'bun test' } });
+    const gateError = 'Error: full diagnostic context\nAPI_KEY=do-not-expose\n' + 'x'.repeat(4000) + '\nTS2345: 类型不匹配';
     s.driver.onRunCommand = (argv) =>
-      argv.includes('typecheck') ? { code: 2, err: 'TS2345: 类型不匹配' } : { code: 0 };
+      argv.includes('typecheck') ? { code: 2, err: gateError } : { code: 0 };
 
     await s.appendOutput(jl, asst(`STAGE_DONE:${issue.id}:testing`));
     await s.engine.tick();
@@ -8234,6 +8240,13 @@ describe('门禁在会话外跑（#279 / I-03）', () => {
     const failed = evt(s, issue.id, 'validation_failed');
     expect(failed?.dataJson).toContain('typecheck');
     expect(failed?.dataJson).toContain('TS2345');
+    const diagnostic = evt(s, issue.id, 'validation_diagnostic');
+    expect(JSON.parse(diagnostic!.dataJson!)).toMatchObject({
+      argv: ['bun', 'run', 'typecheck'], code: 2, sourceTruncated: false,
+    });
+    expect(diagnostic?.dataJson).toContain('full diagnostic context');
+    expect(diagnostic?.dataJson).not.toContain('do-not-expose');
+    expect(JSON.parse(failed!.dataJson!).summaryTruncated).toBe(true);
     const rework = evt(s, issue.id, 'tests_failed');
     expect(rework?.dataJson).toContain('TS2345'); // 失败输出回灌给代理
     expect(rework?.dataJson).toContain('"source":"validation"');
@@ -8667,6 +8680,20 @@ describe('direct execution contract', () => {
   const report = { version: 1, outcome: 'complete', objective: '复制按钮', implementation: ['调整按钮'],
     advantages: [], disadvantages: [], verification: ['定向检查通过'], completion: '完成',
     unmetGoals: [], remainingWork: [], optionalFollowUps: ['尚未推送', '尚未部署', '以后可优化动画'] };
+  test('local-plan batch starts directly while design graph publication keeps its planning stage', async () => {
+    const s = await setup({ config: { directExecution: true, resultSummaryTimeoutMs: 0 } });
+    s.setManualReview(false);
+    const draft: DesignIssueDraft = { nodeId: '1', title: '本地计划任务', body: '完整需求和验收', moduleId: null, agent: 'claude', implMode: 'direct' };
+    const prepared = await s.engine.prepareIssueBatch(s.projectId, [draft]);
+    const [issue] = s.engine.commitPreparedDesignBatch(prepared, [], () => {});
+    expect(issue).toMatchObject({ executionMode: 'direct', publicationLocked: true });
+    await s.engine.completeDesignBatch(s.projectId, [issue.id]);
+    expect(s.engine.store.get(issue.id)?.status).toBe('implementing');
+    expect(s.engine.store.subtasksOf(s.engine.store.get(issue.id)!)).toEqual([]);
+    const design = await s.engine.prepareDesignBatch(s.projectId, [{ ...draft, title: '设计发布任务', executionMode: 'direct' }]);
+    const [designIssue] = s.engine.commitPreparedDesignBatch(design, [], () => {});
+    expect(designIssue.executionMode).toBe('planned');
+  });
   test('default direct route completes without planning, subtasks or a testing model turn', async () => {
     const s = await setup({ config: { directExecution: true, resultSummaryTimeoutMs: 100, validationTimeoutMs: 0 } });
     s.setManualReview(false);
@@ -8819,4 +8846,27 @@ describe('validation execution integrity',()=>{
   identity='b'.repeat(64);await s.engine.applyEvent(issue.id,'pause',{note:'改动后再验'});await s.engine.unblockIssue(issue.id,'验证修改');
   await s.appendOutput(jl,asst(`STAGE_DONE:${issue.id}:testing`));await s.engine.tick();expect(runs).toBe(2);
  });
+});
+
+test('显式恢复测试失败暂停后，旧失败与重入预算不再立即触发暂停',async()=>{
+ const s=await setup({config:{resultSummaryTimeoutMs:0,stopLossStageReentry:99}});
+ const issue=await s.engine.createIssue(s.projectId,{title:'恢复保留的验收现场'});
+ const jl=await s.bindJsonl(issue.id);
+ s.engine.store.setSubtasks(issue.id,['保留的实施步骤']);
+ await s.engine.applyEvent(issue.id,'plan_ready');
+ await s.engine.applyEvent(issue.id,'plan_approved');
+ for(let n=0;n<=MAX_TEST_FAILURES;n++) {
+   await s.engine.applyEvent(issue.id,'impl_done');
+   await s.appendOutput(jl,asst(`TESTS_FAILED:${issue.id} 第 ${n} 次失败`));
+   await s.engine.tick();
+ }
+ expect(s.engine.store.get(issue.id)!.status).toBe('paused');
+ const conv=s.engine.store.get(issue.id)!.convId;
+ expect((await s.engine.unblockIssue(issue.id,'已修复环境，继续原阶段')).ok).toBe(true);
+ expect(s.engine.store.countEvents(issue.id,'stop_loss_resumed')).toBe(1);
+ expect(s.engine.store.get(issue.id)!.convId).toBe(conv);
+ await s.appendOutput(jl,asst(`TESTS_FAILED:${issue.id} 恢复后的首次失败`));
+ await s.engine.tick();
+ expect(s.engine.store.get(issue.id)!.status).toBe('implementing');
+ expect(s.engine.store.countEvents(issue.id,'tests_failed')).toBe(MAX_TEST_FAILURES+2);
 });

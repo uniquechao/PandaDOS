@@ -1,3 +1,4 @@
+import { issueWorkspaceCwd } from '../../core/workspace-ownership';
 /**
  * web/routes/git —— 项目 git 视图（图形化提交图 + 提交详情 + 单文件 diff + 工作区改动）。
  *
@@ -689,7 +690,10 @@ export function gitRoutes(deps: GitRoutesDeps): RouteDef[] {
     const project = getProject(db, Number(ctx.params.projectId));
     if (!project) return json({ ok: false, error: '无此项目' }, 404); // owner 校验已过=admin
     const driver = deps.driverForProject(project);
-    const cwd = project.cwd;
+    const issueId=ctx.params.issueId ?? ctx.url.searchParams.get('issue');
+    const scoped=issueId ? issueWorkspaceCwd(db,project.id,issueId) : null;
+    if(issueId && !scoped && ctx.url.searchParams.has('issue')) return json({ok:false,error:'工作区不存在'},404);
+    const cwd=scoped ?? project.cwd;
     const repo = await driver.git(cwd, ['rev-parse', '--is-inside-work-tree']);
     if (repo.code !== 0 || repo.out.trim() !== 'true') {
       return json({ ok: false, error: '非 git 仓库', cwd });
@@ -703,7 +707,10 @@ export function gitRoutes(deps: GitRoutesDeps): RouteDef[] {
     write: (driver: GitDriver, cwd: string) => Promise<Response>,
   ): Promise<Response> {
     try {
-      return await mutex.runExclusive(gitLockKey(Number(ctx.params.projectId)), async () => {
+      const issueId=ctx.params.issueId ?? ctx.url.searchParams.get('issue');
+      const a=issueId && issueWorkspaceCwd(db,Number(ctx.params.projectId),issueId) ? db.query<{id:string;workspace_id:number},[string]>('SELECT id,workspace_id FROM workspace_attempts WHERE issue_id=? ORDER BY created_ts DESC,rowid DESC LIMIT 1').get(issueId) : null;
+      return await mutex.runExclusive(a ? `workspace-git:${a.workspace_id}` : gitLockKey(Number(ctx.params.projectId)), async () => {
+        if(a && !db.query('SELECT 1 FROM workspace_attempts a JOIN module_workspaces w ON w.current_attempt=a.id WHERE a.id=? AND a.released_ts IS NULL AND a.result_sha IS NULL AND a.stop_confirmed=0').get(a.id)) return json({ok:false,error:'工作区执行轮次不可写'},409);
         const r = await repoCtx(ctx);
         if (r instanceof Response) return r;
         return write(r.driver, r.cwd);

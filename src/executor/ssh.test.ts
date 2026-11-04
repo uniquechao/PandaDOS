@@ -463,6 +463,18 @@ describe('SshDriver（mock ssh2）', () => {
     await d2.close();
   });
 
+  it('idle hibernation probes the remote executor and uses guarded exact tmux identities', async () => {
+    const {driver}=mkDriver({onExec:tmuxStub([
+      [/display-message.*session_id/,{out:'$2:%3:123:1000:900:0:1:1:0:codex\n'}],
+      [/^ps /,{out:'123 1 bash\n124 123 codex\n'}],
+      [/if-shell/,{out:'panda-idle-slept\n'}],
+    ])});
+    const state=await driver.inspectIdleSession('chat-test');
+    expect(state?.processesIdle).toBe(true);
+    expect(await driver.sleepSessionIfIdle(state!)).toBe(true);
+    await driver.close();
+  });
+
   it('sendKeys：净化 + 稳定抓屏 + 响应后不重复 Enter', async () => {
     let pane = '› 空输入框';
     let enters = 0;
@@ -577,6 +589,22 @@ describe('SshDriver（mock ssh2）', () => {
     );
     expect(await driver.capturePane('t1')).toBe('PANE\nCONTENT');
     await expect(driver.killSession('nope')).rejects.toThrow('kill-session');
+    await driver.close();
+  });
+
+  it('createSession 将环境传给 new-session，远程路径和值保持严格转义', async () => {
+    const { driver, clients } = mkDriver({ onExec: tmuxStub([[/new-session/, { code: 0 }]]) });
+    await driver.createSession('t1', '/工作 目录', {
+      PANDA_WORKSPACE_ATTEMPT: 'attempt-11376',
+      TMPDIR: "路径 ' $HOME",
+    });
+    const cmd = clients[0]!.execCalls[0]!.cmd;
+    const [creation, ...following] = cmd.split(" ';' ");
+    expect(creation).toContain("'-e' 'PANDA_WORKSPACE_ATTEMPT=attempt-11376'");
+    expect(creation).toContain(`'-e' ${shq("TMPDIR=路径 ' $HOME")}`);
+    expect(creation).toContain(shq('/工作 目录'));
+    expect(following).toHaveLength(3);
+    expect(following.join(' ')).not.toContain("'-e'");
     await driver.close();
   });
 
@@ -936,4 +964,17 @@ describe('SshDriver 集成（localhost 回环）', () => {
     },
     30_000,
   );
+});
+
+describe('模块工作区环境与停止确认',()=>{
+ it('远程环境逐项转义并保留轮次标记，停止失败不继续删除会话',async()=>{
+  const {driver,clients}=mkDriver({onExec:tmuxStub([[/^cd /,{out:'ok\n'}],[/^tmux /,{out:''}]])});
+  await driver.runCommand('/工作区',['printf','%s','ok'],5000,{PANDA_WORKSPACE_ATTEMPT:'attempt',TMPDIR:"路径 ' $HOME"});
+  const cmd=clients[0]!.execCalls[0]!.cmd;
+  expect(cmd).toContain(shq('PANDA_WORKSPACE_ATTEMPT=attempt'));expect(cmd).toContain(shq("TMPDIR=路径 ' $HOME"));
+  const before=clients[0]!.execCalls.length;
+  await expect(driver.stopSessionConfirmed('cc-test','00000000-0000-0000-0000-000000000001',Date.now())).rejects.toThrow('未能确认');
+  expect(clients[0]!.execCalls.slice(before).some(c=>c.cmd.includes('kill-session'))).toBe(false);
+  await driver.close();
+ });
 });

@@ -18,6 +18,7 @@ import { fmtChatEvent } from './progress';
 export interface ToolConvOps {
   listByProject(projectId: number): Conversation[];
   currentConv(projectId: number): string | undefined;
+  isExecutionConversation?(projectId:number,convId:string):boolean;
   tmuxName(projectId: number, convId?: string | null): string;
   /**
    * 强制重启代理（issue #97）：会话还在、里面只剩 bash 时用（activate 会因「会话还在」短路）。
@@ -77,7 +78,7 @@ export const TOOL_SCHEMAS = [
     function: {
       name: 'capture_pane',
       description: '抓取本项目专用 tmux 会话当前的终端屏幕内容（看实时画面/是否卡住/弹窗）',
-      parameters: { type: 'object', properties: {} },
+      parameters: { type: 'object', properties: {conv_id:{type:'string'}} },
     },
   },
   {
@@ -88,7 +89,7 @@ export const TOOL_SCHEMAS = [
         '给本项目的 Claude Code 发送一条指令/消息（模拟键入并回车）。改变状态的操作，确认主人意图后再调。',
       parameters: {
         type: 'object',
-        properties: { text: { type: 'string' } },
+        properties: { text: { type: 'string' }, conv_id:{type:'string'} },
         required: ['text'],
       },
     },
@@ -116,7 +117,7 @@ export async function executeTool(
       const head = `项目专用会话 @${ded}：${tmuxLive ? '运行中' : '未启动'}`;
       if (!convs.length) return `${head}\n（本项目还没有对话）`;
       const lines = convs.map((c, i) => {
-        const marks = [c.id === current ? '当前激活' : '', c.archived ? '已归档' : ''].filter(Boolean);
+        const marks = [c.id === current ? '当前激活' : '', deps.convs.isExecutionConversation?.(deps.projectId,c.id) && c.id!==current ? '工作区执行中' : '', c.archived ? '已归档' : ''].filter(Boolean);
         return `${i + 1}. ${c.label ?? c.id}（${c.id.slice(0, 8)}…${marks.length ? '｜' + marks.join('｜') : ''}）`;
       });
       return `${head}\n${lines.join('\n')}`;
@@ -141,7 +142,9 @@ export async function executeTool(
     }
 
     case 'capture_pane': {
-      const ded = deps.convs.tmuxName(deps.projectId);
+      const selected=typeof args.conv_id==='string'?args.conv_id:undefined;
+      if(selected&&!deps.convs.listByProject(deps.projectId).some(c=>c.id===selected))return '对话不属于本项目';
+      const ded = deps.convs.tmuxName(deps.projectId,selected);
       try {
         const p = await deps.driver.capturePane(ded);
         // ANSI 清洗 + 非空尾行（v1 tools.ts:60-61 平移）
@@ -161,14 +164,15 @@ export async function executeTool(
     case 'send_command': {
       const text = String(args.text ?? '').trim();
       if (!text) return '不能发送空消息';
-      const ded = deps.convs.tmuxName(deps.projectId);
+      const convId=typeof args.conv_id==='string'?args.conv_id:deps.convs.currentConv(deps.projectId);
+      if(convId && (!deps.convs.listByProject(deps.projectId).some(c=>c.id===convId) || deps.convs.isExecutionConversation && !deps.convs.isExecutionConversation(deps.projectId,convId)))return '工作区对话归属失效';
+      const ded = deps.convs.tmuxName(deps.projectId,typeof args.conv_id==='string'?args.conv_id:undefined);
       const sessions = await deps.driver.listSessions().catch(() => []);
       const entry = sessions.find((s) => s.name === ded);
       if (!entry) return `本项目专用会话 @${ded} 未启动`;
 
       // 代理存活门禁（issue #97）：会话在 ≠ 代理在跑。代理退出后窗格里只剩 bash，
       // 盲发等于把 PM 的催办当 shell 命令跑掉（command not found），PM 还以为自己催过了。
-      const convId = deps.convs.currentConv(deps.projectId);
       const conv = convId
         ? deps.convs.listByProject(deps.projectId).find((c) => c.id === convId)
         : undefined;
@@ -200,7 +204,7 @@ export async function executeTool(
       }
 
       // 注入必须经 KeyedMutex：与引擎 kickoff/nudge、web、飞书回调抢同一把 tmuxLockKey（评审 H9）
-      await deps.mutex.runExclusive(tmuxLockKey(ded), () => deps.driver.sendKeys(ded, text));
+      await deps.mutex.runExclusive(tmuxLockKey(ded), () => { if(convId && deps.convs.isExecutionConversation && !deps.convs.isExecutionConversation(deps.projectId,convId))throw new Error('工作区输入归属失效');return deps.driver.sendKeys(ded,text); });
       return `已向 @${ded} 发送：${text}`;
     }
 

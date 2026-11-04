@@ -1,13 +1,14 @@
 {
   "name": "panda",
   "private": true,
-  "version": "2.4.1",
+  "version": "2.6.0",
   "type": "module",
   "scripts": {
     "start": "bun run src/web/server.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "build-ui": "vite build ui",
+    "usage-report": "bun run scripts/usage-report.ts",
     "check-i18n": "bun test shared/i18n/catalogs.test.ts shared/i18n/guard.test.ts shared/i18n/locales.test.ts shared/i18n/formatter.test.ts"
   },
   "dependencies": {

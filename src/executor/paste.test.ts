@@ -1,3 +1,4 @@
+import { testTmuxDirectory } from '../../scripts/test-tmux';
 import { expect, test } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
@@ -30,7 +31,8 @@ for (const bracketed of [true, false]) {
   test.skipIf(!Bun.which('tmux') || !Bun.which('python3'))(`真实 tmux 58×38：${bracketed ? '显式粘贴事件' : '非粘贴终端兼容'}，长中文完整提交一次`, async () => {
     await mkdir('.panda/tmp', { recursive: true });
     const dir = await mkdtemp('.panda/tmp/paste-test-');
-    const socket = resolve(dir, 'tmux.sock');
+    const socketRoot = testTmuxDirectory();
+    const socket = resolve(socketRoot, 'tmux.sock');
     const output = resolve(dir, 'received.json');
     const script = resolve(dir, 'terminal.py');
     await writeFile(script, `import os,sys,tty,json,time
@@ -64,6 +66,7 @@ while True:
       expect(buffers.out).not.toContain('panda-input-');
     } finally {
       await tmux(['kill-server']);
+      await rm(socketRoot, { recursive: true, force: true });
       await rm(dir, { recursive: true, force: true });
     }
   }, 15000);

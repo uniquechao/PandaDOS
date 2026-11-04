@@ -5,7 +5,7 @@
  * - 项目归属调整（PUT /api/admin/projects/:id/owner）
  * - 活跃概览（GET /api/admin/overview）
  */
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { FeishuLoginConfigTab } from './FeishuLoginConfigTab';
 import { api, ApiError } from '../lib/api';
 import { fmtTime, timeAgo } from '../lib/fmt';
@@ -626,6 +626,7 @@ function ExecutorsTab() {
 }
 
 function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose: () => void; onSaved: () => void }) {
+  const fieldsRef = useRef<HTMLDivElement>(null);
   const [f, setF] = useState(() =>
     exec
       ? {
@@ -653,6 +654,14 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
   const [detecting, setDetecting] = useState(false);
   const [detection, setDetection] = useState<ExecutorDetection | null>(null);
   const [picking, setPicking] = useState<'workspaceRoot' | 'claudeDir' | 'codexDir' | null>(null);
+  const [invalidPath, setInvalidPath] = useState<string | null>(null);
+  const directoriesRef = useRef<HTMLDetailsElement>(null);
+  const changeAgents = (next: AgentKind[]): void => {
+    if (next.some(agent => !agents.includes(agent)) && directoriesRef.current) {
+      directoriesRef.current.open = true;
+    }
+    setAgents(next);
+  };
   const previewConnection = {
     name: f.name.trim(),
     host: f.host.trim(),
@@ -678,6 +687,15 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
 
   const submit = async (): Promise<void> => {
     if (busy) return;
+    const missingPath = Array.from(fieldsRef.current?.querySelectorAll<HTMLInputElement>('input[required]') ?? [])
+      .find(input => !input.value.trim());
+    if (missingPath) {
+      const details = missingPath.closest('details');
+      if (details) details.open = true;
+      setInvalidPath(missingPath.name);
+      missingPath.focus();
+      return;
+    }
     setBusy(true);
     setErr('');
     const body = {
@@ -732,11 +750,17 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
         },
       );
       setDetection(r.detection);
+      setF(current => ({
+        ...current,
+        workspaceRoot: current.workspaceRoot.trim() ? current.workspaceRoot : r.detection.workspaceSuggestion ?? '',
+        claudeDir: current.claudeDir.trim() ? current.claudeDir : r.detection.agents.claude.suggestedDir ?? '',
+        codexDir: current.codexDir.trim() ? current.codexDir : r.detection.agents.codex.suggestedDir ?? '',
+      }));
       const detected = (['claude', 'codex'] as AgentKind[]).filter((agent) => {
         const d = r.detection.agents[agent];
         return d.commandFound || d.stateDirFound;
       });
-      if (detected.length > 0) setAgents(detected);
+      if (detected.length > 0) changeAgents(detected);
     } catch (x) {
       setErr(x instanceof ApiError ? x.message : String(x));
     } finally {
@@ -751,11 +775,21 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
     suggestion?: string | null,
   ) => (
     <label class="field">
-      {label}
+      <span>{label} <span aria-hidden="true">*</span></span>
       <div class="row exec-path-row">
-        <input class="grow" value={f[key]} placeholder={placeholder} onInput={set(key)} />
+        <input
+          class="grow" name={key} aria-label={label} required value={f[key]}
+          aria-invalid={invalidPath === key && !f[key].trim() ? true : undefined}
+          aria-describedby={invalidPath === key && !f[key].trim() ? `exec-${key}-error` : undefined}
+          placeholder={placeholder} onInput={set(key)}
+        />
         <button class="btn sm" disabled={!canUseConnection} onClick={() => setPicking(key)}>{tr('admin.chooseDirectory')}</button>
       </div>
+      {invalidPath === key && !f[key].trim() && (
+        <span class="err small" role="alert" id={`exec-${key}-error`}>
+          {tr('admin.directoryRequired', { field: label })}
+        </span>
+      )}
       {!exec && !canUseConnection && (
         <span class="mut small">{tr('admin.connectionFirst')}</span>
       )}
@@ -770,7 +804,7 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
 
   return (
     <Modal title={exec ? tr('admin.editExecutor', { name: exec.name }) : tr('admin.registerExecutor')} onClose={onClose}>
-      <div class="formcol">
+      <div class="formcol" ref={fieldsRef}>
         {CONNECTION_FIELDS.map(([k, label, ph]) => (
           <label key={k} class="field">
             {label}
@@ -790,7 +824,7 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
               {detecting ? tr('admin.detecting') : tr('admin.autoDetect')}
             </button>
           </div>
-          <AgentPicker value={agents} onChange={setAgents} />
+          <AgentPicker value={agents} onChange={changeAgents} />
           {detection && (
             <div class="detect-result small">
               {(['claude', 'codex'] as AgentKind[]).map((agent) => {
@@ -812,7 +846,7 @@ function ExecModal({ exec, onClose, onSaved }: { exec: Executor | null; onClose:
           '/Users/you/workspace',
           detection?.workspaceSuggestion,
         )}
-        <details class="exec-advanced" open={!!exec}>
+        <details class="exec-advanced" ref={directoriesRef} open>
           <summary>{tr('admin.advanced')}</summary>
           <div class="formcol" style={{ marginTop: 8 }}>
             {agents.includes('claude') &&

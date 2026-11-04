@@ -1,3 +1,7 @@
+import { issueStatusLabel } from '../lib/labels';
+import { issueStopState, redactDiagnostic } from '../../../shared/issue-diagnostics';
+import { AgentModelSettings } from '../components/AgentModelSettings';
+import { IssueWorkspace } from '../components/IssueWorkspace';
 import { SkillPolicyEditor } from '../components/SkillPolicyEditor';
 /**
  * Issue 工作台（2026-07-15 重构：看板→主从工作台的右栏）。
@@ -17,7 +21,7 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { api, ApiError, getProjectExecutorAgents, setIssueAutoApprove } from '../lib/api';
 import { nav } from '../lib/router';
-import { timeAgo, truncate, tryJson } from '../lib/fmt';
+import { fmtTime, timeAgo, truncate, tryJson } from '../lib/fmt';
 import { fmtDuration } from '../lib/runstream';
 import { onLazyLoadError } from '../lib/updatePrompt';
 import { ChatPane } from '../components/ChatPane';
@@ -43,8 +47,6 @@ import type {
   MergeGatePayload,
   PlanGatePayload,
   ProjectModule,
-  ReasoningEffort,
-  ReasoningInfo,
   MergedFromInfo,
   Subtask,
   UnblockRequest,
@@ -262,18 +264,6 @@ export function IssueWorkbench({
     );
   };
 
-  /**
-   * 改本 issue 的推理档覆盖（#281 / I-04）：'' = 继承模块。
-   * codex 的 effort 是**进程启动参数**，所以这里改完只对**下次启动的会话**生效——
-   * 不做乐观更新也不重启会话，等接口回来刷新详情即可。
-   */
-  const changeReasoning = (value: string): void => {
-    const next = value === '' ? null : (value as ReasoningEffort);
-    void api(`/api/projects/${pid}/issues/${iid}`, 'PATCH', { reasoningEffort: next })
-      .then(() => load())
-      .catch((e: unknown) => setActErr(e instanceof ApiError ? e.message : String(e)));
-  };
-
   /** 复活重跑（#93）：二次确认必须点破「立刻开跑」——想改需求得先改完再点，落 pending 就没窗口了 */
   const reopen = (): void => {
     const plan = retryPlan('cancelled', false);
@@ -318,7 +308,7 @@ export function IssueWorkbench({
   };
 
   const submitRecovery = async (): Promise<void> => {
-    if (busy || !recoveryGuidance.trim()) {
+    if (busy || (issue?.status !== 'paused' && !recoveryGuidance.trim())) {
       if (!recoveryGuidance.trim()) setRecoveryError(tr('issue.recoveryGuidanceRequired'));
       return;
     }
@@ -326,7 +316,7 @@ export function IssueWorkbench({
     setRecoveryError('');
     setActErr('');
     try {
-      await api(`/api/projects/${pid}/issues/${iid}/unblock`, 'POST', { guidance: recoveryGuidance.trim() });
+      await api(`/api/projects/${pid}/issues/${iid}/unblock`, 'POST', { guidance: recoveryGuidance.trim() || tr('issue.stopResumeNote') });
       setRecoveryOpen(false);
       setRecoveryGuidance('');
       load();
@@ -546,6 +536,7 @@ export function IssueWorkbench({
               {issue.implMode === 'team' && <span class="badge b-purple">{tr('issue.team')}</span>}
               {issue.agent === 'codex' && <span class="badge b-ai">codex</span>}
               <ModelBadge model={model} />
+              <AgentModelSettings pid={pid} issueId={issue.id} />
               {issue.branch && <span class="badge b-gray mono">⎇ {issue.branch}</span>}
               <span class="mut small id-creator">{tr('issue.creator', { name: issue.createdByName || '—' })}</span>
             </>
@@ -589,6 +580,7 @@ export function IssueWorkbench({
 
       {/* 顶部常驻澄清提示条（tab 栏之上，任何 tab 都看得到；点击弹窗回答，答完自动收起） */}
       {clarifyPanel}
+      {issue && <IssueStopNotice key={issue.id} issue={issue} events={events} pid={pid} />}
 
       {/* 「已完成但未推送」警示条（#272）：与澄清条同层常驻，直到有一次 auto_push 成功 */}
       {pushFailure && <PushFailedBar branch={pushFailure.branch} detail={pushFailure.detail} />}
@@ -653,8 +645,6 @@ export function IssueWorkbench({
             conversationSegments={detail?.conversationSegments ?? []}
             moduleSegments={detail?.moduleSegments ?? []}
             validation={detail?.validation ?? null}
-            reasoning={detail?.reasoning ?? null}
-            onReasoning={changeReasoning}
             subs={subs}
             gateBar={gateBar}
             busy={busy}
@@ -678,6 +668,7 @@ export function IssueWorkbench({
 
       {recoveryOpen && ['blocked', 'paused'].includes(issue?.status ?? '') && (
         <BlockedRecoveryModal
+          issue={issue!}
           blockedReason={blockedReason}
           guidance={recoveryGuidance}
           error={recoveryError}
@@ -739,7 +730,8 @@ export function IssueWorkbench({
 
 // ---------- 编辑 issue（pending / blocked / cancelled；保存不改变状态） ----------
 
-function BlockedRecoveryModal(props: {
+export function BlockedRecoveryModal(props: {
+  issue: Issue;
   blockedReason: string;
   guidance: string;
   error: string;
@@ -752,7 +744,7 @@ function BlockedRecoveryModal(props: {
   onSubmit: () => void;
 }) {
   return (
-    <Modal title={tr('issue.recoveryTitle')} onClose={props.onClose}>
+    <Modal title={props.issue.status === 'paused' ? tr('issue.stopRecoveryTitle') : tr('issue.recoveryTitle')} onClose={props.onClose}>
       <form
         class="blocked-recovery"
         onSubmit={(event) => {
@@ -760,19 +752,19 @@ function BlockedRecoveryModal(props: {
           props.onSubmit();
         }}
       >
-        <section class="recovery-reason" aria-label={tr('issue.recoveryReason')}>
-          <div class="recovery-label">{tr('issue.recoveryReason')}</div>
-          <BlockedReason reason={props.blockedReason} />
+        <section class="recovery-reason" aria-label={props.issue.status === 'paused' ? tr('issue.stopReason') : tr('issue.recoveryReason')}>
+          <div class="recovery-label">{props.issue.status === 'paused' ? tr('issue.stopReason') : tr('issue.recoveryReason')}</div>
+          {props.issue.status === 'paused' ? <details><summary>{tr('issue.stopDetails')}</summary><pre class="stop-raw">{redactDiagnostic(props.blockedReason)}</pre></details> : <BlockedReason reason={props.blockedReason} />}
         </section>
-        <p class="recovery-help">{tr('issue.recoveryHelp')}</p>
+        <p class="recovery-help">{props.issue.status === 'paused' ? tr('issue.stopRecoveryHelp') : tr('issue.recoveryHelp')}</p>
         <label class="field recovery-guidance">
-          {tr('issue.recoveryGuidance')}
+          {props.issue.status === 'paused' ? tr('issue.stopGuidance') : tr('issue.recoveryGuidance')}
           <textarea
             autoFocus
             rows={5}
             maxLength={4000}
             value={props.guidance}
-            placeholder={tr('issue.recoveryGuidancePlaceholder')}
+            placeholder={props.issue.status === 'paused' ? tr('issue.stopGuidance') : tr('issue.recoveryGuidancePlaceholder')}
             aria-invalid={props.error ? 'true' : undefined}
             onInput={(event) => props.onGuidanceChange(event.currentTarget.value)}
             onKeyDown={(event) => {
@@ -799,19 +791,19 @@ function BlockedRecoveryModal(props: {
           >
             <span aria-hidden="true">☑</span>
             <span>
-              <b>{tr('issue.editBlockedSubtask')}</b>
-              <small>{props.canEditSubtask ? tr('issue.editBlockedSubtaskHint') : tr('issue.noEditableBlockedSubtask')}</small>
+              <b>{props.issue.status === 'paused' ? tr('issue.stopEditCurrent') : tr('issue.editBlockedSubtask')}</b>
+              <small>{props.canEditSubtask ? (props.issue.status === 'paused' ? tr('issue.stopEditCurrentHelp') : tr('issue.editBlockedSubtaskHint')) : tr('issue.noEditableBlockedSubtask')}</small>
             </span>
           </button>
         </div>
         {props.error && <div class="err" role="alert">{props.error}</div>}
-        <div class="recovery-queue-hint">{tr('issue.recoveryQueueHint')}</div>
+        <div class="recovery-queue-hint">{props.issue.status === 'paused' ? tr('issue.stopQueueHint') : tr('issue.recoveryQueueHint')}</div>
         <div class="mbtns">
           <button class="btn" type="button" disabled={props.busy} onClick={props.onClose}>
             {tr('ui.cancel')}
           </button>
-          <button class="btn primary" type="submit" disabled={props.busy || !props.guidance.trim()}>
-            {props.busy ? tr('ui.saving') : tr('issue.confirmRecovery')}
+          <button class="btn primary" type="submit" disabled={props.busy || (props.issue.status !== 'paused' && !props.guidance.trim())}>
+            {props.busy ? tr('ui.saving') : props.issue.status === 'paused' ? tr('issue.stopConfirmRecovery') : tr('issue.confirmRecovery')}
           </button>
         </div>
       </form>
@@ -1008,6 +1000,7 @@ function EditIssueModal({
           {agentUnavailable && <span class="err small">{tr('board.agentUnavailable')}</span>}
         </label>
         <IssueGitBranchFields
+          legacy={!issue.workspace}
           pid={pid}
           value={gitBranch}
           onChange={setGitBranch}
@@ -1406,7 +1399,8 @@ function DetailTab({
 
   return (
     <div class="id-scroll wb-detail">
-      <IssueGitBranchSummary issue={issue} />
+      {!issue.workspace && <IssueGitBranchSummary issue={issue} />}
+      <IssueWorkspace issue={issue} />
       <SkillPolicyEditor pid={pid} issueId={issue.id} />
       {issue.body && <div class="id-body">{issue.body}</div>}
       {images.length > 0 && (
@@ -1546,8 +1540,6 @@ function ExecTab({
   conversationSegments,
   moduleSegments,
   validation,
-  reasoning,
-  onReasoning,
   subs,
   gateBar,
   busy,
@@ -1562,10 +1554,6 @@ function ExecTab({
   moduleSegments: ConversationSegment[];
   /** 门禁范围与最近一次结果（#279）：只读展示，不给按钮 */
   validation: ValidationInfo | null;
-  /** 生效推理档与来源（#281） */
-  reasoning: ReasoningInfo | null;
-  /** 改本 issue 的推理档覆盖（'' = 继承模块） */
-  onReasoning: (value: string) => void;
   /** 子任务计划（详情接口返回）：顶栏进度链用，空数组则整块不渲染 */
   subs: { text: string; done: boolean }[];
   gateBar: JSX.Element | null;
@@ -1594,7 +1582,6 @@ function ExecTab({
         disabledHint={tr('issue.approvalLocked')}
       />
       <ValidationLine validation={validation} />
-      <ReasoningLine reasoning={reasoning} onChange={onReasoning} />
       <ExecProgress subs={subs} subIndex={issue.subIndex} status={issue.status} />
     </>
   );
@@ -1710,6 +1697,7 @@ function IssueChangesTab({
     const q = new URLSearchParams({ path: leaf.path });
     if (leaf.oldPath) q.set('old', leaf.oldPath);
     if (leaf.source === 'wt') {
+      q.set('issue',iid);
       if (leaf.code === '?') q.set('untracked', '1');
       return `/api/projects/${pid}/git/worktree/diff?${q}`;
     }
@@ -1770,7 +1758,7 @@ function IssueChangesTab({
           oldPath={leaf.oldPath}
           imageUrls={gitImageUrls(
             leaf.source === 'wt'
-              ? `/api/projects/${pid}/git/worktree/raw`
+              ? `/api/projects/${pid}/git/worktree/raw?issue=${encodeURIComponent(iid)}`
               : `/api/projects/${pid}/issues/${iid}/git/raw`,
             leaf.path,
             leaf.oldPath,
@@ -1848,7 +1836,7 @@ function IssueChangesTab({
                 oldPath={fd.file.oldPath}
                 imageUrls={gitImageUrls(
                   fd.file.source === 'wt'
-                    ? `/api/projects/${pid}/git/worktree/raw`
+                    ? `/api/projects/${pid}/git/worktree/raw?issue=${encodeURIComponent(iid)}`
                     : `/api/projects/${pid}/issues/${iid}/git/raw`,
                   fd.file.path,
                   fd.file.oldPath,
@@ -1869,6 +1857,63 @@ function IssueChangesTab({
 
 // ---------- 卡点操作面（底部拇指区 / 工作台底条） ----------
 
+function DiagnosticOutput({ event }: { event: IssueEvent }) {
+  const data = tryJson<Record<string, unknown>>(event.dataJson) ?? {};
+  const { out, err, ...context } = data;
+  return <><pre class="stop-raw">{JSON.stringify({ eventId: event.id, ...context }, null, 2)}</pre>
+    {typeof out === 'string' && out && <pre class="stop-raw">{out}</pre>}
+    {typeof err === 'string' && err && <pre class="stop-raw">{err}</pre>}</>;
+}
+
+export function IssueStopNotice({ issue, events, pid }: { issue: Issue; events: IssueEvent[]; pid: number }) {
+  const [diagnostics, setDiagnostics] = useState<{ retainedOutput: boolean; events: IssueEvent[] } | null>(null);
+  const [open, setOpen] = useState(false);
+  const [error, setError] = useState('');
+  const diagnosticButton = useRef<HTMLButtonElement>(null);
+  const closeDiagnostics = () => { setOpen(false); diagnosticButton.current?.focus(); };
+  const stop = issueStopState(issue.status, !!issue.awaitingClarify, events);
+  if (!stop) return null;
+  const title = stop.kind === 'validation' ? tr('issue.stopValidation') : stop.kind === 'environment' ? tr('issue.stopEnvironment')
+    : stop.kind === 'budget' ? tr('issue.stopBudget') : stop.kind === 'clarify' ? tr('issue.clarification')
+      : stop.kind === 'blocked' ? tr('issue.blockedNeedsYou') : tr('issue.stopPaused');
+  const help = stop.kind === 'validation' ? tr('issue.stopValidationHelp', { label: stop.label })
+    : stop.kind === 'environment' ? tr('issue.stopEnvironmentHelp') : stop.kind === 'budget' ? tr('issue.stopBudgetHelp')
+      : stop.kind === 'clarify' ? tr('issue.stopClarifyHelp') : stop.kind === 'blocked' ? tr('issue.stopBlockedHelp') : tr('issue.stopPausedHelp');
+  const load = async () => {
+    setOpen(true); setError(''); setDiagnostics(null);
+    try { setDiagnostics(await api(`/api/projects/${pid}/issues/${issue.id}/diagnostics`)); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  return <section class="issue-stop" role="status">
+    <strong>{issue.status === 'paused' && stop.kind !== 'paused' ? `${tr('issue.stopPaused')} · ${title}` : title}</strong>
+    <p>{tr('issue.stopStage', { stage: stop.stage ? issueStatusLabel(stop.stage) : tr('issue.stopUnknownStage') })}。{help}</p>
+    {stop.stopLoss && stop.kind !== 'budget' && <p>{tr('issue.stopBudgetHelp')}</p>}
+    {stop.failures > 0 && <p>{tr('issue.stopFailures', { count: stop.failures })}</p>}
+    {stop.tail && <>
+      <ul>{stop.tail.split('\n').filter(line => /^\s*\(fail\)/.test(line)).map(line => <li key={line}>{line.trim()}</li>)}</ul>
+      <details><summary>{tr('issue.stopDetails')}</summary><pre class="stop-raw">{stop.tail}</pre></details>
+      {stop.summaryTruncated && <small>{tr('issue.stopTruncated')}</small>}
+    </>}
+    <details><summary>{tr('issue.stopDetails')}</summary><pre class="stop-raw">{redactDiagnostic(issue.note ?? '')}</pre></details>
+    <button ref={diagnosticButton} class="btn sm" onClick={() => void load()}>{tr('issue.stopDiagnostics')}</button>
+    {open && <Modal title={tr('issue.stopDiagnostics')} onClose={closeDiagnostics}>
+      <div class="stop-diagnostics"><p>{tr('issue.stopDiagnosticsHelp')}</p>
+        {error && <p role="alert">{error}</p>}
+        {!diagnostics && !error && <Loading />}
+        {diagnostics && <>
+          {!diagnostics.retainedOutput && <p>{tr('issue.stopHistorical')}</p>}
+          {diagnostics.events.map(e => <details key={e.id} open={e.kind === 'validation_diagnostic'}>
+            <summary tabIndex={0}>{fmtTime(e.ts)} · {e.kind}</summary>
+            {tryJson<{ sourceTruncated?: boolean }>(e.dataJson)?.sourceTruncated && <p>{tr('issue.stopSourceTruncated')}</p>}
+            <DiagnosticOutput event={e} />
+          </details>)}
+        </>}
+      </div>
+      <div class="mbtns"><button class="btn" onClick={closeDiagnostics}>{tr('ui.cancel')}</button></div>
+    </Modal>}
+  </section>;
+}
+
 /**
  * 受阻原因（#301）。
  *
@@ -1880,6 +1925,7 @@ function IssueChangesTab({
  * Git 失败）也不会有——宁可少一层加工，也不猜着给用户编行动指引。
  */
 function BlockedReason({ reason }: { reason: string }) {
+  reason = redactDiagnostic(reason);
   const parts = parseBlockedNote(reason);
   if (!parts) return <div class="block-box">{reason}</div>;
   const rows: Array<[string, string, boolean]> = [
@@ -1967,14 +2013,14 @@ function GateBar(props: {
           {st === 'paused' ? tr('status.paused') : tr('issue.blockedNeedsYou')}
         </div>
         {st === 'blocked' && <div class="gate-note">{tr('issue.blockedNeedsYouHint')}</div>}
-        <BlockedReason reason={props.blockedReason} />
+        {props.issue.status === 'paused' ? <details><summary>{tr('issue.stopDetails')}</summary><pre class="stop-raw">{redactDiagnostic(props.blockedReason)}</pre></details> : <BlockedReason reason={props.blockedReason} />}
         {actErr && <div class="err">{actErr}</div>}
         <div class="gate-row">
           <button class="btn" disabled={busy} onClick={props.onCancel}>
             {tr('issue.cancelIssue')}
           </button>
           <button class="btn ok" disabled={busy} onClick={props.onUnblock}>
-            {tr('issue.openRecovery')}
+            {st === 'paused' ? tr('issue.stopResume') : tr('issue.openRecovery')}
           </button>
         </div>
       </div>
@@ -2072,43 +2118,6 @@ function UnblockQueuedBar({ request, onCancel }: { request: UnblockRequest; onCa
       </span>
       <span class="mut small" title={request.guidance}>{truncate(request.guidance, 60)}</span>
       <button class="btn sm" onClick={onCancel}>{tr('issue.unblockQueuedCancel')}</button>
-    </div>
-  );
-}
-
-/**
- * 推理档（#281 / I-04；#300 起内联进 .runctl 工具条）：选本 issue 的覆盖档，并显示当前生效档与它来自哪一层。
- *
- * codex 的 `model_reasoning_effort` 是**进程启动参数**，改完只对下次启动的会话生效——
- * 界面必须把这句说出来，否则用户会以为改了立刻就省钱/立刻就变聪明。claude 没有这个开关。
- */
-function ReasoningLine({
-  reasoning,
-  onChange,
-}: {
-  reasoning: ReasoningInfo | null;
-  onChange: (value: string) => void;
-}) {
-  if (!reasoning) return null;
-  // 工具条里只留生效档值本身（#300）：「生效：X（来自 Y）」整句 + 「仅 codex 生效」的提醒
-  // 都塞进 title / aria-label——来源这层信息一年也用不到几次，不值得在常驻工具条上占一句话。
-  const effective = tr('issue.reasoningEffective', { effort: reasoning.effort, source: reasoning.source });
-  const hint = `${effective} · ${tr('ui.reasoningCodexOnly')}`;
-  return (
-    <div class="val-line mut" title={hint}>
-      <span>{tr('ui.reasoningEffort')}</span>
-      <select
-        class="rc-sel"
-        value={reasoning.override ?? ''}
-        aria-label={tr('ui.reasoningEffort')}
-        onChange={(e) => onChange(e.currentTarget.value)}
-      >
-        <option value="">{tr('ui.reasoningInherit')}</option>
-        {(['low', 'medium', 'high'] as const).map((v) => (
-          <option key={v} value={v}>{v}</option>
-        ))}
-      </select>
-      <span class="val-scope" title={effective} aria-label={effective}>{reasoning.effort}</span>
     </div>
   );
 }

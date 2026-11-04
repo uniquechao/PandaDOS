@@ -88,6 +88,7 @@ export interface ChatApprovals {
 }
 
 export interface ChatWsDeps {
+  workspaceOwned?(projectId:number,convId:string):boolean;
   /** jsonl 读取（与引擎同源：主执行机 Driver） */
   reader: JsonlReader;
   locator: {
@@ -404,7 +405,7 @@ async function sendBaseline(ws: ServerWebSocket<ChatWsData>, deps: ChatWsDeps): 
     d.live = true;
   } else {
     d.convId = d.pinnedConv ?? cur;
-    d.live = d.pinnedConv === null || d.pinnedConv === cur;
+    d.live = d.pinnedConv === null || d.pinnedConv === cur || Boolean(d.pinnedConv && deps.workspaceOwned?.(d.projectId,d.pinnedConv));
   }
   // 钉住模式（issue 现场或独立聊天）的 mode 帧先于 baseline（前端据此初始化输入区）；非钉住不发
   if (d.pinnedConv !== null) send(ws, { type: 'mode', live: d.live });
@@ -444,7 +445,7 @@ async function chatTick(ws: ServerWebSocket<ChatWsData>, deps: ChatWsDeps): Prom
     // 独立聊天对话：不跟随切换、不翻转 live（恒 true，注入始终打到自身会话）
   } else if (d.pinnedConv !== null) {
     // 钉住模式：对话不跟随切换，只翻转 live（并在转非 live 时清菜单——它属于新激活对话）
-    const live = d.pinnedConv === cur;
+    const live = d.pinnedConv === cur || Boolean(deps.workspaceOwned?.(d.projectId,d.pinnedConv));
     if (live !== d.live) {
       d.live = live;
       send(ws, { type: 'mode', live });

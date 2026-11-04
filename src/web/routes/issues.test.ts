@@ -1685,3 +1685,31 @@ describe('模块管理路由：智能整理 / 执行合并 / 改名归档', () =
     expect((await j(s.dispatch(req('PATCH', url, s.alice.token, {})))).status).toBe(400);
   });
 });
+
+describe('完整诊断入口', () => {
+  test('项目鉴权、跨项目隔离、原文追溯与凭据脱敏', async () => {
+    const s = await setup();
+    const issue = await s.engine.createIssue(1, { title: '诊断入口' }, false);
+    const base = `/api/projects/1/issues/${issue.id}/diagnostics`;
+    s.engine.store.logEvent(issue.id, 'validation_diagnostic', {
+      out: 'original stdout\n…[前 100 字省略]…', err: '(fail) actual failure\nAPI_KEY=do-not-expose',
+      argv: ['bun', 'test', '--token', 'do-not-expose'], sourceTruncated: true,
+    });
+    expect((await s.dispatch(req('GET', base)))!.status).toBe(401);
+    expect((await s.dispatch(req('GET', base, s.bob.token)))!.status).toBe(403);
+    expect((await s.dispatch(req('GET', `/api/projects/2/issues/${issue.id}/diagnostics`, s.alice.token)))!.status).toBe(404);
+    const result = await j(s.dispatch(req('GET', base, s.alice.token)));
+    expect(result.status).toBe(200);
+    expect(result.body.retainedOutput).toBe(true);
+    expect(result.body.events.some((e: { kind: string }) => e.kind === 'validation_diagnostic')).toBe(true);
+    const text = JSON.stringify(result.body);
+    expect(text).toContain('(fail) actual failure');
+    expect(text).toContain('original stdout');
+    expect(text).toContain('省略');
+    expect(text).not.toContain('do-not-expose');
+    const compact = await j(s.dispatch(req('GET', `/api/projects/1/issues/${issue.id}/events`, s.alice.token)));
+    expect(JSON.stringify(compact.body)).not.toContain('original stdout');
+    expect(JSON.stringify(compact.body)).not.toContain('do-not-expose');
+    expect(compact.body.find((e: { kind: string }) => e.kind === 'validation_diagnostic')).toBeTruthy();
+  });
+});

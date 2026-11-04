@@ -28,6 +28,7 @@ import { SkillsView } from './views/Skills';
 import { SettingsView } from './views/Settings';
 import { ProjectSettingsView } from './views/ProjectSettings';
 import { ExternalIssuesView } from './views/ExternalIssues';
+import { LocalPlansView } from './views/LocalPlans';
 import { DesignsView } from './views/Designs';
 import { RoomsView } from './views/Rooms';
 import { RoomDetailView } from './views/RoomDetail';
@@ -35,28 +36,7 @@ import { WorkflowTemplatesView } from './views/WorkflowTemplates';
 import { AdminView } from './views/Admin';
 import { I18nProvider, useI18n } from './i18n/provider';
 import releaseInfo from '../../release.json';
-
-const RELEASE_NOTE_KEYS = {
-  workflow: 'release.note.workflow',
-  validation: 'release.note.validation',
-  usage: 'release.note.usage',
-  experience: 'release.note.experience',
-  'terminal-scrollback': 'release.note.terminalScrollback',
-  'feishu-colleague-login': 'release.note.feishuColleagueLogin',
-  'feishu-messaging': 'release.note.feishuMessaging',
-  'conversation-binding': 'release.note.conversationBinding',
-  'chat-navigation-sync': 'release.note.chatNavigationSync',
-  'project-data-sync': 'release.note.projectDataSync',
-  'issue-direct-execution': 'release.note.issueDirectExecution',
-  'issue-pause-resume': 'release.note.issuePauseResume',
-  'skill-policies': 'release.note.skillPolicies',
-  'project-sync-reliability': 'release.note.projectSyncReliability',
-  'issue-handoff-activation': 'release.note.issueHandoffActivation',
-  'unified-workspace': 'release.note.unifiedWorkspace',
-  'issue-injection-recovery': 'release.note.issueInjectionRecovery',
-  'validation-delivery-evidence': 'release.note.validationDeliveryEvidence',
-  'dedicated-ssh-isolation': 'release.note.dedicatedSshIsolation',
-} as const;
+import { RELEASE_NOTE_KEYS } from '../../shared/release-notes';
 
 function ReleaseNotes({ onClose }: { onClose: () => void }) {
   const { t } = useI18n();
@@ -523,6 +503,9 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
       break;
     case 'external-issues':
       view = <ExternalIssuesView key={route.pid} pid={route.pid} />;
+      break;
+    case 'local-plans':
+      view = <LocalPlansView key={route.pid} pid={route.pid} />;
       break;
     case 'workflows':
       view = <WorkflowTemplatesView key={route.pid} pid={route.pid} />;

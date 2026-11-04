@@ -220,6 +220,14 @@ export function failureTail(result: Pick<CommandResult, 'out' | 'err'>, limit = 
   const err = result.err.trim();
   const out = result.out.trim();
   if (!err) return out.length <= limit ? out : out.slice(-limit);
+  // A long Bun log ends in successful cases and skip lists. Preserve actual failures first,
+  // otherwise a paused issue shows passing tests while hiding the reason it stopped.
+  const failures = [...new Set(err.split('\n').filter(line => /^\s*\(fail\)/.test(line)))];
+  if (err.length > limit && failures.length && limit >= 80) {
+    const budget = Math.floor(limit * 0.65);
+    const selected = failures.map(line => line.trim().slice(0, 240)).join('\n').slice(0, budget);
+    return `${selected}\n---\n${err.slice(-(limit - selected.length - 5))}`;
+  }
   const errTail = err.length <= limit ? err : err.slice(-limit);
   const sep = '\n---\n';
   const rest = limit - errTail.length - sep.length;

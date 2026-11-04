@@ -49,6 +49,8 @@ export interface ProjectSettingsFields {
   goal: string;
   /** 门禁命令（#279）：一行一条，参数空格分隔；空文本 = 未配置（按 package.json 探测） */
   validationCommands: string;
+  moduleConcurrency?: number;
+  workBranch?: string;
   validationPolicy?: 'required' | 'optional' | 'none';
 }
 
@@ -87,6 +89,8 @@ function normalizedProjectSettings(fields: ProjectSettingsFields): ProjectSettin
     name: fields.name.trim(),
     goal: fields.goal.trim(),
     validationCommands: formatValidationCommandLines(parseValidationCommandLines(fields.validationCommands)),
+    moduleConcurrency: fields.moduleConcurrency ?? 2,
+    workBranch: fields.workBranch ?? '',
     validationPolicy: fields.validationPolicy ?? 'optional',
   };
 }
@@ -94,7 +98,7 @@ function normalizedProjectSettings(fields: ProjectSettingsFields): ProjectSettin
 export function projectSettingsDirty(saved: ProjectSettingsFields, current: ProjectSettingsFields): boolean {
   const a = normalizedProjectSettings(saved);
   const b = normalizedProjectSettings(current);
-  return a.name !== b.name || a.goal !== b.goal || a.validationCommands !== b.validationCommands || a.validationPolicy !== b.validationPolicy;
+  return a.moduleConcurrency !== b.moduleConcurrency || a.workBranch !== b.workBranch || a.name !== b.name || a.goal !== b.goal || a.validationCommands !== b.validationCommands || a.validationPolicy !== b.validationPolicy;
 }
 
 /** 空 token 不进入请求，避免界面把脱敏摘要或空值误当成新凭据覆盖后端。 */
@@ -246,6 +250,8 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
   const [project, setProject] = useState<Project | null>(null);
   const [name, setName] = useState('');
   const [goal, setGoal] = useState('');
+  const [moduleConcurrency, setModuleConcurrency] = useState(2);
+  const [workBranch, setWorkBranch] = useState('');
   const [validationCommands, setValidationCommands] = useState('');
   const [validationPolicy, setValidationPolicy] = useState<'required' | 'optional' | 'none'>('optional');
   const [remotes, setRemotes] = useState<ExternalIssueRemote[]>([]);
@@ -270,12 +276,16 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
 
   const applyProject = (next: Project): void => {
     const fields = {
+      moduleConcurrency: next.moduleConcurrency ?? 2,
+      workBranch: next.integrationBranch ?? next.workBranch ?? '',
       name: next.name,
       goal: next.goal ?? '',
       validationCommands: formatValidationCommandLines(next.validationCommands),
       validationPolicy: next.validationPolicy ?? 'optional',
     };
     setProject(next);
+    setModuleConcurrency(fields.moduleConcurrency);
+    setWorkBranch(fields.workBranch);
     setName(fields.name);
     setGoal(fields.goal);
     setValidationCommands(fields.validationCommands);
@@ -319,7 +329,7 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
   };
   useEffect(load, [pid]);
 
-  const currentFields = { name, goal, validationCommands, validationPolicy };
+  const currentFields = { name, goal, validationCommands, validationPolicy, moduleConcurrency, workBranch };
   const dirty = Boolean(savedFields && projectSettingsDirty(savedFields, currentFields));
 
   useEffect(() => {
@@ -348,6 +358,8 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
         // 留空 = null = 未配置（后端按 package.json 探测），与「显式不跑门禁」不是一回事
         validationCommands: parseValidationCommandLines(currentFields.validationCommands),
         validationPolicy: currentFields.validationPolicy,
+        moduleConcurrency: currentFields.moduleConcurrency,
+        ...(!project?.integrationBranch ? {workBranch:currentFields.workBranch || null} : {}),
       });
       applyProject(result.project);
       toast.success(t('projectSettings.saved'));
@@ -449,6 +461,13 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
             <div class="ps-form-grid">
               <label class="field">{t('project.projectName')}<input value={name} disabled={!canManage} onInput={(e) => setName(e.currentTarget.value)} /></label>
               <label class="field">{t('project.goal')}<textarea rows={3} value={goal} disabled={!canManage} onInput={(e) => setGoal(e.currentTarget.value)} /><span class="small mut">{t('projectSettings.descriptionHelp')}</span></label>
+              <label class="field">{t('moduleWorkspace.concurrency')}
+                <input type="number" min="1" max="32" value={moduleConcurrency} disabled={!canManage} onInput={e => setModuleConcurrency(Number(e.currentTarget.value))} />
+              </label>
+              <label class="field">{t('moduleWorkspace.target')}
+                <input value={workBranch} disabled={!canManage || Boolean(project?.integrationBranch)} onInput={e => setWorkBranch(e.currentTarget.value)} />
+                <span class="small mut">{t('moduleWorkspace.fixedTarget')}</span>
+              </label>
               <label class="field">{t('projectSettings.validationCommands')}
                 <textarea
                   rows={3}

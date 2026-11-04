@@ -1,3 +1,4 @@
+import { AgentModelSettings } from '../components/AgentModelSettings';
 /**
  * 对话模式主视图（chat 界面）。
  *
@@ -756,6 +757,7 @@ function ConversationPane({
       <NativeModeSwitch mode={mode} onChange={onModeChange} />
       <AutoApproveSwitch level={autoApprove} onChange={onAutoApprove} />
       <ModelBadge model={model} />
+      <AgentModelSettings pid={pid} convId={selected} />
       <ConvIdChip id={selected} />
     </>
   );

@@ -3,5 +3,6 @@
 registry = "https://registry.npmmirror.com"
 
 [test]
+preload = ["./scripts/test-environment.ts"]
 # 仓库内的发布副本有独立依赖与测试，不纳入主项目门禁。
 pathIgnorePatterns = ["panda_ai_public/**"]

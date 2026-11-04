@@ -176,6 +176,27 @@ describe('localized API errors', () => {
     globalThis.fetch = (async () => { throw new Error('offline'); }) as unknown as typeof fetch;
     expect((await api('/x').catch((value) => value) as ApiError).code).toBe('network.unreachable');
   });
+
+  test('rejects a response stream failure after successful headers instead of returning null', async () => {
+    globalThis.fetch = (async () => new Response(new ReadableStream({
+      start(controller) { controller.error(new TypeError('net::ERR_HTTP2_PROTOCOL_ERROR')); },
+    }), { status: 200 })) as unknown as typeof fetch;
+    await expect(api('/api/projects/3/issues/issue-1/events')).rejects.toMatchObject({
+      code: 'network.unreachable', status: 0, details: 'net::ERR_HTTP2_PROTOCOL_ERROR',
+    });
+  });
+
+  test('rejects incomplete JSON in a successful response instead of passing null to views', async () => {
+    globalThis.fetch = (async () => new Response('[{"id":', { status: 200 })) as unknown as typeof fetch;
+    await expect(api('/api/projects/3/issues')).rejects.toMatchObject({
+      code: 'http.unexpected_response', status: 200,
+    });
+  });
+
+  test('accepts an intentional no-content response', async () => {
+    globalThis.fetch = (async () => new Response(null, { status: 204 })) as unknown as typeof fetch;
+    expect(await api('/api/project/3/items/1', 'DELETE')).toBeNull();
+  });
 });
 
 // ---------- XHR 上传（进度条底座） ----------

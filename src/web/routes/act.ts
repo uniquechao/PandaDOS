@@ -1,3 +1,4 @@
+import { managedConversationOwned } from '../../core/workspace-ownership';
 /**
  * web/routes/act —— 对话动作的可靠 HTTP 版（Wave3 任务 B；v1 /api/act 平移改造）。
  *
@@ -25,7 +26,7 @@ import { actOnMenu, injectKey, injectText, type MenuDriver } from '../ws/inject'
 
 export interface ActRoutesDeps {
   db: Database;
-  convs: { tmuxName(projectId: number): string };
+  convs: { tmuxName(projectId: number,convId?:string|null): string };
   mutex: KeyedMutex;
   driverForProject(project: Project): MenuDriver;
   approvals?: ChatApprovals;
@@ -52,14 +53,21 @@ export function actRoutes(deps: ActRoutesDeps): RouteDef[] {
         const pid = Number(params.projectId);
         const project = getProject(deps.db, pid);
         if (!project) return json({ ok: false, error: '无此项目' }, 404); // owner 校验已过=admin
-        const session = deps.convs.tmuxName(pid);
+        const b = await readBody(req);
+        const chosen=typeof b.convId==='string'?b.convId:typeof b.issueId==='string'
+          ?deps.db.query<{conv_id:string|null},[string,number]>('SELECT conv_id FROM issues WHERE id=? AND project_id=?').get(b.issueId,pid)?.conv_id:null;
+        const hasManaged=Boolean(deps.db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_attempts'").get() && deps.db.query(`SELECT 1 FROM workspace_attempts a JOIN module_workspaces w ON w.id=a.workspace_id WHERE w.project_id=? AND a.released_ts IS NULL`).get(pid));
+        if(hasManaged && (!chosen || !managedConversationOwned(deps.db,pid,chosen)))return json({ok:false,error:'请指定仍属于本任务的工作区对话'},409);
+        if(chosen && !deps.db.query('SELECT 1 FROM conversations WHERE id=? AND project_id=?').get(chosen,pid))return json({ok:false,error:'对话不属于本项目'},403);
+        const session = deps.convs.tmuxName(pid,chosen);
         const inj = {
-          driver: deps.driverForProject(project),
+          driver: new Proxy(deps.driverForProject(project),{get(target,key){
+            const value=Reflect.get(target,key);if(typeof value!=='function')return value;
+            return (...args:unknown[])=>{if(hasManaged&&chosen&&!managedConversationOwned(deps.db,pid,chosen))throw new Error('工作区输入归属失效');return value.apply(target,args);};
+          }}),
           mutex: deps.mutex,
           ...(deps.retryDelayMs !== undefined ? { retryDelayMs: deps.retryDelayMs } : {}),
         };
-        const b = await readBody(req);
-
         if (b.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
           try {
             await injectText(inj, session, b.text);

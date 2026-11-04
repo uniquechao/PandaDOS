@@ -1,3 +1,7 @@
+import { issueDiagnosticMessages } from '../domains/issue-diagnostics';
+import { localPlanMessages } from '../domains/local-plans';
+import { agentModelMessages } from '../domains/agent-models';
+import { moduleWorkspaceMessages } from '../domains/module-workspace';
 import { roomMemberMessages } from '../domains/rooms-members';
 import { roomChatMessages } from '../domains/rooms-chat';
 import { roomExtraMessages } from '../domains/rooms-extra';
@@ -23,6 +27,10 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const enCatalog = {
+  ...issueDiagnosticMessages,
+  ...localPlanMessages["en"],
+  ...agentModelMessages,
+  ...moduleWorkspaceMessages["en"],
   ...roomMemberMessages["en"],
   ...roomChatMessages["en"],
   ...roomExtraMessages["en"],
@@ -69,4 +77,5 @@ export const enCatalog = {
   'date.localTime': 'local time',
   'date.today': 'today',
   'date.tomorrow': 'tomorrow',
+  'admin.directoryRequired': "Enter {field}. Type an absolute path or choose a directory.",
 } as const;

@@ -204,6 +204,15 @@ describe('执行与归约', () => {
     expect(exec.calls[0]).toEqual(['bun', 'run', 'typecheck']);
   });
 
+  test('long validation output keeps real failures before passing noise and skip lists', () => {
+    const err = '(fail) registration regression > missing session directory\n' + '(pass) unrelated test\n'.repeat(200)
+      + '(skip) SSH integration unavailable\n 7 fail\nRan 3593 tests';
+    const summary = failureTail({ out: '', err });
+    expect(summary).toContain('(fail) registration regression > missing session directory');
+    expect(summary.endsWith('Ran 3593 tests')).toBe(true);
+    expect(summary.length).toBeLessThanOrEqual(VALIDATION_TAIL_CHARS);
+  });
+
   test('failureTail 保尾不保头，stderr 收尾', () => {
     expect(failureTail({ out: 'stdout 内容', err: 'stderr 内容' })).toBe('stdout 内容\n---\nstderr 内容');
     expect(failureTail({ out: '', err: '  ' })).toBe('');

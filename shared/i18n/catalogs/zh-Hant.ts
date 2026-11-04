@@ -1,3 +1,7 @@
+import { issueDiagnosticMessages } from '../domains/issue-diagnostics';
+import { localPlanMessages } from '../domains/local-plans';
+import { agentModelMessages } from '../domains/agent-models';
+import { moduleWorkspaceMessages } from '../domains/module-workspace';
 import { roomMemberMessages } from '../domains/rooms-members';
 import { roomChatMessages } from '../domains/rooms-chat';
 import { roomExtraMessages } from '../domains/rooms-extra';
@@ -24,6 +28,10 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const zhHantCatalog = {
+  ...issueDiagnosticMessages,
+  ...localPlanMessages["zh-Hant"],
+  ...agentModelMessages,
+  ...moduleWorkspaceMessages["zh-Hant"],
   ...roomMemberMessages["zh-Hant"],
   ...roomChatMessages["zh-Hant"],
   ...roomExtraMessages["zh-Hant"],
@@ -149,4 +157,5 @@ export const zhHantCatalog = {
   'ui.organizeDescriptionCreate':'建立模組「{name}」（{slug} · {agent}）','ui.organizeDescriptionRename':'「{name}」：{fromSlug} → {slug}','ui.organizeDescriptionRenameWithName':'「{name}」：{fromSlug} → {slug}（顯示名稱 → 「{displayName}」）','ui.organizeDescriptionMerge':'將 {sources} 合併至「{target}」','ui.organizeDescriptionMove':'將 {issues} 移至「{target}」',
   'ui.moduleIssueCount':'{count, plural, other {# 個 issue}}','ui.organizeResultCreate':'已建立模組「{name}」（{slug} · {agent}）','ui.organizeResultRename':'已將模組重新命名為「{name}」（{slug}）','ui.organizeResultMerge':'{count, plural, other {已合併至「{target}」，移入 # 個 issue}}','ui.organizeResultMove':'{count, plural, other {已將 # 個 issue 移至「{target}」}}',
   'ui.organizeFailureTimeout':'上次分析逾時，可重新執行。','ui.organizeFailureNoOutput':'上次分析未傳回整理方案，可重新執行。','ui.organizeFailureError':'上次分析失敗，可重新執行。','ui.organizeFailureDetail':'技術詳細資料：{detail}',
+  'admin.directoryRequired': "請填寫{field}。輸入絕對路徑，或選擇目錄。",
 } as const satisfies MessageCatalog;

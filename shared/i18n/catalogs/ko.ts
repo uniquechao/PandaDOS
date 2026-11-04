@@ -1,3 +1,7 @@
+import { issueDiagnosticMessages } from '../domains/issue-diagnostics';
+import { localPlanMessages } from '../domains/local-plans';
+import { agentModelMessages } from '../domains/agent-models';
+import { moduleWorkspaceMessages } from '../domains/module-workspace';
 import { roomMemberMessages } from '../domains/rooms-members';
 import { roomChatMessages } from '../domains/rooms-chat';
 import { roomExtraMessages } from '../domains/rooms-extra';
@@ -24,6 +28,10 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const koCatalog = {
+  ...issueDiagnosticMessages,
+  ...localPlanMessages["ko"],
+  ...agentModelMessages,
+  ...moduleWorkspaceMessages["ko"],
   ...roomMemberMessages["ko"],
   ...roomChatMessages["ko"],
   ...roomExtraMessages["ko"],
@@ -416,4 +424,5 @@ export const koCatalog = {
   'ui.moduleIssueCount':'{count, plural, other {issue #개}}','ui.organizeResultCreate':'모듈 “{name}”을(를) 만들었습니다({slug} · {agent})','ui.organizeResultRename':'모듈 이름을 “{name}”(으)로 바꿨습니다({slug})','ui.organizeResultMerge':'{count, plural, other {“{target}”에 병합하고 issue #개를 이동했습니다}}','ui.organizeResultMove':'{count, plural, other {issue #개를 “{target}”로 이동했습니다}}',
   'ui.organizeFailureTimeout':'마지막 분석 시간이 초과되었습니다. 다시 실행할 수 있습니다.','ui.organizeFailureNoOutput':'마지막 분석에서 정리 계획을 반환하지 않았습니다. 다시 실행할 수 있습니다.','ui.organizeFailureError':'마지막 분석에 실패했습니다. 다시 실행할 수 있습니다.','ui.organizeFailureDetail':'기술 세부 정보: {detail}',
   'git.imageBefore':'변경 전','git.imageAfter':'변경 후','git.openImage':'{name} 열기','git.viewImage':'{name} 이미지 보기','git.downloadImage':'{name} 다운로드',
+  'admin.directoryRequired': "{field}을(를) 입력해 주세요. 절대 경로를 입력하거나 디렉터리를 선택해 주세요.",
 } as const satisfies MessageCatalog;

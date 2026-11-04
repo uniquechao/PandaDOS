@@ -1,3 +1,5 @@
+import { IssueWorkspace } from '../components/IssueWorkspace';
+import { LocalPlansButton } from './LocalPlans';
 import { SkillPolicyEditor } from '../components/SkillPolicyEditor';
 /**
  * 项目工作台（2026-07-15 重构：看板 → 主从工作台）。
@@ -209,8 +211,13 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: IssueId }) {
       <div class="wb-list-hd">
         <span class="wb-list-t">{tr('board.tasks')}{issues ? ` · ${issues.length}` : ''}</span>
         <div class="wb-list-actions">
-          <button class="btn sm" onClick={() => nav(`/p/${pid}/external-issues`)}>{tr('externalImport.title')}</button>
-          <button class="btn sm primary" onClick={() => setCreating(true)}>＋ {tr('ui.create')}</button>
+          <LocalPlansButton pid={pid} />
+          <button class="btn sm wb-list-action" title={tr('externalImport.title')} aria-label={tr('externalImport.title')} onClick={() => nav(`/p/${pid}/external-issues`)}>
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5" /></svg>
+          </button>
+          <button class="btn sm primary wb-list-action" title={tr('ui.create')} aria-label={tr('ui.create')} onClick={() => setCreating(true)}>
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>
+          </button>
         </div>
       </div>
       <div class="wb-groups">
@@ -432,6 +439,7 @@ function IssueRow({
       </div>
       <div class="wb-row-m">
         <StatusBadge status={issue.status} awaitingClarify={issue.awaitingClarify} />
+        <IssueWorkspace issue={issue} compact />
         {/* #275：等你澄清/选择/审核/验收/处理/受阻 统一由这一个徽标承载，
             替掉原来的 WaitingBadge + clarifyPending 两块分散判断 */}
         <AttentionBadge kind={issue.attentionKind} />

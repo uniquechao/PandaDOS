@@ -102,3 +102,16 @@ messaging in Admin rather than relying on `PANDA_FEISHU_CHANNEL=off` alone. See 
 ## Operations
 
 Use `journalctl -u panda -f`, `systemctl status panda`, and the health endpoint for routine checks. Avoid restarting while an issue is running. Diagnose production databases read-only; use SQLite online backup or another WAL-aware method for consistent backups.
+
+## Idle chat hibernation
+
+PandaDOS checks every five minutes and hibernates detached chat sessions after two hours of inactivity.
+Set `PANDA_CHAT_IDLE_MINUTES` to a value from `60` to `120` to change the timeout; invalid values use `120`.
+Web chat/terminal connections and attached tmux clients protect their sessions. The last web disconnect
+updates the persisted activity time, so a service restart retains the timeout.
+
+Only a completed native Agent turn with an intact resume history and an empty input qualifies.
+Running tools, unfinished issues, managed design/workspace conversations, unknown states and drafts
+are retained. Only the tmux runtime is removed: the project files, conversation and native session history
+stay intact. Opening the same conversation starts Claude/Codex with its original resume ID.
+Project Bash consoles and issue execution terminals are outside this cleanup scope.

@@ -1,3 +1,5 @@
+import { KeyedMutex } from '../../issues/mutex';
+import { issueWorkspaceCwd } from '../../core/workspace-ownership';
 /**
  * web/routes/files —— 项目文件浏览（v1 web.ts /api/files|file|download|upload 平移改造）。
  *
@@ -133,6 +135,7 @@ export function parseGrep(out: string, limit: number): Array<{ path: string; lin
 const MULTIPART_OVERHEAD = 64 * 1024;
 
 export interface FilesRoutesDeps {
+  mutex?: KeyedMutex;
   db: Database;
   /** 项目所在执行机的 Driver（server.ts driverForProject；executor 缺失即失败） */
   driverForProject(project: Project): FilesDriver;
@@ -223,7 +226,12 @@ export function filesRoutes(deps: FilesRoutesDeps): RouteDef[] {
     params: Record<string, string>,
     url: URL,
   ): { project: Project; driver: FilesDriver; full: string; rel: string } | Response {
-    const project = getProject(db, Number(params.projectId));
+    let project = getProject(db, Number(params.projectId));
+    if (project && url.searchParams.has('issue')) {
+      const cwd = issueWorkspaceCwd(db,project.id,url.searchParams.get('issue')!);
+      if (!cwd) return json({ok:false,error:'工作区不存在'},404);
+      project = {...project,cwd};
+    }
     if (!project) return json({ ok: false, error: '无此项目' }, 404); // owner 校验已过=admin
     const p = resolveReq(project, url);
     if (!p) return json({ ok: false, error: '路径越界' }, 400);
@@ -234,8 +242,15 @@ export function filesRoutes(deps: FilesRoutesDeps): RouteDef[] {
   function prepareW(
     params: Record<string, string>,
     raw: string,
+    issueId?: string | null,
   ): { project: Project; driver: FilesDriver; full: string; rel: string } | Response {
-    const project = getProject(db, Number(params.projectId));
+    let project = getProject(db, Number(params.projectId));
+    if (project && issueId) {
+      const cwd = issueWorkspaceCwd(db,project.id,issueId);
+      const held = db.query("SELECT 1 FROM workspace_attempts WHERE issue_id=? AND released_ts IS NULL AND result_sha IS NULL").get(issueId);
+      if (!cwd || !held) return fail('workspace.path_invalid','工作区不可写',409);
+      project = {...project,cwd};
+    }
     if (!project) return fail('project.not_found', 'Project not found.', 404);
     const full = resolveProjectPath(project.cwd, raw);
     if (full === null) return fail('workspace.path_invalid', 'The path must stay inside the project directory.', 400);
@@ -247,13 +262,13 @@ export function filesRoutes(deps: FilesRoutesDeps): RouteDef[] {
   const opFailed = (e: unknown): Response =>
     fail('workspace.operation_failed', 'The file operation failed.', 500, {}, String(e).slice(0, 500));
 
-  return [
+  const routes: RouteDef[] = [
     {
       method: 'GET',
       path: '/api/projects/:projectId/fs/stat',
       auth: 'project-access',
       handler: async ({ url, params }) => {
-        const c = prepareW(params, url.searchParams.get('path') ?? '');
+        const c = prepareW(params, url.searchParams.get('path') ?? '', url.searchParams.get('issue'));
         if (c instanceof Response) return c;
         try {
           const st = await c.driver.statPath(c.full);
@@ -280,7 +295,7 @@ export function filesRoutes(deps: FilesRoutesDeps): RouteDef[] {
       path: '/api/projects/:projectId/fs/file',
       auth: 'project-access',
       handler: async ({ req, url, params }) => {
-        const c = prepareW(params, url.searchParams.get('path') ?? '');
+        const c = prepareW(params, url.searchParams.get('path') ?? '', url.searchParams.get('issue'));
         if (c instanceof Response) return c;
         if (!c.rel || !validLeaf(c.rel)) return fail('workspace.name_invalid', 'Enter a valid name.', 400);
         const body = (await req.json().catch(() => ({}))) as { content?: unknown };
@@ -306,7 +321,7 @@ export function filesRoutes(deps: FilesRoutesDeps): RouteDef[] {
       path: '/api/projects/:projectId/fs/mkdir',
       auth: 'project-access',
       handler: async ({ url, params }) => {
-        const c = prepareW(params, url.searchParams.get('path') ?? '');
+        const c = prepareW(params, url.searchParams.get('path') ?? '', url.searchParams.get('issue'));
         if (c instanceof Response) return c;
         if (!c.rel || !validLeaf(c.rel)) return fail('workspace.name_invalid', 'Enter a valid name.', 400);
         if (!c.driver.mkdirp) return fail('workspace.operation_failed', 'The file operation failed.', 501);
@@ -327,14 +342,14 @@ export function filesRoutes(deps: FilesRoutesDeps): RouteDef[] {
       method: 'POST',
       path: '/api/projects/:projectId/fs/move',
       auth: 'project-access',
-      handler: async ({ req, params }) => {
+      handler: async ({ req, params, url }) => {
         const body = (await req.json().catch(() => ({}))) as { from?: unknown; to?: unknown };
         if (typeof body?.from !== 'string' || typeof body?.to !== 'string') {
           return fail('workspace.path_invalid', 'The path must stay inside the project directory.', 400);
         }
-        const src = prepareW(params, body.from);
+        const src = prepareW(params, body.from, url.searchParams.get('issue'));
         if (src instanceof Response) return src;
-        const dst = prepareW(params, body.to);
+        const dst = prepareW(params, body.to, url.searchParams.get('issue'));
         if (dst instanceof Response) return dst;
         if (!src.rel || !dst.rel || !validLeaf(dst.rel)) return fail('workspace.name_invalid', 'Enter a valid name.', 400);
         if (dst.rel === src.rel) return json({ ok: true, path: dst.rel });
@@ -363,7 +378,7 @@ export function filesRoutes(deps: FilesRoutesDeps): RouteDef[] {
       path: '/api/projects/:projectId/fs',
       auth: 'project-access',
       handler: async ({ url, params }) => {
-        const c = prepareW(params, url.searchParams.get('path') ?? '');
+        const c = prepareW(params, url.searchParams.get('path') ?? '', url.searchParams.get('issue'));
         if (c instanceof Response) return c;
         if (!c.rel) return fail('workspace.delete_root', 'The project root cannot be deleted.', 400);
         if (!c.driver.removeTree) return fail('workspace.operation_failed', 'The file operation failed.', 501);
@@ -397,7 +412,7 @@ export function filesRoutes(deps: FilesRoutesDeps): RouteDef[] {
       path: '/api/projects/:projectId/fs/search',
       auth: 'project-access',
       handler: async ({ url, params }) => {
-        const c = prepareW(params, url.searchParams.get('path') ?? '');
+        const c = prepareW(params, url.searchParams.get('path') ?? '', url.searchParams.get('issue'));
         if (c instanceof Response) return c;
         const q = (url.searchParams.get('q') ?? '').trim();
         if (!q || q.length > 200) return fail('workspace.search_query_required', 'Enter text to search for.', 400);
@@ -445,7 +460,7 @@ export function filesRoutes(deps: FilesRoutesDeps): RouteDef[] {
       path: '/api/projects/:projectId/fs/download-dir',
       auth: 'project-access',
       handler: async ({ url, params }) => {
-        const c = prepareW(params, url.searchParams.get('path') ?? '');
+        const c = prepareW(params, url.searchParams.get('path') ?? '', url.searchParams.get('issue'));
         if (c instanceof Response) return c;
         if (!c.driver.runCommand || !c.driver.removeTree) {
           return fail('workspace.operation_failed', 'The file operation failed.', 501);
@@ -681,4 +696,16 @@ export function filesRoutes(deps: FilesRoutesDeps): RouteDef[] {
       },
     },
   ];
+  const mutex=deps.mutex ?? new KeyedMutex();
+  return routes.map(route=>({...route,handler:async ctx=>{
+    const id=ctx.url.searchParams.get('issue');
+    if(!id || route.method==='GET')return route.handler(ctx);
+    const cwd=issueWorkspaceCwd(db,Number(ctx.params.projectId),id);
+    const a=cwd ? db.query<{id:string;workspace_id:number},[string]>('SELECT id,workspace_id FROM workspace_attempts WHERE issue_id=? ORDER BY created_ts DESC,rowid DESC LIMIT 1').get(id):null;
+    if(!a)return fail('workspace.path_invalid','工作区不可写',409);
+    return mutex.runExclusive(`workspace-git:${a.workspace_id}`,()=>{
+      if(!db.query('SELECT 1 FROM workspace_attempts a JOIN module_workspaces w ON w.current_attempt=a.id WHERE a.id=? AND a.released_ts IS NULL AND a.result_sha IS NULL AND a.stop_confirmed=0').get(a.id))return fail('workspace.path_invalid','工作区执行轮次不可写',409);
+      return route.handler(ctx);
+    });
+  }}));
 }

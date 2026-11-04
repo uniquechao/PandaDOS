@@ -27,6 +27,12 @@ export interface ApiErrorDescriptor {
 }
 
 const ERROR_MESSAGE_KEYS: Readonly<Record<string, MessageKey>> = {
+  'local_plans.invalid': 'errors.local_plans.invalid',
+  'local_plans.changed': 'errors.local_plans.changed',
+  'local_plans.published': 'errors.local_plans.published',
+  'local_plans.unavailable': 'errors.local_plans.unavailable',
+  'local_plans.forbidden': 'errors.local_plans.forbidden',
+  'local_plans.not_found': 'errors.local_plans.not_found',
   'rooms.not_found': 'errors.rooms.not_found',
   'rooms.invalid_request': 'errors.rooms.invalid_request',
   'rooms.conflict': 'errors.rooms.conflict',
@@ -306,7 +312,22 @@ export async function api<T>(
     }, 0);
   }
   if (r.status === 401 && !opts.silent401) onUnauthorized?.();
-  const j = await r.json().catch(() => null) as unknown;
+  if (r.status === 204 || r.status === 205) return null as T;
+  const j = await r.json().catch((cause: unknown) => {
+    // Error pages may have no JSON body; preserve their HTTP status fallback.
+    if (!r.ok) return null;
+    if (cause instanceof SyntaxError) {
+      throw localizedError({ ...descriptorFromBody(null, r.status), details: cause.message }, r.status);
+    }
+    // Fetch can resolve its headers before a failed HTTP/2 body stream rejects.
+    // Never let that failure replace view state with a successful null result.
+    throw localizedError({
+      code: 'network.unreachable',
+      params: {},
+      fallback: 'Could not reach the server. Check your connection and try again.',
+      details: cause instanceof Error ? cause.message : undefined,
+    }, 0);
+  }) as unknown;
   if (!r.ok) throw localizedError(descriptorFromBody(j, r.status), r.status);
   return j as T;
 }

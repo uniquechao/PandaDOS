@@ -1,14 +1,10 @@
 {
-  "version": "2.4.1-2026.0929",
+  "version": "2.6.0-2026.1104",
   "notes": [
-    "unified-workspace",
-    "issue-injection-recovery",
-    "validation-delivery-evidence",
-    "dedicated-ssh-isolation",
-    "agent-chatroom-workspace",
-    "local-session-member-models",
-    "agent-roster-editing",
-    "compact-member-contact-list",
-    "conversation-segment-resume"
+    "idle-chat-hibernation",
+    "local-plan-workspace",
+    "executor-environment-recovery",
+    "issue-stop-diagnostics",
+    "host-build-release"
   ]
 }

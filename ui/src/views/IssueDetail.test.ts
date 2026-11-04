@@ -233,7 +233,8 @@ describe('Issue 工作台信息架构', () => {
   test('受阻恢复必须经弹窗提交解除方法，并提供编辑 issue 与受阻子任务入口', () => {
     expect(source).toContain('function BlockedRecoveryModal');
     expect(source).toContain('setRecoveryOpen(true)');
-    expect(source).toContain("{ guidance: recoveryGuidance.trim() }");
+    expect(source).toContain("{ guidance: recoveryGuidance.trim() || tr('issue.stopResumeNote') }");
+    expect(source).toContain("issue?.status !== 'paused' && !recoveryGuidance.trim()");
     expect(source).toContain("tr('issue.recoveryGuidanceRequired')");
     expect(source).toContain("tr('issue.editBlockedIssue')");
     expect(source).toContain("tr('issue.editBlockedSubtask')");
@@ -522,28 +523,21 @@ describe('执行页门禁一行（#279 / I-03）', () => {
   });
 });
 
-describe('执行页推理档一行（#281 / I-04）', () => {
-  test('可选覆盖档 + 显示生效档与来源，并说明「下次启动才生效」', () => {
-    expect(source).toContain('reasoning={detail?.reasoning ?? null}');
-    expect(source).toContain('<ReasoningLine reasoning={reasoning} onChange={onReasoning} />');
-    expect(source).toContain("tr('ui.reasoningInherit')"); // 继承模块 = 清空覆盖
-    expect(source).toContain("tr('issue.reasoningEffective'");
-    expect(source).toContain("tr('ui.reasoningCodexOnly')");
-    // 改档走 PATCH reasoningEffort，且改完只刷新详情——不重启会话（effort 是启动参数）
-    expect(source).toContain("'PATCH', { reasoningEffort: next }");
-    const line = source.slice(source.indexOf('function ReasoningLine'), source.indexOf('function ValidationLine'));
-    expect(line).not.toContain('relaunch');
+describe('模型与 level 设置入口', () => {
+  test('详情页使用实时模型控件，移除只在下次启动生效的旧档位控件', () => {
+    expect(source).toContain('<AgentModelSettings pid={pid} issueId={issue.id} />');
+    expect(source).not.toContain('<ReasoningLine');
+    expect(source).not.toContain('reasoningEffort: next');
   });
 });
 
 describe('执行页工具条合成一行（#300）', () => {
-  test('门禁 / 推理档内联进 .runctl 的 seg 插槽，不再各占一整行', () => {
+  test('门禁内联进 .runctl 的 seg 插槽，不再占一整行', () => {
     const seg = source.slice(source.indexOf('const seg = ('), source.indexOf('<div class="wb-exec-body">'));
-    // 顺序：对话/原生 → 审批 → 门禁 → 推理档 → 子任务进度
+    // 顺序：对话/原生 → 审批 → 门禁 → 子任务进度
     expect(seg.indexOf('<NativeModeSwitch')).toBeLessThan(seg.indexOf('<AutoApproveSwitch'));
     expect(seg.indexOf('<AutoApproveSwitch')).toBeLessThan(seg.indexOf('<ValidationLine'));
-    expect(seg.indexOf('<ValidationLine')).toBeLessThan(seg.indexOf('<ReasoningLine'));
-    expect(seg.indexOf('<ReasoningLine')).toBeLessThan(seg.indexOf('<ExecProgress'));
+    expect(seg.indexOf('<ValidationLine')).toBeLessThan(seg.indexOf('<ExecProgress'));
     // .wb-exec 里不再有独立成行的门禁/推理档（seg 是三条渲染路径共用的唯一出处）
     const exec = source.slice(source.indexOf('<div class="wb-exec">'), source.indexOf('type TermPaneComp'));
     expect(exec).not.toContain('<ValidationLine');
@@ -555,9 +549,7 @@ describe('执行页工具条合成一行（#300）', () => {
     expect(line).not.toContain('border-bottom');
     expect(line).toContain('flex: 0 0 auto');
     expect(line).toContain('inline-flex');
-    // 推理档下拉用工具条尺寸，不借模块面板的宽下拉
-    expect(source).toContain('class="rc-sel"');
-    expect(styles).toContain('.rc-sel {');
+
   });
 
   test('「运行中」只留呼吸绿点，文案进 title / aria-label（项目对话页同一控件条）', () => {
@@ -571,13 +563,7 @@ describe('执行页工具条合成一行（#300）', () => {
     expect(label).toContain('height: 7px');
   });
 
-  test('文案只留必要的：生效档只显示档位值，整句与「仅 codex 生效」进 title', () => {
-    const line = source.slice(source.indexOf('function ReasoningLine'), source.indexOf('function ValidationLine'));
-    expect(line).toContain("tr('issue.reasoningEffective'");
-    expect(line).toContain("tr('ui.reasoningCodexOnly')");
-    expect(line).toContain('title={hint}');
-    expect(line).toContain('>{reasoning.effort}</span>');
-  });
+
 });
 
 describe('已排队等待恢复（#283 / B-10）', () => {
@@ -590,7 +576,7 @@ describe('已排队等待恢复（#283 / B-10）', () => {
   });
 
   test('提示条是 status 角色而不是 alert：这不是故障，只是在排队', () => {
-    const bar = source.slice(source.indexOf('function UnblockQueuedBar'), source.indexOf('function ReasoningLine'));
+    const bar = source.slice(source.indexOf('function UnblockQueuedBar'), source.indexOf('function ValidationLine'));
     expect(bar).toContain('role="status"');
     expect(bar).not.toContain('role="alert"');
   });

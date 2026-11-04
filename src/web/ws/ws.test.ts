@@ -1,3 +1,4 @@
+import { testTmuxDirectory } from '../../../scripts/test-tmux';
 /**
  * WS 挂载测试（Wave3 任务 A/B）：
  * - 鉴权矩阵（term/chat 同一套 upgrade 前置鉴权，'project-access' 口径）：无 token 401 /
@@ -21,7 +22,7 @@ import { migratePmAgent } from '../../agents/pm';
 import { fileReadHint, imageReadHint } from '../../core/uploads';
 import { LocalDriver } from '../../executor/local';
 import { KEY_WHITELIST, type PtyChannel } from '../../executor/driver';
-import { startServer, type PandaServer } from '../server';
+import { startServer, type PandaServer, type ServerOptions } from '../server';
 
 // ---------- 假 Driver（tmux/PTY 面 stub，文件/git 面真 LocalDriver） ----------
 
@@ -133,7 +134,7 @@ interface Ctx {
   pid: number;
 }
 
-async function boot(withSecondExecutor = false): Promise<Ctx> {
+async function boot(withSecondExecutor = false, overrides: Partial<ServerOptions> = {}): Promise<Ctx> {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'panda-ws-'));
   cleanups.push(() => fsp.rm(dir, { recursive: true, force: true }));
   const dbPath = path.join(dir, 'panda.db');
@@ -167,6 +168,7 @@ async function boot(withSecondExecutor = false): Promise<Ctx> {
     engineConfig: { tickMs: 3_600_000 },
     statusIntervalMs: 3_600_000,
     wsChatPollMs: 30,
+    ...overrides,
   });
   cleanups.push(() => server.stop());
 
@@ -201,6 +203,42 @@ async function boot(withSecondExecutor = false): Promise<Ctx> {
     pid: proj.body.project.id as number,
   };
 }
+
+test('idle hibernation: real HTTP/WS protects connected history, then reopening resumes the same conversation',async()=>{
+  const t=await boot(false,{chatIdleTimeoutMs:50,chatIdleSweepMs:3_600_000});
+  const response=await fetch(`${t.base}/api/projects/${t.pid}/conversations`,{
+    method:'POST',headers:{authorization:`Bearer ${t.aliceToken}`,'content-type':'application/json'},
+    body:JSON.stringify({agent:'claude',label:'idle integration'}),
+  });
+  const {conversation}=await response.json() as {conversation:{id:string}};
+  const id=conversation.id,name=chatTmux(id);
+  const folder=path.join(t.claudeDir,'project');await fsp.mkdir(folder,{recursive:true});
+  const history=path.join(folder,id+'.jsonl');
+  await fsp.writeFile(history,JSON.stringify({type:'assistant',message:{content:[{type:'text',text:'done'}],stop_reason:'end_turn'}})+'\n');
+  await fsp.utimes(history,new Date(1000),new Date(1000));
+  t.server.db.run('UPDATE conversations SET created_ts=1,last_active_ts=1 WHERE id=?',[id]);
+  t.driver.sessions.add(name);t.driver.pane='❯\n';
+  t.driver.inspectIdleSession=async()=>({name,sessionId:'$2',paneId:'%3',panePid:123,activityTs:1,createdTs:1,
+    attached:false,windows:1,panes:1,inMode:false,command:'claude',processesIdle:true});
+  t.driver.sleepSessionIfIdle=async()=>{t.driver.sessions.delete(name);return true;};
+  const client=await connect(`${t.wsBase}/ws/chat/${t.pid}?conv=${id}`,t.aliceToken);
+  try {
+    await client.next();
+    expect(await t.server.chatIdleReaper.tick()).toBe(0);
+    expect(t.driver.sessions.has(name)).toBe(true);
+  } finally {client.close();await client.closed;}
+  await Bun.sleep(70);
+  const slept=await t.server.chatIdleReaper.tick();
+  expect(slept).toBe(1);
+  expect(t.driver.sessions.has(name)).toBe(false);
+  const wake=await fetch(`${t.base}/api/projects/${t.pid}/conversations/${id}/activate`,{
+    method:'POST',headers:{authorization:`Bearer ${t.aliceToken}`},
+  });
+  expect(wake.status).toBe(200);
+  expect(t.driver.sent.at(-1)?.text).toContain(`--resume ${id}`);
+  expect(t.driver.sessions.has(name)).toBe(true);
+  expect((await fsp.readFile(history,'utf8'))).toContain('done');
+});
 
 // ---------- WS 客户端小工具 ----------
 
@@ -1345,6 +1383,16 @@ describe.if(tmuxOk && scriptOk)('WS term 集成（真 tmux attach）', () => {
       .query('INSERT INTO sessions (name, executor_id, project_id, owner_user_id) VALUES (?, ?, ?, ?)')
       .run(session, 1, pid, adminId);
 
+    const shortSocketRoot = testTmuxDirectory();
+    const oldSocket = { TMUX: process.env.TMUX, TMUX_TMPDIR: process.env.TMUX_TMPDIR };
+    delete process.env.TMUX;
+    process.env.TMUX_TMPDIR = shortSocketRoot;
+    cleanups.push(async () => {
+      for (const [key, value] of Object.entries(oldSocket)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      await fsp.rm(shortSocketRoot, { recursive: true, force: true });
+    });
     await local.createSession(session, dir);
     cleanups.push(async () => {
       await local.killSession(session).catch(() => {});

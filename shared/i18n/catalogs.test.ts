@@ -1,3 +1,5 @@
+import { issueDiagnosticMessages } from './domains/issue-diagnostics';
+import { agentModelMessages } from './domains/agent-models';
 import { describe, expect, test } from 'bun:test';
 import { IntlMessageFormat } from 'intl-messageformat';
 import { catalogs } from './catalogs';
@@ -43,7 +45,8 @@ describe('launch catalogs', () => {
       const identical = (Object.keys(english) as MessageKey[])
         .filter((key) => catalogs[locale][key] === english[key])
         .sort();
-      expect(identical).toEqual([...identicalEnglishAllowlist[locale]].sort());
+      // 当前模型设置需求明确指定所有新增文案为简体中文，单独列出该消息域。
+      expect(identical).toEqual([...identicalEnglishAllowlist[locale],...(Object.keys(agentModelMessages) as MessageKey[]), ...(Object.keys(issueDiagnosticMessages) as MessageKey[])].sort());
     }
   });
 

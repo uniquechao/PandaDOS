@@ -37,6 +37,7 @@ export type Route =
   | { name: 'workspace'; pid: number; loc: WorkspaceLoc }
   | { name: 'skills'; pid: number }
   | { name: 'external-issues'; pid: number }
+  | { name: 'local-plans'; pid: number }
   | { name: 'workflows'; pid: number }
   | { name: 'project-settings'; pid: number };
 
@@ -102,6 +103,7 @@ export function parseHash(hash: string): Route {
       if (parts[2] === 'files') return { name: 'workspace', pid, loc: legacyFilesLoc(parts[3]) };
       if (parts[2] === 'git') return { name: 'workspace', pid, loc: { view: 'changes' } };
       if (parts[2] === 'external-issues') return { name: 'external-issues', pid };
+      if (parts[2] === 'local-plans') return { name: 'local-plans', pid };
       if (parts[2] === 'workflows') return { name: 'workflows', pid };
       if (parts[2] === 'settings') return { name: 'project-settings', pid };
       if (parts[2] === 'skills') return { name: 'skills', pid };

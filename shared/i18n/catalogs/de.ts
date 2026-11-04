@@ -1,3 +1,7 @@
+import { issueDiagnosticMessages } from '../domains/issue-diagnostics';
+import { localPlanMessages } from '../domains/local-plans';
+import { agentModelMessages } from '../domains/agent-models';
+import { moduleWorkspaceMessages } from '../domains/module-workspace';
 import { roomMemberMessages } from '../domains/rooms-members';
 import { roomChatMessages } from '../domains/rooms-chat';
 import { roomExtraMessages } from '../domains/rooms-extra';
@@ -24,6 +28,10 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const deCatalog = {
+  ...issueDiagnosticMessages,
+  ...localPlanMessages["de"],
+  ...agentModelMessages,
+  ...moduleWorkspaceMessages["de"],
   ...roomMemberMessages["de"],
   ...roomChatMessages["de"],
   ...roomExtraMessages["de"],
@@ -407,4 +415,5 @@ export const deCatalog = {
   'ui.moduleIssueCount':'{count, plural, one {# Issue} other {# Issues}}','ui.organizeResultCreate':'Modul „{name}“ erstellt ({slug} · {agent})','ui.organizeResultRename':'Modul in „{name}“ umbenannt ({slug})','ui.organizeResultMerge':'{count, plural, one {In „{target}“ zusammengeführt; # Issue verschoben} other {In „{target}“ zusammengeführt; # Issues verschoben}}','ui.organizeResultMove':'{count, plural, one {# Issue nach „{target}“ verschoben} other {# Issues nach „{target}“ verschoben}}',
   'ui.organizeFailureTimeout':'Die letzte Analyse hat das Zeitlimit überschritten. Sie können sie erneut ausführen.','ui.organizeFailureNoOutput':'Die letzte Analyse hat keinen Organisationsplan geliefert. Sie können sie erneut ausführen.','ui.organizeFailureError':'Die letzte Analyse ist fehlgeschlagen. Sie können sie erneut ausführen.','ui.organizeFailureDetail':'Technische Details: {detail}',
   'git.imageBefore':'Vorher','git.imageAfter':'Nachher','git.openImage':'{name} öffnen','git.viewImage':'Bild {name} anzeigen','git.downloadImage':'{name} herunterladen',
+  'admin.directoryRequired': "Geben Sie {field} an. Tragen Sie einen absoluten Pfad ein oder wählen Sie ein Verzeichnis.",
 } as const satisfies MessageCatalog;

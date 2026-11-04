@@ -1,3 +1,4 @@
+import { issueWorkspaceCwd } from '../core/workspace-ownership';
 /**
  * 工作流 Agent 节点执行协议。
  *
@@ -353,6 +354,7 @@ export class WorkflowNodeRunner {
       )
       .get(issueWorkflowId);
     if (!row) throw new Error('工作流实例不存在');
+    row.cwd = issueWorkspaceCwd(this.deps.db,row.project_id,row.issue_id) ?? row.cwd;
     return {
       row,
       graph: JSON.parse(row.graph_json) as WorkflowGraphSnapshot,
@@ -519,7 +521,8 @@ export class WorkflowNodeRunner {
     const node = graph.nodes.find((candidate) => candidate.key === run.nodeKey);
     if (!node) throw new Error('节点定义不存在');
     const candidateEdges = graph.edges.filter((edge) => edge.fromNodeKey === node.key);
-    const paths = workflowNodePaths(row.cwd, run.issueWorkflowId, run.id);
+    const worktree=this.deps.db.query<{path:string},[number]>('SELECT path FROM issue_workflow_worktrees WHERE node_run_id=?').get(run.id);
+    const paths = workflowNodePaths(worktree?.path ?? row.cwd, run.issueWorkflowId, run.id);
     const done = await this.driver(row.project_id).statPath(paths.done).catch(() => null);
     if (!done?.isFile) return { state: 'pending', run };
     const routingTs = this.now();

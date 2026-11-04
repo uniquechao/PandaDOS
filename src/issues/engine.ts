@@ -1,7 +1,12 @@
+import { redactDiagnostic, redactDiagnosticValue } from '../../shared/issue-diagnostics';
+import { prepareDependencies, DependencyPreparationError } from './dependency-preparation';
+import { WorkspaceOperationUncertain, type ModuleWorkspaceService } from './module-workspaces';
+import { managedConversationOwned, issueWorkspaceView, type IssueWorkspaceView } from '../core/workspace-ownership';
 import { effectiveSkillPolicy, skillSessionSettings, saveSkillPolicy, type SkillPolicy } from '../core/skill-policy';
 import { ClarificationDelivery, ClarificationNotDeliveredError, type ClarificationDeliveryInput } from './clarification-delivery';
 import { createHash } from 'node:crypto';
 import { agentHomesFromClaudeDir, listGlobalSkills, listProjectSkills } from '../core/skills';
+import { WorkspaceExecutionDeferred } from './workspace-deferral';
 import { validationIdentity, validationCheckKey } from './validation-identity';
 /**
  * issues/engine —— issue 生命周期状态机引擎（v2 的心脏，spec §5）。
@@ -242,6 +247,7 @@ export interface ImplCommitsSnapshot {
 
 /** issues 表全量行（030 起的 issue 引擎增量列；036 补目标分支/源 ref） */
 export interface EngineIssue extends Issue {
+  workspace?: IssueWorkspaceView | null;
   moduleId: number | null;
   module: string;
   implMode: ImplMode;
@@ -280,6 +286,9 @@ export interface DesignIssueDraft {
   createdBy?: number | null;
   targetBranch?: string | null;
   sourceRef?: string | null;
+  /** Generic local-plan publications; design graph callers remain task-only. */
+  category?: IssueCategory;
+  executionMode?: 'direct' | 'planned';
 }
 
 export interface PreparedIssueDependency {
@@ -709,7 +718,7 @@ export interface EngineLocator {
 
 export interface EngineExecutionWorkspace {
   cwd: string;
-  kind: 'project' | 'design-worktree';
+  kind: 'project' | 'design-worktree' | 'module-worktree';
   /** Fixed batch branch; required for a managed design worktree. */
   branch: string | null;
   runId: string | null;
@@ -890,6 +899,8 @@ interface ProjectRow {
   readme_summary?: string | null;
   /** 006 迁移；同上，旧库兜底 null */
   work_branch?: string | null;
+  module_concurrency?: number;
+  integration_branch?: string | null;
   /** 007 迁移；同上，旧库兜底 null / 'idle' */
   understanding?: string | null;
   understanding_agent?: string | null;
@@ -921,6 +932,8 @@ export function mapProject(r: ProjectRow): Project {
     ...(r.execution_isolation === 'dedicated-ssh' ? { executionIsolation: 'dedicated-ssh' as const } : {}),
     readmeSummary: r.readme_summary ?? null,
     workBranch: r.work_branch ?? null,
+    moduleConcurrency:r.module_concurrency ?? 2,
+    integrationBranch:r.integration_branch ?? null,
     understanding: r.understanding ?? null,
     understandingAgent:
       r.understanding_agent === 'codex' || r.understanding_agent === 'claude'
@@ -1204,7 +1217,7 @@ export class IssueStore {
         projectId,
         input.title,
         input.body,
-        'task',
+        input.category ?? 'task',
         input.moduleSlug,
         input.moduleId,
         input.implMode === 'team' ? 'team' : 'seq',
@@ -1215,20 +1228,21 @@ export class IssueStore {
         nextIssueCreatedTs(),
       ));
     if (!row) throw new Error('insert published issue failed');
+    if (input.executionMode) this.db.run('UPDATE issues SET execution_mode = ? WHERE id = ?', [input.executionMode, row.id]);
     this.logEvent(row.id, 'created', { title: row.title, publication: true, nodeId: input.nodeId });
     return this.get(row.id)!;
   }
 
   get(id: IssueId): EngineIssue | undefined {
     const r = this.db.query<IssueRow, [IssueId]>('SELECT * FROM issues WHERE id = ?').get(id);
-    return r ? mapIssue(r) : undefined;
+    return r ? {...mapIssue(r),workspace:issueWorkspaceView(this.db,r.id)} : undefined;
   }
 
   listByProject(projectId: number): EngineIssue[] {
     return this.db
       .query<IssueRow, [number]>('SELECT * FROM issues WHERE project_id = ? ORDER BY created_ts, id')
       .all(projectId)
-      .map(mapIssue);
+      .map(r => ({...mapIssue(r),workspace:issueWorkspaceView(this.db,r.id)}));
   }
 
   /**
@@ -1838,7 +1852,12 @@ export class IssueStore {
   }
 
   remove(id: IssueId): boolean {
-    return this.db.query('DELETE FROM issues WHERE id = ?').run(id).changes > 0;
+    return this.db.transaction(() => {
+      // Remove the live link, not the publication identity: replay must never recreate deleted tasks.
+      // Both deletes roll back if another retained history record still references this issue.
+      this.db.query('DELETE FROM local_issue_plan_items WHERE issue_id = ?').run(id);
+      return this.db.query('DELETE FROM issues WHERE id = ?').run(id).changes > 0;
+    })();
   }
 
   /** 项目内「未关闭 issue 已占用」的 conv id 集合（含 pending 已绑——v1 漏排是雷） */
@@ -2726,6 +2745,7 @@ export interface EngineDeps {
   executionUnavailable?(project: Project): string | null;
   /** Neutral adapter; omitted preserves legacy Issue behavior exactly. */
   executionWorkspaces?: EngineExecutionWorkspaceOps;
+  moduleWorkspaces?: ModuleWorkspaceService;
   pmFor(project: Project): EnginePm;
   notify: EngineNotifier;
   mutex: KeyedMutex;
@@ -2868,7 +2888,7 @@ export interface WatchState {
  * `error{where:'scheduleNext',error:'项目忙（已有 issue 在跑），先排队'}` 就是这么来的；
  * 真故障（工作区不可用、绑会话失败、开跑后状态无进展）才值得报 error。
  */
-export type SchedulingDeferralReason = 'project-busy' | 'not-pending' | 'issue-gone';
+export type SchedulingDeferralReason = 'project-busy' | 'not-pending' | 'issue-gone' | 'workspace-not-ready';
 
 export type ApplyResult =
   | { ok: true; from: IssueState; to: IssueState }
@@ -2944,7 +2964,7 @@ export class IssueEngine {
   /** reservation 等待信号；并发 start 等前一个 commit 后重读 busy 状态。 */
   private readonly startingProjectWaits = new Map<number, Promise<void>>();
   /** 每项目独立 tick flight：同项目单飞，慢项目不阻塞其他项目。 */
-  private readonly tickFlights = new Map<number, ProjectTickFlight>();
+  private readonly tickFlights = new Map<string, ProjectTickFlight>();
   /** stop() 先关闭入口；start() 可在停机完成后重新开启。构造后默认允许手动 tick。 */
   private acceptingTicks = true;
   /** 停机在途期间拒绝 start；重复 stop 复用同一个等待链。 */
@@ -2960,10 +2980,16 @@ export class IssueEngine {
   constructor(private readonly deps: EngineDeps) {
     this.store = new IssueStore(deps.db);
     this.transitionRepository = new IssueTransitionRepository(deps.db, this.store);
-    this.schedulingPolicy = new IssueSchedulingPolicy(this.store, (id) => this.transitionCoordinator.isActive(id));
+    this.schedulingPolicy = new IssueSchedulingPolicy(this.store, (id) => this.transitionCoordinator.isActive(id),
+      deps.moduleWorkspaces ? {
+        pick: (candidates, siblings, preferred) => deps.moduleWorkspaces!.pick(candidates, siblings, preferred),
+        canStart: (issue, siblings) => deps.moduleWorkspaces!.canStart(issue, siblings),
+      } : undefined);
     this.scheduler = new IssueScheduler({
       store: this.store,
       policy: this.schedulingPolicy,
+      parallel: Boolean(deps.moduleWorkspaces),
+      pickIssue: (id, preferred, deferred) => this.schedulingPolicy.pick(id, preferred, deferred),
       canSchedule: (id) => {
         const project = this.project(id);
         return this.acceptingTicks && !!project && !this.deps.executionUnavailable?.(project);
@@ -3106,6 +3132,7 @@ export class IssueEngine {
     if (!proj) throw new Error(`项目 ${projectId} 不存在`);
     const unavailable = this.deps.executionUnavailable?.(proj);
     if (unavailable) throw new Error(unavailable);
+    if (this.deps.moduleWorkspaces) input = {...input,targetBranch:null,sourceRef:null};
     const workflows = new WorkflowTemplateStore(this.deps.db, () => this.now());
     let selectedWorkflow: WorkflowTemplateDetail | null = null;
     if (input.workflowTemplateId !== undefined) {
@@ -3210,6 +3237,17 @@ export class IssueEngine {
     projectId: number,
     drafts: readonly DesignIssueDraft[],
   ): Promise<PreparedDesignBatch> {
+    return this.preparePublicationBatch(projectId, drafts, false);
+  }
+
+  /** Generic file-plan publication, sharing the same atomic commit and post-commit effects. */
+  async prepareIssueBatch(projectId: number, drafts: readonly DesignIssueDraft[]): Promise<PreparedDesignBatch> {
+    return this.preparePublicationBatch(projectId, drafts, true);
+  }
+
+  private preparePublicationBatch(
+    projectId: number, drafts: readonly DesignIssueDraft[], generic: boolean,
+  ): PreparedDesignBatch {
     const project = this.requirePublicationProject(projectId);
     if (!Array.isArray(drafts) || drafts.length === 0 || drafts.length > MAX_PUBLICATION_BATCH) {
       throw new Error(`publication batch must contain 1-${MAX_PUBLICATION_BATCH} nodes`);
@@ -3222,7 +3260,10 @@ export class IssueEngine {
         throw new Error('publication node ids must be unique non-empty strings');
       }
       seen.add(nodeId);
-      prepared.push(this.validatePublicationDraft(project, { ...draft, nodeId }));
+      prepared.push(this.validatePublicationDraft(project, {
+        ...draft, nodeId,
+        executionMode: generic && !project.manualReview && draft.category !== 'design' ? 'direct' : 'planned',
+      }, generic));
     }
     const batch = Object.freeze({
       [PREPARED_DESIGN_BATCH_BRAND]: true as const,
@@ -3257,7 +3298,10 @@ export class IssueEngine {
     const validatedDependencies = validatePreparedDependencies(prepared, dependencies);
     const commit = this.deps.db.transaction(() => {
       const project = this.requirePublicationProject(prepared.projectId);
-      const revalidated = prepared.drafts.map((draft) => this.validatePublicationDraft(project, draft));
+      const revalidated = prepared.drafts.map((draft) => this.validatePublicationDraft(project, {
+        ...draft,
+        ...(draft.executionMode ? { executionMode: draft.executionMode === 'direct' && !project.manualReview && draft.category !== 'design' ? 'direct' as const : 'planned' as const } : {}),
+      }, true));
       const byNode = new Map<string, EngineIssue>();
       for (const draft of revalidated) byNode.set(draft.nodeId, this.store.createPublished(project.id, draft));
 
@@ -3650,7 +3694,7 @@ export class IssueEngine {
     return project;
   }
 
-  private validatePublicationDraft(project: Project, input: DesignIssueDraft): PreparedDesignIssue {
+  private validatePublicationDraft(project: Project, input: DesignIssueDraft, generic = false): PreparedDesignIssue {
     const nodeId = input.nodeId.trim();
     const title = input.title.trim();
     if (!nodeId || nodeId.length > 120) throw new Error('invalid publication node id');
@@ -3661,7 +3705,8 @@ export class IssueEngine {
     if (input.implMode !== 'direct' && input.implMode !== 'team') throw new Error('invalid publication mode');
     if (input.agent !== 'claude' && input.agent !== 'codex') throw new Error('invalid publication agent');
     const suppliedCategory = (input as DesignIssueDraft & { category?: unknown }).category;
-    if (suppliedCategory !== undefined && suppliedCategory !== 'task') {
+    if (suppliedCategory !== undefined && (generic
+      ? !['task', 'debug', 'design'].includes(String(suppliedCategory)) : suppliedCategory !== 'task')) {
       throw new Error('published graph nodes must be ordinary task issues');
     }
     const support = projectAgentSupport(this.deps.db, project.id, input.agent);
@@ -3717,6 +3762,7 @@ export class IssueEngine {
     if (initial.publicationLocked) {
       throw new Error('设计发布的 Issue 只能通过 revision-aware sync 修改 contract 字段');
     }
+    if (this.deps.moduleWorkspaces?.enabled(initial) && (meta.targetBranch || meta.sourceRef)) throw new Error('模块工作区统一使用项目集成目标');
     if (!isEditableStatus(initial.status)) {
       throw new Error(`只有待办、受阻或已取消的 issue 可以修改（当前 ${initial.status}）`);
     }
@@ -3766,6 +3812,11 @@ export class IssueEngine {
               }
             : {}),
       };
+      if(this.deps.moduleWorkspaces?.held(issueId) && (
+        combined.moduleId!==undefined && combined.moduleId!==fresh.moduleId ||
+        combined.agent!==undefined && combined.agent!==fresh.agent ||
+        combined.module!==undefined && combined.module!==fresh.module
+      ))throw new Error('工作区仍有恢复现场，不能修改模块或代理');
       // source 只是「谁改的」这条元信息，不进 SQL 更新集
       const { targetBranch, sourceRef, source: _source, ...rest } = combined;
       const finalTarget = targetBranch !== undefined ? targetBranch : fresh.targetBranch;
@@ -4571,6 +4622,16 @@ export class IssueEngine {
     return this.scheduler.scheduleNext(projectId, opts);
   }
 
+  private issueConversationActive(issue: EngineIssue): boolean {
+    return Boolean(issue.convId && (managedConversationOwned(this.deps.db, issue.projectId, issue.convId)
+      || (!this.deps.moduleWorkspaces?.enabled(issue) && this.deps.convs.currentConv(issue.projectId) === issue.convId)));
+  }
+
+  private workspaceGitKey(projectId: number, issueId: IssueId): string {
+    const a = this.deps.moduleWorkspaces?.attempt(issueId);
+    return a ? `workspace-git:${a.workspace_id}` : gitLockKey(projectId);
+  }
+
   /**
    * 同模块智能合并：把 module 下、与「将跑的那条」相容（同 agent/类型/实施模式）的 pending
    * 交 LLM 判归并；每个合并组保留最早的一条为 host（并入其余的 title/body），其余 pending
@@ -4581,7 +4642,7 @@ export class IssueEngine {
    */
   private async maybeMergeModule(projectId: number, moduleKey: string): Promise<IssueId[]> {
     const hosts: IssueId[] = [];
-    if (!this.cfg.autoMerge) return hosts;
+    if (!this.cfg.autoMerge || this.deps.moduleWorkspaces) return hosts;
     const project = this.project(projectId);
     if (!project) return hosts;
     const pm = this.deps.pmFor(project);
@@ -4813,9 +4874,9 @@ export class IssueEngine {
       || typeof resolved.cwd !== 'string'
       || !resolved.cwd.startsWith('/')
       || resolved.cwd.trim() !== resolved.cwd
-      || (resolved.kind !== 'project' && resolved.kind !== 'design-worktree')
+      || (resolved.kind !== 'project' && resolved.kind !== 'design-worktree' && resolved.kind !== 'module-worktree')
       || (resolved.kind === 'project' && resolved.cwd !== project.cwd)
-      || (resolved.kind === 'design-worktree' && (!resolved.branch || !resolved.runId))) {
+      || (resolved.kind !== 'project' && (!resolved.branch || !resolved.runId))) {
       throw new Error('execution workspace contract mismatch');
     }
     return resolved;
@@ -4833,7 +4894,14 @@ export class IssueEngine {
     const project = this.project(issue.projectId);
     if (!project) return { ok: false, error: '项目不存在' };
     const unavailable = this.deps.executionUnavailable?.(project);
-    if (unavailable) return { ok: false, error: unavailable };
+    if (unavailable) {
+      if(this.deps.moduleWorkspaces?.enabled(issue)) {
+        this.store.logEvent(issue.id,'environment_preparation_failed',{stage:'executor',note:unavailable});
+        await this.applyEvent(issue.id,'pause',{note:unavailable,resumeState:'pending'});
+        this.scheduleEnvironmentRecovery(issue.id);
+      }
+      return { ok: false, error: unavailable };
+    }
 
     // 不持粗 project mutex：这里只串行化“从 pending 抢启动权到 planning commit”的最小窗口。
     // 已有 reservation 时等待其 commit/失败释放，再从头重读 issue/project/busy，避免脏判断。
@@ -4861,6 +4929,7 @@ export class IssueEngine {
 
     try {
       let immediate: ApplyResult | null = null;
+      let preparationFailure: string | null = null;
       let transitionPromise: Promise<ApplyResult> | null = null;
 
       // 锁序固定为 issue-meta → transition → git。pending 编辑/删除/自动合并都先拿
@@ -4889,7 +4958,7 @@ export class IssueEngine {
         const pausedWorkflow = siblings.some(
           (candidate) => (candidate.status === 'blocked' || candidate.status === 'paused') && this.workflowSnapshot(candidate.id)?.status === 'paused',
         );
-        if (isBusy(siblings) || pausedWorkflow || this.schedulingPolicy.inputSubmitHeldBy(fresh, siblings)) {
+        if (this.deps.moduleWorkspaces ? !this.deps.moduleWorkspaces.canStart(fresh, siblings) : (isBusy(siblings) || pausedWorkflow || this.schedulingPolicy.inputSubmitHeldBy(fresh, siblings))) {
           immediate = { ok: false, error: '项目忙（已有 issue 在跑），先排队', deferral: 'project-busy' };
           return;
         }
@@ -4898,8 +4967,17 @@ export class IssueEngine {
         try {
           workspace = await this.resolveExecutionWorkspace(fresh, project);
         } catch (e) {
+          if (e instanceof WorkspaceExecutionDeferred) {
+            immediate = { ok: false, error: e.message, deferral: 'workspace-not-ready' };
+            return;
+          }
           const detail = String(e).slice(0, 200);
           this.store.logEvent(fresh.id, 'error', { where: 'execution-workspace', error: detail });
+          if (this.deps.moduleWorkspaces?.enabled(fresh)) {
+            this.deps.moduleWorkspaces.compute(fresh.id,false);
+            this.deps.db.query('UPDATE workspace_attempts SET diagnostic=? WHERE issue_id=? AND released_ts IS NULL').run(detail,fresh.id);
+          }
+          preparationFailure = detail;
           immediate = { ok: false, error: `执行工作区不可用：${detail}` };
           return;
         }
@@ -4911,7 +4989,7 @@ export class IssueEngine {
         // 正式模块永久绑定唯一逻辑对话；tmux 只是可随时休眠/恢复的运行容器。
         if (!fresh.convId && !this.workflowSnapshot(fresh.id)) {
           let conv: Conversation | undefined;
-          if (workspace.kind === 'design-worktree') {
+          if (workspace.kind !== 'project') {
             try {
               conv = await this.deps.executionWorkspaces!.conversationFor(fresh, workspace);
             } catch (e) {
@@ -4995,7 +5073,7 @@ export class IssueEngine {
             immediate = { ok: false, error: `绑定会话失败：${String(e).slice(0, 160)}` };
             return;
           }
-        } else if (workspace.kind === 'design-worktree') {
+        } else if (workspace.kind !== 'project') {
           let conv: Conversation;
           try {
             conv = await this.deps.executionWorkspaces!.conversationFor(fresh, workspace);
@@ -5038,8 +5116,7 @@ export class IssueEngine {
         };
         transitionPromise = this.transitionCoordinator.run(issueId, () =>
           this.applyEventLocked(issueId, this.store.get(issueId)?.executionMode === 'direct'
-            && !project.manualReview && !this.workflowSnapshot(issueId)
-            && !this.store.get(issueId)?.publicationLocked ? 'start_direct' : 'skip_clarifying', {}, () => {
+            && !project.manualReview && !this.workflowSnapshot(issueId) ? 'start_direct' : 'skip_clarifying', {}, () => {
             releaseStarting();
             signalOnce();
           }),
@@ -5048,6 +5125,12 @@ export class IssueEngine {
         await metaCanRelease;
       });
 
+      if (preparationFailure) {
+        releaseStarting();
+        this.store.logEvent(issueId, 'environment_preparation_failed', { stage: 'workspace', note: preparationFailure });
+        await this.applyEvent(issueId, 'pause', { note: preparationFailure, resumeState: 'pending' });
+        this.scheduleEnvironmentRecovery(issueId);
+      }
       if (immediate) return immediate;
       if (!transitionPromise) return { ok: false, error: 'issue 启动失败' };
       return await transitionPromise;
@@ -5110,8 +5193,12 @@ export class IssueEngine {
 
     if (DRIVING_STATES.includes(issue.status)) {
       if (!issue.convId) return { ok: false, error: '该 issue 未绑定会话，无法注入澄清答复' };
-      if (this.deps.convs.currentConv(issue.projectId) !== issue.convId) {
+      if (!this.issueConversationActive(issue)) {
         return { ok: false, error: '当前激活的不是该 issue 对话，请切回后重发答复' };
+      }
+      if (this.deps.moduleWorkspaces?.enabled(issue)) {
+        if (!this.deps.moduleWorkspaces.canStart(issue, this.store.listByProject(issue.projectId))) return {ok:false,error:'项目并发名额已满，请稍后继续'};
+        this.deps.moduleWorkspaces.compute(issue.id, true);
       }
       const wasWaiting = this.store.execClarifyWait(issueId) !== null; // 记录来源（执行中澄清 vs 开跑后补答）
       const session = this.deps.convs.tmuxName(issue.projectId, issue.convId);
@@ -5190,6 +5277,29 @@ export class IssueEngine {
     return this.applyEvent(issue.id, ev, { note, actor: userId });
   }
 
+  async retryWorkspace(issueId: IssueId, actor?: number, confirmInput = false): Promise<{ok:boolean;error?:string}> {
+    const issue=this.store.get(issueId), service=this.deps.moduleWorkspaces;
+    if(!issue || !service?.enabled(issue)) return {ok:false,error:'模块工作区不存在'};
+    const project=this.project(issue.projectId)!;
+    try {
+      await service.recover(issue,project);
+      if(confirmInput) {
+        if(issue.status!=='paused' || !issue.convId) return {ok:false,error:'仅可确认暂停任务的输入现场'};
+        const a=service.attempt(issue.id)!;service.assertOwned(a);
+        const target=this.deps.convs.tmuxName(issue.projectId,issue.convId);
+        this.deps.db.query("UPDATE issue_effect_journal SET status='confirmed',updated_ts=? WHERE issue_id=? AND target=? AND status IN ('running','uncertain')")
+          .run(this.now(),issue.id,target);
+        this.store.logEvent(issue.id,'workspace_input_confirmed',{actor,attempt:a.id});
+      }
+      this.store.logEvent(issue.id,'workspace_retry',{actor,attempt:service.attempt(issue.id)?.id});
+      if(issue.status==='paused'||issue.status==='blocked') return this.unblockIssue(issue.id,'已核对保留的工作区，继续原执行轮次',actor);
+      if(issue.status==='merging') await this.transitionCoordinator.run(issue.id,()=>this.completeWorkspaceIntegration(issue,project));
+      else if(issue.status==='pending') await this.scheduleNext(issue.projectId,{source:'manual'});
+      else if(issue.status==='cancelled'||issue.status==='done') await service.release(issue,project);
+      return {ok:true};
+    } catch(e) {return {ok:false,error:String(e).slice(0,500)};}
+  }
+
   async cancelIssue(issueId: IssueId, actor?: number): Promise<ApplyResult> {
     return this.applyEvent(issueId, 'cancel', { actor });
   }
@@ -5201,6 +5311,7 @@ export class IssueEngine {
   async removeIssue(issueId: IssueId): Promise<{ ok: true } | { ok: false; error: string }> {
     const initial = this.store.get(issueId);
     if (!initial) return { ok: false, error: '无此 issue' };
+    if (this.deps.moduleWorkspaces?.attempt(issueId)) return {ok:false,error:'工作区执行记录需要保留，不能删除；可保留为已取消任务'};
     return this.deps.mutex.runExclusive(issueMetaLockKey(initial.projectId), () => {
       const fresh = this.store.get(issueId);
       if (!fresh) return { ok: false as const, error: '无此 issue' };
@@ -5210,7 +5321,19 @@ export class IssueEngine {
           error: `进行中（${fresh.status}）不能直接删，先取消`,
         };
       }
-      if (!this.store.remove(issueId)) return { ok: false as const, error: '删除失败' };
+      const pendingPublication = this.deps.db.query(`SELECT 1 FROM local_issue_plan_items i
+        JOIN local_issue_plan_effects e ON e.project_id=i.project_id AND e.plan_id=i.plan_id
+        WHERE i.issue_id=? AND e.completed_ts IS NULL LIMIT 1`).get(issueId);
+      if (pendingPublication) return { ok: false as const, error: '本地 issue 计划仍在完成导入，请稍后再删除' };
+      try {
+        if (!this.store.remove(issueId)) return { ok: false as const, error: '删除失败' };
+      } catch (error) {
+        if (error instanceof Error && 'code' in error
+          && String(error.code).startsWith('SQLITE_CONSTRAINT') && /FOREIGN KEY constraint failed/.test(error.message)) {
+          return { ok: false as const, error: '该 issue 仍关联执行现场或发布记录，不能直接删除；请先取消并保留历史记录' };
+        }
+        throw error;
+      }
       return { ok: true as const };
     });
   }
@@ -5237,7 +5360,7 @@ export class IssueEngine {
       return { ok: false, error: `仅受阻或暂停可继续运行（当前 ${fresh.status}）` };
     }
     const siblings = this.store.listByProject(fresh.projectId).filter((candidate) => candidate.id !== issueId);
-    if (isBusy(siblings)) {
+    if (this.deps.moduleWorkspaces ? !this.deps.moduleWorkspaces.canStart(fresh, siblings) : isBusy(siblings)) {
       const ts = this.now();
       // 重复请求幂等：只落一条新意图，读取侧永远取最后一条（以最后一次的 guidance 为准）
       this.store.logEvent(issueId, 'unblock_requested', {
@@ -5268,12 +5391,14 @@ export class IssueEngine {
       : isResumableState(blocked?.from)
         ? blocked.from
         : undefined;
+    if (raw === 'merging' && this.deps.moduleWorkspaces?.enabled({id:issueId}) && this.deps.moduleWorkspaces.attempt(issueId)?.result_sha) return raw;
     return raw === undefined ? undefined : demoteAgentlessResume(raw);
   }
 
   /** 真正执行恢复：手动解除与接力消费意图共用这一条路径，保证留痕与注入完全一致 */
   private async applyUnblock(issueId: IssueId, guidance: string, actor?: number): Promise<ApplyResult> {
     const blocked = this.store.lastEnterInfo(issueId, this.store.get(issueId)?.status === 'paused' ? 'paused' : 'blocked');
+    const wasPaused = this.store.get(issueId)?.status === 'paused';
     const resumeState = this.resumeStateOf(issueId);
     return this.applyEvent(issueId, 'unblock', {
       note: guidance,
@@ -5287,8 +5412,8 @@ export class IssueEngine {
       });
       // #274：这次受阻是止损闸打的 → 落新锚点。少了它，用户点「继续运行」之后
       // 三项计数还是原样超标，下一个 tick 立刻又被暂停，人根本推不动。
-      // 只对止损来源落：普通受阻的恢复不该把烧钱账目一笔勾销。
-      if (blocked?.stopLoss) {
+      // 显式恢复暂停也开启新预算；普通外部受阻仍沿用原预算。
+      if (blocked?.stopLoss || wasPaused) {
         this.store.logEvent(issueId, 'stop_loss_resumed', {
           resumeState: resumeState ?? 'pending',
           ...(actor !== undefined ? { actor } : {}),
@@ -5312,6 +5437,12 @@ export class IssueEngine {
     if (issue.status !== 'cancelled' && issue.status !== 'done') {
       return { ok: false, error: `仅已取消或已完成的 issue 可重新运行（当前 ${issue.status}）` };
     }
+    const attempt=this.deps.moduleWorkspaces?.enabled(issue) ? this.deps.moduleWorkspaces.attempt(issue.id) : null;
+    if(attempt?.released_ts===null) {
+      if(attempt.result_sha) return {ok:false,error:'固定成果仍保留，请另建后续 issue 并引用保留成果'};
+      try {await this.deps.moduleWorkspaces!.stop(issue,this.project(issue.projectId)!);}
+      catch(e) {return {ok:false,error:String(e)};}
+    }
     const normalized = guidance.trim();
     if (issue.status === 'done' && !normalized) {
       return { ok: false, error: '退回已完成 issue 前必须填写未达目标或继续处理说明' };
@@ -5322,6 +5453,10 @@ export class IssueEngine {
       ...(normalized ? { note: normalized } : {}),
     }, () => {
       this.store.clearRunState(issueId);
+      if(attempt) {
+        if(attempt.released_ts!==null) this.deps.db.query('UPDATE issues SET conv_id=NULL,branch=NULL WHERE id=?').run(issueId);
+        else this.deps.db.query('UPDATE workspace_attempts SET stop_confirmed=0 WHERE id=? AND released_ts IS NULL').run(attempt.id);
+      }
       this.store.logEvent(issueId, 'reopened', {
         from: issue.status,
         ...(normalized ? { guidance: normalized } : {}),
@@ -5473,10 +5608,18 @@ export class IssueEngine {
       if (held) return { ok: true, from, to: from };
     }
     const commitTransition = (fresh: EngineIssue, finalize?: () => void): boolean => {
+      if (ev === 'unblock' && this.deps.moduleWorkspaces?.enabled(fresh)
+        && !this.deps.moduleWorkspaces.canStart(fresh, this.store.listByProject(fresh.projectId))) return false;
       const committed = this.transitionRepository.commit({
         issueId, from, to, event: ev, options: opts, fresh,
         workflowStatus: () => this.workflowSnapshot(issueId)?.status ?? null,
-        finalizeDb, finalize,
+        finalizeDb: () => {
+          if (ev === 'unblock' && this.deps.moduleWorkspaces?.enabled(fresh)) {
+            this.deps.moduleWorkspaces.compute(fresh.id, true);
+          }
+          finalizeDb?.();
+        },
+        finalize,
       });
       if (committed) issue = fresh;
       return committed;
@@ -5502,7 +5645,7 @@ export class IssueEngine {
         if (workspace.kind === 'project' && !issue.targetBranch) {
           // Preserve the legacy no-target path byte-for-byte: no Git observation or mutation.
         } else {
-        const prepared = await this.deps.mutex.runExclusive(gitLockKey(project.id), async () => {
+        const prepared = await this.deps.mutex.runExclusive(this.workspaceGitKey(project.id, issue.id), async () => {
           const fresh = this.store.get(issueId);
           if (!fresh || fresh.status !== from) return { kind: 'stale' as const };
           let branch: Awaited<ReturnType<typeof this.prepareIssueBranchLocked>>;
@@ -5553,12 +5696,12 @@ export class IssueEngine {
           return this.applyEventLocked(issueId, 'pause', { note: '执行工作区不可用' }, finalizeDb);
         }
         if (ev === 'start_direct') await this.precheckGitIdentity(project, issueId, workspace.cwd);
-        const inspected = await this.deps.mutex.runExclusive(gitLockKey(project.id), async () => {
+        const inspected = await this.deps.mutex.runExclusive(this.workspaceGitKey(project.id, issue.id), async () => {
           const fresh = this.store.get(issueId);
           if (!fresh || fresh.status !== from) return { kind: 'stale' as const };
           let preparedBranch: { branch: string; mode: string } | null = null;
           if (ev === 'start_direct') {
-            if (fresh.targetBranch || workspace.kind === 'design-worktree') {
+            if (fresh.targetBranch || workspace.kind !== 'project') {
               let prepared: Awaited<ReturnType<typeof this.prepareIssueBranchLocked>>;
               try { prepared = await this.prepareIssueBranchLocked(project, fresh, workspace); }
               catch (error) { return { kind: 'unavailable' as const, err: String(error).slice(0, 300) }; }
@@ -5652,6 +5795,7 @@ export class IssueEngine {
   private async syncModuleIssue(issueId: IssueId): Promise<void> {
     const issue = this.store.get(issueId);
     if (!issue?.moduleId) return;
+    if (this.deps.moduleWorkspaces?.enabled(issue)) return;
     const project = this.project(issue.projectId);
     const modules = project ? this.deps.modulesFor?.(project) : undefined;
     if (!modules) return;
@@ -5676,7 +5820,7 @@ export class IssueEngine {
   /**
    * 解锁 / 恢复 / 重开后重新进入驱动态：上一段已在 blocked/paused/done 时收口，这里补开新段。
    * 执行页对话按 segment 时间归属过滤消息，不补开的话续跑的整段对话都会被隐藏，
-   * 原生终端里却看得到（#20260928-0fa767d）。首段仍由 startIssue 绑定会话时开启，这里只接续。
+   * 原生终端里却看得到（#20260101-000006d）。首段仍由 startIssue 绑定会话时开启，这里只接续。
    */
   private reopenConversationSegment(issue: EngineIssue, to: IssueState): void {
     if (!DRIVING_STATES.includes(to) || !issue.moduleId || !issue.convId) return;
@@ -5711,7 +5855,12 @@ export class IssueEngine {
       return;
     }
     let workspace: EngineExecutionWorkspace;
-    try { workspace = await this.resolveExecutionWorkspace(issue, project); }
+    try {
+      const retained=to==='paused' ? this.deps.moduleWorkspaces?.attempt(issue.id) : null;
+      if(retained)this.deps.moduleWorkspaces!.assertOwned(retained);
+      workspace=retained ? {cwd:retained.cwd,kind:'module-worktree',branch:retained.branch,runId:retained.id}
+        : await this.resolveExecutionWorkspace(issue, project);
+    }
     catch (e) {
       this.store.logEvent(issue.id, 'error', { where: 'execution-workspace', error: String(e).slice(0, 200) });
       if (to === 'paused') {
@@ -5859,7 +6008,7 @@ export class IssueEngine {
             return;
           }
           const finished = await this.deps.mutex
-            .runExclusive(gitLockKey(project.id), async () => {
+            .runExclusive(this.workspaceGitKey(project.id, issue.id), async () => {
               const branch = await this.inspectIssueBranchLocked(project, issue, workspace);
               if (!branch.ok) return branch;
               const autoFailure = await this.gitDelivery.deliverLocked(project, issue, workspace);
@@ -5915,7 +6064,7 @@ export class IssueEngine {
           break;
         }
         const review = await this.deps.mutex
-          .runExclusive(gitLockKey(project.id), async () => {
+          .runExclusive(this.workspaceGitKey(project.id, issue.id), async () => {
             const branch = await this.inspectIssueBranchLocked(project, issue, workspace);
             if (!branch.ok) return branch;
             await this.stampImplTip(project, issue, workspace); // 定格本 issue 终点：范围收在 impl_base..impl_tip
@@ -5942,6 +6091,10 @@ export class IssueEngine {
         break;
       }
       case 'merging': {
+        if (workspace.kind === 'module-worktree' && this.deps.moduleWorkspaces) {
+          await this.completeWorkspaceIntegration(issue, project);
+          break;
+        }
         // 引擎不做本地合并：改动已经落在 issue 的实际工作分支上，合并/MR 由开发者在 GitLab 侧处理。
         // 保留 merging 这个过渡态只为不动状态机；此处直接放行到 done。
         this.store.logEvent(issueId, 'merge_skipped', { branch: issue.branch ?? '', reason: 'no-local-merge' });
@@ -5957,6 +6110,13 @@ export class IssueEngine {
       case 'blocked':
       case 'paused':
       case 'cancelled': {
+        if (workspace.kind === 'module-worktree' && this.deps.moduleWorkspaces) {
+          this.deps.moduleWorkspaces.compute(issue.id, false);
+          if (to === 'done' || to === 'cancelled') {
+            try { await this.deps.moduleWorkspaces.release(issue, project); }
+            catch (e) { this.store.logEvent(issue.id, 'workspace_retained', { reason: String(e) }); }
+          }
+        }
         if (to === 'blocked' || to === 'paused') this.workflowScheduler.pause(issueId, note ?? 'issue.blocked');
         if (to === 'cancelled') this.workflowScheduler.cancel(issueId);
         if (to === 'paused' && note?.startsWith('PANDA_INPUT_SUBMIT_UNCONFIRMED') && issue.convId) {
@@ -5971,7 +6131,7 @@ export class IssueEngine {
         // 就定格好了，不重记。分支准备只发生在首次进入 planning 前，故收尾不动工作树。
         if (this.implTipSha(issueId) === null) {
           const stamped = await this.deps.mutex
-            .runExclusive(gitLockKey(project.id), async () => {
+            .runExclusive(this.workspaceGitKey(project.id, issue.id), async () => {
               const branch = await this.inspectIssueBranchLocked(project, issue, workspace);
               if (!branch.ok) return branch;
               await this.stampImplTip(project, issue, workspace);
@@ -6011,12 +6171,13 @@ export class IssueEngine {
           // 沉淀进模块知识只会误导下一条 issue。
           if (to !== 'cancelled') await this.recordModuleKnowledge(project, issue, to);
         }
-        const reservesProject = (to === 'blocked' || to === 'paused') && this.workflowSnapshot(issueId)?.status === 'paused';
+        const reservesProject = workspace.kind === 'project' && (to === 'blocked' || to === 'paused') && this.workflowSnapshot(issueId)?.status === 'paused';
         if (!reservesProject) {
           // done/普通 blocked 接力
           await this.scheduleNext(issue.projectId, { preferModuleKey: moduleKeyOf(issue), source: 'relay' });
         }
         if (
+          workspace.kind === 'project' &&
           !(to === 'paused' && note?.startsWith('PANDA_INPUT_SUBMIT_UNCONFIRMED')) &&
           issue.convId &&
           !isBusy(this.store.listByProject(issue.projectId)) &&
@@ -6064,7 +6225,7 @@ export class IssueEngine {
       ownerUsername: this.ownerUsername(project),
     });
     const ensured = await this.deps.mutex
-      .runExclusive(gitLockKey(project.id), () => ensureGitIdentity(this.driverForProject(project), cwd, fallback))
+      .runExclusive(this.workspaceGitKey(project.id, issueId), () => ensureGitIdentity(this.driverForProject(project), cwd, fallback))
       .catch((e: unknown) => ({ ok: false as const, error: String(e).slice(0, 300) }));
     if (!ensured.ok) {
       this.store.logEvent(issueId, 'error', {
@@ -6092,6 +6253,7 @@ export class IssueEngine {
     issue: EngineIssue,
     status: IssueState,
   ): Promise<void> {
+    if (this.deps.moduleWorkspaces?.enabled(issue)) return;
     const modules = this.deps.modulesFor?.(project);
     if (!modules?.recordModuleKnowledge || issue.moduleId === null) return;
     try {
@@ -6167,12 +6329,12 @@ export class IssueEngine {
     const driver = this.driverForProject(project);
     // 调用方已持有 git:<projectId>；这里不得再次获取同 key（KeyedMutex 非重入）。
       const cwd = workspace.cwd;
-      const target = workspace.kind === 'design-worktree'
+      const target = workspace.kind !== 'project'
         ? workspace.branch ?? ''
         : issue.targetBranch?.trim() ?? '';
       if (!target) return { ok: false, err: '目标分支为空' };
 
-      if (workspace.kind === 'design-worktree') {
+      if (workspace.kind !== 'project') {
         const inspected = await this.inspectIssueBranchLocked(project, issue, workspace);
         return inspected.ok
           ? { ok: true, branch: inspected.branch, mode: 'current' }
@@ -6309,7 +6471,7 @@ export class IssueEngine {
       'HEAD',
     ]);
     const actual = currentResult.code === 0 ? currentResult.out.trim() : '';
-    const expected = (workspace.kind === 'design-worktree'
+    const expected = (workspace.kind !== 'project'
       ? workspace.branch ?? ''
       : issue.branch ?? issue.targetBranch ?? '').trim();
     if (expected && actual !== expected) {
@@ -6330,7 +6492,7 @@ export class IssueEngine {
    * server 装配 issueGitRef 时读取（见 routes/index）。
    */
   implBaseSha(issueId: IssueId): string | null {
-    return this.eventSha(issueId, 'impl_base', 'first');
+    return this.deps.moduleWorkspaces?.attempt(issueId)?.base_sha ?? this.eventSha(issueId, 'impl_base', 'first');
   }
 
   /**
@@ -6339,7 +6501,7 @@ export class IssueEngine {
    * **后续** issue 的提交也算进本 issue。issue 仍在推进（implementing/testing）时无此锚点，视图退回分支 tip。
    */
   implTipSha(issueId: IssueId): string | null {
-    return this.eventSha(issueId, 'impl_tip', 'last');
+    return this.deps.moduleWorkspaces?.attempt(issueId)?.result_sha ?? this.eventSha(issueId, 'impl_tip', 'last');
   }
 
   /**
@@ -6538,7 +6700,7 @@ export class IssueEngine {
     }
 
     this.store.setResultSummary(issue.id, text);
-    if (workspace.kind === 'design-worktree') {
+    if (workspace.kind !== 'project') {
       await this.deps.executionWorkspaces?.recordResult?.(issue, workspace, text).catch((e) => {
         this.store.logEvent(issue.id, 'error', {
           where: 'design-result', error: String(e).slice(0, 200),
@@ -6577,8 +6739,9 @@ export class IssueEngine {
    * 门禁与让位观测在 tickIssue（I2）。失败 → paused（返回 false，调用方停止本阶段动作）。
    */
   private async ensureActiveConv(issue: EngineIssue, resuming = false): Promise<boolean> {
-    const current = this.deps.convs.currentConv(issue.projectId);
-    if (current !== undefined && (!resuming || current === issue.convId)) return true;
+    const current = this.issueConversationActive(issue) ? issue.convId ?? undefined : this.deps.convs.currentConv(issue.projectId);
+    if (this.issueConversationActive(issue)) return true;
+    if (!this.deps.moduleWorkspaces?.enabled(issue) && current !== undefined && (!resuming || current === issue.convId)) return true;
     try {
       await this.activateConv(issue);
       return true;
@@ -6608,7 +6771,7 @@ export class IssueEngine {
 
   /** 自动文本投递的统一前置条件：目标逻辑会话当前激活，且窗格已画出真实代理输入行。 */
   private async issueInputReady(issue: EngineIssue): Promise<boolean> {
-    if (!issue.convId || this.deps.convs.currentConv(issue.projectId) !== issue.convId) return false;
+    if (!issue.convId || !this.issueConversationActive(issue)) return false;
     const session = this.deps.convs.tmuxName(issue.projectId, issue.convId);
     const pane = await this.executionForIssue(issue).driver.capturePane(session).catch(() => '');
     return paneHasAgentInput(issue.agent, pane);
@@ -6931,6 +7094,41 @@ export class IssueEngine {
     return out;
   }
 
+  /** 环境恢复使用持久事件保存退避与总预算；重启不清零，也不消耗 tests_failed。 */
+  private scheduleEnvironmentRecovery(issueId:IssueId):void {
+    if (this.store.get(issueId)?.status !== 'paused' || !this.deps.moduleWorkspaces?.enabled({id:issueId})) return;
+    const retries=this.store.countEventsSince(issueId,'environment_recovery_attempt',this.store.lastEventId(issueId,'reopened'));
+    const pauseEventId=this.store.lastEnterEventId(issueId,'paused');
+    if(retries>=3) {
+      this.store.logEvent(issueId,'environment_recovery_exhausted',{pauseEventId,note:'环境自动恢复已达 3 次，保留现场和诊断，修复环境后可显式继续'});
+      return;
+    }
+    this.store.logEvent(issueId,'environment_recovery_scheduled',{pauseEventId,retryAt:this.now()+[30000,120000,300000][retries]!,retry:retries+1});
+  }
+
+  private environmentRecoveryDue(issueId:IssueId):boolean {
+    const events=this.store.listEvents(issueId);
+    const scheduled=events.filter(e=>e.kind==='environment_recovery_scheduled').at(-1);
+    if(!scheduled || this.store.lastEventId(issueId,'environment_recovery_exhausted')>scheduled.id) return false;
+    try {
+      const data=JSON.parse(scheduled.dataJson??'{}');
+      return data.pauseEventId===this.store.lastEnterEventId(issueId,'paused') && data.retryAt<=this.now();
+    } catch {return false;}
+  }
+
+  private async recoverEnvironment(issue:EngineIssue):Promise<void> {
+    if(this.store.get(issue.id)?.status!=='paused' || !this.environmentRecoveryDue(issue.id)) return;
+    if(!this.deps.moduleWorkspaces?.canStart(issue,this.store.listByProject(issue.projectId))) return;
+    const retries=this.store.countEventsSince(issue.id,'environment_recovery_attempt',this.store.lastEventId(issue.id,'reopened'));
+    if(retries>=3) {this.scheduleEnvironmentRecovery(issue.id);return;}
+    this.store.logEvent(issue.id,'environment_recovery_attempt',{retry:retries+1,pauseEventId:this.store.lastEnterEventId(issue.id,'paused')});
+    const result=await this.retryWorkspace(issue.id);
+    if(!result.ok) {
+      this.store.logEvent(issue.id,'environment_recovery_failed',{note:result.error});
+      this.scheduleEnvironmentRecovery(issue.id);
+    }
+  }
+
   /** watcher 主循环：每项目单飞，不同项目并行；每 issue 的错误独立落事件。 */
   async tick(): Promise<void> {
     if (!this.acceptingTicks) return;
@@ -6939,7 +7137,7 @@ export class IssueEngine {
       if (!flight.stuckWarned && this.now() - flight.since > TICK_STUCK_WARN_MS) {
         flight.stuckWarned = true;
         console.error(
-          `[engine] 项目 ${projectId} issue #${flight.issueId} tick 在途已 ` +
+          `[engine] 项目 ${this.store.get(flight.issueId)?.projectId ?? projectId} issue #${flight.issueId} tick 在途已 ` +
             `${Math.round((this.now() - flight.since) / 1000)}s 未归还，` +
             `疑似执行机调用卡死（不重置，等待其归还）`,
         );
@@ -6947,12 +7145,24 @@ export class IssueEngine {
     }
 
     const started: Promise<void>[] = [];
-    for (const issue of this.store.listDriving()) {
-      if (!this.acceptingTicks || this.tickFlights.has(issue.projectId)) continue;
+    const environmental = this.deps.moduleWorkspaces ? this.deps.db.query<{id:IssueId},never[]>(
+      "SELECT i.id FROM issues i JOIN projects p ON p.id=i.project_id WHERE i.status='paused' AND i.workspace_mode='module' AND p.status='active'").all()
+      .map(r=>this.store.get(r.id)!).filter(i=>i && this.environmentRecoveryDue(i.id)) : [];
+    for (const issue of environmental.concat(this.store.listDriving()).concat(this.deps.moduleWorkspaces ? this.deps.db.query<{id:IssueId},never[]>(
+      "SELECT id FROM issues WHERE status='merging' AND workspace_mode='module'").all().map(r => this.store.get(r.id)!).filter(Boolean) : [])) {
+      const flightKey = this.deps.moduleWorkspaces?.enabled(issue) ? `issue:${issue.id}` : `project:${issue.projectId}`;
+      if (!this.acceptingTicks || this.tickFlights.has(flightKey)) continue;
 
       let promise!: Promise<void>;
       promise = Promise.resolve()
-        .then(() => this.tickIssue(issue))
+        .then(async () => {
+          if (issue.status === 'paused') {
+            await this.recoverEnvironment(issue);
+          } else if (issue.status === 'merging' && this.deps.moduleWorkspaces?.enabled(issue)) {
+            const project = this.project(issue.projectId);
+            if (project) await this.transitionCoordinator.run(issue.id, () => this.completeWorkspaceIntegration(issue, project));
+          } else await this.tickIssue(issue);
+        })
         .catch(async (e) => {
           this.store.logEvent(issue.id, 'error', { where: 'tick', error: String(e).slice(0, 300) });
           if (e instanceof InputSubmitUnconfirmedError) {
@@ -6961,10 +7171,10 @@ export class IssueEngine {
           }
         })
         .finally(() => {
-          const current = this.tickFlights.get(issue.projectId);
-          if (current?.promise === promise) this.tickFlights.delete(issue.projectId);
+          const current = this.tickFlights.get(flightKey);
+          if (current?.promise === promise) this.tickFlights.delete(flightKey);
         });
-      this.tickFlights.set(issue.projectId, {
+      this.tickFlights.set(flightKey, {
         issueId: issue.id,
         since: this.now(),
         stuckWarned: false,
@@ -6973,6 +7183,10 @@ export class IssueEngine {
       started.push(promise);
     }
     await Promise.allSettled(started);
+    if (this.deps.moduleWorkspaces) {
+      const projects = this.deps.db.query<{project_id:number},never[]>("SELECT DISTINCT project_id FROM issues WHERE status='pending'").all();
+      await Promise.allSettled(projects.map(p => this.scheduleNext(p.project_id, {source:'relay'})));
+    }
   }
 
   /**
@@ -7062,7 +7276,7 @@ export class IssueEngine {
     }
     if (!issue.convId) return;
     const convId = issue.convId;
-    const current = this.deps.convs.currentConv(issue.projectId);
+    const current = this.issueConversationActive(issue) ? issue.convId ?? undefined : this.deps.convs.currentConv(issue.projectId);
     if (current === undefined) {
       // I1：项目没有任何激活对话（v1→v2 迁移只登记了 conv、重启丢激活行等）——
       // 驱动中的 issue 自行激活自己的对话，否则永远静默冻结在 driving 态。
@@ -7777,6 +7991,9 @@ export class IssueEngine {
     session: string,
     inputReady = true,
   ): Promise<void> {
+    const owner = this.store.get(issueId);
+    if (owner && this.deps.moduleWorkspaces?.enabled(owner) && (!this.issueConversationActive(owner)
+      || !owner.convId || this.deps.convs.tmuxName(owner.projectId,owner.convId)!==session)) return;
     for (const msg of msgs) {
       if (msg.role === 'tool_use' && msg.tool === 'Skill') this.store.logEvent(issueId,'skill_invoked',{tool:msg.tool,input:msg.input?.slice(0,300),callId:msg.toolCallId});
       else if (msg.role === 'tool_use' && /SKILL\.md/.test(msg.input ?? '')) this.store.logEvent(issueId,'skill_read',{tool:msg.tool,input:msg.input?.slice(0,300),callId:msg.toolCallId});
@@ -7965,7 +8182,7 @@ export class IssueEngine {
           // 含本次。只数**本轮**的失败：复活（#93）等于重新开始，上一轮攒下的失败次数不能
           // 继续压在头上——否则一条曾经失败 3 次被取消的 issue，复活后第一次失败就直接 blocked。
           const failCount =
-            this.store.countEventsSince(id, 'tests_failed', this.store.lastEventId(id, 'reopened')) + 1;
+            this.store.countEventsSince(id, 'tests_failed', Math.max(this.store.lastEventId(id, 'reopened'), this.stopLossAnchor(id))) + 1;
           this.store.logEvent(id, 'tests_failed', { note: failed.note, failCount });
           await this.applyEvent(id, 'tests_failed', { failCount, note: failed.note || '测试未通过' });
         }
@@ -7973,6 +8190,38 @@ export class IssueEngine {
       }
       default:
         return;
+    }
+  }
+
+  private async completeWorkspaceIntegration(issue: EngineIssue, project: Project): Promise<void> {
+    const workspaces = this.deps.moduleWorkspaces!;
+    if (this.store.get(issue.id)?.status !== 'merging') return;
+    try {
+      const result = await workspaces.integrate(issue, project, async cwd => {
+        const validation = await this.runValidationGate(issue, project, cwd);
+        if (validation.outcome === 'error') throw new DependencyPreparationError(validation.note);
+        return validation.outcome === 'passed' || validation.outcome === 'skipped';
+      });
+      if (!result.done) {
+        const last = this.store.listEvents(issue.id).filter(e => e.kind === 'integration_wait').at(-1);
+        if (last?.dataJson !== JSON.stringify({reason:result.reason})) this.store.logEvent(issue.id, 'integration_wait', {reason:result.reason});
+        return;
+      }
+      const workspace = await this.resolveExecutionWorkspace(issue, project);
+      const summary = await this.collectResultSummary(project, issue, 'done', workspace);
+      if (summary.kind === 'incomplete') { await this.applyEventLocked(issue.id, 'block', {note:summary.reason}); return; }
+      this.store.logEvent(issue.id, 'workspace_integrated', {sha:workspaces.attempt(issue.id)?.integrated_sha});
+      const pushed = await workspaces.push(issue, project);
+      if (!pushed.ok) this.store.logEvent(issue.id, 'auto_push_failed', {detail:pushed.detail});
+      await this.applyEventLocked(issue.id, 'merged');
+    } catch(e) {
+      const reason=String(e).slice(0,500);
+      await this.applyEventLocked(issue.id, 'pause', { note: reason });
+      if (e instanceof DependencyPreparationError || e instanceof WorkspaceOperationUncertain) this.scheduleEnvironmentRecovery(issue.id);
+      workspaces.compute(issue.id,false);
+      this.deps.db.query('UPDATE workspace_attempts SET diagnostic=? WHERE issue_id=? AND released_ts IS NULL').run(reason,issue.id);
+      const last=this.store.listEvents(issue.id).filter(event=>event.kind==='integration_wait').at(-1);
+      if(last?.dataJson!==JSON.stringify({reason}))this.store.logEvent(issue.id,'integration_wait',{reason});
     }
   }
 
@@ -8048,6 +8297,7 @@ export class IssueEngine {
   private async runValidationGate(
     issue: EngineIssue,
     project: Project,
+    candidateCwd?: string,
   ): Promise<{ outcome: 'passed' | 'failed' | 'skipped' | 'error'; note: string }> {
     if (project.validationPolicy === 'none') {
       this.store.logEvent(issue.id, 'validation_skipped', { reason: 'policy-none' });
@@ -8067,9 +8317,11 @@ export class IssueEngine {
     } catch (e) {
       this.store.logEvent(issue.id, 'error', { where: 'validation-workspace', error: String(e).slice(0, 200) });
       this.store.logEvent(issue.id,'validation_error',{reason:'workspace-unavailable'});
+      this.store.logEvent(issue.id,'environment_preparation_failed',{stage:'validation-workspace',note:String(e).slice(-2000)});
       return { outcome: 'error', note: '执行工作区不可用，恢复后重试验证' };
     }
-    const scope = await this.computeValidationScope(issue, workspace);
+    if (candidateCwd) workspace = { ...workspace, cwd: candidateCwd };
+    const scope: ValidationScope = candidateCwd ? {kind:'full',files:[],reason:'集成候选'} : await this.computeValidationScope(issue, workspace);
     this.store.setValidationScope(issue.id, scope);
 
     const commands = resolveValidationCommands(
@@ -8090,11 +8342,23 @@ export class IssueEngine {
       commands: commands.map((c) => c.label),
     });
     const driver = this.driverForProject(project);
+    if (this.deps.moduleWorkspaces?.enabled(issue)) {
+      this.store.logEvent(issue.id, 'environment_preparing', { cwd: workspace.cwd, stage: candidateCwd ? 'candidate' : 'testing' });
+      try {
+        await prepareDependencies(driver, workspace.cwd, this.deps.moduleWorkspaces.environment(issue.id, workspace.cwd));
+        this.store.logEvent(issue.id, 'environment_ready', { cwd: workspace.cwd });
+      } catch (error) {
+        const note = String(error).slice(-2000);
+        this.store.logEvent(issue.id, 'environment_preparation_failed', { cwd: workspace.cwd, note });
+        return { outcome: 'error', note };
+      }
+    }
     const cacheable = project.validationCommands === null && commands.every(c => c.argv[0] === 'bun');
     const workspaceIdentity = await validationIdentity(driver, workspace.cwd);
     const identity = cacheable ? workspaceIdentity : null;
     const passed = new Set(this.store.listEvents(issue.id).filter(e => e.kind === 'validation_check_passed')
       .flatMap(e => { try { return [JSON.parse(e.dataJson ?? '{}').key as string]; } catch { return []; } }));
+    let capturedOutputChars = 0;
     const executor = {
       runCommand: async (cwd: string, argv: string[], timeoutMs: number) => {
         const key = identity ? validationCheckKey(identity, argv) : null;
@@ -8102,7 +8366,13 @@ export class IssueEngine {
           this.store.logEvent(issue.id, 'validation_reused', { key, argv });
           return { code: 0, out: '', err: '', durationMs: 0, timedOut: false };
         }
-        const result = await driver.runCommand(cwd, argv, timeoutMs);
+        const result = await driver.runCommand(cwd, argv, timeoutMs, this.deps.moduleWorkspaces?.enabled(issue) ? this.deps.moduleWorkspaces.environment(issue.id, cwd) : undefined);
+        capturedOutputChars = result.out.trim().length + result.err.trim().length;
+        this.store.logEvent(issue.id, 'validation_diagnostic', redactDiagnosticValue({
+          argv, code: result.code, timedOut: result.timedOut, durationMs: result.durationMs,
+          out: redactDiagnostic(result.out), err: redactDiagnostic(result.err),
+          sourceTruncated: /…\[前 \d+ 字省略\]…/.test(result.out + result.err),
+        }) as Record<string, unknown>);
         if (key && result.code === 0 && !result.timedOut) {
           // Commands that change inputs must never certify the old identity.
           if (await validationIdentity(driver, cwd) === identity) {
@@ -8152,11 +8422,12 @@ export class IssueEngine {
       code: failed.code,
       timedOut: failed.timedOut,
       durationMs: run.durationMs,
-      tail: run.tail.slice(0, 2000),
+      tail: redactDiagnostic(run.tail).slice(0, 2000),
+      summaryTruncated: capturedOutputChars > run.tail.length,
     });
     return {
       outcome: 'failed',
-      note: `门禁「${failed.label}」未通过（退出码 ${failed.code}）：\n${run.tail}`.slice(0, 1600),
+      note: `门禁「${failed.label}」未通过（退出码 ${failed.code}）：\n${redactDiagnostic(run.tail)}`.slice(0, 1600),
     };
   }
 
@@ -8187,6 +8458,7 @@ export class IssueEngine {
       // The graph has already finished: returning to implementing would immediately replay
       // completed nodes and loop. Preserve the integrated workspace for a deliberate repair.
       await apply(issueId, 'pause', { note: gate.note }, recordReport);
+      if (gate.outcome === 'error' && this.store.lastEventId(issueId,'environment_preparation_failed') > this.store.lastEventId(issueId,'environment_ready')) this.scheduleEnvironmentRecovery(issueId);
       return;
     }
     await apply(issueId, 'tests_passed', { note: '工作流最终工作区验证已完成' }, recordReport);
@@ -8242,11 +8514,12 @@ export class IssueEngine {
     const gateDecision = decideValidationGate(gate, source);
     if (gateDecision.event !== 'tests_failed') {
       await this.applyEvent(issueId, gateDecision.event, gateDecision.note ? { note: gateDecision.note } : {});
+      if (gate.outcome === 'error' && this.store.lastEventId(issueId,'environment_preparation_failed') > this.store.lastEventId(issueId,'environment_ready')) this.scheduleEnvironmentRecovery(issueId);
       return;
     }
     // 只数**本轮**的失败（复活后重新开始，口径同哨兵路径）
     const failCount =
-      this.store.countEventsSince(issueId, 'tests_failed', this.store.lastEventId(issueId, 'reopened')) + 1;
+      this.store.countEventsSince(issueId, 'tests_failed', Math.max(this.store.lastEventId(issueId, 'reopened'), this.stopLossAnchor(issueId))) + 1;
     this.store.logEvent(issueId, 'tests_failed', { note: gateDecision.note, failCount, source: 'validation' });
     await this.applyEvent(issueId, 'tests_failed', { failCount, note: gateDecision.note });
   }
@@ -8334,6 +8607,7 @@ export class IssueEngine {
     via: 'sentinel' | 'judge',
     text?: string,
   ): Promise<void> {
+    this.deps.moduleWorkspaces?.compute(issue.id, false);
     this.store.logEvent(issue.id, 'clarify_questions', {
       source: 'exec',
       stage,
@@ -8366,6 +8640,9 @@ export class IssueEngine {
     if (!project) throw new Error(`项目 ${issue.projectId} 不存在`);
     await this.deps.mutex.runExclusive(tmuxLockKey(session), async () => {
       beforeSend?.();
+      const managed = this.deps.db.query<{conversation_id:string},[number]>(`SELECT a.conversation_id FROM workspace_attempts a JOIN module_workspaces w ON w.id=a.workspace_id WHERE w.project_id=?`).all(issue.projectId)
+        .find(a => a.conversation_id && this.deps.convs.tmuxName(issue.projectId,a.conversation_id) === session);
+      if (managed && !managedConversationOwned(this.deps.db,issue.projectId,managed.conversation_id)) throw new Error('工作区输入归属失效');
       if (this.effects.hasUncertainInput(issue.id)) {
         throw new InputSubmitUnconfirmedError('此前终端输入结果不确定；已停止后续自动注入，需先核对现场');
       }

@@ -1,3 +1,7 @@
+import { issueDiagnosticMessages } from '../domains/issue-diagnostics';
+import { localPlanMessages } from '../domains/local-plans';
+import { agentModelMessages } from '../domains/agent-models';
+import { moduleWorkspaceMessages } from '../domains/module-workspace';
 import { roomMemberMessages } from '../domains/rooms-members';
 import { roomChatMessages } from '../domains/rooms-chat';
 import { roomExtraMessages } from '../domains/rooms-extra';
@@ -24,6 +28,10 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const jaCatalog = {
+  ...issueDiagnosticMessages,
+  ...localPlanMessages["ja"],
+  ...agentModelMessages,
+  ...moduleWorkspaceMessages["ja"],
   ...roomMemberMessages["ja"],
   ...roomChatMessages["ja"],
   ...roomExtraMessages["ja"],
@@ -150,4 +158,5 @@ export const jaCatalog = {
   'ui.moduleIssueCount':'{count, plural, other {issue # 件}}','ui.organizeResultCreate':'モジュール「{name}」を作成しました（{slug} · {agent}）','ui.organizeResultRename':'モジュール名を「{name}」に変更しました（{slug}）','ui.organizeResultMerge':'{count, plural, other {「{target}」に統合し、issue # 件を移動しました}}','ui.organizeResultMove':'{count, plural, other {issue # 件を「{target}」へ移動しました}}',
   'ui.organizeFailureTimeout':'前回の分析はタイムアウトしました。再実行できます。','ui.organizeFailureNoOutput':'前回の分析では整理プランが返されませんでした。再実行できます。','ui.organizeFailureError':'前回の分析に失敗しました。再実行できます。','ui.organizeFailureDetail':'技術的な詳細：{detail}',
   'git.imageBefore':'変更前','git.imageAfter':'変更後','git.openImage':'{name} を開く','git.viewImage':'画像 {name} を表示','git.downloadImage':'{name} をダウンロード',
+  'admin.directoryRequired': "{field}を入力してください。絶対パスを入力するか、ディレクトリを選択してください。",
 } as const satisfies MessageCatalog;

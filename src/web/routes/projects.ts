@@ -1415,6 +1415,7 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
         const wb = parseWorkBranch(b);
         if (wb.error) return wb.error;
         if (wb.value !== undefined) {
+          if (db.query('SELECT 1 FROM module_workspaces WHERE project_id=? LIMIT 1').get(id)) return json({ok:false,error:'模块工作区已启用，集成目标保持固定'},409);
           sets.push('work_branch = ?');
           vals.push(wb.value);
         }
@@ -1438,6 +1439,10 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
         if (typeof b.manualReview === 'boolean') {
           sets.push('manual_review = ?');
           vals.push(b.manualReview ? 1 : 0);
+        }
+        if ('moduleConcurrency' in b) {
+          if (!Number.isInteger(b.moduleConcurrency) || Number(b.moduleConcurrency)<1 || Number(b.moduleConcurrency)>32) return json({ok:false,error:'模块并发上限须为 1 到 32 的整数'},400);
+          sets.push('module_concurrency = ?'); vals.push(Number(b.moduleConcurrency));
         }
         // 门禁命令（047 / #279）：数组 = 显式配置；null = 清回「未配置」（按 package.json 探测）。
         // 空数组是「显式不跑门禁」，与 null 不同，必须原样落库。

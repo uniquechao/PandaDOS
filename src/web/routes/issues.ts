@@ -1,3 +1,4 @@
+import { diagnosticData, redactDiagnosticValue } from '../../../shared/issue-diagnostics';
 import { normalizeSkillPolicy } from '../../core/skill-policy';
 /**
  * web/routes/issues —— issue CRUD + start + 卡点 approve/reject + 时间线（spec §9-2）。
@@ -804,6 +805,18 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
       },
     },
     {
+      method:'POST',
+      path:'/api/projects/:projectId/issues/:issueId/workspace/retry',
+      auth:'project-access',
+      handler:async({req,params,user})=>{
+        const issue=issueOf(engine,params);
+        if(!issue)return json({ok:false,error:'无此 issue'},404);
+        const body=await readBody(req);
+        const result=await engine.retryWorkspace(issue.id,user!.id,body.confirmInput===true);
+        return result.ok?json({ok:true,issue:engine.store.get(issue.id)}):json(result,409);
+      },
+    },
+    {
       // 复活重跑（#93）：cancelled → pending，随后接力立刻开跑。
       // 「取消 → 改需求 → 重新运行」里的最后一步，所以**编辑要在调本接口之前做完**——
       // 一落到 pending 就可能马上开跑，没有再改的窗口。回 issue 便于前端直接刷新状态。
@@ -850,6 +863,23 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
       },
     },
 
+    {
+      method: 'GET',
+      path: '/api/projects/:projectId/issues/:issueId/diagnostics',
+      auth: 'project-access',
+      handler: ({ params }) => {
+        const issue = issueOf(engine, params);
+        if (!issue) return json({ ok: false, error: '无此 issue' }, 404);
+        const events = engine.store.listEvents(issue.id).filter(e =>
+          /^(validation_|environment_|tests_failed$|stop_loss|transition$|error$)/.test(e.kind));
+        return json({ issueId: issue.id, status: issue.status,
+          // 历史轮次只存摘要时，明确说明无法补回原始输出。
+          retainedOutput: events.some(e => e.kind === 'validation_diagnostic'),
+          events: events.map(e => ({ ...e, dataJson: e.dataJson ? JSON.stringify(redactDiagnosticValue(diagnosticData(e))) : null })),
+        });
+      },
+    },
+
     // ===== 时间线（全量 events，不截断） =====
     {
       method: 'GET',
@@ -858,7 +888,13 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
       handler: ({ params }) => {
         const issue = issueOf(engine, params);
         if (!issue) return json({ ok: false, error: '无此 issue' }, 404);
-        return json(engine.store.listEvents(issue.id));
+        return json(engine.store.listEvents(issue.id).map(e => {
+          const data = diagnosticData(e);
+          if (e.kind === 'validation_diagnostic') {
+            delete data.out; delete data.err;
+          }
+          return { ...e, dataJson: e.dataJson ? JSON.stringify(redactDiagnosticValue(data)) : null };
+        }));
       },
     },
 

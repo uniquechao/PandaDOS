@@ -16,6 +16,7 @@ import { MAX_TMUX_SCROLL_LINES, TMUX_WIN_COLS, TMUX_WIN_ROWS } from '../../execu
 
 export interface TermWsData {
   kind: 'term';
+  authorized?: () => boolean;
   session: string;
   cols: number;
   rows: number;
@@ -44,6 +45,7 @@ function safeSend(ws: ServerWebSocket<unknown>, data: string | Uint8Array): void
 
 export async function termOpen(ws: ServerWebSocket<TermWsData>): Promise<void> {
   const d = ws.data;
+  if (d.authorized && !d.authorized()) { ws.close(); return; }
   let pty: PtyChannel;
   // issue #95：会话平时被锁成 220×50（manual），attach 前先把定尺权交还客户端，
   // 否则手机上只能看见窗口左上角一小块；断开时在 termClose 里收回。
@@ -60,7 +62,7 @@ export async function termOpen(ws: ServerWebSocket<TermWsData>): Promise<void> {
     }
     return;
   }
-  if (d.closed) {
+  if (d.closed || (d.authorized && !d.authorized())) {
     // openPty 在途时客户端已断：立刻回收，不留孤儿 PTY
     pty.close();
     return;
@@ -80,6 +82,7 @@ export async function termOpen(ws: ServerWebSocket<TermWsData>): Promise<void> {
 
 export function termMessage(ws: ServerWebSocket<TermWsData>, msg: string | Uint8Array): void {
   const d = ws.data;
+  if (d.authorized && !d.authorized()) { ws.close(); return; }
   if (typeof msg === 'string') {
     // 控制帧：{type:'resize',cols,rows} | {type:'scroll',direction,lines}
     let j: unknown;
@@ -111,7 +114,7 @@ export function termMessage(ws: ServerWebSocket<TermWsData>, msg: string | Uint8
       const direction = f.direction;
       const lines = Math.min(MAX_TMUX_SCROLL_LINES, f.lines);
       d.scrollQueue = d.scrollQueue
-        .then(() => (d.closed ? undefined : d.driver.scrollPane(d.session, direction, lines)))
+        .then(() => (d.closed || (d.authorized && !d.authorized()) ? undefined : d.driver.scrollPane(d.session, direction, lines)))
         .catch(() => {});
     }
     return;

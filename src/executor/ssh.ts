@@ -1,3 +1,7 @@
+import { discoverAgentModels, applyAgentModel } from './agent-model-protocol';
+import type { AgentModelApplyRequest } from '../../shared/agent-models';
+import { STOP_WORKSPACE_PROCESSES, workspaceEnvArgs } from './workspace-processes';
+import { idleSessionProbeArgs, parseIdleSession, idleProcessTree, idleSessionStopArgs, type IdleSessionState } from './idle-session';
 /**
  * executor/ssh —— SshDriver：ExecutorDriver 的生产实现（spec §3 + 评审 5.1 逐条落地）。
  *
@@ -274,6 +278,14 @@ export class SshDriver implements ExecutorDriver {
     return this.conn.exec([cmd, ...args.map(shq)].join(' '), timeoutMs);
   }
 
+  discoverAgentModels(agent: AgentKind, cwd: string, env?: Record<string,string>) {
+    return discoverAgentModels(this, agent, cwd, env);
+  }
+
+  applyAgentModel(request: AgentModelApplyRequest) {
+    return applyAgentModel(this, request);
+  }
+
   async findExecutable(agent: AgentKind): Promise<string | null> {
     if (agent !== 'claude' && agent !== 'codex') throw new Error('不支持的 Agent 命令');
     const r = await this.exec('command', ['-v', '--', agent]);
@@ -327,14 +339,37 @@ export class SshDriver implements ExecutorDriver {
    * 换行腰斩、打断菜单检测（评审 [M5]，5.1#3「建会话显式大终端尺寸」）。
    * 参数与 LocalDriver 同源（driver.ts tmuxNewSessionArgs，I6 收敛）。
    */
-  async createSession(name: string, cwd: string): Promise<void> {
-    const r = await this.exec('tmux', tmuxNewSessionArgs(name, cwd));
+  async createSession(name: string, cwd: string, env?: Record<string, string>): Promise<void> {
+    const r = await this.exec('tmux', tmuxNewSessionArgs(name, cwd, env));
     if (r.code !== 0) throw new Error(`tmux new-session 失败: ${r.err || r.out}`);
+  }
+
+  async stopSessionConfirmed(session: string, attempt: string, executorStartTs: number): Promise<void> {
+    const stopped = await this.runCommand('/', ['python3', '-c', STOP_WORKSPACE_PROCESSES, attempt, String(executorStartTs)], 15_000);
+    if (stopped.code !== 0 || stopped.timedOut || stopped.out.trim() !== 'stopped') throw new Error('未能确认工作区进程已停止：'+(stopped.err||stopped.out).slice(0,500));
+    const killed = await this.exec('tmux', ['kill-session', '-t', session]);
+    if (killed.code !== 0 && !/can't find session|no server running|error connecting.*No such file/i.test(killed.err)) {
+      throw new Error('未能确认工作区终端已停止：' + killed.err);
+    }
   }
 
   async killSession(name: string): Promise<void> {
     const r = await this.exec('tmux', ['kill-session', '-t', name]);
     if (r.code !== 0) throw new Error(`tmux kill-session 失败: ${r.err || r.out}`);
+  }
+
+  async inspectIdleSession(name: string): Promise<IdleSessionState | null> {
+    const result=await this.exec('tmux',idleSessionProbeArgs(name));
+    const state=result.code===0 ? parseIdleSession(name,result.out) : null;
+    if (!state) return null;
+    const ps=await this.exec('ps',['-axo','pid=,ppid=,comm=']);
+    state.processesIdle=ps.code===0 && idleProcessTree(state,ps.out);
+    return state;
+  }
+
+  async sleepSessionIfIdle(snapshot: IdleSessionState): Promise<boolean> {
+    const result=await this.exec('tmux',idleSessionStopArgs(snapshot));
+    return result.code===0 && result.out.trim()==='panda-idle-slept';
   }
 
   /** 注入文本并提交：净化后等待 pane 稳定，仅在确认未提交时补交一次 Enter。 */
@@ -669,10 +704,12 @@ export class SshDriver implements ExecutorDriver {
    * 兑现方式。`cd` 也走 shq，且与命令之间用 `&&` 串（这个 `&&` 是控制面写死的，不来自入参）。
    * conn.exec 超时是 reject，这里翻译成 `timedOut`，与 LocalDriver 行为一致。
    */
-  async runCommand(cwd: string, argv: string[], timeoutMs: number): Promise<CommandResult> {
+  async runCommand(cwd: string, argv: string[], timeoutMs: number, env?: Record<string,string>): Promise<CommandResult> {
+    workspaceEnvArgs(env);
     if (argv.length === 0) throw new Error('runCommand 需要至少一个命令词');
     const started = Date.now();
-    const line = `cd ${shq(cwd)} && ${argv.map(shq).join(' ')}`;
+    const words = env ? ['env', ...workspaceEnvArgs(env), ...argv] : argv;
+    const line = `cd ${shq(cwd)} && ${words.map(shq).join(' ')}`;
     try {
       const r = await this.conn.exec(line, timeoutMs);
       return {

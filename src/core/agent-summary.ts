@@ -23,6 +23,7 @@ import {
   pickAffirmative,
   runAgentArtifacts,
   type AgentArtifactDriver,
+  type AgentArtifactDiagnostics,
 } from './agent-artifact-runner';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
 import { outputLanguageInstruction, promptLanguage } from '../agents/prompts/language';
@@ -36,6 +37,9 @@ export type SummaryDriver = AgentArtifactDriver;
 
 /** scratch 目录名（挂在项目 cwd 下；README.md 在仓库根，不在此，故清理不误伤） */
 export const SCRATCH_DIR = '.panda/tmp/summary';
+
+/** 记忆增量维护涉及历史与代码核对，使用独立预算，不放大全部旁路任务的等待时间。 */
+export const MEMORY_SUMMARY_TIMEOUT_MS = 15 * 60 * 1000;
 const REL_HISTORY = `${SCRATCH_DIR}/history.md`;
 const REL_UNDERSTANDING = `${SCRATCH_DIR}/understanding.md`;
 const REL_DONE = `${SCRATCH_DIR}/done`;
@@ -84,6 +88,9 @@ export function buildSummaryPrompt(
   target: SummaryTarget = 'readme',
   locale: SupportedLocale = 'zh-Hans',
 ): string {
+  const scope = promptLanguage(locale) === 'en'
+    ? 'Use existing memory and the history digest first; inspect at most 10 directly relevant source/configuration files. Do not scan the entire repository, run tests/builds, start subtasks, or make unrelated fixes. Preserve existing instruction bridges and follow their authoritative memory destination. Finish the requested artifacts promptly.'
+    : '优先依据已有记忆和历史摘要，最多核对 10 个直接相关的源码或配置文件；不要全库扫描、运行测试或构建、创建子任务或修复无关问题。保留已有指令桥，遵循其指定的权威记忆文件路径，尽快完成要求的产物。';
   if (promptLanguage(locale) === 'en') {
     const who = projectName ? `project "${projectName}"` : 'this project';
     const targetFile = target === 'memory' ? memoryFileFor(agent) : 'README.md';
@@ -94,6 +101,7 @@ export function buildSummaryPrompt(
       `(2) Incrementally update or create root ${targetFile} so it accurately preserves durable project context; do not remove still-valid content.`,
       `(3) Write a user-facing ${artifact} to ${REL_UNDERSTANDING}, using plain text or light Markdown and at most 600 words.`,
       `(4) As the final step, create ${REL_DONE} containing ok.`,
+      target === 'memory' ? scope : '',
       `Do not modify unrelated code.`,
       agent === 'codex' ? 'Proceed without requesting approval.' : '',
       outputLanguageInstruction(locale),
@@ -108,6 +116,7 @@ export function buildSummaryPrompt(
       `(2) 用简洁准确的中文更新（若不存在则新建）项目根目录的 ${memFile}（项目记忆/长期上下文文件），把「后续对话需要知道的持久信息」沉淀进去：项目目标、结构与关键模块、约定与禁区、当前状态与待办、重要决策；增量维护，别删掉仍有效的既有内容；`,
       `(3) 另写一段给用户看的「项目记忆概要」到文件 ${REL_UNDERSTANDING}：讲清项目定位、结构、当前状态与注意事项，纯文本或轻量 markdown，控制在 600 字以内；`,
       `(4) 全部完成后，最后创建标记文件 ${REL_DONE}（内容写 ok 即可）——这一步必须最后做。`,
+      scope,
       `不要改动与记忆无关的代码。`,
       agent === 'codex' ? '（无需请求审批，直接执行。）' : '',
       outputLanguageInstruction(locale),
@@ -152,7 +161,7 @@ export interface RunSummaryInput {
 export interface SummaryRunOptions {
   /** 轮询间隔（ms） */
   pollIntervalMs?: number;
-  /** 从注入提示词起算的总超时（ms） */
+  /** 总超时（ms）：记忆更新默认 15 分钟，简介沿用共享 runner 默认值。 */
   timeoutMs?: number;
   /** 拉起代理后、注入提示词前的就绪等待（其间清菜单） */
   readyDelayMs?: number;
@@ -171,7 +180,7 @@ export interface SummaryRunOptions {
 
 export type RunSummaryResult =
   | { ok: true; understanding: string }
-  | { ok: false; reason: 'timeout' | 'no-output' | 'error'; error?: string };
+  | { ok: false; reason: 'timeout' | 'no-output' | 'error'; error?: string; diagnostics?: AgentArtifactDiagnostics };
 
 export class AgentSummaryRunner {
   private readonly driver: SummaryDriver;
@@ -204,12 +213,21 @@ export class AgentSummaryRunner {
           required: false,
         }],
       },
-      options,
+      {
+        ...options,
+        timeoutMs: options.timeoutMs ?? (input.target === 'memory' ? MEMORY_SUMMARY_TIMEOUT_MS : undefined),
+        preserveScratchOnFailure: true,
+      },
     );
     if (!result.ok) {
-      return result.reason === 'timeout'
-        ? { ok: false, reason: 'timeout' }
-        : { ok: false, reason: 'error', ...(result.error ? { error: result.error } : {}) };
+      // 保留机器可读的现场，后续重试由共享 runner 先清理旧 scratch，避免旧 done 污染新任务。
+      await this.driver.writeFile(`${p.scratch}/failure.json`, JSON.stringify(result, null, 2)).catch(() => {});
+      return {
+        ok: false,
+        reason: result.reason === 'timeout' ? 'timeout' : 'error',
+        ...(result.error ? { error: result.error } : {}),
+        ...(result.diagnostics ? { diagnostics: result.diagnostics } : {}),
+      };
     }
     const understanding = typeof result.artifacts.understanding === 'string'
       ? result.artifacts.understanding.trim()

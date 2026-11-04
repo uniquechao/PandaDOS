@@ -1,3 +1,7 @@
+import { issueDiagnosticMessages } from '../domains/issue-diagnostics';
+import { localPlanMessages } from '../domains/local-plans';
+import { agentModelMessages } from '../domains/agent-models';
+import { moduleWorkspaceMessages } from '../domains/module-workspace';
 import { roomMemberMessages } from '../domains/rooms-members';
 import { roomChatMessages } from '../domains/rooms-chat';
 import { roomExtraMessages } from '../domains/rooms-extra';
@@ -24,6 +28,10 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const ruCatalog = {
+  ...issueDiagnosticMessages,
+  ...localPlanMessages["ru"],
+  ...agentModelMessages,
+  ...moduleWorkspaceMessages["ru"],
   ...roomMemberMessages["ru"],
   ...roomChatMessages["ru"],
   ...roomExtraMessages["ru"],
@@ -97,4 +105,5 @@ export const ruCatalog = {
   'ui.moduleIssueCount':'{count, plural, one {# задача} few {# задачи} many {# задач} other {# задачи}}','ui.organizeResultCreate':'Создан модуль «{name}» ({slug} · {agent})','ui.organizeResultRename':'Модуль переименован в «{name}» ({slug})','ui.organizeResultMerge':'{count, plural, one {Объединено с «{target}»; перемещена # задача} few {Объединено с «{target}»; перемещено # задачи} many {Объединено с «{target}»; перемещено # задач} other {Объединено с «{target}»; перемещено # задачи}}','ui.organizeResultMove':'{count, plural, one {# задача перемещена в «{target}»} few {# задачи перемещены в «{target}»} many {# задач перемещено в «{target}»} other {# задачи перемещены в «{target}»}}',
   'ui.organizeFailureTimeout':'Последний анализ превысил время ожидания. Его можно запустить снова.','ui.organizeFailureNoOutput':'Последний анализ не вернул план организации. Его можно запустить снова.','ui.organizeFailureError':'Последний анализ завершился ошибкой. Его можно запустить снова.','ui.organizeFailureDetail':'Технические подробности: {detail}',
   'git.imageBefore':'До','git.imageAfter':'После','git.openImage':'Открыть {name}','git.viewImage':'Открыть изображение {name}','git.downloadImage':'Скачать {name}',
+  'admin.directoryRequired': "Заполните поле «{field}». Введите абсолютный путь или выберите каталог.",
 } as const satisfies MessageCatalog;
