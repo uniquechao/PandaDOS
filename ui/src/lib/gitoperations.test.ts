@@ -3,11 +3,46 @@ import {
   createGitOperationCoordinator,
   createGitOperationGuard,
   deriveGitFileOperations,
+  directoryStagePaths,
+  writeGitPathBatches,
   requireGitOperationSuccess,
   type GitOperationKind,
 } from './gitoperations';
 
 describe('Git 文件写操作模型', () => {
+  test('大目录按后端上限顺序暂存；逻辑失败后停止后续批次', async () => {
+    const paths = Array.from({ length: 1001 }, (_, i) => `src/${i}.ts`);
+    const batches: string[][] = [];
+    await writeGitPathBatches(paths, async (batch) => {
+      batches.push(batch);
+      return { ok: true };
+    });
+    expect(batches.map((batch) => batch.length)).toEqual([500, 500, 1]);
+    expect(batches.flat()).toEqual(paths);
+    let calls = 0;
+    await expect(writeGitPathBatches(paths, async () => {
+      calls++;
+      return calls === 2 ? { ok: false, error: '写入失败' } : { ok: true };
+    })).rejects.toThrow('写入失败');
+    expect(calls).toBe(2);
+  });
+
+  test('目录暂存仅包含当前分组的目录后代，重命名包含旧路径、复制排除源路径并去重', () => {
+    const operations = deriveGitFileOperations([
+      { status: ' R', path: 'src/new.ts', oldPath: 'outside/old.ts' },
+      { status: ' C', path: 'src/sub/copy.ts', oldPath: 'outside/source.ts' },
+      { status: ' D', path: 'src/deleted.ts' },
+      { status: ' M', path: 'src-other/file.ts' },
+      { status: 'A ', path: 'src/staged.ts' },
+    ]);
+    const paths = ['src/new.ts', 'src/sub/copy.ts', 'src/deleted.ts', 'src-other/file.ts', 'src/new.ts', 'src/untracked.md'];
+    expect(directoryStagePaths('src', paths, operations)).toEqual([
+      'outside/old.ts', 'src/new.ts', 'src/sub/copy.ts', 'src/deleted.ts', 'src/untracked.md',
+    ]);
+    expect(directoryStagePaths('src/sub', paths, operations)).toEqual(['src/sub/copy.ts']);
+    expect(directoryStagePaths('missing', paths, operations)).toEqual([]);
+  });
+
   test('按 porcelain XY 两列区分已暂存与未暂存，同一文件可同时提供两种操作', () => {
     expect(deriveGitFileOperations([
       { status: 'MM', path: 'both.ts' },

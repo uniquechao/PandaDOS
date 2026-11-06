@@ -1245,6 +1245,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     mutex, // 对话模式 conversations 路由 activate/archive 用（与引擎/PM/act/WS 同一把锁）
     agentModels,
     models: modelProbe, // 对话/issue 详情页显示「正在用哪个模型」
+    locateConversation: (project, id) => historyForProject(project).locator.locate(id),
     modelsForProject: (project) => {
       const context = historyForProject(project);
       return new ModelProbe(context.reader, context.locator);

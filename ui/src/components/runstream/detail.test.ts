@@ -23,10 +23,16 @@ describe('DetailBody / CopyButton', () => {
   });
 
   test('拿到全文后显示的就是全文；仍被上限截尾时标注截断', () => {
-    expect(detail).toContain("const full = state?.phase === 'ready' ? state.content : undefined;");
+    expect(detail).toContain("const full = state?.phase === 'ready' && (!expandOnRequestOnly || requested) ? state.content : undefined;");
     expect(detail).toContain('const shown = full ?? text;');
     expect(detail).toContain("tr('ui.fullTruncated', { shown: state.content.length, total: state.total })");
     expect(detail).toContain("tr('ui.loadFullFailed')");
+  });
+
+  test('吸顶全文缓存不会自动展开原用户气泡，原气泡主动展开可复用缓存', () => {
+    expect(message).toContain("expandOnRequestOnly={role === 'user'}");
+    expect(detail).toContain('setRequested(true);');
+    expect(detail).toContain("if (state?.phase !== 'ready') {");
   });
 
   test('在途时按钮禁用、不重复请求', () => {
@@ -52,7 +58,7 @@ describe('复制钮浮层（issue #299）', () => {
   });
 
   test('操作条只剩「查看完整内容」与说明文案，两者都没有时整条不渲染', () => {
-    expect(detail).toContain("const note = state?.phase === 'error' || (state?.phase === 'ready' && state.truncated);");
+    expect(detail).toContain("const note = state?.phase === 'error' || (full !== undefined && state?.phase === 'ready' && state.truncated);");
     expect(detail).toContain('const showBar = canLoad || note;');
     expect(detail).toContain('{showBar && (');
   });

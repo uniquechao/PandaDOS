@@ -559,6 +559,7 @@ export class SshDriver implements ExecutorDriver {
       return (await sftpReaddir(sftp, current)).map((entry) => ({
         name: entry.filename,
         type: typeFromMode(entry.attrs.mode),
+        modifiedTs: entry.attrs.mtime == null ? undefined : entry.attrs.mtime * 1000,
       }));
     } catch (error) {
       if (isNoSuchFile(error)) return null;

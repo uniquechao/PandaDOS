@@ -90,6 +90,8 @@ export function ChatView({ pid, cid }: { pid: number; cid?: string }) {
   const [importingHistory, setImportingHistory] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameText, setRenameText] = useState('');
+  const titleMutation = useRef(0);
+  const titleWrites = useRef(0);
   const [err, setErr] = useState('');
   const [showFiles, setShowFiles] = useState(false);
   const [produced, setProduced] = useState<string[]>([]);
@@ -131,6 +133,41 @@ export function ChatView({ pid, cid }: { pid: number; cid?: string }) {
       })
       .catch((e: Error) => { if (!disposed) setErr(e.message); });
     return () => { disposed = true; };
+  }, [pid]);
+
+  // 单个请求串行轮询，重新联网或返回页面时立即补齐；只合并同 ID 的名称字段。
+  useEffect(() => {
+    let disposed = false;
+    let pending = false;
+    const refresh = async (): Promise<void> => {
+      if (pending || document.hidden || titleWrites.current > 0) return;
+      pending = true;
+      const revision = titleMutation.current;
+      try {
+        const r = await api<{ conversations: Conversation[] }>(`/api/projects/${pid}/conversations`);
+        if (disposed || revision !== titleMutation.current) return;
+        const latest = new Map(r.conversations.map((c) => [c.id, c]));
+        setConvs((current) => current?.map((c) => {
+          const next = latest.get(c.id);
+          return next && next.agent === c.agent
+            ? { ...c, label: next.label, agentTitle: next.agentTitle, manualTitle: next.manualTitle }
+            : c;
+        }) ?? current);
+      } catch { /* 保留现有名称，网络恢复后重试。 */ }
+      finally { pending = false; }
+    };
+    const timer = window.setInterval(() => void refresh(), 2000);
+    const resume = (): void => { void refresh(); };
+    window.addEventListener('online', resume);
+    window.addEventListener('focus', resume);
+    document.addEventListener('visibilitychange', resume);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      window.removeEventListener('online', resume);
+      window.removeEventListener('focus', resume);
+      document.removeEventListener('visibilitychange', resume);
+    };
   }, [pid]);
 
   // 确保对话自身会话已启动（幂等：会话活着不重启，故不打断其它在跑对话）
@@ -236,6 +273,8 @@ export function ChatView({ pid, cid }: { pid: number; cid?: string }) {
     const label = renameText.trim();
     setRenamingId(null);
     if (!id || !label) return;
+    titleMutation.current += 1;
+    titleWrites.current += 1;
     try {
       const r = await api<{ conversation: Conversation }>(
         `/api/projects/${pid}/conversations/${id}/rename`,
@@ -245,6 +284,23 @@ export function ChatView({ pid, cid }: { pid: number; cid?: string }) {
       setConvs((cur) => (cur ?? []).map((c) => (c.id === id ? r.conversation : c)));
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      titleWrites.current -= 1;
+      titleMutation.current += 1;
+    }
+  };
+
+  const restoreTitle = async (id: string): Promise<void> => {
+    titleMutation.current += 1;
+    titleWrites.current += 1;
+    try {
+      const r = await api<{ conversation: Conversation }>(`/api/projects/${pid}/conversations/${id}/auto-title`, 'POST');
+      setConvs((current) => current?.map((c) => c.id === id ? r.conversation : c) ?? current);
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      titleWrites.current -= 1;
+      titleMutation.current += 1;
     }
   };
 
@@ -316,8 +372,15 @@ export function ChatView({ pid, cid }: { pid: number; cid?: string }) {
           />
         ) : (
           <>
-            <span class="conv-nm grow">{c.label || t('view.newConversation')}</span>
+            <span class="conv-nm grow">{c.label || t('view.untitledConversation')}</span>
             <span class="conv-time">{timeAgo(c.lastActiveTs ?? c.createdTs)}</span>
+            {c.manualTitle && (
+              <button type="button" class="conv-act" title={t('view.restoreAgentTitle')}
+                aria-label={t('view.restoreAgentTitle')}
+                onClick={(e) => { e.stopPropagation(); void restoreTitle(c.id); }}>
+                ↻
+              </button>
+            )}
             <span
               class="conv-act"
               role="button"
@@ -413,7 +476,7 @@ export function ChatView({ pid, cid }: { pid: number; cid?: string }) {
             <button class="back" onClick={() => setSelected(null)}>
               ‹
             </button>
-            <span class="btitle">{selectedConv?.label || t('view.conversation')}</span>
+            <span class="btitle">{selectedConv?.label || t('view.untitledConversation')}</span>
             {selectedConv && <AgentLogo agent={selectedConv.agent} size="sm" />}
           </div>
         </div>
@@ -493,6 +556,7 @@ export function ChatView({ pid, cid }: { pid: number; cid?: string }) {
             {selected ? (
               <ConversationPane
                 pid={pid}
+                conversationTitle={selectedConv?.label || t('view.untitledConversation')}
                 selected={selected}
                 mode={mode}
                 onModeChange={setMode}
@@ -734,6 +798,7 @@ function ConvIdChip({ id }: { id: string }) {
 /** 选中对话的两种同源视图；mode 或 conversation 改变都卸载原有 WS/xterm。 */
 function ConversationPane({
   pid,
+  conversationTitle,
   selected,
   mode,
   onModeChange,
@@ -742,6 +807,7 @@ function ConversationPane({
   onProducedFiles,
 }: {
   pid: number;
+  conversationTitle?: string;
   selected: string;
   mode: NativeMode;
   onModeChange: (mode: NativeMode) => void;
@@ -754,6 +820,7 @@ function ConversationPane({
   const model = useConvModel(pid, selected);
   const switcher = (
     <>
+      {conversationTitle && <span class="conv-current-title" title={conversationTitle}>{conversationTitle}</span>}
       <NativeModeSwitch mode={mode} onChange={onModeChange} />
       <AutoApproveSwitch level={autoApprove} onChange={onAutoApprove} />
       <ModelBadge model={model} />

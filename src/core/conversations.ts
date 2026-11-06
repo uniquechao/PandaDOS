@@ -91,6 +91,8 @@ interface ConvRow {
   id: string;
   project_id: number;
   label: string | null;
+  agent_title?: string | null;
+  manual_title?: string | null;
   created_ts: number;
   archived: number;
   agent: string;
@@ -110,6 +112,8 @@ function mapConv(r: ConvRow): Conversation {
     id: r.id,
     projectId: r.project_id,
     label: r.label,
+    agentTitle: r.agent_title ?? null,
+    manualTitle: r.manual_title ?? null,
     createdTs: r.created_ts,
     archived: r.archived !== 0,
     agent: r.agent === 'codex' ? 'codex' : 'claude',
@@ -450,7 +454,9 @@ export class ConversationManager {
 
   /** 改对话标题（chat 对话重命名用；≤80 字符） */
   rename(id: string, label: string): void {
-    this.db.query('UPDATE conversations SET label = ? WHERE id = ?').run((label || '会话').slice(0, 80), id);
+    const title = label.trim().slice(0, 80);
+    if (!title) return;
+    this.db.query('UPDATE conversations SET label = ?, manual_title = ? WHERE id = ?').run(title, title, id);
   }
 
   /**

@@ -31,12 +31,19 @@ export function createProjectDataPersistence(
 ): ProjectDataPersistenceOutbox {
   const handler: ProjectDataOutboxHandler = {
     async persist(job) {
-      const workspace = () => job.entityKind === 'issue' && db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_attempts'").get()
-        ? db.query<{workspace_id:number;cwd:string;result_sha:string|null},[string]>(`SELECT a.workspace_id,COALESCE(a.execution_cwd,w.cwd) cwd,a.result_sha FROM workspace_attempts a JOIN module_workspaces w ON w.id=a.workspace_id WHERE a.issue_id=? ORDER BY a.created_ts DESC,a.rowid DESC LIMIT 1`).get(job.entityId) : null;
+      const workspace = () => {
+        const attempt = job.entityKind === 'issue' && db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_attempts'").get()
+          ? db.query<{id:string;workspace_id:number;cwd:string;phase:string;result_sha:string|null},[string]>(`SELECT a.id,a.workspace_id,COALESCE(a.execution_cwd,w.cwd) cwd,a.phase,a.result_sha FROM workspace_attempts a JOIN module_workspaces w ON w.id=a.workspace_id WHERE a.issue_id=? ORDER BY a.created_ts DESC,a.rowid DESC LIMIT 1`).get(job.entityId) : null;
+        // Reservation does not make the directory writable. During preparation the service
+        // checks/fast-forwards a clean tree, then copies the current project documents itself.
+        // Keep early projections in the project root so they cannot dirty that initial tree.
+        return attempt && !attempt.result_sha && ['reserved','preparing','prepared'].includes(attempt.phase)
+          ? null : attempt;
+      };
       const reservation=workspace();
       await mutex.runExclusive(reservation ? `workspace-git:${reservation.workspace_id}` : gitLockKey(job.projectId), async () => {
         const managed=workspace();
-        if(managed?.workspace_id!==reservation?.workspace_id)throw new Error('工作区投影归属变化，等待重新投影');
+        if(managed?.id!==reservation?.id)throw new Error('工作区投影归属变化，等待重新投影');
         const project = getProject(db, job.projectId);
         if (!project) return;
         const driver = driverForProject(project);

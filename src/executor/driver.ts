@@ -43,6 +43,8 @@ export interface PathStat {
 }
 
 export interface DirEntry {
+  /** File modification time in milliseconds, when supplied by the executor. */
+  modifiedTs?: number;
   name: string;
   type: 'file' | 'dir' | 'symlink' | 'other';
 }

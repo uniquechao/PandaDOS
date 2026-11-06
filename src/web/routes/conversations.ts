@@ -1,3 +1,4 @@
+import { ConversationTitleSync, restoreAgentTitle } from '../../executor/conversation-titles';
 /**
  * web/routes/conversations —— 对话模式的对话 CRUD + 激活（落地 server.ts Wave4 TODO）。
  *
@@ -69,6 +70,7 @@ export interface ConversationsRoutesDeps {
   /** 当前模型探测（读会话 jsonl，见 core/model-probe）；缺省 = model 恒 null（前端不显示） */
   models?: ConvModelPort;
   modelsForProject?(project: Project): ConvModelPort;
+  locateConversation?(project: Project, id: string): Promise<string | null>;
   /** 项目所在执行机的只读 Driver；本地历史查询/导入使用。缺省时相关端点返回 503。 */
   driverForProject?(project: Project): AgentHistoryReader & HistoryArchiveFs;
   /** Legacy fail-closed guard when modelsForProject is absent. */
@@ -82,6 +84,16 @@ async function readBody(req: Request): Promise<Record<string, unknown>> {
 
 export function conversationsRoutes(deps: ConversationsRoutesDeps): RouteDef[] {
   const { db, convs, mutex, models } = deps;
+  const titleSync = new ConversationTitleSync(db);
+  const syncTitles = async (project: Project, conversations: Conversation[]): Promise<void> => {
+    if (!deps.driverForProject) return;
+    const executor = getExecutor(db, project.executorId);
+    if (!executor) return;
+    try {
+      await titleSync.sync(project.id, executor, deps.driverForProject(project), conversations,
+        deps.locateConversation ? (id) => deps.locateConversation!(project, id) : undefined);
+    } catch { /* 执行机暂时离线时仍返回现有名称；下次读取会补齐。 */ }
+  };
 
   const designBound = (conversationId: string): boolean => {
     const exists = db.query<{ n: number }, []>(
@@ -165,11 +177,13 @@ export function conversationsRoutes(deps: ConversationsRoutesDeps): RouteDef[] {
       method: 'GET',
       path: '/api/projects/:projectId/conversations',
       auth: 'project-access',
-      handler: ({ params, url }) => {
+      handler: async ({ params, url }) => {
         const pid = Number(params.projectId);
-        if (!getProject(db, pid)) return json({ ok: false, error: '无此项目' }, 404);
+        const project = getProject(db, pid);
+        if (!project) return json({ ok: false, error: '无此项目' }, 404);
         const iaw = url.searchParams.get('includeArchived');
         const includeArchived = iaw === '1' || iaw === 'true';
+        await syncTitles(project, convs.listChats(pid, includeArchived));
         return json({ ok: true, conversations: convs.listChats(pid, includeArchived) });
       },
     },
@@ -309,12 +323,13 @@ export function conversationsRoutes(deps: ConversationsRoutesDeps): RouteDef[] {
         const pid = Number(params.projectId);
         if (!getProject(db, pid)) return json({ ok: false, error: '无此项目' }, 404);
         const b = await readBody(req);
-        const label = typeof b.label === 'string' && b.label.trim() ? b.label.trim() : '新对话';
+        const label = typeof b.label === 'string' ? b.label.trim() : '';
         const agent: AgentKind = b.agent === 'codex' ? 'codex' : 'claude';
         const support = projectAgentSupport(db, pid, agent);
         if (!support.ok) return json({ ok: false, error: support.error }, 409);
-        const conversation = convs.create(pid, label, agent, 'chat');
-        return json({ ok: true, conversation });
+        const conversation = convs.create(pid, label || '新对话', agent, 'chat');
+        if (label) convs.rename(conversation.id, label);
+        return json({ ok: true, conversation: convs.get(conversation.id) });
       },
     },
     {
@@ -364,6 +379,19 @@ export function conversationsRoutes(deps: ConversationsRoutesDeps): RouteDef[] {
         const label = typeof b.label === 'string' ? b.label.trim() : '';
         if (!label) return json({ ok: false, error: '缺 label' }, 400);
         convs.rename(r.conv.id, label);
+        return json({ ok: true, conversation: convs.get(r.conv.id) });
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/projects/:projectId/conversations/:convId/auto-title',
+      auth: 'project-access',
+      handler: async ({ params }) => {
+        const r = chatConvOf(params);
+        if ('error' in r) return r.error;
+        restoreAgentTitle(db, r.conv.id);
+        const project = getProject(db, r.conv.projectId);
+        if (project) await syncTitles(project, [r.conv]);
         return json({ ok: true, conversation: convs.get(r.conv.id) });
       },
     },

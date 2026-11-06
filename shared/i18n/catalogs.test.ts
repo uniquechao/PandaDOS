@@ -1,3 +1,5 @@
+import { localPlanBrowserMessages } from './domains/local-plans';
+import { conversationTitleMessages } from './domains/conversation-titles';
 import { issueDiagnosticMessages } from './domains/issue-diagnostics';
 import { agentModelMessages } from './domains/agent-models';
 import { describe, expect, test } from 'bun:test';
@@ -46,7 +48,7 @@ describe('launch catalogs', () => {
         .filter((key) => catalogs[locale][key] === english[key])
         .sort();
       // 当前模型设置需求明确指定所有新增文案为简体中文，单独列出该消息域。
-      expect(identical).toEqual([...identicalEnglishAllowlist[locale],...(Object.keys(agentModelMessages) as MessageKey[]), ...(Object.keys(issueDiagnosticMessages) as MessageKey[])].sort());
+      expect(identical).toEqual([...identicalEnglishAllowlist[locale],...(Object.keys(conversationTitleMessages) as MessageKey[]), ...(Object.keys(agentModelMessages) as MessageKey[]), ...(Object.keys(issueDiagnosticMessages) as MessageKey[]), ...(Object.keys(localPlanBrowserMessages) as MessageKey[])].sort());
     }
   });
 

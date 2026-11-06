@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDb } from './db';
@@ -48,7 +48,7 @@ const EXPECTED_TABLES = [
 ].sort();
 
 /** core/migrations 当前最新编号（新增迁移文件时同步 +1） */
-const LATEST_MIGRATION = 89;
+const LATEST_MIGRATION = 91;
 
 function tableNames(db: Database): string[] {
   return db
@@ -116,6 +116,38 @@ describe('migrate', () => {
     expect(db.query<{ kind: string }, []>('SELECT kind FROM projects LIMIT 1').get()?.kind).toBe('issue');
     expect(db.query<{ kind: string }, []>("SELECT kind FROM conversations WHERE id = 'chat-history'").get()?.kind).toBe('chat');
     db.close();
+  });
+
+  test('091 升级保留已有自动摘要与命名模式，重新打开数据库后可恢复', () => {
+    mkdirSync('.panda/tmp', { recursive: true });
+    const dir = mkdtempSync('.panda/tmp/conversation-titles-');
+    let db: Database | null = null;
+    try {
+      const dbPath = join(dir, 'titles.db');
+      db = openDb(dbPath);
+      // 模拟迁移 090 后的已有数据；不把无法确认来源的旧手动名称当成摘要。
+      db.exec(`CREATE TABLE conversations (
+        id TEXT PRIMARY KEY, kind TEXT, label TEXT, agent_title TEXT, manual_title TEXT
+      );
+      INSERT INTO conversations VALUES
+        ('auto', 'chat', '首条摘要', NULL, NULL),
+        ('manual', 'chat', '用户名称', 'Agent 名称', '用户名称'),
+        ('new', 'chat', '新对话', NULL, NULL),
+        ('issue', 'issue', 'issue 名称', NULL, NULL);`);
+      db.exec(readFileSync(join(import.meta.dir, 'migrations/091_conversation_first_message_title.sql'), 'utf8'));
+      db.close();
+      db = openDb(dbPath);
+      const rows = db.query<any, []>('SELECT * FROM conversations ORDER BY id').all();
+      expect(rows.find((r) => r.id === 'auto').first_message_title).toBe('首条摘要');
+      expect(rows.find((r) => r.id === 'manual')).toMatchObject({
+        label: '用户名称', manual_title: '用户名称', agent_title: 'Agent 名称', first_message_title: null,
+      });
+      expect(rows.find((r) => r.id === 'new').first_message_title).toBeNull();
+      expect(rows.find((r) => r.id === 'issue').first_message_title).toBeNull();
+    } finally {
+      db?.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('索引已创建（抽查关键索引）', () => {

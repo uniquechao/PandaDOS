@@ -32,7 +32,7 @@ import {
   type GitWorkspaceFile,
   type GitWorkspaceState,
 } from '../lib/gitworkspace';
-import { deriveGitFileOperations } from '../lib/gitoperations';
+import { deriveGitFileOperations, directoryStagePaths, writeGitPathBatches } from '../lib/gitoperations';
 import {
   beginGitLoad,
   completeGitLoad,
@@ -885,7 +885,14 @@ export function WorkspaceView({ pid, loc }: { pid: number; loc: WorkspaceLoc }) 
 
   // ---- Git 操作 ----
   const stagePaths = (paths: string[], stage: boolean): void =>
-    runQuiet(stage ? 'stage' : 'unstage', () => api(`/api/projects/${pid}/git/${stage ? 'stage' : 'unstage'}`, 'POST', { paths }));
+    runQuiet(stage ? 'stage' : 'unstage', async () => {
+      try {
+        await writeGitPathBatches(paths, (batch) => api(`/api/projects/${pid}/git/${stage ? 'stage' : 'unstage'}`, 'POST', { paths: batch }));
+      } catch (e) {
+        if (alive.current) refresh(); // 前面的批次可能已完成，同步真实暂存状态。
+        throw e;
+      }
+    });
 
   const fileOps = useMemo(() => deriveGitFileOperations(changes), [changes]);
 
@@ -1035,10 +1042,25 @@ export function WorkspaceView({ pid, loc }: { pid: number; loc: WorkspaceLoc }) 
         <span class="mut small ws-target-dir" title={tr('ws.uploadTarget', { dir: curDir || '.' })}>
           {tr('ws.inFolder', { dir: curDir || '.' })}
         </span>
-        <button class="btn sm" onClick={() => setNameDlg({ kind: 'file', base: curDir })}>＋ {tr('ws.newFile')}</button>
-        <button class="btn sm" onClick={() => setNameDlg({ kind: 'dir', base: curDir })}>＋ {tr('ws.newFolder')}</button>
-        <button class="btn sm fs-up" disabled={upload !== null} onClick={() => fileInput.current?.click()}>
-          {upload ? (upload.pct > 0 ? `${upload.pct}%` : tr('ui.uploading')) : `⇧ ${tr('ui.upload')}`}
+        <button class="btn sm ws-file-action" title={tr('ws.newFile')} aria-label={tr('ws.newFile')}
+          onClick={() => setNameDlg({ kind: 'file', base: curDir })}>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z M14 2v6h6 M12 12v6 M9 15h6" />
+          </svg>
+        </button>
+        <button class="btn sm ws-file-action" title={tr('ws.newFolder')} aria-label={tr('ws.newFolder')}
+          onClick={() => setNameDlg({ kind: 'dir', base: curDir })}>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M20 20H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 2h9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2Z M12 10v6 M9 13h6" />
+          </svg>
+        </button>
+        <button class="btn sm fs-up ws-file-action" disabled={upload !== null}
+          title={upload ? tr('ui.uploadingPercent', { percent: upload.pct }) : tr('ui.upload')}
+          aria-label={upload ? tr('ui.uploadingPercent', { percent: upload.pct }) : tr('ui.upload')}
+          aria-busy={upload !== null} onClick={() => fileInput.current?.click()}>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M12 16V3 M7 8l5-5 5 5 M3 16v4a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1v-4" />
+          </svg>
           {upload && (
             <span class="up-prog" role="progressbar" aria-valuenow={upload.pct} aria-valuemin={0} aria-valuemax={100}
               aria-label={tr('ui.uploadingPercent', { percent: upload.pct })}>
@@ -1546,11 +1568,11 @@ function ChangesPane({
           <button class="btn sm danger" disabled={busy} onClick={onAbort}>{tr('ws.abortOperation')}</button>
         </div>
       )}
+      <div class="git-ops-row ws-stage-actions">
+        <button class="btn sm" disabled={busy || !hasUnstaged} onClick={() => onStageAll(true)}>＋ {tr('git.stageAll')}</button>
+        <button class="btn sm" disabled={busy || stagedN === 0} onClick={() => onStageAll(false)}>－ {tr('git.unstageAll')}</button>
+      </div>
       <div class="git-ops-panel">
-        <div class="git-ops-row">
-          <button class="btn sm" disabled={busy || !hasUnstaged} onClick={() => onStageAll(true)}>＋ {tr('git.stageAll')}</button>
-          <button class="btn sm" disabled={busy || stagedN === 0} onClick={() => onStageAll(false)}>－ {tr('git.unstageAll')}</button>
-        </div>
         <textarea
           class="git-commit-input"
           rows={2}
@@ -1584,7 +1606,12 @@ function ChangesPane({
             {tr(GROUP_LABEL[group])} · {leaves.length}
             {group === 'conflict' && <span class="mut small"> {tr('ws.conflictHint')}</span>}
           </div>
-          <ChangeTree key={group} leaves={leaves} selKey={selKey} onOpen={onOpen} renderActions={(leaf) => actions(leaf, group)} />
+          <ChangeTree key={group} leaves={leaves} selKey={selKey} onOpen={onOpen} renderActions={(leaf) => actions(leaf, group)}
+            renderDirActions={group === 'unstaged' || group === 'untracked' ? (dir) => (
+              <button class="git-file-op" disabled={busy} title={tr('git.stagePath', { path: dir.path })} aria-label={tr('git.stagePath', { path: dir.path })}
+                onClick={() => onStage(directoryStagePaths(dir.path, leaves.map((leaf) => leaf.path), fileOps))}>＋</button>
+            ) : undefined}
+          />
         </div>
       ))}
     </div>

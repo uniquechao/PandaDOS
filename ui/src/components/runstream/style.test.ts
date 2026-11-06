@@ -3,10 +3,26 @@ import { readFileSync } from 'node:fs';
 
 const css = readFileSync(new URL('../../style.css', import.meta.url), 'utf8');
 
-function declarations(selector: string): string {
-  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return css.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`))?.[1] ?? '';
+function declarations(selector: string, stylesheet = css): string {
+  const source = stylesheet.replace(/\/\*[\s\S]*?\*\//g, '');
+  for (const rule of source.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    if (rule[1]!.trim() === selector) return rule[2]!;
+  }
+  return '';
 }
+
+test('样式契约精确匹配完整选择器，不把后代覆盖当成全局规则', () => {
+  const descendant = '.sticky-question-full .rs-body { max-height: none; }';
+  expect(declarations('.rs-body', descendant)).toBe('');
+  expect(declarations('.rs-body', descendant + '.rs-body { position: relative; }')).toContain('position: relative');
+  expect(declarations('.rs-body', '.other.rs-body { position: absolute; }')).toBe('');
+});
+
+test('注释中的规则不参与匹配，分组选择器仍精确读取', () => {
+  const fixture = '/* .rs-body { position: absolute; } */ .rs-body { position: relative; } .a, .b { color: red; }';
+  expect(declarations('.rs-body', fixture)).toContain('position: relative');
+  expect(declarations('.a, .b', fixture)).toContain('color: red');
+});
 
 describe('runstream 布局约束', () => {
   test('命令卡在可滚动的纵向 flex 消息流中不可被压成边框', () => {

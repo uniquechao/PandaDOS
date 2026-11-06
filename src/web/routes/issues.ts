@@ -1,3 +1,5 @@
+import { ISSUE_LIST_GROUPS, ISSUE_LIST_PAGE_SIZE, type IssueListGroup } from '../../../shared/issue-list';
+import { readIssueList, type IssueListObservation } from '../../issues/issue-list';
 import { diagnosticData, redactDiagnosticValue } from '../../../shared/issue-diagnostics';
 import { normalizeSkillPolicy } from '../../core/skill-policy';
 /**
@@ -53,7 +55,7 @@ export interface IssuesRoutesDeps {
    * waiting_input 派生标记：该 issue 是否在等人工输入（CC 弹窗升级人工未处理 / 菜单滞留）。
    * 状态机不为此加状态——它是「实施中但被弹窗卡住」的横切观测。缺省恒 false（测试/最小装配）。
    */
-  waitingInput?(issue: EngineIssue): boolean;
+  waitingInput?(issue: IssueListObservation): boolean;
   /**
    * 用户 id → 用户名解析（issue 列表/详情/新建回显 createdByName 用；缺省恒 null）。
    * 生产由 routes/index.ts 接 UserStore.byId；未接则前端回退显示「—」。
@@ -216,7 +218,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
     });
   };
 
-  const waitingInput = (issue: EngineIssue): boolean => {
+  const waitingInput = (issue: IssueListObservation): boolean => {
     try {
       return deps.waitingInput?.(issue) ?? false;
     } catch {
@@ -227,7 +229,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
    * 「这条 issue 在等什么」（#275 / I-07）：把 blocked 这个统一出口按原因拆开。
    * 与 waitingInput 同款容错——派生失败降级成 'none'，不拖垮列表接口。
    */
-  const attentionKind = (issue: EngineIssue): AttentionKind => {
+  const attentionKind = (issue: IssueListObservation): AttentionKind => {
     try {
       return engine.attentionKindOf(issue, waitingInput(issue));
     } catch {
@@ -243,7 +245,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
     }
   };
   /** 派生标记：执行中代理在等你澄清（NEED_CLARIFY / PM 兜底判 clarify）——issue 页覆盖显示「等待用户澄清」 */
-  const awaitingClarify = (issue: EngineIssue): boolean => {
+  const awaitingClarify = (issue: Pick<EngineIssue, 'id'>): boolean => {
     try {
       return engine.store.execClarifyWait(issue.id) !== null;
     } catch {
@@ -414,8 +416,22 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
       handler: ({ params, url }) => {
         const pid = num(params.projectId);
         if (!pid) return json({ ok: false, error: '缺 projectId' }, 400);
+        if (url.searchParams.get('view') === 'summary') {
+          const group = url.searchParams.get('group') ?? '';
+          const page = Number(url.searchParams.get('page') ?? 1);
+          const pageSize = Number(url.searchParams.get('pageSize') ?? ISSUE_LIST_PAGE_SIZE);
+          const q = url.searchParams.get('q') ?? '';
+          if (!Object.hasOwn(ISSUE_LIST_GROUPS, group) || !Number.isSafeInteger(page) || page < 1 ||
+              !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 100 || q.length > 200) {
+            return json(apiError('issues.list_invalid', 'Invalid issue list query.', 400), 400);
+          }
+          const result = readIssueList(db, pid, group as IssueListGroup, page, pageSize, q, issue => ({
+            waitingInput: waitingInput(issue), awaitingClarify: awaitingClarify(issue), attentionKind: attentionKind(issue),
+          }));
+          return json(result);
+        }
         // 可选过滤（#368 本地代理拉新增 issue 用）：since=createdTs 下界（不含），status=逗号列表。
-        // 不带参数时行为与原来完全一致（UI 仍拿全量）。
+        // 未指定摘要视图时保留旧数组协议，兼容代理等现有调用方。
         const sinceRaw = url.searchParams.get('since');
         const since = sinceRaw === null ? null : Number(sinceRaw);
         if (since !== null && !Number.isFinite(since)) return json({ ok: false, error: 'since 须为毫秒时间戳' }, 400);

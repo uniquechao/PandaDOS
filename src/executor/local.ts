@@ -467,10 +467,11 @@ export class LocalDriver implements ExecutorDriver {
         if (st.isSymbolicLink() || !st.isDirectory()) throw new Error('secure list rejects links and non-directories');
       }
       const entries = await fsp.readdir(current, { withFileTypes: true });
-      return entries.map((entry) => ({
+      return Promise.all(entries.map(async (entry): Promise<DirEntry> => ({
         name: entry.name,
         type: entry.isFile() ? 'file' : entry.isDirectory() ? 'dir' : entry.isSymbolicLink() ? 'symlink' : 'other',
-      }));
+        modifiedTs: (await fsp.lstat(join(current, entry.name))).mtimeMs,
+      })));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
       throw error;

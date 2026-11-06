@@ -3,7 +3,7 @@
  * Worktrees are not a security sandbox against processes deliberately dropping the marker.
  */
 export const STOP_WORKSPACE_PROCESSES = String.raw`
-import os,sys,time,signal
+import os,sys,time,signal,re
 marker=b'PANDA_WORKSPACE_ATTEMPT='+sys.argv[1].encode()
 cutoff=float(sys.argv[2])/1000-2
 with open('/proc/stat') as f: boot=int(next(line.split()[1] for line in f if line.startswith('btime ')))
@@ -11,6 +11,23 @@ hz=os.sysconf('SC_CLK_TCK')
 if len(sys.argv[1])!=36: raise RuntimeError('invalid attempt')
 def process_stat(root):
  with open(root+'/stat') as f: return f.read().rsplit(')',1)[1].split()
+def unified_cgroup(root):
+ with open(root+'/cgroup') as f:
+  return next((line.strip()[3:] for line in f if line.startswith('0::')),None)
+def foreign_system_login(root):
+ # A user-service workload cannot move itself into a root-owned logind session scope.
+ # Exclude only protected processes in that separate domain, never by process name or UID alone.
+ try:
+  prefix='/user.slice/user-'+str(os.getuid())+'.slice/'
+  service=prefix+'user@'+str(os.getuid())+'.service'
+  own=unified_cgroup('/proc/self')
+  other=unified_cgroup(root)
+  if not own or not (own==service or own.startswith(service+'/')): return False
+  if not other or not re.fullmatch(re.escape(prefix)+r'session-[0-9]+\.scope',other): return False
+  group='/sys/fs/cgroup'+other
+  return (os.stat(root+'/environ').st_uid!=os.getuid()
+   and os.stat(group).st_uid==0 and not os.access(group+'/cgroup.procs',os.W_OK))
+ except (OSError,StopIteration): return False
 def exited_after_denial(root):
  # environ can become unreadable before the exiting task reaches zombie state.
  # Wait briefly for proof of exit, never treat the permission error itself as proof.
@@ -34,6 +51,7 @@ def matching():
    if stat[0]!='Z': result.append((int(name),stat[19]))
   except (FileNotFoundError,ProcessLookupError): pass
   except PermissionError:
+   if foreign_system_login(root): continue
    # A process may exit after stat was read: Linux can deny environ before /proc disappears.
    # Only a fresh zombie/disappearance check proves it cannot write; live unknowns still fail closed.
    if exited_after_denial(root): continue

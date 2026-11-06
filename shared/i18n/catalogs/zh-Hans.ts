@@ -1,3 +1,5 @@
+import { issueListMessages } from '../domains/issue-list';
+import { conversationTitleMessages } from '../domains/conversation-titles';
 import { issueDiagnosticMessages } from '../domains/issue-diagnostics';
 import { localPlanMessages } from '../domains/local-plans';
 import { agentModelMessages } from '../domains/agent-models';
@@ -28,9 +30,11 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const zhHansCatalog = {
+  ...issueListMessages["zh-Hans"],
   ...issueDiagnosticMessages,
   ...localPlanMessages["zh-Hans"],
   ...agentModelMessages,
+  ...conversationTitleMessages,
   ...moduleWorkspaceMessages["zh-Hans"],
   ...roomMemberMessages["zh-Hans"],
   ...roomChatMessages["zh-Hans"],

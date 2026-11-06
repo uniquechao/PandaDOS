@@ -1713,3 +1713,87 @@ describe('完整诊断入口', () => {
     expect(compact.body.find((e: { kind: string }) => e.kind === 'validation_diagnostic')).toBeTruthy();
   });
 });
+
+describe('issue board summary pages', () => {
+  test('filters and pages history in SQL, omits large fields, preserves legacy list', async () => {
+    const s = await setup();
+    const ids: string[] = [];
+    for (let n = 0; n < 25; n++) {
+      const i = s.engine.store.create(1, { title: `history-${n}`, body: 'private-body'.repeat(500) });
+      ids.push(i.id);
+      s.db.run("UPDATE issues SET status = 'done', done_ts = ? WHERE id = ?", [n + 1, i.id]);
+    }
+    const other = s.engine.store.create(2, { title: 'other-project' });
+    s.db.run("UPDATE issues SET status = 'done' WHERE id = ?", [other.id]);
+    const legacy = await j(s.dispatch(req('GET', '/api/projects/1/issues', s.alice.token)));
+    expect(legacy.body).toHaveLength(25);
+    // History paging must not load complete EngineIssue objects or the full project list.
+    s.engine.store.listByProject = () => { throw new Error('full project read'); };
+    s.engine.store.get = () => { throw new Error('full issue read'); };
+    const page = await j(s.dispatch(req('GET', '/api/projects/1/issues?view=summary&group=finished&page=2&pageSize=20', s.alice.token)));
+    expect(page.status).toBe(200);
+    expect(page.body.total).toBe(25);
+    expect(page.body.page).toBe(2);
+    expect(page.body.items.map((i: { id: string }) => i.id)).toEqual(ids.slice(0, 5).reverse());
+    expect(page.body.items.every((i: { attentionKind: string }) => i.attentionKind === 'none')).toBe(true);
+    for (const field of ['body', 'planJson', 'subtasksJson', 'resultSummary', 'completionReport', 'note', 'clarifyFeedback', 'convId']) {
+      expect(Object.hasOwn(page.body.items[0], field)).toBe(false);
+    }
+    const clamped = await j(s.dispatch(req('GET', '/api/projects/1/issues?view=summary&group=finished&page=999', s.alice.token)));
+    expect(clamped.body.page).toBe(2);
+    const search = await j(s.dispatch(req('GET', '/api/projects/1/issues?view=summary&group=finished&q=history-0', s.alice.token)));
+    expect(search.body.total).toBe(1);
+    expect(search.body.items[0].id).toBe(ids[0]);
+    const literal = await j(s.dispatch(req('GET', '/api/projects/1/issues?view=summary&group=finished&q=%25', s.alice.token)));
+    expect(literal.body.total).toBe(0);
+  });
+
+  test('groups active statuses separately, keeps queue order and derived attention', async () => {
+    const s = await setup();
+    const active = s.engine.store.create(1, { title: 'running', module: 'B' });
+    s.db.run("UPDATE issues SET status = 'implementing' WHERE id = ?", [active.id]);
+    const a = s.engine.store.create(1, { title: 'A first', module: 'A' });
+    const b = s.engine.store.create(1, { title: 'B follows active', module: 'B' });
+    const pinned = s.engine.store.create(1, { title: 'pinned', module: 'C' });
+    s.db.run('UPDATE issues SET pinned_ts = 123 WHERE id = ?', [pinned.id]);
+    s.waitingSet.add(active.id);
+    s.engine.store.get = () => { throw new Error('summary must not read task bodies'); };
+    const todo = await j(s.dispatch(req('GET', '/api/projects/1/issues?view=summary&group=todo', s.alice.token)));
+    expect(todo.body.items.map((i: { id: string }) => i.id)).toEqual([pinned.id, a.id, b.id]);
+    expect(todo.body.pageSize).toBeNull();
+    const doing = await j(s.dispatch(req('GET', '/api/projects/1/issues?view=summary&group=doing', s.alice.token)));
+    expect(doing.body.items).toHaveLength(1);
+    expect(doing.body.items[0].waitingInput).toBe(true);
+    expect(doing.body.items[0].attentionKind).toBe('choice');
+    s.db.run("UPDATE issues SET status = 'paused' WHERE id = ?", [active.id]);
+    const blocked = await j(s.dispatch(req('GET', '/api/projects/1/issues?view=summary&group=blocked', s.alice.token)));
+    expect(blocked.body.items[0].id).toBe(active.id);
+    const empty = await j(s.dispatch(req('GET', '/api/projects/1/issues?view=summary&group=finished', s.alice.token)));
+    expect(empty.body).toMatchObject({ total: 0, page: 1, items: [] });
+  });
+
+  test('search preserves Unicode case folding and stable legacy-ID ordering at page boundaries', async () => {
+    const s = await setup();
+    for (const [id, title] of [['2', 'ÄPFEL_100%'], ['10', 'ÄPFEL second']]) {
+      s.db.run("INSERT INTO issues (id, project_id, title, status, created_ts, done_ts) VALUES (?, 1, ?, 'done', 42, 42)", [id!, title!]);
+    }
+    const first = await j(s.dispatch(req('GET', '/api/projects/1/issues?view=summary&group=finished&pageSize=1&q=%C3%A4pfel', s.alice.token)));
+    expect(first.body.total).toBe(2);
+    expect(first.body.items[0].id).toBe('10');
+    const second = await j(s.dispatch(req('GET', '/api/projects/1/issues?view=summary&group=finished&pageSize=1&page=2&q=%C3%A4pfel', s.alice.token)));
+    expect(second.body.items[0].id).toBe('2');
+    const literal = await j(s.dispatch(req('GET', '/api/projects/1/issues?view=summary&group=finished&q=_100%25', s.alice.token)));
+    expect(literal.body.total).toBe(1);
+    expect(literal.body.items[0].id).toBe('2');
+  });
+
+  test('validates paging and preserves project authorization', async () => {
+    const s = await setup();
+    for (const suffix of ['group=nope', 'group=__proto__', 'group=finished&page=0', 'group=finished&page=1.5',
+      'group=finished&pageSize=101', 'group=finished&pageSize=0', 'group=finished&page=NaN']) {
+      expect((await j(s.dispatch(req('GET', `/api/projects/1/issues?view=summary&${suffix}`, s.alice.token)))).status).toBe(400);
+    }
+    expect((await j(s.dispatch(req('GET', '/api/projects/1/issues?view=summary&group=finished')))).status).toBe(401);
+    expect((await j(s.dispatch(req('GET', '/api/projects/1/issues?view=summary&group=finished', s.bob.token)))).status).toBe(403);
+  });
+});

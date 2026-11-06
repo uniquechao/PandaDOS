@@ -216,6 +216,7 @@ describe('local plan discovery and atomic publication', () => {
 
   test('HTTP routes deny strangers, allow members, and validate the exact preview digest', async () => {
     const s = await setup(); const input = await s.write();
+    await s.service.recover();
     const call = async (method: string, token: string, body?: unknown) => s.dispatch(new Request(
       `http://test/api/projects/1/local-plans${method === 'POST' ? '/execute' : ''}`, {
         method, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
@@ -258,4 +259,83 @@ describe('local plan discovery and atomic publication', () => {
     expect(await ensurePandaIssuePlanSkill(s.driver, homes)).toHaveLength(0);
     expect(await fs.readFile(skill, 'utf8')).toBe('# Manual instructions');
   });
+});
+
+
+describe('本地计划摘要与按需详情', () => {
+  test('全部计划先按时间和身份排序再分页；列表不读取正文或展开执行记录', async () => {
+    const s = await setup();
+    for (let i = 0; i < 25; i++) {
+      const filename = `plan-${String(i).padStart(2, '0')}.md`;
+      await s.write(markdown([task], `id-${String(i).padStart(2, '0')}`), filename);
+      const date = new Date(1_700_000_000_000 + Math.floor(i / 2) * 1000);
+      await fs.utimes(path.join(s.repo, '.panda/plans', filename), date, date);
+    }
+    await s.service.recover();
+    const read = s.driver.readFileNoFollowWithin.bind(s.driver);
+    let reads = 0;
+    s.driver.readFileNoFollowWithin = async (...args) => { reads++; return read(...args); };
+    const get = s.service.store.get.bind(s.service.store);
+    s.service.store.get = () => { throw new Error('列表不可展开执行详情'); };
+    const first = await s.service.list(1, s.owner.user.id);
+    const second = await s.service.list(1, s.owner.user.id, { page: 2 });
+    expect(first).toMatchObject({ page: 1, pageSize: 20, total: 25 });
+    expect(first.items).toHaveLength(20);
+    expect(second.items).toHaveLength(5);
+    expect(first.items.slice(0, 3).map(item => item.planId)).toEqual(['id-24', 'id-22', 'id-23']);
+    expect(new Set([...first.items, ...second.items].map(item => item.id)).size).toBe(25);
+    expect(Object.keys(first.items[0]).sort()).toEqual(['id', 'planId', 'status', 'time', 'title']);
+    expect((await s.service.list(1, s.owner.user.id, { q: 'id-00' })).items[0].planId).toBe('id-00');
+    expect((await s.service.list(1, s.owner.user.id, { status: 'published' })).total).toBe(0);
+    expect(reads).toBe(0);
+    s.service.store.get = get;
+    const detail = await s.service.detail(1, s.owner.user.id, second.items[0].id);
+    expect(detail.plan!.issues[0].body).toBe(task.body);
+    expect(reads).toBe(1);
+  });
+
+  test('历史计划回退发布时间，来源删除仍可读取发布快照；详情与刷新均保留鉴权', async () => {
+    const s = await setup(); const input = await s.write();
+    const execution = await s.service.execute(1, s.owner.user.id, input);
+    await fs.unlink(path.join(s.repo, input.path));
+    await s.service.refresh(1, s.owner.user.id);
+    const list = await s.service.list(1, s.owner.user.id);
+    expect(list.items).toEqual([{ id: 'plan:test-plan', planId: 'test-plan', title: '本地计划', status: 'published', time: execution.createdTs }]);
+    expect((await s.service.detail(1, s.member.user.id, list.items[0].id)).execution!.issues).toHaveLength(2);
+    expect(() => s.service.detail(1, s.stranger.user.id, list.items[0].id)).toThrow('forbidden');
+    expect(() => s.service.refresh(1, s.stranger.user.id)).toThrow('forbidden');
+    await expect(s.service.detail(1, s.owner.user.id, 'file:../outside.md')).rejects.toMatchObject({ code: 'invalid' });
+  });
+
+  test('独立详情错误可重试；显式刷新更新失效摘要，不创建 issue', async () => {
+    const s = await setup(); await s.write();
+    await s.service.recover();
+    const id = (await s.service.list(1, s.owner.user.id)).items[0].id;
+    const read = s.driver.readFileNoFollowWithin.bind(s.driver);
+    s.driver.readFileNoFollowWithin = async () => { throw new Error('读取暂时失败'); };
+    await expect(s.service.detail(1, s.owner.user.id, id)).rejects.toThrow('读取暂时失败');
+    expect((await s.service.list(1, s.owner.user.id)).total).toBe(1);
+    s.driver.readFileNoFollowWithin = read;
+    expect((await s.service.detail(1, s.owner.user.id, id)).plan!.title).toBe('本地计划');
+    await s.write('# invalid', 'invalid.md');
+    await s.service.refresh(1, s.owner.user.id);
+    expect((await s.service.list(1, s.owner.user.id, { status: 'invalid' })).total).toBe(1);
+    expect(s.engine.store.listByProject(1)).toHaveLength(0);
+  });
+});
+
+
+test('首次发现失败提供刷新重试提示，修复后可建立摘要索引', async () => {
+  const s = await setup(); await s.write();
+  const list = s.driver.listDirectoryNoFollowWithin.bind(s.driver);
+  s.driver.listDirectoryNoFollowWithin = async () => { throw new Error('发现暂时失败'); };
+  await s.service.recover();
+  const response = await s.dispatch(new Request('http://test/api/projects/1/local-plans', {
+    headers: { authorization: `Bearer ${s.owner.token}` },
+  }));
+  expect(response!.status).toBe(503);
+  expect(await response!.json()).toMatchObject({ error: { code: 'local_plans.unavailable', params: { refresh: true } } });
+  s.driver.listDirectoryNoFollowWithin = list;
+  await s.service.refresh(1, s.owner.user.id);
+  expect((await s.service.list(1, s.owner.user.id)).total).toBe(1);
 });

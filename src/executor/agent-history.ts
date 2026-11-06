@@ -211,8 +211,8 @@ interface CodexIndexTitle {
  * 同一 id 可能多次出现；按 updated_at（相同时按后出现的行）取最新 thread_name。
  * 逐块读取避免将执行机上长期累积的索引一次性载入内存。
  */
-async function codexTitles(
-  reader: AgentHistoryReader,
+export async function codexTitles(
+  reader: Pick<AgentHistoryReader, 'statPath' | 'readFileRange'>,
   sessionsRoot: string,
   wantedIds: Set<string>,
 ): Promise<Map<string, string>> {
@@ -259,7 +259,8 @@ async function codexTitles(
     pending += decoder.decode();
     if (pending.trim()) consume(pending);
   } catch {
-    // 索引是可选增强；缺失/瞬时读失败时保留 rollout 的用户消息回退标题。
+    // 读取中途失败也不能用不完整索引中的旧名称覆盖已知标题。
+    return new Map();
   }
   return new Map([...titles].map(([id, value]) => [id, value.title]));
 }

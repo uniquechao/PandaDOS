@@ -1,8 +1,19 @@
 import type { SupportedLocale } from '../locales';
 import { localPlanWorkspaceMessages } from './local-plans-workspace';
 
+// 本轮新增界面文案按需求统一使用简体中文，沿用共享中文消息约定。
+export const localPlanBrowserMessages = {
+  'localPlans.filter': '筛选计划状态',
+  'localPlans.noMatches': '没有符合条件的计划',
+  'localPlans.choose': '选择一个计划查看详情',
+  'localPlans.executionProgress': '执行进度',
+  'localPlans.content': '计划内容',
+  'localPlans.page': '第 {page} / {pages} 页',
+} as const;
+
 export const localPlanMessages = {
   "en": {
+    ...localPlanBrowserMessages,
     ...localPlanWorkspaceMessages["en"],
     "localPlans.title": "Local issue plans",
     "localPlans.help": "Ask your agent to use panda-issue-plan. Plans in .panda/plans are discovered automatically; select Execute plan to create issues and start the queue.",
@@ -31,10 +42,11 @@ export const localPlanMessages = {
     "errors.local_plans.not_found": "The project or plan does not exist."
   },
   "zh-Hans": {
+    ...localPlanBrowserMessages,
     ...localPlanWorkspaceMessages["zh-Hans"],
     "localPlans.title": "本地 issue 计划",
     "localPlans.help": "让 Agent 使用 panda-issue-plan 生成计划。系统自动发现 .panda/plans 中的文件；点击“执行计划”后创建 issue 并启动队列。",
-    "localPlans.empty": "尚未发现本地计划。",
+    "localPlans.empty": "暂无本地计划",
     "localPlans.refresh": "刷新计划",
     "localPlans.preview": "预览计划",
     "localPlans.execute": "执行计划",
@@ -59,6 +71,7 @@ export const localPlanMessages = {
     "errors.local_plans.not_found": "项目或计划不存在。"
   },
   "zh-Hant": {
+    ...localPlanBrowserMessages,
     ...localPlanWorkspaceMessages["zh-Hant"],
     "localPlans.title": "本地 issue 計畫",
     "localPlans.help": "請 Agent 使用 panda-issue-plan 產生計畫。系統自動發現 .panda/plans 中的檔案；點擊「執行計畫」後建立 issue 並啟動佇列。",
@@ -87,6 +100,7 @@ export const localPlanMessages = {
     "errors.local_plans.not_found": "專案或計畫不存在。"
   },
   "ja": {
+    ...localPlanBrowserMessages,
     ...localPlanWorkspaceMessages["ja"],
     "localPlans.title": "ローカル issue 計画",
     "localPlans.help": "エージェントに panda-issue-plan の使用を依頼してください。.panda/plans の計画は自動検出されます。計画を実行すると issue が作成され、キューが開始されます。",
@@ -115,6 +129,7 @@ export const localPlanMessages = {
     "errors.local_plans.not_found": "プロジェクトまたは計画が存在しません。"
   },
   "ko": {
+    ...localPlanBrowserMessages,
     ...localPlanWorkspaceMessages["ko"],
     "localPlans.title": "로컬 issue 계획",
     "localPlans.help": "에이전트에게 panda-issue-plan을 사용하도록 요청하세요. .panda/plans의 계획을 자동으로 찾습니다. 계획 실행을 선택하면 issue를 생성하고 대기열을 시작합니다.",
@@ -143,6 +158,7 @@ export const localPlanMessages = {
     "errors.local_plans.not_found": "프로젝트 또는 계획이 존재하지 않습니다."
   },
   "es": {
+    ...localPlanBrowserMessages,
     ...localPlanWorkspaceMessages["es"],
     "localPlans.title": "Planes locales de issues",
     "localPlans.help": "Pide al agente que use panda-issue-plan. Los planes de .panda/plans se detectan automáticamente; selecciona Ejecutar plan para crear las issues e iniciar la cola.",
@@ -171,6 +187,7 @@ export const localPlanMessages = {
     "errors.local_plans.not_found": "El proyecto o plan no existe."
   },
   "fr": {
+    ...localPlanBrowserMessages,
     ...localPlanWorkspaceMessages["fr"],
     "localPlans.title": "Plans locaux des issues",
     "localPlans.help": "Demandez à votre agent d’utiliser panda-issue-plan. Les plans dans .panda/plans sont détectés automatiquement ; exécutez le plan pour créer les issues et démarrer la file.",
@@ -199,6 +216,7 @@ export const localPlanMessages = {
     "errors.local_plans.not_found": "Le projet ou le plan n’existe pas."
   },
   "de": {
+    ...localPlanBrowserMessages,
     ...localPlanWorkspaceMessages["de"],
     "localPlans.title": "Lokale Issue-Pläne",
     "localPlans.help": "Bitten Sie Ihren Agent, panda-issue-plan zu verwenden. Pläne in .panda/plans werden automatisch erkannt. Mit Plan ausführen erstellen Sie Issues und starten die Warteschlange.",
@@ -227,6 +245,7 @@ export const localPlanMessages = {
     "errors.local_plans.not_found": "Das Projekt oder der Plan existiert nicht."
   },
   "pt-BR": {
+    ...localPlanBrowserMessages,
     ...localPlanWorkspaceMessages["pt-BR"],
     "localPlans.title": "Planos locais de issues",
     "localPlans.help": "Peça ao agente para usar panda-issue-plan. Os planos em .panda/plans são detectados automaticamente; selecione Executar plano para criar as issues e iniciar a fila.",
@@ -255,6 +274,7 @@ export const localPlanMessages = {
     "errors.local_plans.not_found": "O projeto ou plano não existe."
   },
   "ru": {
+    ...localPlanBrowserMessages,
     ...localPlanWorkspaceMessages["ru"],
     "localPlans.title": "Локальные планы задач",
     "localPlans.help": "Попросите агента использовать panda-issue-plan. Планы в .panda/plans обнаруживаются автоматически. Запуск плана создаёт задачи и запускает очередь.",

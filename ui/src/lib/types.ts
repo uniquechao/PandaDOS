@@ -326,6 +326,8 @@ export interface Conversation {
   id: string;
   projectId: number;
   label: string | null;
+  agentTitle?: string | null;
+  manualTitle?: string | null;
   createdTs: number;
   archived: boolean;
   /** 驱动本对话的 CLI 代理（生命周期内不变） */

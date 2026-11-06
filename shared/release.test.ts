@@ -10,14 +10,12 @@ describe('release metadata', () => {
     expect(await file.exists()).toBe(true);
     const release = await file.json();
     expect(release.version).toMatch(/^\d+\.\d+\.\d+-\d{4}\.\d{4}$/);
-    expect(release.version).toBe('2.6.0-2026.1104');
+    expect(release.version).toBe('2.6.5-2026.1106');
     expect(release.version.split('-')[0]).toBe(pkg.version);
     expect(release.notes).toEqual([
-      'idle-chat-hibernation',
-      'local-plan-workspace',
-      'executor-environment-recovery',
-      'issue-stop-diagnostics',
-      'host-build-release',
+      'issue-list-pagination',
+      'sticky-user-question',
+      'agent-conversation-titles',
     ]);
   });
 

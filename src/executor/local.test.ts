@@ -465,7 +465,7 @@ describe('I5 本地命令超时', () => {
       await fsp.mkdir(path.join(dir, '.panda/designs/design-1'), { recursive: true });
       await fsp.writeFile(path.join(dir, '.panda/designs/design-1/DESIGN.md'), 'v1');
       expect(await driver.listDirectoryNoFollowWithin(dir, '.panda/designs/design-1')).toEqual([
-        { name: 'DESIGN.md', type: 'file' },
+        { name: 'DESIGN.md', type: 'file', modifiedTs: expect.any(Number) },
       ]);
       const v1 = createHash('sha256').update('v1').digest('hex');
       expect(await driver.replaceFileNoFollowWithin(

@@ -1,4 +1,4 @@
-import { IssueWorkspace } from '../components/IssueWorkspace';
+import { IssueWorkspaceBadge } from '../components/IssueWorkspace';
 import { LocalPlansButton } from './LocalPlans';
 import { SkillPolicyEditor } from '../components/SkillPolicyEditor';
 /**
@@ -25,7 +25,6 @@ import { fmtTime, timeAgo } from '../lib/fmt';
 import type {
   AgentKind,
   AutoApproveLevel,
-  Issue,
   IssueCategory,
   IssueStatus,
   Me,
@@ -37,8 +36,9 @@ import type {
   WorkflowTemplateDetail,
 } from '../lib/types';
 import { pollProjectSummary } from '../lib/pollSummary';
-import { resolveSelIid } from '../lib/seliid';
-import { filterIssueList, pageSlice, pickDefaultIssueId, sortBoardGroup, type BoardGroupKey } from '../lib/issueOrdering';
+import { useIssueList } from '../lib/useIssueList';
+import type { IssueSummary } from '../../../shared/issue-list';
+import { pickDefaultIssueId, type BoardGroupKey } from '../lib/issueOrdering';
 import { AttentionBadge, StatusBadge } from '../components/badges';
 import { Modal } from '../components/Modal';
 import { ModuleSelect } from '../components/ModuleSelect';
@@ -58,14 +58,13 @@ import {
 import { IssueWorkbench } from './IssueDetail';
 import { reconcileAgent } from '../components/AgentPicker';
 import { WorkflowGraph } from '../components/WorkflowGraph';
-import { tr } from '../i18n/runtime';
+import { tr, runtimeI18n } from '../i18n/runtime';
 import type { IssueId } from '../../../shared/issue-id';
 
-const POLL_MS = 5000;
 
 /** 列表分组（顺序即视觉优先级：待确认最先，等你拍板；收尾三组殿后）。
  * #105：完成混桶拆开——受阻要被看见排收尾组最前，已取消最沉底；空组不渲染（有才出现）。
- * paged=50/页分页，searchable=组内搜索框（完成组条目多才需要）。 */
+ * paged=后端分页，searchable=组内搜索框（完成组条目多才需要）。 */
 const GROUPS: {
   key: BoardGroupKey;
   label: string;
@@ -83,9 +82,8 @@ const GROUPS: {
   { key: 'cancelled', get label() { return tr('status.cancelled'); }, statuses: ['cancelled'], tone: 'cancelled', paged: true },
 ];
 
-export function BoardView({ pid, selIid }: { pid: number; selIid?: IssueId }) {
+export function BoardView({ pid, selIid, localPlansOpen }: { pid: number; selIid?: IssueId; localPlansOpen?: boolean }) {
   const [project, setProject] = useState<Project | null>(null);
-  const [issues, setIssues] = useState<Issue[] | null>(null);
   const [err, setErr] = useState('');
   const [creating, setCreating] = useState(false);
   const [subscribed, setSubscribed] = useState<boolean | null>(null);
@@ -99,60 +97,47 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: IssueId }) {
   const listW = useListWidth(); // 宽屏左栏（任务列表）宽度：拖拽持久化，未设则回落 CSS 默认
   const splitRef = useRef<HTMLDivElement>(null); // .wb-split 容器 ref，供分隔条换算左栏像素宽
 
-  const load = (): void => {
-    api<Project>(`/api/projects/${pid}`).then(setProject).catch((e: Error) => setErr(e.message));
-    api<Issue[]>(`/api/projects/${pid}/issues`)
-      .then(setIssues)
-      .catch((e: Error) => setErr(e.message));
+  // Separate requests: active groups are summaries; history groups are server pages.
+  const groups = {
+    review: useIssueList(pid, 'review', 1, searchQ),
+    doing: useIssueList(pid, 'doing', 1, searchQ),
+    todo: useIssueList(pid, 'todo', 1, searchQ),
+    blocked: useIssueList(pid, 'blocked', (groupPage.blocked ?? 0) + 1, searchQ),
+    finished: useIssueList(pid, 'finished', (groupPage.finished ?? 0) + 1, searchQ),
+    cancelled: useIssueList(pid, 'cancelled', (groupPage.cancelled ?? 0) + 1, searchQ),
   };
-
+  const issues = Object.values(groups).flatMap(group => group.data?.items ?? []);
+  const total = Object.values(groups).reduce((n, group) => n + (group.data?.total ?? 0), 0);
+  const allLoaded = Object.values(groups).every(group => group.data !== null);
+  const [autoSelected, setAutoSelected] = useState<IssueId | null>(null);
+  const settled = Object.values(groups).every(group => group.data !== null || group.error !== null);
+  const candidate = pickDefaultIssueId(issues);
   useEffect(() => {
-    setProject(null);
-    setIssues(null);
-    setErr('');
-    load();
-    const t = window.setInterval(() => {
-      api<Issue[]>(`/api/projects/${pid}/issues`).then(setIssues).catch(() => {});
-    }, POLL_MS);
-    api<Subscription[]>('/api/me/subscriptions')
-      .then((subs) => setSubscribed(subs.some((s) => s.scope === 'project' && s.targetId === pid)))
-      .catch(() => {});
-    void getProjectExecutorAgents(pid).then(setSupportedAgents).catch(() => setSupportedAgents([]));
-    return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pid]);
-
-  const byGroup = useMemo(() => {
-    const m = new Map<string, Issue[]>();
-    for (const g of GROUPS) {
-      const items = (issues ?? []).filter((i) => g.statuses.includes(i.status));
-      // 每组使用明确策略；待办直接复用引擎完整队列顺序，避免展示与实际调度漂移。
-      m.set(g.key, sortBoardGroup(g.key, items, issues ?? []));
-    }
-    return m;
-  }, [issues]);
-
-  // 宽屏默认落在最需要处理的一条：待确认 > 进行中 > 待办 > 最近完成 > 任意
-  const defaultIid = useMemo(() => pickDefaultIssueId(issues ?? []), [issues]);
-
-  // 深链校验：URL 指定优先，但仅当它属于本项目（issues 加载完后校验）。失效/跨项目的旧深链
-  // → 回退自动选优先项 + 清掉 URL 里的坏 iid（否则每 5s 轮询刷 404）。issues=null 视为未加载。
-  // 切项目由 Shell 的 key={pid} 强制重挂（issues 从 null 起），本组件生命周期内 pid 恒定，
-  // 故 issues!==null 即「本项目已加载可判定」，无需再比对 loadedPid。
-  const sel = resolveSelIid(selIid, issues, issues !== null);
-  const selectedId = sel.effectiveIid ?? (wide ? defaultIid : null);
-  useEffect(() => {
-    if (sel.stale) nav(`/p/${pid}`, { replace: true });
-  }, [sel.stale, pid]);
-  // 默认选中落在已完成 issue 时，把初始折叠的完成组展开一次，让选中项在列表里可见；
-  // 只做一次，用户之后手动折叠不再被强制展开（#305）
+    if (settled && !searchQ.trim() && !autoSelected && candidate) setAutoSelected(candidate);
+  }, [settled, searchQ, autoSelected, candidate]);
+  // Page membership is not project membership. Detail validates deep links itself (403/404).
+  const selectedId = selIid ?? (wide ? autoSelected : null);
   const finishedAutoOpened = useRef(false);
-  const defaultIsDone = wide && sel.effectiveIid == null && issues?.find((i) => i.id === defaultIid)?.status === 'done';
   useEffect(() => {
-    if (!defaultIsDone || finishedAutoOpened.current) return;
-    finishedAutoOpened.current = true;
-    setCollapsed((c) => ({ ...c, finished: false }));
-  }, [defaultIsDone]);
+    if (autoSelected && issues.find(i => i.id === autoSelected)?.status === 'done' && !finishedAutoOpened.current) {
+      finishedAutoOpened.current = true;
+      setCollapsed(c => ({ ...c, finished: false }));
+    }
+  }, [autoSelected, issues]);
+
+  const load = (): void => {
+    for (const group of Object.values(groups)) void group.refresh();
+  };
+  useEffect(() => {
+    const controller = new AbortController();
+    const opts = { signal: controller.signal };
+    api<Project>(`/api/projects/${pid}`, 'GET', undefined, opts)
+      .then(setProject).catch((e: Error) => { if (!controller.signal.aborted) setErr(e.message); });
+    api<Subscription[]>('/api/me/subscriptions', 'GET', undefined, opts)
+      .then(subs => setSubscribed(subs.some(s => s.scope === 'project' && s.targetId === pid))).catch(() => {});
+    void getProjectExecutorAgents(pid, controller.signal).then(setSupportedAgents).catch(() => {});
+    return () => controller.abort();
+  }, [pid]);
 
   const toggleSub = async (): Promise<void> => {
     if (subscribed === null) return;
@@ -209,9 +194,9 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: IssueId }) {
   const list = (
     <div class="wb-issuelist">
       <div class="wb-list-hd">
-        <span class="wb-list-t">{tr('board.tasks')}{issues ? ` · ${issues.length}` : ''}</span>
+        <span class="wb-list-t">{tr('board.tasks')}{allLoaded ? ` · ${runtimeI18n().formatNumber(total)}` : ''}</span>
         <div class="wb-list-actions">
-          <LocalPlansButton pid={pid} />
+          <LocalPlansButton pid={pid} initialOpen={localPlansOpen} />
           <button class="btn sm wb-list-action" title={tr('externalImport.title')} aria-label={tr('externalImport.title')} onClick={() => nav(`/p/${pid}/external-issues`)}>
             <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5" /></svg>
           </button>
@@ -221,23 +206,16 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: IssueId }) {
         </div>
       </div>
       <div class="wb-groups">
-        {issues === null && <Loading />}
-        {issues !== null && issues.length === 0 && (
-          <div class="empty">{tr('board.noIssues')}</div>
-        )}
-        {issues !== null &&
-          GROUPS.map((g) => {
-            const items = byGroup.get(g.key) ?? [];
-            if (items.length === 0) return null;
-            // 搜索（#106）：查询非空时全部分组都过滤——零命中组整组隐藏，命中组无视折叠态
-            // 强制展开；完成组是搜索入口宿主，零命中也留头（否则清不掉查询）。
+        {allLoaded && total === 0 && !searchOpen && <div class="empty">{tr('board.noIssues')}</div>}
+        {GROUPS.map((g) => {
+            const state = groups[g.key];
+            const data = state.data;
             const searching = searchOpen && searchQ.trim() !== '';
-            const searched = searching ? filterIssueList(items, searchQ) : items;
-            if (searching && searched.length === 0 && !g.searchable) return null;
+            if (data?.total === 0 && !state.error && !g.searchable) return null;
             const isCollapsed = searching ? false : (collapsed[g.key] ?? false);
-            const { rows, page, pages } = g.paged
-              ? pageSlice(searched, groupPage[g.key] ?? 0)
-              : { rows: searched, page: 0, pages: 1 };
+            const rows = data?.items ?? [];
+            const page = (data?.page ?? (groupPage[g.key] ?? 0) + 1) - 1;
+            const pages = data?.pageSize ? Math.max(1, Math.ceil(data.total / data.pageSize)) : 1;
             const setPage = (p: number): void => setGroupPage((m) => ({ ...m, [g.key]: p }));
             return (
               <div class={`wb-group ${g.tone}`} key={g.key}>
@@ -263,13 +241,15 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: IssueId }) {
                       🔍
                     </button>
                   )}
-                  <span class="wb-group-cnt">{searching ? searched.length : items.length}</span>
+                  <span class="wb-group-cnt">{data ? runtimeI18n().formatNumber(data.total) : '…'}</span>
                 </div>
                 {g.searchable && searchOpen && (
                   <input
                     class="wb-group-search"
                     type="search"
                     placeholder={tr('board.searchIssuePlaceholder')}
+                    aria-label={tr('board.searchIssuePlaceholder')}
+                    maxLength={200}
                     value={searchQ}
                     autofocus
                     onInput={(e) => {
@@ -278,8 +258,15 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: IssueId }) {
                     }}
                   />
                 )}
+                {state.error && (
+                  <div class="wb-group-error" role="alert">
+                    <span>{tr('board.listLoadFailed')}</span>
+                    <button class="btn sm" disabled={state.busy} onClick={() => void state.refresh()}>{tr('action.retry')}</button>
+                  </div>
+                )}
                 {!isCollapsed && (
                   <>
+                    {!data && state.busy && <Loading />}
                     {rows.map((i) => (
                       <IssueRow
                         key={i.id}
@@ -289,18 +276,18 @@ export function BoardView({ pid, selIid }: { pid: number; selIid?: IssueId }) {
                         onPin={(p) => void pinIssue(i.id, p)}
                       />
                     ))}
-                    {searching && g.searchable && searched.length === 0 && (
+                    {searching && g.searchable && data?.total === 0 && (
                       <div class="wb-group-empty mut small">{tr('board.noGroupMatches', { query: searchQ.trim() })}</div>
                     )}
                     {pages > 1 && (
                       <div class="wb-group-pager">
-                        <button class="linkbtn" disabled={page === 0} onClick={() => setPage(page - 1)}>
+                        <button class="linkbtn" disabled={state.busy || page === 0} onClick={() => setPage(page - 1)}>
                           ‹ {tr('board.previous')}
                         </button>
                         <span class="mut small">
-                          {page + 1}/{pages}
+                          {runtimeI18n().formatNumber(page + 1)}/{runtimeI18n().formatNumber(pages)}
                         </span>
-                        <button class="linkbtn" disabled={page >= pages - 1} onClick={() => setPage(page + 1)}>
+                        <button class="linkbtn" disabled={state.busy || page >= pages - 1} onClick={() => setPage(page + 1)}>
                           {tr('board.next')} ›
                         </button>
                       </div>
@@ -407,7 +394,7 @@ function IssueRow({
   onOpen,
   onPin,
 }: {
-  issue: Issue;
+  issue: IssueSummary;
   active: boolean;
   onOpen: () => void;
   onPin?: (pinned: boolean) => void;
@@ -439,7 +426,7 @@ function IssueRow({
       </div>
       <div class="wb-row-m">
         <StatusBadge status={issue.status} awaitingClarify={issue.awaitingClarify} />
-        <IssueWorkspace issue={issue} compact />
+        <IssueWorkspaceBadge issue={issue} />
         {/* #275：等你澄清/选择/审核/验收/处理/受阻 统一由这一个徽标承载，
             替掉原来的 WaitingBadge + clarifyPending 两块分散判断 */}
         <AttentionBadge kind={issue.attentionKind} />

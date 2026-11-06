@@ -28,7 +28,6 @@ import { SkillsView } from './views/Skills';
 import { SettingsView } from './views/Settings';
 import { ProjectSettingsView } from './views/ProjectSettings';
 import { ExternalIssuesView } from './views/ExternalIssues';
-import { LocalPlansView } from './views/LocalPlans';
 import { DesignsView } from './views/Designs';
 import { RoomsView } from './views/Rooms';
 import { RoomDetailView } from './views/RoomDetail';
@@ -505,7 +504,7 @@ function Shell({ me, onLogout }: { me: Me; onLogout: () => void }) {
       view = <ExternalIssuesView key={route.pid} pid={route.pid} />;
       break;
     case 'local-plans':
-      view = <LocalPlansView key={route.pid} pid={route.pid} />;
+      view = <BoardView key={route.pid} pid={route.pid} localPlansOpen />;
       break;
     case 'workflows':
       view = <WorkflowTemplatesView key={route.pid} pid={route.pid} />;

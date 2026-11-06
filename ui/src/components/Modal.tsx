@@ -9,12 +9,14 @@ export function Modal({
   title,
   onClose,
   wide,
+  className,
   children,
 }: {
   title: string;
   onClose: () => void;
   /** 桌面加宽（列表型面板不挤爆换行）；窄屏仍是底部抽屉，不受影响 */
   wide?: boolean;
+  className?: string;
   children: ComponentChildren;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -70,7 +72,7 @@ export function Modal({
     >
       <div
         ref={panelRef}
-        class={wide ? 'modal wide' : 'modal'}
+        class={`${wide ? 'modal wide' : 'modal'}${className ? ` ${className}` : ''}`}
         role="dialog"
         aria-modal="true"
         aria-label={title}

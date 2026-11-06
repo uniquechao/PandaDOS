@@ -1,6 +1,6 @@
 import type { Database } from 'bun:sqlite';
 import type { LocalPlan } from '../../shared/local-plan-format.mjs';
-import type { LocalPlanEffect, LocalPlanExecution } from '../../shared/local-plans';
+import type { LocalPlanEffect, LocalPlanExecution, LocalPlanSummary } from '../../shared/local-plans';
 import type { IssueId } from '../../shared/issue-id';
 
 interface PublicationRow {
@@ -36,6 +36,14 @@ export class LocalPlanStore {
       plan: JSON.parse(row.snapshot_json) as LocalPlan, createdTs: row.created_ts,
       effectsPending: pending.length > 0, lastError: pending.find(item => item.last_error)?.last_error ?? null, issues,
     };
+  }
+
+  /** Never selects snapshots, issue bodies, dependencies or execution details. */
+  summaries(projectId: number): LocalPlanSummary[] {
+    return this.db.query<{ plan_id: string; title: string; created_ts: number }, [number]>(
+      'SELECT plan_id,title,created_ts FROM local_issue_plan_publications WHERE project_id=?',
+    ).all(projectId).map(row => ({ id: `plan:${row.plan_id}`, planId: row.plan_id,
+      title: row.title, status: 'published', time: row.created_ts }));
   }
 
   list(projectId: number): LocalPlanExecution[] {

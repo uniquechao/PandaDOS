@@ -2084,7 +2084,9 @@ export class IssueStore {
    * 它可能被取消、被手动开跑，这时候再自动恢复就是「用户没让我做的事」。
    */
   pendingUnblockRequest(issueId: IssueId): PendingUnblockRequest | null {
-    const issue = this.get(issueId);
+    const issue = this.db.query<{ status: IssueState }, [IssueId]>(
+      'SELECT status FROM issues WHERE id = ?',
+    ).get(issueId);
     if (!issue || (issue.status !== 'blocked' && issue.status !== 'paused')) return null;
     let request: { data: Record<string, unknown>; ts: number } | null = null;
     for (const e of this.listEvents(issueId)) {
@@ -4959,7 +4961,7 @@ export class IssueEngine {
           (candidate) => (candidate.status === 'blocked' || candidate.status === 'paused') && this.workflowSnapshot(candidate.id)?.status === 'paused',
         );
         if (this.deps.moduleWorkspaces ? !this.deps.moduleWorkspaces.canStart(fresh, siblings) : (isBusy(siblings) || pausedWorkflow || this.schedulingPolicy.inputSubmitHeldBy(fresh, siblings))) {
-          immediate = { ok: false, error: '项目忙（已有 issue 在跑），先排队', deferral: 'project-busy' };
+          immediate = { ok: false, error: this.deps.moduleWorkspaces?.retainedBlocker(fresh) ?? '项目忙（已有 issue 在跑），先排队', deferral: 'project-busy' };
           return;
         }
 
@@ -7065,7 +7067,7 @@ export class IssueEngine {
    * 这里只负责把引擎才拿得到的三样东西喂进去：状态、事件流、以及**外部**的弹窗等待标记
    * （waitingInput 是审批管道的内存态，引擎自己看不到，由路由层传入）。
    */
-  attentionKindOf(issue: EngineIssue, waitingInput = false): AttentionKind {
+  attentionKindOf(issue: Pick<EngineIssue, 'id' | 'status'>, waitingInput = false): AttentionKind {
     return attentionKindOf({
       status: issue.status,
       events: this.store.listEvents(issue.id),
@@ -7079,7 +7081,7 @@ export class IssueEngine {
    * 该 issue 会话的弹窗是否已滞留超过 menuStuckMs（waiting_input 派生标记数据源之二：
    * 升级卡之外，长时间没人管的弹窗也该在界面亮「等你选择」）。非驱动/无观测态恒 false。
    */
-  menuStuck(issue: EngineIssue): boolean {
+  menuStuck(issue: Pick<EngineIssue, 'convId'>): boolean {
     if (!issue.convId) return false;
     const w = this.watch.get(issue.convId);
     return !!w && w.menuSince > 0 && this.now() - w.menuSince > this.cfg.menuStuckMs;

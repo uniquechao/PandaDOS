@@ -8,6 +8,7 @@ import { LinkedText, Markdown, type ProjectPaths } from '../Markdown';
 import { localizeUtcTimes } from '../../lib/utctime';
 import { tr } from '../../i18n/runtime';
 import { DetailBody } from './detail';
+import { questionData } from '../questionPosition';
 
 export function MessageEvent({
   role,
@@ -41,13 +42,19 @@ export function MessageEvent({
   // 纯图消息（有图无正文）：加 imgonly 去掉气泡底/内边距，且不渲染空文本节点。
   // 只有附件（无图）时不去底：文件 chip 本身要贴在气泡里才读得出「这是我发的」。
   return (
-    <div class={`rs-msg ${role}${hasImgs && !text ? ' imgonly' : ''}`}>
+    <div class={`rs-msg ${role}${hasImgs && !text ? ' imgonly' : ''}`}
+      data-user-question={role === 'user' ? '' : undefined}
+      tabIndex={role === 'user' ? -1 : undefined}
+      ref={(element) => {
+        if (element && role === 'user') questionData.set(element, { text, off, images, files });
+      }}>
       {text ? (
         <DetailBody
           className="rs-msg-body"
           text={text}
           off={off}
           role={role}
+          expandOnRequestOnly={role === 'user'}
           // AI 正文：先就地补本地时间（`6:50am (UTC)`，原文保留），再按 markdown 渲染
           // （issue #298 —— 表格是重点，容错见 lib/markdown）。
           // 用户自己打的字一个都不动：不换算时间，也不当 markdown 解析，只把其中的文件路径

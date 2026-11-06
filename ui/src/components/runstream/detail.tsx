@@ -88,6 +88,7 @@ export function DetailBody({
   tool,
   render,
   className,
+  expandOnRequestOnly = false,
 }: {
   text: string;
   /** 该正文所属消息的稳定标识；缺省（老数据无 off）时不提供「查看完整内容」 */
@@ -96,15 +97,18 @@ export function DetailBody({
   tool?: string;
   render: (text: string) => JSX.Element;
   className?: string;
+  /** 吸顶预览会共享全文缓存；原用户气泡仅在自身请求展开后使用全文，保持正文高度。 */
+  expandOnRequestOnly?: boolean;
 }) {
   const api = useDetailApi();
+  const [requested, setRequested] = useState(false);
   const state = api?.get(off);
-  const full = state?.phase === 'ready' ? state.content : undefined;
+  const full = state?.phase === 'ready' && (!expandOnRequestOnly || requested) ? state.content : undefined;
   const shown = full ?? text;
   // 只有「服务端确实截过」且还没拿到全文时才出按钮——没被截的内容不该平白多一个钮
   const canLoad = api !== null && off !== undefined && full === undefined && isClipped(text);
   const loading = state?.phase === 'loading';
-  const note = state?.phase === 'error' || (state?.phase === 'ready' && state.truncated);
+  const note = state?.phase === 'error' || (full !== undefined && state?.phase === 'ready' && state.truncated);
   // 复制钮已经浮出去了：既没有「查看完整内容」也没有说明文案时，操作条只剩一条空高度
   const showBar = canLoad || note;
   return (
@@ -124,14 +128,17 @@ export function DetailBody({
               disabled={loading}
               onClick={(e: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
                 e.stopPropagation();
-                api!.request(off!, { ...(role ? { role } : {}), ...(tool ? { tool } : {}) });
+                setRequested(true);
+                if (state?.phase !== 'ready') {
+                  api!.request(off!, { ...(role ? { role } : {}), ...(tool ? { tool } : {}) });
+                }
               }}
             >
               {loading ? tr('ui.loading') : `⇣ ${tr('ui.showFull')}`}
             </button>
           )}
           {state?.phase === 'error' && <span class="rs-body-note bad">{tr('ui.loadFullFailed')}</span>}
-          {state?.phase === 'ready' && state.truncated && (
+          {full !== undefined && state?.phase === 'ready' && state.truncated && (
             <span class="rs-body-note">
               {tr('ui.fullTruncated', { shown: state.content.length, total: state.total })}
             </span>

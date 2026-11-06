@@ -8,7 +8,7 @@ import type { ExecutorDriver } from '../executor/driver';
 import { getProject, type DesignIssueDraft, type IssueEngine } from '../issues/engine';
 import { ResourceDrain, type DrainResult } from '../rooms/lifecycle';
 import { MAX_PLAN_BYTES, parseLocalPlan, type LocalPlan } from '../../shared/local-plan-format.mjs';
-import type { LocalPlanCandidate, LocalPlanEffect, LocalPlanExecution, LocalPlansView } from '../../shared/local-plans';
+import type { LocalPlanCandidate, LocalPlanEffect, LocalPlanExecution, LocalPlansView, LocalPlanSummary, LocalPlanPage, LocalPlanStatus } from '../../shared/local-plans';
 
 export type LocalPlanDriver = Pick<ExecutorDriver, 'readFileNoFollowWithin' | 'listDirectoryNoFollowWithin'>;
 export type LocalPlanEngine = Pick<IssueEngine, 'prepareIssueBatch' | 'commitPreparedDesignBatch' | 'completeDesignBatch' | 'scheduleNext'>;
@@ -18,7 +18,7 @@ const MAX_SCAN_BYTES = 16 * 1024 * 1024;
 const digestOf = (data: Uint8Array): string => createHash('sha256').update(data).digest('hex');
 
 export class LocalPlanError extends Error {
-  constructor(readonly code: 'invalid' | 'changed' | 'published' | 'unavailable' | 'forbidden' | 'not_found', readonly details?: string) {
+  constructor(readonly code: 'invalid' | 'changed' | 'published' | 'unavailable' | 'forbidden' | 'not_found', readonly details?: string, readonly refresh = false) {
     super(code);
   }
 }
@@ -30,6 +30,9 @@ export class LocalPlanService {
   private stopped = false;
   private timer?: ReturnType<typeof setInterval>;
   private recovery?: Promise<void>;
+  // Discovery owns indexing. List queries never open plan files or expand execution records.
+  private readonly indexes = new Map<number, { cwd: string; executorId: number; items: LocalPlanSummary[] }>();
+  private readonly indexErrors = new Map<number, unknown>();
   private readonly scans = new Map<number, Promise<LocalPlanCandidate[]>>();
   private readonly effects = new Map<string, Promise<void>>();
   private readonly cache = new Map<number, { cwd: string; executorId: number; ts: number; candidates: LocalPlanCandidate[] }>();
@@ -56,6 +59,7 @@ export class LocalPlanService {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.cache.clear();
+    this.indexes.clear();
     return this.drain.close(waitMs);
   }
 
@@ -129,6 +133,7 @@ export class LocalPlanService {
       .filter(entry => entry.type === 'file' && FILE_RE.test(entry.name)).sort((a, b) => a.name.localeCompare(b.name));
     if (entries.length > MAX_FILES) throw new LocalPlanError('invalid', 'At most 100 plan files may be scanned');
     const result: LocalPlanCandidate[] = [];
+    const times = new Map(entries.map(entry => [`.panda/plans/${entry.name}`, entry.modifiedTs ?? null]));
     let bytes = 0;
     for (const entry of entries) {
       if (this.stopped) throw new LocalPlanError('unavailable');
@@ -154,7 +159,83 @@ export class LocalPlanService {
     const byId = new Map<string, LocalPlanCandidate[]>();
     for (const item of result) if (item.plan) byId.set(item.plan.planId, [...(byId.get(item.plan.planId) ?? []), item]);
     for (const items of byId.values()) if (items.length > 1) for (const item of items) item.error = `Duplicate planId: ${item.plan!.planId}`;
+    if (this.stopped) throw new LocalPlanError('unavailable');
+    this.indexes.set(project.id, { cwd: project.cwd, executorId: project.executorId, items: result.map(item => ({
+      id: `file:${item.path.slice('.panda/plans/'.length)}`, planId: item.plan?.planId ?? null,
+      title: item.plan?.title ?? item.path, status: item.error ? 'invalid' : 'draft', time: times.get(item.path) ?? null,
+    })) });
+    this.indexErrors.delete(project.id);
     return result;
+  }
+
+  async list(projectId: number, actorId: number, query: { page?: number; pageSize?: number; q?: string; status?: string } = {}): Promise<LocalPlanPage> {
+    const project = this.authorize(projectId, actorId);
+    // Only cold startup waits for discovery; existing pages never wait for a rescan.
+    const previous = this.indexes.get(projectId);
+    if (!previous || previous.cwd !== project.cwd || previous.executorId !== project.executorId) {
+      if (this.recovery) await this.recovery;
+      const flight = this.scans.get(projectId);
+      if (flight) await flight;
+    }
+    const current = this.authorize(projectId, actorId);
+    if (current.cwd !== project.cwd || current.executorId !== project.executorId) throw new LocalPlanError('unavailable', undefined, true);
+    const index = this.indexes.get(projectId);
+    if (this.indexErrors.has(projectId) || !index || index.cwd !== project.cwd || index.executorId !== project.executorId) {
+      throw new LocalPlanError('unavailable', undefined, true);
+    }
+    const publications = this.store.summaries(projectId);
+    const byId = new Map(publications.map(item => [item.planId, item]));
+    const seen = new Set<string>();
+    const items = index.items.flatMap(item => {
+      const publication = item.planId ? byId.get(item.planId) : undefined;
+      if (!publication) return [item];
+      if (seen.has(publication.id)) return [];
+      seen.add(publication.id);
+      return [{ ...item, id: publication.id, title: publication.title, status: 'published' as LocalPlanStatus,
+        time: item.time ?? publication.time }];
+    });
+    items.push(...publications.filter(item => !seen.has(item.id)));
+    const search = (query.q ?? '').trim().toLocaleLowerCase();
+    const filtered = items.filter(item => (!query.status || item.status === query.status)
+      && (!search || `${item.title} ${item.planId ?? item.id}`.toLocaleLowerCase().includes(search)));
+    filtered.sort((a, b) => (b.time ?? 0) - (a.time ?? 0)
+      || (a.planId ?? a.id).localeCompare(b.planId ?? b.id, 'en') || a.id.localeCompare(b.id, 'en'));
+    const pageSize = Math.max(1, Math.min(100, Number.isFinite(query.pageSize) ? Math.floor(query.pageSize || 20) : 20));
+    const page = Math.max(1, Math.min(Math.ceil(filtered.length / pageSize) || 1, Number.isFinite(query.page) ? Math.floor(query.page || 1) : 1));
+    return { items: filtered.slice((page - 1) * pageSize, page * pageSize), page, pageSize, total: filtered.length };
+  }
+
+  /** Explicit refresh reindexes discovery; normal pagination uses only the summary index. */
+  refresh(projectId: number, actorId: number): Promise<void> {
+    const project = this.authorize(projectId, actorId);
+    this.cache.delete(projectId);
+    return this.drain.track(this.scan(project).then(() => { this.authorize(projectId, actorId); }));
+  }
+
+  detail(projectId: number, actorId: number, id: string): Promise<LocalPlanCandidate> {
+    const project = this.authorize(projectId, actorId);
+    return this.drain.track((async () => {
+      if (id.startsWith('plan:')) {
+        const execution = this.store.get(projectId, id.slice(5));
+        if (!execution) throw new LocalPlanError('not_found');
+        let changed = false;
+        try { changed = (await this.read(project, execution.path)).digest !== execution.digest; }
+        catch (error) { if (!(error instanceof LocalPlanError) || !['not_found', 'invalid'].includes(error.code)) throw error; }
+        this.authorize(projectId, actorId);
+        return { path: execution.path, digest: execution.digest, plan: execution.plan, execution, changed, error: null };
+      }
+      if (!id.startsWith('file:') || !FILE_RE.test(id.slice(5))) throw new LocalPlanError('invalid');
+      const path = `.panda/plans/${id.slice(5)}`;
+      const { digest, plan } = await this.read(project, path);
+      let error: string | null = null;
+      try { await this.deps.engine.prepareIssueBatch(projectId, this.drafts(project, plan)); }
+      catch (reason) { error = String(reason); }
+      const duplicate = this.indexes.get(projectId)?.items.filter(item => item.planId === plan.planId).length ?? 0;
+      if (duplicate > 1) error = `Duplicate planId: ${plan.planId}`;
+      this.authorize(projectId, actorId);
+      const execution = this.store.get(projectId, plan.planId);
+      return { path, digest, plan, execution, changed: !!execution && execution.digest !== digest, error };
+    })());
   }
 
   view(projectId: number, actorId: number, refresh = false): Promise<LocalPlansView> {
@@ -246,11 +327,11 @@ export class LocalPlanService {
       await this.deps.engine.scheduleNext(projectId, { source: 'publication' });
     }
     // Polling also works for SSH executors and catches files created while the UI was closed.
-    const projects = this.deps.db.query<{ id: number }, []>("SELECT id FROM projects WHERE status='active'").all();
+    const projects = this.deps.db.query<{ id: number }, []>("SELECT id FROM projects").all();
     for (const item of projects) {
       if (this.stopped) return;
       const project = getProject(this.deps.db, item.id);
-      if (project) await this.scan(project).catch(() => {});
+      if (project) await this.scan(project).catch(error => { this.indexErrors.set(project.id, error); });
     }
   }
 }

@@ -36,7 +36,7 @@ export interface SftpStatsLike {
 
 export interface SftpDirEntryLike {
   filename: string;
-  attrs: { mode: number };
+  attrs: { mode: number; mtime?: number };
 }
 
 /** SFTP channel 的最小面（readFileRange/statPath/listDir/writeFile 所需）。 */

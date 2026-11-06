@@ -39,3 +39,19 @@ export interface LocalPlansView {
   candidates: LocalPlanCandidate[];
   executions: LocalPlanExecution[];
 }
+
+export type LocalPlanStatus = 'draft' | 'published' | 'invalid';
+/** Summary identity is opaque; it also addresses invalid files and missing published sources. */
+export interface LocalPlanSummary {
+  id: string;
+  planId: string | null;
+  title: string;
+  status: LocalPlanStatus;
+  time: number | null;
+}
+export interface LocalPlanPage {
+  items: LocalPlanSummary[];
+  page: number;
+  pageSize: number;
+  total: number;
+}

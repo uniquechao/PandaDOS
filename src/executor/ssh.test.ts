@@ -978,3 +978,20 @@ describe('模块工作区环境与停止确认',()=>{
   await driver.close();
  });
 });
+
+it('安全目录枚举透传毫秒修改时间，缺少时间时保持可选且不读取正文', async () => {
+  const sftp = new MockSftp();
+  for (const path of ['/project', '/project/.panda', '/project/.panda/plans']) sftp.modes.set(path, 0o040755);
+  sftp.readdir = (_path, cb) => cb(null, [
+    { filename: 'new.md', attrs: { mode: 0o100644, mtime: 1_700_000_000 } },
+    { filename: 'old.md', attrs: { mode: 0o100644 } },
+  ]);
+  const { driver } = mkDriver({ sftp });
+  try {
+    expect(await driver.listDirectoryNoFollowWithin('/project', '.panda/plans')).toEqual([
+      { name: 'new.md', type: 'file', modifiedTs: 1_700_000_000_000 },
+      { name: 'old.md', type: 'file', modifiedTs: undefined },
+    ]);
+    expect(sftp.readCalls).toBe(0);
+  } finally { await driver.close(); }
+});

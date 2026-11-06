@@ -218,7 +218,7 @@ describe('conversations 路由：新建/列表', () => {
 
     const list = await t.call('GET', P, t.aliceToken);
     expect(list.body.conversations).toEqual([]);
-    for (const action of ['activate', 'archive', 'rename']) {
+    for (const action of ['activate', 'archive', 'rename', 'auto-title']) {
       const result = await t.call(
         'POST',
         `${P}/${conversation.id}/${action}`,
@@ -472,6 +472,30 @@ describe('conversations 路由：activate/archive/rename', () => {
     expect(withArch.body.conversations.map((x: any) => x.id)).toContain(c.id);
   });
 
+  test('列表读取同步原生后续名称，手动改名保护并可恢复', async () => {
+    const fixture = await historyFixture();
+    try {
+      const t = setup(undefined, fixture.driver);
+      t.db.query('UPDATE executors SET codex_dir = ? WHERE id = 1').run(fixture.codexRoot);
+      const c = (await t.call('POST', P, t.aliceToken, { agent: 'codex' })).body.conversation;
+      t.db.query('UPDATE conversations SET agent_session_id = ? WHERE id = ?').run(fixture.codexSid, c.id);
+      const index = path.join(path.dirname(fixture.codexRoot), 'session_index.jsonl');
+      const writeTitle = (title: string) => fsp.writeFile(index, JSON.stringify({ id: fixture.codexSid, thread_name: title }) + '\n');
+      await writeTitle('Agent 初次名称');
+      expect((await t.call('GET', P, t.aliceToken)).body.conversations[0].label).toBe('Agent 初次名称');
+      await writeTitle('Agent 后续名称');
+      expect((await t.call('GET', P, t.aliceToken)).body.conversations[0].label).toBe('Agent 后续名称');
+      await t.call('POST', `${P}/${c.id}/rename`, t.aliceToken, { label: '用户名称' });
+      await writeTitle('Agent 最新名称');
+      const manual = (await t.call('GET', P, t.aliceToken)).body.conversations[0];
+      expect(manual.label).toBe('用户名称');
+      expect(manual.agentTitle).toBe('Agent 最新名称');
+      expect((await t.call('POST', `${P}/${c.id}/auto-title`, t.aliceToken)).body.conversation.label).toBe('Agent 最新名称');
+    } finally {
+      await fsp.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   test('rename 改标题；空 label 400', async () => {
     const t = setup();
     const c = (await t.call('POST', P, t.aliceToken, { label: 'old' })).body.conversation;
@@ -479,6 +503,22 @@ describe('conversations 路由：activate/archive/rename', () => {
     expect(rn.status).toBe(200);
     expect(rn.body.conversation.label).toBe('new');
     expect((await t.call('POST', `${P}/${c.id}/rename`, t.aliceToken, { label: '  ' })).status).toBe(400);
+  });
+
+  test('恢复自动命名采用最新 Agent 标题，并校验归属与对话类型', async () => {
+    const t = setup();
+    const c = (await t.call('POST', P, t.aliceToken, { label: '手动名称' })).body.conversation;
+    expect(c.manualTitle).toBe('手动名称');
+    t.db.query('UPDATE conversations SET agent_title = ? WHERE id = ?').run('Agent 最新名称', c.id);
+    expect((await t.call('POST', `${P}/${c.id}/auto-title`, null)).status).toBe(401);
+    expect((await t.call('POST', `${P}/${c.id}/auto-title`, t.bobToken)).status).toBe(403);
+    const restored = await t.call('POST', `${P}/${c.id}/auto-title`, t.aliceToken);
+    expect(restored.status).toBe(200);
+    expect(restored.body.conversation.label).toBe('Agent 最新名称');
+    expect(restored.body.conversation.manualTitle).toBeNull();
+    const issue = t.convs.create(1, 'issue', 'claude', 'issue');
+    expect((await t.call('POST', `${P}/${issue.id}/auto-title`, t.aliceToken)).status).toBe(400);
+    expect((await t.call('POST', `${P}/missing/auto-title`, t.aliceToken)).status).toBe(404);
   });
 
   test('auto-approve 改档位：新建默认 cautious，改完回显；非法值 400、非 chat 对话 400', async () => {

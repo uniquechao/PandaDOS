@@ -14,6 +14,7 @@ import { ImageAttach, type AttachedFile, type AttachedImage } from './ImageAttac
 import { ImageLightbox } from './ImageLightbox';
 import { DetailCtx, RunStream, type DetailApi, type DetailState } from './runstream';
 import { ConversationSegments } from './ConversationSegments';
+import { StickyQuestion } from './StickyQuestion';
 import { RunControls } from './RunControls';
 import { isDriving, retryPlan } from '../lib/issueStatus';
 import { lastToolErrored, producedFilesOf } from '../lib/runstream';
@@ -411,65 +412,70 @@ export function ChatPane({
   };
   return (
     <div class="fullcol chatpane">
-      {showRunCtl && runCtl && plan ? (
-        <RunControls
-          leading={headerLeading}
-          busy={runCtl.busy}
-          onRetry={doRetry}
-          retryLabel={plan.label}
-          retryEnabled={plan.enabled}
-          retryHint={plan.hint}
-          onTerminate={runCtl.onTerminate}
-        />
-      ) : (
-        headerLeading && <div class="runctl">{headerLeading}</div>
-      )}
-      <div class="chat-msgs runstream" ref={listRef} onScroll={onScroll}>
-        {visibleMsgs.length === 0 && pending.length === 0 && !loadingHistory && (
-          <div class="empty">{t('ui.noChatMessages')}</div>
+      <div class="chat-toolbar">
+        {showRunCtl && runCtl && plan ? (
+          <RunControls
+            leading={headerLeading}
+            busy={runCtl.busy}
+            onRetry={doRetry}
+            retryLabel={plan.label}
+            retryEnabled={plan.enabled}
+            retryHint={plan.hint}
+            onTerminate={runCtl.onTerminate}
+          />
+        ) : (
+          headerLeading && <div class="runctl">{headerLeading}</div>
         )}
-        {(visibleMsgs.length > 0 || loadingHistory) && (
-          <div class="chat-hist-top">
-            {loadingHistory ? (
-              <span class="chat-hist-hint">
-                <span class="tool-spin" /> {t('ui.loadingEarlier')}
-              </span>
-            ) : canLoadOlder ? (
-              <button class="chat-hist-more" onClick={loadOlder}>
-                ↑ {t('ui.loadingEarlier')}
-              </button>
-            ) : (
-              <span class="chat-hist-hint mut">· {t('ui.startOfHistory')} ·</span>
-            )}
-          </div>
-        )}
-        {/* 展开看全/复制的能力对整条消息流一视同仁：模块历史时间线里的 RunStream 也在里面 */}
-        <DetailCtx.Provider value={detailApi}>
-          {currentIssueId !== undefined && (moduleSegments?.length ?? 0) > 0 && (
-            <ConversationSegments
-              msgs={msgs}
-              segments={moduleSegments ?? []}
-              convId={conv}
-              currentIssueId={currentIssueId}
-              pid={pid}
-              onOpenImage={setLightbox}
-            />
-          )}
-          <RunStream msgs={visibleMsgs} pid={pid} onOpenImage={setLightbox} />
-        </DetailCtx.Provider>
-        {/* 我刚发出去、还没从 jsonl 回流的消息（issue #116）：恒在流的末尾，带送达状态 */}
-        {pending.map((p) => (
-          <div key={p.id} class={`rs-msg user pending ${p.state}`}>
-            {p.text || null}
-            {p.imgCount > 0 && <div class="rs-msg-note">📎 {t('ui.imageCount', { count: p.imgCount })}</div>}
-            {(p.fileCount ?? 0) > 0 && (
-              <div class="rs-msg-note">📎 {t('ui.fileCount', { count: p.fileCount ?? 0 })}</div>
-            )}
-            <span class="rs-msg-ack">{pendingHint(p.state)}</span>
-          </div>
-        ))}
+        <StickyQuestion listRef={listRef} detailApi={detailApi} pid={pid} onOpenImage={setLightbox}
+          scope={`${pid}:${conv ?? ''}:${currentIssueId ?? ''}`} />
       </div>
-
+      <div class="chat-reading-area">
+        <div class="chat-msgs runstream" ref={listRef} onScroll={onScroll}>
+          {visibleMsgs.length === 0 && pending.length === 0 && !loadingHistory && (
+            <div class="empty">{t('ui.noChatMessages')}</div>
+          )}
+          {(visibleMsgs.length > 0 || loadingHistory) && (
+            <div class="chat-hist-top">
+              {loadingHistory ? (
+                <span class="chat-hist-hint">
+                  <span class="tool-spin" /> {t('ui.loadingEarlier')}
+                </span>
+              ) : canLoadOlder ? (
+                <button class="chat-hist-more" onClick={loadOlder}>
+                  ↑ {t('ui.loadingEarlier')}
+                </button>
+              ) : (
+                <span class="chat-hist-hint mut">· {t('ui.startOfHistory')} ·</span>
+              )}
+            </div>
+          )}
+          {/* 展开看全/复制的能力对整条消息流一视同仁：模块历史时间线里的 RunStream 也在里面 */}
+          <DetailCtx.Provider value={detailApi}>
+            {currentIssueId !== undefined && (moduleSegments?.length ?? 0) > 0 && (
+              <ConversationSegments
+                msgs={msgs}
+                segments={moduleSegments ?? []}
+                convId={conv}
+                currentIssueId={currentIssueId}
+                pid={pid}
+                onOpenImage={setLightbox}
+              />
+            )}
+            <RunStream msgs={visibleMsgs} pid={pid} onOpenImage={setLightbox} />
+          </DetailCtx.Provider>
+          {/* 我刚发出去、还没从 jsonl 回流的消息（issue #116）：恒在流的末尾，带送达状态 */}
+          {pending.map((p) => (
+            <div key={p.id} class={`rs-msg user pending ${p.state}`}>
+              {p.text || null}
+              {p.imgCount > 0 && <div class="rs-msg-note">📎 {t('ui.imageCount', { count: p.imgCount })}</div>}
+              {(p.fileCount ?? 0) > 0 && (
+                <div class="rs-msg-note">📎 {t('ui.fileCount', { count: p.fileCount ?? 0 })}</div>
+              )}
+              <span class="rs-msg-ack">{pendingHint(p.state)}</span>
+            </div>
+          ))}
+        </div>
+      </div>
       <div class="composer">
         {connHint && <div class="conn-hint mut small">{connHint}</div>}
         {activity && (

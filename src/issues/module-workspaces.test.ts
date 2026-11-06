@@ -10,6 +10,8 @@ import { KeyedMutex } from './mutex';
 import { ModuleWorkspaceService } from './module-workspaces';
 import { release as kernelRelease } from 'node:os';
 import { testTmuxDirectory } from '../../scripts/test-tmux';
+import { createProjectDataPersistence } from '../web/project-data-persistence';
+import { moduleIssueRelPath } from './module-docs';
 
 class DiagnosticDriver extends LocalDriver {
  readonly commandTrace: Array<Record<string, unknown>> = [];
@@ -95,6 +97,50 @@ async function setup(diagnostics=false) {
  }
  return {root,repo,db,driver,git,project,store,service,issue,deps,captureFailure};
 }
+
+test('准备期间过程页回写不能污染新 worktree，准备完成后再投影执行目录',async()=>{
+ const s=await setup(),a=s.issue(1);
+ s.db.run('DELETE FROM project_data_outbox');
+ const outbox=createProjectDataPersistence(s.db,()=>s.driver,s.deps.mutex);
+ outbox.enqueue(1,'issue',a.id,'upsert');
+ const original=s.driver.runCommand.bind(s.driver);
+ let projected=false;
+ s.driver.runCommand=async(cwd,argv,timeoutMs,env)=>{
+  if(!projected&&cwd!==s.repo&&argv.includes('status')&&argv.includes('--porcelain')) {
+   projected=true;
+   expect((await outbox.drain()).failed).toBe(0);
+  }
+  return original(cwd,argv,timeoutMs,env);
+ };
+ const w=await s.service.resolve(a,s.project);
+ expect(projected).toBe(true);
+ expect(s.service.attempt(a.id)?.phase).toBe('ready');
+ const doc=moduleIssueRelPath('m1',a.id,a.title);
+ expect(readFileSync(s.repo+'/'+doc,'utf8')).toContain(a.title);
+ expect(readFileSync(w.cwd+'/'+doc,'utf8')).toContain(a.title);
+ s.db.query("UPDATE issues SET status='implementing' WHERE id=?").run(a.id);
+ expect((await outbox.drain()).failed).toBe(0);
+ expect(readFileSync(w.cwd+'/'+doc,'utf8')).toContain('status: implementing');
+ expect(readFileSync(s.repo+'/'+doc,'utf8')).toContain('status: pending');
+});
+
+test('准备期间真实代码改动仍阻止开工并原样保留',async()=>{
+ const s=await setup(),a=s.issue(1);
+ const original=s.driver.runCommand.bind(s.driver);
+ let touched:string|undefined;
+ s.driver.runCommand=async(cwd,argv,timeoutMs,env)=>{
+  if(!touched&&cwd!==s.repo&&argv.includes('status')&&argv.includes('--porcelain')) {
+   touched=cwd;writeFileSync(cwd+'/same.txt','用户未保存的代码\n');
+  }
+  return original(cwd,argv,timeoutMs,env);
+ };
+ const failure=await s.service.resolve(a,s.project).then(()=>null,error=>error);
+ expect(failure).toBeInstanceOf(Error);
+ expect(failure.message).toContain('工作区有未保存改动');
+ expect(failure.message).toContain('same.txt');
+ expect(readFileSync(touched!+'/same.txt','utf8')).toBe('用户未保存的代码\n');
+ expect(s.service.attempt(a.id)?.phase).toBe('preparing');
+});
 
 test('真实 Git：同模块复用、跨模块并发及主目录脏文件保持原样',async()=>{
  const s=await setup(true);const a=s.issue(1),a2=s.issue(1),b=s.issue(2),c=s.issue(3);
@@ -221,6 +267,32 @@ test('引擎接线：两模块同时启动，暂停不释放同模块，完成�
  expect(engine.store.get(dependent.id)?.status).toBe('pending');
  writeFileSync(bw.cwd+'/b.txt','依赖成果');await engine.applyEvent(b.id,'impl_done');await engine.applyEvent(b.id,'tests_passed');
  expect(engine.store.get(dependent.id)?.status).toBe('implementing');expect(readFileSync(s.service.attempt(dependent.id)!.cwd+'/b.txt','utf8')).toBe('依赖成果');
+});
+
+test('取消：干净且基线已集成的现场释放后同模块可以接力',async()=>{
+ const s=await setup(),a=s.issue(1),next=s.issue(1);
+ const w=await s.service.resolve(a,s.project);
+ rmSync(w.cwd+'/.panda/modules',{recursive:true,force:true});
+ s.db.query("UPDATE issues SET status='cancelled' WHERE id=?").run(a.id);
+ await s.service.release(s.store.get(a.id)!,s.project);
+ expect(s.service.held(a.id)).toBe(false);
+ expect(s.service.attempt(a.id)?.integrated_sha).toBeNull();
+ expect(s.store.get(a.id)?.status).toBe('cancelled');
+ expect(s.service.canStart(next,[s.store.get(a.id)!,next])).toBe(true);
+ expect((await s.service.resolve(next,s.project)).cwd).toBe(w.cwd);
+});
+
+test('取消：已提交但未集成的成果仍保留并说明实际占用者',async()=>{
+ const s=await setup(),a=s.issue(1),next=s.issue(1);
+ const w=await s.service.resolve(a,s.project);
+ writeFileSync(w.cwd+'/kept.txt','保留已提交成果');
+ await s.git(w.cwd,['add','.']);await s.git(w.cwd,['commit','-m','unmerged work']);
+ s.db.query("UPDATE issues SET status='cancelled' WHERE id=?").run(a.id);
+ await s.service.release(s.store.get(a.id)!,s.project);
+ expect(s.service.held(a.id)).toBe(true);
+ expect(s.service.retainedBlocker(next)).toContain(a.id);
+ expect(s.service.retainedBlocker(next)).toContain('已取消');
+ expect(readFileSync(w.cwd+'/kept.txt','utf8')).toBe('保留已提交成果');
 });
 
 test('取消：停止未知时不释放；停止确认后保留脏现场且拒绝下一条接管',async()=>{

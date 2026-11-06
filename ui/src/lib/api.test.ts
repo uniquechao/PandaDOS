@@ -344,3 +344,20 @@ describe('uploadWithProgress', () => {
     await p2;
   });
 });
+
+test('a 200 response with a broken body rejects instead of succeeding as null', async () => {
+  globalThis.fetch = (async () => ({ status: 200, ok: true,
+    json: async () => { throw new TypeError('Failed to fetch'); },
+  }) as unknown as Response) as unknown as typeof fetch;
+  const error = await api('/api/projects/1/issues').catch(value => value) as ApiError;
+  expect(error).toBeInstanceOf(ApiError);
+  expect(error.code).toBe('network.unreachable');
+  expect(error.details).toBe('Failed to fetch');
+});
+
+test('invalid JSON rejects, while genuine no-content success remains supported', async () => {
+  globalThis.fetch = (async () => new Response('{invalid', { status: 200 })) as unknown as typeof fetch;
+  await expect(api('/api/projects/1/issues')).rejects.toBeInstanceOf(ApiError);
+  globalThis.fetch = (async () => new Response(null, { status: 204 })) as unknown as typeof fetch;
+  expect(await api('/api/delete')).toBeNull();
+});

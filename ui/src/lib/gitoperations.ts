@@ -16,6 +16,20 @@ export interface GitFileOperation {
 
 export type GitFileOperations = Record<string, GitFileOperation>;
 
+/** 只暂存当前分组中属于目录的改动，沿用逐文件操作的重命名路径规则。 */
+export function directoryStagePaths(directory: string, paths: readonly string[], operations: GitFileOperations): string[] {
+  return [...new Set(paths
+    .filter((path) => path.startsWith(`${directory}/`))
+    .flatMap((path) => operations[path]?.paths ?? [path]))];
+}
+
+/** 后端每次最多接收 500 条路径；在同一前端操作门闩内顺序发送，失败立即停止。 */
+export async function writeGitPathBatches(paths: string[], write: (batch: string[]) => Promise<{ ok: boolean; error?: string }>): Promise<void> {
+  for (let offset = 0; offset < paths.length; offset += 500) {
+    requireGitOperationSuccess(await write(paths.slice(offset, offset + 500)));
+  }
+}
+
 function addUnique(paths: string[], path: string | undefined): void {
   if (path && !paths.includes(path)) paths.push(path);
 }

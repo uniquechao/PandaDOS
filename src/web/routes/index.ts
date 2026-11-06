@@ -2,6 +2,7 @@ import { agentModelsRoutes } from './agent-models';
 import { localPlansRoutes } from './local-plans';
 import type { LocalPlanService } from '../local-plans';
 import type { AgentModelSettings } from '../../core/agent-model-settings';
+import type { IssueListObservation } from '../../issues/issue-list';
 /**
  * web/routes —— 全部路由工厂的聚合点（集成接线，spec §9）。
  * 各域模块只 export 自己的 RouteDef[] 工厂；这里按 createDispatcher 约定统一编排：
@@ -32,7 +33,7 @@ import type { DesignFilesService } from '../../designs/files';
 import type { DesignAssetService } from '../../designs/assets';
 import type { ExecutorDriver } from '../../executor/driver';
 import type { SummaryTarget } from '../../core/agent-summary';
-import { getProject, type EngineIssue, type IssueEngine } from '../../issues/engine';
+import { getProject, type IssueEngine } from '../../issues/engine';
 import type { KeyedMutex } from '../../issues/mutex';
 import type { ModuleStore } from '../../issues/modules';
 import type { SubscriptionStore } from '../../notify/router';
@@ -123,6 +124,7 @@ export interface ApiDeps {
   /** 对话当前模型探测（core/model-probe.ModelProbe）；缺省 = model 接口恒 null */
   models?: ConvModelPort;
   modelsForProject?(project: Project): ConvModelPort;
+  locateConversation?(project: Project, id: string): Promise<string | null>;
   /** 订阅存储（NotifyRouter.subscriptions） */
   subs: SubscriptionStore;
   /** 飞书通道（未配置传 null → 绑定接口 503，其余照常） */
@@ -138,7 +140,7 @@ export interface ApiDeps {
   /** 通知钩子：建项目自动订阅属主（NotifyRouter 结构兼容） */
   notify?: { ensureOwnerSubscription(projectId: number, ownerUserId: number): unknown };
   /** waiting_input 派生标记（弹窗升级人工未处理/菜单滞留；见 issuesRoutes）；缺省恒 false */
-  waitingInput?(issue: EngineIssue): boolean;
+  waitingInput?(issue: IssueListObservation): boolean;
   /** 用户消息计数（013 user_message_counts）：目前给 issues 的澄清答复用；缺省不接 = 不统计 */
   messages?: MessageBumper;
   projectDataSync?: { sync(project: Project): Promise<unknown>; status(projectId: number): ProjectDataSyncStatus };
@@ -231,6 +233,7 @@ export function allRoutes(deps: ApiDeps): RouteDef[] {
           convs: deps.convs,
           mutex: deps.mutex,
           driverForProject: deps.driverForProject,
+          ...(deps.locateConversation ? { locateConversation: deps.locateConversation } : {}),
           ...(deps.executionUnavailable ? { executionUnavailable: deps.executionUnavailable } : {}),
           ...(deps.models ? { models: deps.models } : {}),
           ...(deps.modelsForProject ? { modelsForProject: deps.modelsForProject } : {}),

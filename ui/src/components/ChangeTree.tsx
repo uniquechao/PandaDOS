@@ -8,7 +8,7 @@
  */
 import type { JSX } from 'preact';
 import { useMemo, useState } from 'preact/hooks';
-import { buildChangeTree, type ChangeLeaf, type ChangeNode } from '../lib/changetree';
+import { buildChangeTree, type ChangeDirNode, type ChangeLeaf, type ChangeNode } from '../lib/changetree';
 import { PlusMinus, StatusChip } from '../views/Git';
 
 /** 每层缩进像素（同 FileTree） */
@@ -19,6 +19,7 @@ export function ChangeTree({
   selKey,
   onOpen,
   renderActions,
+  renderDirActions,
 }: {
   leaves: ChangeLeaf[];
   /** 当前选中叶子的 key（用于高亮）；undefined = 未选 */
@@ -26,6 +27,8 @@ export function ChangeTree({
   onOpen: (leaf: ChangeLeaf) => void;
   /** 可选文件行操作区；内部会阻止点击冒泡，避免操作按钮同时打开文件。 */
   renderActions?: (leaf: ChangeLeaf) => JSX.Element | null;
+  /** 可选目录行操作区，点击不会展开或收起目录。 */
+  renderDirActions?: (dir: ChangeDirNode) => JSX.Element | null;
 }) {
   const tree = useMemo(() => buildChangeTree(leaves), [leaves]);
   // 折叠目录集（键 = 目录完整路径；默认全展开——改动树是有限清单，先看全貌）
@@ -44,6 +47,11 @@ export function ChangeTree({
               <span class="ft-name mono">{n.name}</span>
               <span class="ct-agg mut">{n.files}</span>
               {(n.adds > 0 || n.dels > 0) && <PlusMinus adds={n.adds} dels={n.dels} />}
+              {renderDirActions && (
+                <span class="ct-actions" onClick={(e) => e.stopPropagation()}>
+                  {renderDirActions(n)}
+                </span>
+              )}
             </div>
             {open && renderNodes(n.children, depth + 1)}
           </div>

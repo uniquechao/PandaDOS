@@ -17,6 +17,47 @@ afterEach(async () => {
 });
 
 describe('Issue Markdown 协作持久化', () => {
+  test('预留、Git 准备和依赖准备阶段只回写项目目录，就绪后才写执行目录', async () => {
+    const base = path.resolve('.private/workspace-tests');
+    await fsp.mkdir(base, { recursive: true });
+    const cwd = await fsp.mkdtemp(path.join(base, 'early-projection-'));
+    cleanups.push(cwd);
+    const worktree = path.join(cwd, 'worktree');
+    await fsp.mkdir(worktree);
+    const original = '.panda/modules/module/issues/33-original.md';
+    const db = openDb(':memory:');
+    try {
+      migrate(db); migrateIssueEngine(db);
+      db.run("INSERT INTO users(id,username,token_hash,role,created_ts) VALUES(1,'admin','x','admin',1)");
+      db.run("INSERT INTO executors(id,name,host,ssh_user,key_ref,workspace_root,claude_dir) VALUES(1,'local','localhost','local','',?,'')", [cwd]);
+      db.run("INSERT INTO projects(id,name,executor_id,cwd,owner_user_id,created_ts) VALUES(7,'准备回归',1,?,1,1)", [cwd]);
+      db.run("INSERT INTO issues(id,project_id,title,agent,status,sync_uid,doc_path,created_ts) VALUES('247',7,'准备回归','codex','pending','issue-uid',?,1)", [original]);
+      db.run("INSERT INTO module_workspaces(id,project_id,module_key,executor_id,cwd,branch,current_attempt,created_ts,updated_ts) VALUES(1,7,0,1,?,'module-branch','attempt-a',1,1)", [worktree]);
+      db.run("INSERT INTO workspace_attempts(id,workspace_id,issue_id,agent,created_ts,updated_ts) VALUES('attempt-a',1,'247','codex',1,1)");
+      await fsp.mkdir(path.dirname(path.join(cwd, original)), { recursive: true });
+      await fsp.writeFile(path.join(cwd, original), '# #247 准备回归\n\n## 设计与实施\n\n人工记录\n');
+      db.run('DELETE FROM project_data_outbox');
+      const outbox = createProjectDataPersistence(db, () => new LocalDriver(), new KeyedMutex());
+      for (const phase of ['reserved', 'preparing', 'prepared']) {
+        db.query('UPDATE workspace_attempts SET phase=? WHERE id=?').run(phase, 'attempt-a');
+        outbox.enqueue(7, 'issue', '247', 'upsert');
+        expect((await outbox.drain()).failed).toBe(0);
+        const content = await fsp.readFile(path.join(cwd, original), 'utf8');
+        expect(content).toContain('人工记录');
+        expect(content).toContain('sync_uid: issue-uid');
+        expect(await fsp.stat(path.join(worktree, original)).catch(() => null)).toBeNull();
+      }
+      const source = await fsp.readFile(path.join(cwd, original), 'utf8');
+      db.run("UPDATE workspace_attempts SET phase='ready' WHERE id='attempt-a'");
+      db.run("UPDATE issues SET status='implementing' WHERE id='247'");
+      expect((await outbox.drain()).failed).toBe(0);
+      const projected = await fsp.readFile(path.join(worktree, original), 'utf8');
+      expect(projected).toContain('人工记录');
+      expect(projected).toContain('status: implementing');
+      expect(await fsp.readFile(path.join(cwd, original), 'utf8')).toBe(source);
+    } finally { db.close(); }
+  });
+
   test('模块投影保留原 doc_path 与人工记录，等待提交锁后不改写固定成果', async () => {
     const evidenceRoot = path.join(process.cwd(), '.private/workspace-tests');
     await fsp.mkdir(evidenceRoot, { recursive: true });
@@ -38,7 +79,7 @@ describe('Issue Markdown 协作持久化', () => {
       }
       db.run("INSERT INTO issues(id,project_id,title,body,module_id,agent,status,sync_uid,doc_path,created_ts) VALUES('247',7,'投影回归','需求',12,'codex','pending','issue-uid',?,1)", [original]);
       db.run("INSERT INTO module_workspaces(id,project_id,module_key,executor_id,cwd,branch,current_attempt,created_ts,updated_ts) VALUES(1,7,12,1,?,'module-branch','attempt-a',1,1)", [a]);
-      db.run("INSERT INTO workspace_attempts(id,workspace_id,issue_id,agent,created_ts,updated_ts) VALUES('attempt-a',1,'247','codex',1,1)");
+      db.run("INSERT INTO workspace_attempts(id,workspace_id,issue_id,agent,phase,created_ts,updated_ts) VALUES('attempt-a',1,'247','codex','ready',1,1)");
       db.run('DELETE FROM project_data_outbox');
       const mutex = new KeyedMutex();
       const outbox = createProjectDataPersistence(db, () => new LocalDriver(), mutex);

@@ -64,6 +64,14 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
      WHERE w.project_id=? AND a.released_ts IS NULL AND a.compute_held=1 AND a.issue_id<>?`).get(issue.projectId,issue.id)!.n;
    return count<this.capacity(issue.projectId);
  }
+ retainedBlocker(issue:EngineIssue):string|null {
+   const owner=this.db.query<{id:string;status:string},[number,number]>(`SELECT i.id,i.status FROM module_workspaces w
+     JOIN workspace_attempts a ON a.id=w.current_attempt AND a.released_ts IS NULL JOIN issues i ON i.id=a.issue_id
+     WHERE w.project_id=? AND w.module_key=?`).get(issue.projectId,issue.moduleId??0);
+   if(!owner||owner.id===issue.id)return null;
+   const labels:Record<string,string>={cancelled:'已取消',done:'已完成',paused:'已暂停',blocked:'受阻'};
+   return labels[owner.status]?`同模块工作区由 #${owner.id}（${labels[owner.status]}）保留，请清理并释放现场后再运行`:null;
+ }
  pick(issues:EngineIssue[], siblings:EngineIssue[], preferred?:string):EngineIssue|undefined {
    return orderPending(issues,preferred).find(i=>this.canStart(i,siblings));
  }
@@ -203,7 +211,8 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
        await this.repoOperation(project,'create-worktree',()=>this.git(driver,project.cwd,['worktree','add','-b',a.branch,a.cwd,base]));
      }
      await this.assertLocation(project,a.cwd,a.branch);
-     if(await this.git(driver,a.cwd,['status','--porcelain'])) throw new Error('工作区有未保存改动，保留现场等待恢复');
+     const dirty=await this.git(driver,a.cwd,['status','--porcelain']);
+     if(dirty) throw new Error('工作区有未保存改动，保留现场等待恢复：\n'+dirty.split('\n').slice(0,8).join('\n').slice(0,1200));
      // Fast-forward only. A failed prior publication cannot be silently folded into another issue.
      await this.git(driver,a.cwd,['merge','--ff-only',base]);
      const head=await this.git(driver,a.cwd,['rev-parse','HEAD']);
@@ -392,18 +401,40 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
  }
  async release(issue:EngineIssue,project:Project):Promise<void> {
    const a=this.attempt(issue.id);if(!a||a.released_ts!==null) return;
-   this.assertOwned(a);await this.stop(issue,project);
-   if(!a.integrated_sha) {this.compute(issue.id,false);return;} // cancelled results remain recoverable
+   await this.operation(`workspace:${a.workspace_id}`,'release',()=>this.deps.mutex.runExclusive(`workspace-git:${a.workspace_id}`,async()=>{
+   if(this.attempt(issue.id)?.released_ts!==null)return;
+   this.assertOwned(a);
+   const current=this.db.query<{status:string},[string]>('SELECT status FROM issues WHERE id=?').get(issue.id);
+   if(!current)throw new Error('任务已不存在，禁止释放');
+   await this.stop(issue,project,current.status==='cancelled');
+   if(!a.integrated_sha) {
+     this.compute(issue.id,false);
+     if(current.status!=='cancelled'||a.result_sha||a.kind==='design-worktree')return;
+   }
    const driver=this.deps.driverForProject(project);
    await this.assertLocation(project,a.cwd,a.branch);
-   if(await this.git(driver,a.cwd,['status','--porcelain'])) throw new Error('工作区仍有改动，禁止释放');
+   if(await this.git(driver,a.cwd,['status','--porcelain'])) {
+     if(!a.integrated_sha)return; // Never discard cancelled work, including untracked files.
+     throw new Error('工作区仍有改动，禁止释放');
+   }
+   if(!a.integrated_sha) {
+     const head=await this.git(driver,a.cwd,['rev-parse','HEAD']);
+     const target=await this.git(driver,project.cwd,['rev-parse',`refs/heads/${await this.target(project)}`]);
+     if(await this.git(driver,a.cwd,['merge-base',head,target])!==head)return;
+   }
    this.db.transaction(()=>{
      this.assertOwned(a);
+     const fresh=this.db.query<{status:string;result_sha:string|null},[string]>(`SELECT i.status,a.result_sha FROM issues i
+       JOIN workspace_attempts a ON a.issue_id=i.id AND a.id=?`).get(a.id);
+     if(!fresh||fresh.status!==current.status||fresh.result_sha!==a.result_sha)throw new Error('任务状态或成果已变化，保留现场');
      this.db.query("UPDATE workspace_attempts SET released_ts=?,phase='released',compute_held=0 WHERE id=?").run(Date.now(),a.id);
      this.db.query("UPDATE module_workspaces SET current_attempt=NULL,lifecycle='idle',updated_ts=? WHERE id=? AND current_attempt=?").run(Date.now(),a.workspace_id,a.id);
      // 保留节点与旧轮次的绑定；负数只作归档标记，不继续占用可分配端口。
      this.db.query('UPDATE workspace_runtime_resources SET port=-rowid WHERE attempt_id=?').run(a.id);
+     if(!a.integrated_sha)this.db.query('INSERT INTO issue_events(issue_id,kind,data_json,ts) VALUES(?,?,?,?)')
+       .run(issue.id,'workspace_released',JSON.stringify({attempt:a.id,reason:'cancelled-clean'}),Date.now());
    })();
+   }));
  }
  async recover(issue:EngineIssue,project:Project):Promise<void> {
    const a=this.attempt(issue.id);if(!a)return;
