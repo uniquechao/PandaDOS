@@ -8,7 +8,7 @@ PandaDOS 是一个开源、自托管的 Agent 编排控制面，让 Claude Code 
 驱动长时间自动运行。你负责定义目标、产品方向和关键架构决策；PandaDOS 负责持续推进
 队列、保留上下文、处理日常确认、观察进度、记录结果，只在真正需要判断时再把你请回来。
 
-[English](README.md)
+[English](README.md) · [日本語](README.ja.md)
 
 [为什么需要 PandaDOS](#为什么需要-pandados) · [快速开始](#快速开始) ·
 [新手十分钟上手](#新手十分钟上手) · [工作原理](#工作原理) ·
