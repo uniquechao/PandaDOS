@@ -709,3 +709,40 @@ describe('管家池与集成契约', () => {
     db.close();
   });
 });
+
+describe('PM supervision decisions',()=>{
+ const observation={issueId:'42',projectId:7,scopeKey:'attempt:a',progressKey:'git:a',status:'implementing' as const,
+  allowedActions:['wait','continue','verify','recover','clarify','pause'] as const,facts:{goal:'deliver CSV',terminal:'API_KEY=private-value',cwd:'/repo/module'}};
+ test('reads bound independent facts and returns one concise instruction',async()=>{
+  const llm=new MockLlm([JSON.stringify({action:'continue',reason:'executor idle',instruction:'完成 CSV 导出并验证。'})]);
+  const signal=new AbortController().signal,pm=new PmAgent(project(),makeDeps(llm));
+  expect(await pm.superviseIssue(observation,signal)).toMatchObject({action:'continue',instruction:'完成 CSV 导出并验证。'});
+  expect(llm.calls).toHaveLength(1);expect(llm.calls[0].opts?.signal).toBe(signal);
+  expect(llm.calls[0].messages[1].content).toContain('/repo/module');
+  expect(llm.calls[0].messages[1].content).not.toContain('private-value');
+  expect(llm.calls[0].messages[0].content).toContain('merge Agent');
+ });
+ test('rejects direct completion, an out-of-scope action and speculative instruction overflow',async()=>{
+  for(const decision of [{action:'done',reason:'worker said done'},{action:'continue',reason:'idle',instruction:'x'.repeat(321)}]) {
+   const pm=new PmAgent(project(),makeDeps(new MockLlm([JSON.stringify(decision)])));
+   await expect(pm.superviseIssue(observation,new AbortController().signal)).rejects.toThrow();
+  }
+  const pm=new PmAgent(project(),makeDeps(new MockLlm(['{"action":"continue","reason":"idle","instruction":"keep going"}'])));
+  await expect(pm.superviseIssue({...observation,allowedActions:['wait','pause']},new AbortController().signal)).rejects.toThrow();
+ });
+});
+
+test('PM supervision uses Chinese internal instructions and the initiating user locale',async()=>{
+ const llm=new MockLlm(['{"action":"wait","reason":"等待","waitSeconds":60}','{"action":"wait","reason":"待機","waitSeconds":60}']);
+ const pm=new PmAgent(project(),makeDeps(llm,{users:{getSettings:id=>({persona:null,memory:null,locale:id===8?'ja':'zh-Hans'}),byId:()=>undefined}}));
+ const base={issueId:'42',projectId:7,scopeKey:'a',progressKey:'b',status:'implementing' as const,allowedActions:['wait'] as const,facts:{}};
+ await pm.superviseIssue(base,new AbortController().signal);expect(llm.calls[0].messages[0].content).toContain('你是');
+ await pm.superviseIssue({...base,createdBy:8},new AbortController().signal);expect(llm.calls[1].messages[0].content).toContain('(ja)');
+});
+
+test('PM supervision falls back from an unset initiating-user locale to project owner',async()=>{
+ const llm=new MockLlm(['{"action":"wait","reason":"等待","waitSeconds":60}']);
+ const pm=new PmAgent(project(),makeDeps(llm,{users:{getSettings:id=>({persona:null,memory:null,locale:id===3?'zh-Hans':null}),byId:()=>undefined}}));
+ await pm.superviseIssue({issueId:'42',projectId:7,createdBy:8,scopeKey:'a',progressKey:'b',status:'implementing',allowedActions:['wait'],facts:{}},new AbortController().signal);
+ expect(llm.calls[0].messages[0].content).toContain('(zh-Hans)');
+});

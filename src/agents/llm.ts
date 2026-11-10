@@ -34,6 +34,8 @@ export interface LlmMessage {
 }
 
 export interface LlmChatOpts {
+  /** Caller lifetime, including queueing and retry waits. */
+  signal?: AbortSignal;
   /** response_format = json_object */
   jsonMode?: boolean;
   /** OpenAI function-calling 工具定义（tools.ts TOOL_SCHEMAS 直传） */
@@ -295,9 +297,10 @@ export class OpenAiCompatibleClient implements LlmClient {
   }
 
   async chat(messages: LlmMessage[], opts: LlmChatOpts = {}): Promise<LlmResult> {
+    opts.signal?.throwIfAborted();
     const config = this.configProvider();
     if (!isLlmConfigured(config)) throw new LlmNotConfiguredError();
-    const release = await this.sem.acquire();
+    const release = await this.sem.acquire(opts.signal);
     try {
       return await this.request(config, messages, opts);
     } finally {
@@ -322,11 +325,12 @@ export class OpenAiCompatibleClient implements LlmClient {
     let lastErr: unknown;
     for (let attempt = 0; attempt < Math.max(1, retries); attempt++) {
       try {
+        opts.signal?.throwIfAborted();
         const res = await this.fetchFn(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
           body: payload,
-          signal: AbortSignal.timeout(timeoutMs),
+          signal: opts.signal ? AbortSignal.any([opts.signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
         });
         if (!res.ok) {
           const text = (await res.text().catch(() => '')).slice(0, 200);
@@ -337,6 +341,7 @@ export class OpenAiCompatibleClient implements LlmClient {
           );
         }
         const j = (await res.json()) as { choices?: Array<{ message?: unknown }> };
+        opts.signal?.throwIfAborted();
         const raw = (j.choices?.[0]?.message ?? { role: 'assistant', content: '' }) as LlmMessage;
         return {
           content: typeof raw.content === 'string' ? raw.content : '',
@@ -344,13 +349,22 @@ export class OpenAiCompatibleClient implements LlmClient {
           raw,
         };
       } catch (e) {
+        opts.signal?.throwIfAborted();
         // 4xx（非 429）不可重试，直接抛给调用方（评审 H13）
         if (e instanceof LlmHttpError && !isRetryableStatus(e.status)) throw e;
         lastErr = e;
         if (attempt < retries - 1) {
           const ra = e instanceof LlmHttpError ? e.retryAfterMs : undefined;
           const wait = ra ?? backoffMs * (attempt + 1); // v1 线性退避平移
-          await sleep(Math.min(wait, MAX_RETRY_WAIT_MS));
+          const delay = Math.min(wait, MAX_RETRY_WAIT_MS);
+          if (!opts.signal) await sleep(delay);
+          else await new Promise<void>((resolve, reject) => {
+            const signal = opts.signal!;
+            const cancel = () => { clearTimeout(timer); signal.removeEventListener('abort', cancel); reject(signal.reason); };
+            const timer = setTimeout(() => { signal.removeEventListener('abort', cancel); resolve(); }, delay);
+            signal.addEventListener('abort', cancel, { once: true });
+            if (signal.aborted) cancel();
+          });
         }
       }
     }

@@ -1204,8 +1204,8 @@ describe('server 集成冒烟（完整装配）', () => {
     const h = await api(ctx, 'GET', '/healthz');
     expect(h.status).toBe(200);
     expect(h.body.ok).toBe(true);
-    expect(h.body.db.latest).toBe(91);
-    expect(h.body.db.applied).toBe(85);
+    expect(h.body.db.latest).toBe(94);
+    expect(h.body.db.applied).toBe(88);
     expect(h.body.executors).toEqual([{ id: 1, name: 'local', status: 'online' }]);
     expect(h.body.engine.running).toBe(true);
     expect(h.body.feishu).toBe(false);

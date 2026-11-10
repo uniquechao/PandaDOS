@@ -1,3 +1,6 @@
+import type { MergeAgentPort } from './module-merge-agent';
+import { MergeAgentPausedError } from './module-merge-agent';
+import { redactDiagnostic, redactDiagnosticValue } from '../../shared/issue-diagnostics';
 import { prepareDependencies } from './dependency-preparation';
 import { randomUUID, createHash } from 'node:crypto';
 import { posix } from 'node:path';
@@ -24,6 +27,7 @@ export interface WorkspaceAttempt {
 interface Integration { id:string; attempt_id:string; target_sha:string; result_sha:string; cwd:string;
  candidate_sha:string|null; phase:string; diagnostic:string|null }
 export interface ModuleWorkspaceDeps {
+ mergeAgent?:MergeAgentPort;
  db:Database; mutex:KeyedMutex; driverForProject(project:Project):ExecutorDriver;
  legacy:EngineExecutionWorkspaceOps;
  conversations: {get(id:string):Conversation|undefined; createInWorkspaceWithId(id:string,projectId:number,label:string,agent:'codex'|'claude',cwd:string):Conversation};
@@ -286,6 +290,7 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
    return workspaceEnvironment(cwd??a.cwd,a.id,r.port);
  }
  async stop(issue:EngineIssue,project:Project,force=false):Promise<void> {
+   await this.deps.mergeAgent?.cancel(issue.id);
    const a=this.attempt(issue.id);if(!a||a.stop_confirmed&&!force) return;
    this.assertOwned(a);
    const driver=this.deps.driverForProject(project);
@@ -323,6 +328,9 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
  async integrate(issue:EngineIssue,project:Project,validate:(cwd:string)=>Promise<boolean>):Promise<{done:boolean;reason?:string}> {
    const a=this.attempt(issue.id)!;this.assertOwned(a);
    if(a.integrated_sha) return {done:true};
+   if(this.deps.mergeAgent&&this.db.query(`SELECT 1 FROM workspace_merge_agents r JOIN workspace_attempts other ON other.id=r.attempt_id
+     WHERE r.project_id=? AND other.issue_id<>? AND r.state IN ('starting','dispatching','running','stopping','uncertain')`).get(project.id,issue.id))
+     return {done:false,reason:'等待本项目合并 Agent 完成；其它模块可继续开发'};
    if(!a.result_sha) await this.commit(issue,project);
    const fresh=this.attempt(issue.id)!;
    const driver=this.deps.driverForProject(project), target=await this.target(project);
@@ -336,6 +344,11 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
      this.db.query("UPDATE workspace_attempts SET integrated_sha=?,phase='integrated',updated_ts=? WHERE id=?").run(recovered,Date.now(),a.id);
      return {done:true};
    }
+   const question=this.db.query<{question:string},[string]>("SELECT question FROM workspace_merge_agents WHERE attempt_id=? AND state='clarification' AND answer IS NULL ORDER BY rowid DESC LIMIT 1").get(a.id);
+   if(question)return {done:false,reason:question.question};
+   // Never abandon a live model writer when the target moves.
+   const stale=this.db.query<{id:string},[string,string]>(`SELECT j.id FROM workspace_integrations j JOIN workspace_merge_agents r ON r.integration_id=j.id WHERE j.attempt_id=? AND j.target_sha<>? AND r.state IN ('starting','dispatching','running','stopping','uncertain') LIMIT 1`).get(a.id,tip);
+   if(stale) {await this.deps.mergeAgent?.cancel(issue.id);return {done:false,reason:'目标已前进，旧合并 Agent 停止后重建候选'};}
    const id=randomUUID();
    this.db.query(`INSERT OR IGNORE INTO workspace_integrations(id,attempt_id,target_sha,result_sha,cwd,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?)`)
      .run(id,a.id,tip,fresh.result_sha!,posix.join(this.root(project),'integration',id),Date.now(),Date.now());
@@ -356,9 +369,33 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
        status('merging');job={...job,phase:'merging'};
      }
      await this.assertLocation(project,job.cwd);
+     const repair=async(files:string[],reason:string)=>{
+       if(!this.deps.mergeAgent)return false;
+       const r=await this.deps.mergeAgent.step({integrationId:job.id,attemptId:a.id,cwd:job.cwd,targetSha:tip,resultSha:fresh.result_sha!,issue,project,reason,files});
+       if(r.state!=='resolved') {status(job.phase,r.reason??'合并 Agent 正在处理');return false;}
+       const remaining=await this.git(driver,job.cwd,['diff','--name-only','--diff-filter=U']);
+       const head=await this.git(driver,job.cwd,['rev-parse','HEAD']);
+       const dirty=await this.git(driver,job.cwd,['status','--porcelain','--untracked-files=no']);
+       const merging=await driver.git(job.cwd,['rev-parse','--verify','MERGE_HEAD']);
+       if(remaining||dirty||merging.code===0||(await driver.git(job.cwd,['merge-base','--is-ancestor',tip,head])).code!==0||(await driver.git(job.cwd,['merge-base','--is-ancestor',fresh.result_sha!,head])).code!==0)
+         throw new MergeAgentPausedError('合并 Agent 报告已完成，但候选不干净或缺少双方成果');
+       this.db.query("UPDATE workspace_integrations SET candidate_sha=?,phase='validating',diagnostic=NULL WHERE id=?").run(head,job.id);
+       job={...job,candidate_sha:head,phase:'validating'};
+       return true;
+     };
+     if(job.phase==='conflict'&&this.deps.mergeAgent&&this.db.query('SELECT 1 FROM workspace_merge_agents WHERE integration_id=?').get(job.id)) {
+       if(!await repair([],job.diagnostic??'集成冲突'))return {done:false,reason:this.attempt(issue.id)?.diagnostic??'合并 Agent 正在处理冲突'};
+     }
+     if(job.phase==='validation_failed'&&this.deps.mergeAgent) {
+       if(!await repair([],job.diagnostic??'集成候选验证未通过'))return {done:false,reason:this.attempt(issue.id)?.diagnostic??'合并 Agent 正在修复验证失败'};
+     }
      if(job.phase==='merging'||job.phase==='conflict') {
        const unmerged=await this.git(driver,job.cwd,['diff','--name-only','--diff-filter=U']);
-       if(unmerged) {status('conflict','集成冲突，现场已保留');return {done:false,reason:'集成冲突，现场已保留'};}
+       if(unmerged) {
+         status('conflict','集成冲突，现场已保留');job={...job,phase:'conflict'};
+         if(!await repair(unmerged.split('\n'),'集成冲突'))return {done:false,reason:this.attempt(issue.id)?.diagnostic??'集成冲突，现场已保留'};
+       }
+       if(job.phase!=='validating') {
        const mergeHead=await driver.git(job.cwd,['rev-parse','--verify','MERGE_HEAD']);
        if(mergeHead.code===0) {
          await this.git(driver,job.cwd,['commit','--no-edit']);
@@ -370,6 +407,7 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
        if((await driver.git(job.cwd,['merge-base','--is-ancestor',fresh.result_sha!,candidate])).code!==0) throw new Error('候选未包含固定成果');
        this.db.query("UPDATE workspace_integrations SET candidate_sha=?,phase='validating' WHERE id=?").run(candidate,job.id);
        job={...job,candidate_sha:candidate,phase:'validating'};
+       }
      }
      if(job.phase==='validating'||job.phase==='validation_failed') {
        for(const path of Object.values(this.environment(issue.id,job.cwd)).filter(v=>v.startsWith(job.cwd)&&!v.endsWith('.db')&&!v.endsWith('/admin-token'))) await driver.mkdirp(path);
@@ -379,7 +417,7 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
          await this.prepareEnvironment(issue,project,{...a,cwd:job.cwd});
          valid=await validate(job.cwd);
        } finally {await this.stop(issue,project,true);}
-       if(!valid) {status('validation_failed','集成候选验证未通过');return {done:false,reason:'集成候选验证未通过'};}
+       if(!valid) {this.db.query("UPDATE workspace_merge_agents SET state='retry' WHERE integration_id=? AND state='resolved'").run(job.id);status('validation_failed','集成候选验证未通过');return {done:false,reason:'集成候选验证未通过'};}
        if(await this.git(driver,job.cwd,['rev-parse','HEAD'])!==job.candidate_sha || await this.git(driver,job.cwd,['status','--porcelain','--untracked-files=no'])) {
          status('validation_failed','验证期间候选内容发生变化');return {done:false,reason:'验证期间候选内容发生变化'};
        }
@@ -452,9 +490,78 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
      await this.git(driver,project.cwd,['rev-parse','HEAD']);
      this.db.query('DELETE FROM workspace_operations WHERE resource=? AND token=?').run(lock.resource,lock.token);
    }
+   await this.deps.mergeAgent?.cancel(issue.id);
+   this.deps.mergeAgent?.retry(issue.id);
    this.db.query('UPDATE workspace_attempts SET diagnostic=NULL WHERE id=?').run(a.id);
    await this.resolve(issue,project);
  }
+ async prepareTimeoutTakeover(issue:EngineIssue,project:Project,pauseEventId:number,reason:string,resumeState:string,role?:'executor'):Promise<{id:string;contextPath:string;oldConversationId:string|null;conversationId:string|null}> {
+   type Job={id:string;attempt_id:string;source_conversation_id:string|null;recovery_conversation_id:string|null;phase:string;context_path:string;diagnostic:string|null};
+   let a=this.attempt(issue.id);if(!a)throw new Error('超时恢复缺少原工作区');this.assertOwned(a);
+   const current=()=>{
+     const row=this.db.query<{status:string;conv_id:string|null},[string]>('SELECT status,conv_id FROM issues WHERE id=?').get(issue.id);
+     const last=this.db.query<{id:number|null},[string]>("SELECT MAX(id) id FROM issue_events WHERE issue_id=? AND kind='transition' AND json_extract(data_json,'$.to')='paused'").get(issue.id);
+     if(row?.status!=='paused'||last?.id!==pauseEventId)throw new Error('超时恢复的暂停轮次已改变');
+     return row;
+   };
+   current();
+   let job=this.db.query<Job,[number]>('SELECT * FROM issue_timeout_takeovers WHERE pause_event_id=?').get(pauseEventId);
+   if(job?.phase==='failed')throw new Error(job.diagnostic??'超时接管已失败，请核对现场');
+   if(!job) {
+     // Graph nodes have their own durable owners; never replace their parent behind the scheduler.
+     if(this.db.query('SELECT 1 FROM issue_workflows WHERE issue_id=?').get(issue.id))throw new Error('工作流超时需先恢复节点归属，保留现场，禁止替换运行中的节点');
+     const count=this.db.query<{n:number},[string]>('SELECT COUNT(*) n FROM issue_timeout_takeovers WHERE issue_id=?').get(issue.id)!.n;
+     if(count>=2)throw new Error('该 issue 的两次自动超时接管预算已耗尽，请核对现场后继续');
+     const id=randomUUID(),next=a.result_sha?null:randomUUID();
+     const path=posix.join(a.cwd,'.panda/tmp/timeout-agent',id,'context.json');
+     this.db.query(`INSERT INTO issue_timeout_takeovers(id,issue_id,attempt_id,pause_event_id,source_conversation_id,recovery_conversation_id,reason,resume_state,context_path,created_ts,updated_ts)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(id,issue.id,a.id,pauseEventId,a.conversation_id,next,reason,resumeState,path,Date.now(),Date.now());
+     job=this.db.query<Job,[number]>('SELECT * FROM issue_timeout_takeovers WHERE pause_event_id=?').get(pauseEventId)!;
+   }
+   const result=()=>({id:job!.id,contextPath:job!.context_path,oldConversationId:job!.source_conversation_id,conversationId:job!.recovery_conversation_id});
+   if(job.phase==='prepared') {
+     const row=current();
+     if(job.recovery_conversation_id&&row.conv_id!==job.recovery_conversation_id)throw new Error('超时恢复会话绑定已改变');
+     return result();
+   }
+   const driver=this.deps.driverForProject(project);
+   const mergeRun=a.result_sha?this.db.query<{conversation_id:string;cwd:string;diagnostic:string|null},[string]>(`SELECT r.conversation_id,j.cwd,r.diagnostic FROM workspace_merge_agents r JOIN workspace_integrations j ON j.id=r.integration_id WHERE r.attempt_id=? ORDER BY r.rowid DESC LIMIT 1`).get(a.id):null;
+   const mergePane=mergeRun?await driver.capturePane(worktreeTmux(project.id,mergeRun.conversation_id)).catch(()=> ''):'';
+   const oldPane=job.source_conversation_id?await driver.capturePane(worktreeTmux(project.id,job.source_conversation_id)).catch(()=> ''):'';
+   await this.deps.mutex.runExclusive(`workspace-git:${a.workspace_id}`,async()=>{
+     current();this.assertOwned(a!);await this.stop(issue,project);
+     await this.assertLocation(project,a!.cwd,a!.branch);
+     const [head,status]=await Promise.all([driver.git(a!.cwd,['rev-parse','HEAD']),driver.git(a!.cwd,['status','--porcelain'])]);
+     if(head.code!==0||status.code!==0)throw new Error('无法核验超时现场的 Git 状态');
+     const events=this.db.query<{kind:string;data_json:string|null;ts:number},[string]>(`SELECT kind,data_json,ts FROM issue_events WHERE issue_id=? AND kind IN
+       ('stop_loss_triggered','validation_failed','validation_diagnostic','error','nudge_exhausted','judge_exhausted','integration_wait') ORDER BY id DESC LIMIT 12`).all(issue.id);
+     await driver.writeFile(job!.context_path,JSON.stringify({version:1,issue:{id:issue.id,title:issue.title,body:issue.body,subIndex:issue.subIndex},
+       mergeCandidate:mergeRun?{cwd:mergeRun.cwd,diagnostic:redactDiagnostic(mergeRun.diagnostic??''),terminal:redactDiagnostic(mergePane).slice(-12000),status:redactDiagnostic((await driver.git(mergeRun.cwd,['status','--porcelain'])).out)}:null,
+       reason,resumeState,sourceConversation:job!.source_conversation_id,attempt:a!.id,branch:a!.branch,cwd:a!.cwd,head:head.out.trim(),
+       worktreeStatus:redactDiagnostic(status.out),terminal:redactDiagnostic(oldPane).slice(-12000),recentEvents:redactDiagnosticValue(events),
+       instructions:'Diagnose the timeout, preserve existing work and confirmed requirements, repair the cause and continue the original goal. Do not restart the task, discard changes, weaken checks, push or deploy. Ask only for genuinely missing business decisions.'},null,2),0o600);
+     if(a!.result_sha)await this.recover(issue,project);
+     this.db.transaction(()=>{
+       const fresh=current();a=this.attempt(issue.id)!;this.assertOwned(a);
+       if(!a.stop_confirmed)throw new Error('旧执行进程尚未确认停止，禁止接管');
+       if(job!.recovery_conversation_id) {
+         if(fresh.conv_id!==job!.source_conversation_id||a.conversation_id!==job!.source_conversation_id)throw new Error('旧会话绑定已改变');
+         const id=job!.recovery_conversation_id;
+         this.deps.conversations.createInWorkspaceWithId(id,issue.projectId,`${role==='executor'?'execution-recovery':'timeout-agent'}:${issue.id}`,issue.agent,a.cwd);
+         this.db.query("UPDATE workspace_attempts SET conversation_id=?,launch_state='none' WHERE id=?").run(id,a.id);
+         this.db.query("UPDATE issues SET conv_id=?,completion_report_json=NULL WHERE id=? AND status='paused'").run(id,issue.id);
+         if(a.kind==='design-worktree'&&a.execution_run_id)this.db.query('UPDATE design_run_conversations SET conversation_id=?,updated_ts=? WHERE run_id=? AND module_key=?').run(id,Date.now(),a.execution_run_id,issue.moduleId===null?`unassigned:${issue.agent}`:`module:${issue.moduleId}`);
+       }
+       this.db.query("UPDATE issue_timeout_takeovers SET phase='prepared',updated_ts=? WHERE id=?").run(Date.now(),job!.id);
+     })();
+   });
+   return result();
+ }
+ async resumeMergeAgent(issueId:string):Promise<void> {await this.deps.mergeAgent?.cancel(issueId);this.deps.mergeAgent?.retry(issueId);}
+ requiresMergeValidation(issueId:string):boolean {
+   return Boolean(this.db.query(`SELECT 1 FROM workspace_merge_agents r JOIN workspace_attempts a ON a.id=r.attempt_id WHERE a.issue_id=? AND a.released_ts IS NULL AND r.state='resolved'`).get(issueId));
+ }
+ answerMergeClarification(issueId:string,answer:string):boolean {return this.deps.mergeAgent?.answer(issueId,answer)??false;}
  async push(issue:EngineIssue,project:Project):Promise<{ok:boolean;detail?:string}> {
    const a=this.attempt(issue.id);if(!a?.integrated_sha) return {ok:false,detail:'尚未集成'};
    const driver=this.deps.driverForProject(project);

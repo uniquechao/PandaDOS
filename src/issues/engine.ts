@@ -1,3 +1,5 @@
+import { MergeAgentTimeoutError, MergeAgentPausedError } from './module-merge-agent';
+import { IssuePmLoop, type PmLoopObservation, type PmLoopDecision, type PmLoopAction } from './pm-loop';
 import { redactDiagnostic, redactDiagnosticValue } from '../../shared/issue-diagnostics';
 import { prepareDependencies, DependencyPreparationError } from './dependency-preparation';
 import { WorkspaceOperationUncertain, type ModuleWorkspaceService } from './module-workspaces';
@@ -520,6 +522,7 @@ export interface EngineMergeGroup {
 
 /** PmAgent 骨架签名子集（agents/pm.ts）；结构兼容，直接传 PmAgent 实例即可 */
 export interface EnginePm {
+  superviseIssue?(observation: PmLoopObservation, signal: AbortSignal): Promise<PmLoopDecision>;
   judgeDone(issue: Issue, recentOutput: string): Promise<EngineDoneJudgement>;
   judgeAgentFailure?(agent: AgentKind, pane: string): Promise<'resume_conflict' | 'ordinary_exit' | 'unknown'>;
   /**
@@ -2585,6 +2588,11 @@ export interface EngineConfig {
   stopLossBlockCount: number;
   /** 止损闸：BUSY 状态累计运行多久就暂停。不计停在 blocked/pending 等人的那段时间。 */
   stopLossRuntimeMs: number;
+  timeoutAgentEnabled: boolean;
+  /** Independent PM observation loop; old PM adapters retain legacy supervision. */
+  pmLoopEnabled: boolean;
+  pmLoopTickMs: number;
+  pmLoopIdleMs: number;
   /** 止损闸：同一阶段重入多少次就暂停（规划↔实现↔测试来回打转的形态） */
   stopLossStageReentry: number;
   /**
@@ -2689,6 +2697,10 @@ export const DEFAULT_ENGINE_CONFIG: EngineConfig = {
   // 三个阈值都取需求正文给的默认值，可由 EngineConfig 覆盖，不硬编码。
   stopLossBlockCount: 3,
   stopLossRuntimeMs: 4 * 60 * 60 * 1000,
+  timeoutAgentEnabled: true,
+  pmLoopEnabled: true,
+  pmLoopTickMs: 30_000,
+  pmLoopIdleMs: 180_000,
   stopLossStageReentry: 3,
   clarifyTimeoutMs: 20 * 60 * 1000,
   // #280：生产实测 codex 路径大量跑不满 8 分钟默认值就被判超时；发起人拍板调到 15 分钟，
@@ -2947,6 +2959,8 @@ interface ProjectTickFlight {
   promise: Promise<void>;
 }
 
+class PmSceneChangedError extends Error {}
+
 export class IssueEngine {
   readonly store: IssueStore;
   private readonly cfg: EngineConfig;
@@ -2978,6 +2992,9 @@ export class IssueEngine {
   /** 模块智能整理的在途分析（每项目单飞，手动触发）：projectId → 后台 promise */
   private readonly organizing = new Map<number, Promise<void>>();
   private timer: ReturnType<typeof setInterval> | null = null;
+  private pmTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly pmLoop: IssuePmLoop;
+  private readonly pmActing = new Set<IssueId>();
 
   constructor(private readonly deps: EngineDeps) {
     this.store = new IssueStore(deps.db);
@@ -3009,6 +3026,14 @@ export class IssueEngine {
     });
     this.cfg = { ...DEFAULT_ENGINE_CONFIG, ...(deps.config ?? {}) };
     this.effects = new IssueEffectJournal(deps.db, () => this.now());
+    this.pmLoop = new IssuePmLoop({
+      db: deps.db, now: () => this.now(),
+      list: () => this.pmCandidates(),
+      observe: (id, signal) => this.observeForPm(id, signal),
+      decide: (observation, signal) => this.deps.pmFor(this.project(observation.projectId)!).superviseIssue!(observation, signal),
+      apply: (observation, decision, operationId) => this.applyPmDecision(observation, decision, operationId),
+      config: { idleMs: this.cfg.pmLoopIdleMs, checkEveryMs: this.cfg.pmLoopTickMs },
+    });
     this.gitDelivery = new GitDeliveryService({
       store: this.store,
       journal: this.effects,
@@ -3083,6 +3108,173 @@ export class IssueEngine {
     return getProject(this.deps.db, id);
   }
 
+  private pmEnabledFor(issue: EngineIssue): boolean {
+    const project = this.project(issue.projectId);
+    return Boolean(this.cfg.pmLoopEnabled && project && this.deps.moduleWorkspaces?.enabled(issue)
+      && !this.workflowSnapshot(issue.id) && this.deps.pmFor(project).superviseIssue);
+  }
+
+  private pmCandidates(): IssueId[] {
+    return this.deps.db.query<{id: IssueId}, []>(`SELECT i.id FROM issues i JOIN projects p ON p.id=i.project_id
+      WHERE p.status='active' AND i.workspace_mode='module' AND i.status IN ('planning','implementing','testing','merging','paused')`)
+      .all().filter(row => this.pmContext(row.id) !== null).map(row => row.id);
+  }
+
+  /** Only database facts here, so scope can be rechecked synchronously immediately before input. */
+  private pmContext(id: IssueId) {
+    const issue = this.store.get(id);
+    if (!issue || !this.pmEnabledFor(issue)) return null;
+    const project = this.project(issue.projectId)!;
+    if (project.status !== 'active' || this.deps.executionUnavailable?.(project)
+      || this.store.clarifyPendingOf(id) || this.store.activeExecutionSyncBoundary(id)
+      || this.store.hasUnresolvedExecutionSyncEffect(id) || this.effects.hasUncertainInput(id)) return null;
+    const timeout = issue.status === 'paused' ? this.timeoutRequest(issue, true) : null;
+    if (issue.status === 'paused' && !timeout) return null; // Manual pauses are never incidents to override.
+    if (!['planning','implementing','testing','merging','paused'].includes(issue.status)) return null;
+    const attempt = this.deps.moduleWorkspaces!.attempt(id);
+    if (!attempt || attempt.released_ts !== null || attempt.executor_id !== project.executorId) return null;
+    if (!this.deps.db.query('SELECT 1 FROM module_workspaces WHERE id=? AND current_attempt=?').get(attempt.workspace_id, attempt.id)) return null;
+    const merge = attempt.result_sha ? this.deps.db.query<{
+      id: string; conversation_id: string; state: string; diagnostic: string | null; cwd: string;
+      integration_id: string; target_sha: string; result_sha: string;
+    }, [string]>(`SELECT r.id,r.conversation_id,r.state,r.diagnostic,j.cwd,r.integration_id,j.target_sha,j.result_sha
+      FROM workspace_merge_agents r JOIN workspace_integrations j ON j.id=r.integration_id
+      WHERE r.attempt_id=? ORDER BY r.rowid DESC LIMIT 1`).get(attempt.id) : null;
+    const scopeKey = createHash('sha256').update(JSON.stringify({
+      attempt: attempt.id, cwd: attempt.cwd, branch: attempt.branch, executor: project.executorId,
+      projectCwd: project.cwd, conv: issue.convId, result: attempt.result_sha,
+      status: issue.status, entry: this.store.lastEnterEventId(id, issue.status),
+      title: issue.title, body: issue.body, goal: project.goal, subIndex: issue.subIndex,
+      manualReview: project.manualReview, validation: project.validationCommands, merge,
+    })).digest('hex');
+    return { issue, project, attempt, merge, timeout, scopeKey };
+  }
+
+  /** Public for deterministic polling and diagnostics; deliberately independent of tickFlights. */
+  async tickPmLoop(): Promise<void> { if (this.acceptingTicks && this.cfg.pmLoopEnabled) await this.pmLoop.tick(); }
+
+  private async observeForPm(id: IssueId, signal: AbortSignal): Promise<PmLoopObservation | null> {
+    signal.throwIfAborted();
+    const context = this.pmContext(id);
+    if (!context) return null;
+    const { issue, project, attempt, merge, timeout, scopeKey } = context;
+    const { driver, locator } = this.executionForProject(project);
+    const conversation = merge?.conversation_id ?? issue.convId;
+    const session = conversation ? this.deps.convs.tmuxName(project.id, conversation) : null;
+    const cwd = merge?.cwd ?? attempt.cwd;
+    // No write tools or worker-supplied diagnosis. Failures remain unknown facts, not proof of death.
+    const [sessions, pane, head, status, output] = await Promise.allSettled([
+      driver.listSessions(),
+      session ? driver.capturePane(session) : Promise.resolve(''),
+      driver.git(cwd, ['rev-parse', 'HEAD']),
+      driver.git(cwd, ['--no-optional-locks', 'status', '--porcelain']),
+      conversation ? locator.locate(conversation).then(path => path
+        ? readRecentMessages(driver, path, this.cfg.judgeWindowBytes).then(messages => messages
+          .filter(m => m.role === 'assistant' || m.role === 'tool_result').map(m => m.text || m.result || '').join('\n').slice(-8000))
+        : '') : Promise.resolve(''),
+    ]);
+    signal.throwIfAborted();
+    if (this.pmContext(id)?.scopeKey !== scopeKey) return null;
+    const sessionInfo = sessions.status === 'fulfilled' ? sessions.value.find(s => s.name === session) : undefined;
+    const terminal = pane.status === 'fulfilled' ? pane.value : '';
+    const inputReady = pane.status === 'fulfilled' && paneHasAgentInput(issue.agent, terminal) && !detectSelection(terminal);
+    const gitKnown = head.status === 'fulfilled' && head.value.code === 0 && status.status === 'fulfilled' && status.value.code === 0;
+    const allowedActions: PmLoopAction[] = ['wait', 'pause'];
+    if (this.cfg.timeoutAgentEnabled && gitKnown && sessions.status === 'fulfilled') allowedActions.push('recover');
+    if (!attempt.result_sha && issue.status !== 'paused' && inputReady && sessionInfo) allowedActions.push('continue', 'verify', 'clarify');
+    const recentEvents = this.deps.db.query<{id:number;kind:string;data_json:string|null;ts:number}, [IssueId]>(
+      `SELECT id,kind,substr(data_json,1,2500) data_json,ts FROM issue_events WHERE issue_id=?
+       AND kind IN ('error','validation_failed','validation_diagnostic','integration_wait','stop_loss_triggered','timeout_takeover_failed','merge_agent_failed','pm_loop_applied','pm_loop_model_failed','pm_loop_decision')
+       ORDER BY id DESC LIMIT 8`).all(id);
+    const facts = redactDiagnosticValue({
+      title: issue.title, goal: issue.body, projectGoal: project.goal, stage: issue.status,
+      attemptId: attempt.id, conversationId: conversation, cwd, branch: attempt.branch,
+      executionEntryBusy: this.transitionCoordinator.isActive(id) || this.tickFlights.has(`issue:${id}`),
+      session: { name: session, exists: sessions.status === 'fulfilled' ? Boolean(sessionInfo) : 'unknown', inputReady, command: sessionInfo?.command },
+      terminal: terminal.slice(-6000),
+      git: { known: gitKnown, head: head.status === 'fulfilled' ? head.value.out.trim() : 'unknown',
+        status: status.status === 'fulfilled' ? status.value.out.slice(-8000) : 'unknown' },
+      recentOutput: output.status === 'fulfilled' ? output.value : 'unavailable',
+      timeout, mergeAgent: merge, recentEvents,
+      readErrors: [sessions, pane, head, status, output].flatMap((r, index) => r.status === 'rejected' ? [{ index, error: String(r.reason).slice(0,500) }] : []),
+    }) as Record<string, unknown>;
+    const progressKey = createHash('sha256').update(JSON.stringify({
+      head: head.status === 'fulfilled' ? head.value.out : null,
+      status: status.status === 'fulfilled' ? status.value.out : null,
+      output: output.status === 'fulfilled' ? output.value : null,
+      alive: sessions.status === 'fulfilled' ? Boolean(sessionInfo) : null,
+    })).digest('hex');
+    const exited = sessions.status === 'fulfilled' && !sessionInfo && this.store.hasInjectedSince(id, issue.status, this.store.lastEnterEventId(id, issue.status));
+    return { issueId: id, projectId: project.id, createdBy: issue.createdBy, scopeKey, progressKey, status: issue.status, allowedActions, facts,
+      ...(timeout ? { trigger: `timeout:${timeout.reason}` } : exited ? { trigger: 'executor-exited' } : {}) };
+  }
+
+  private async applyPmDecision(observation: PmLoopObservation, decision: PmLoopDecision, operationId: string): Promise<'applied' | 'deferred' | 'stale'> {
+    const id = observation.issueId;
+    if (this.pmContext(id)?.scopeKey !== observation.scopeKey) return 'stale';
+    if (this.transitionCoordinator.isActive(id) || this.tickFlights.has(`issue:${id}`) || this.pmActing.has(id)) return 'deferred';
+    this.pmActing.add(id);
+    try {
+      return await this.transitionCoordinator.run(id, async () => {
+        const context = this.pmContext(id);
+        if (!context || context.scopeKey !== observation.scopeKey) return 'stale';
+        const { issue, project, attempt } = context;
+        const current = await this.observeForPm(id, new AbortController().signal);
+        if (!current || current.scopeKey !== observation.scopeKey || current.progressKey !== observation.progressKey
+          || !current.allowedActions.includes(decision.action)) return 'stale';
+        if (decision.action === 'pause') {
+          if (issue.status !== 'paused') {
+            const result = await this.applyEventLocked(id, 'pause', { note: decision.reason });
+            if (!result.ok) throw new Error(result.error);
+          }
+          return 'applied';
+        }
+        if (decision.action === 'recover') {
+          if (!this.cfg.timeoutAgentEnabled || !this.deps.moduleWorkspaces!.canStart(issue, this.store.listByProject(project.id))) return 'deferred';
+          if (issue.status !== 'paused') {
+            const result = await this.applyEventLocked(id, 'pause', { note: decision.reason, timeoutReason: 'idle' });
+            if (!result.ok) throw new Error(result.error);
+          }
+          const guidance = `${decision.instruction ?? decision.reason}`;
+          await this.recoverTimeout(this.store.get(id)!, guidance);
+          return 'applied';
+        }
+        if (attempt.result_sha || issue.status === 'paused') return 'stale';
+        if (decision.action === 'clarify') {
+          await this.enterExecClarify(issue, issue.status, [decision.question!], 'pm-loop', decision.question);
+          return 'applied';
+        }
+        if ((decision.action !== 'continue' && decision.action !== 'verify') || !issue.convId) return 'stale';
+        const session = this.deps.convs.tmuxName(project.id, issue.convId);
+        const locale = this.promptLocale(issue, project);
+        const instruction = decision.action === 'verify'
+          ? (promptLanguage(locale) === 'zh' ? '核对当前目标并返回完成报告；必要验证由系统执行。' : 'Check the current goal and return the completion report; the system runs final checks.')
+          : decision.instruction!;
+        const subs = this.store.subtasksOf(issue);
+        const protocol = this.buildIssueNudge({ issue, stage: issue.status as 'planning'|'implementing'|'testing', locale,
+          seqPending: issue.implMode === 'seq' && issue.subIndex < subs.length && !this.isRework(issue) });
+        const text = `${instruction}\n${protocol}`;
+        if (text.length > 2000) throw new Error('PM instruction exceeds terminal input budget');
+        const pane = await this.driverForProject(project).capturePane(session);
+        if (!paneHasAgentInput(issue.agent, pane) || detectSelection(pane)) return 'deferred';
+        await this.injectOnce(issue, session, `pm-loop:${operationId}`, text, async () => {
+          const freshPane = await this.driverForProject(project).capturePane(session);
+          const final = await this.observeForPm(id, new AbortController().signal);
+          if (!final || final.scopeKey !== observation.scopeKey || final.progressKey !== observation.progressKey
+            || !final.allowedActions.includes(decision.action) || !paneHasAgentInput(issue.agent, freshPane) || detectSelection(freshPane))
+            throw new PmSceneChangedError('PM instruction scene or progress changed before submission');
+        });
+        this.store.logEvent(id, 'pm_loop_instruction', { operationId, action: decision.action, instruction });
+        const watch = this.watch.get(issue.convId);
+        if (watch) { watch.fedTs = this.now(); watch.nudged = false; }
+        return 'applied';
+      });
+    } catch (error) {
+      if (error instanceof PmSceneChangedError) return 'stale';
+      throw error;
+    } finally { this.pmActing.delete(id); }
+  }
+
   // ---- 生命周期 ----
 
   start(): void {
@@ -3098,7 +3290,9 @@ export class IssueEngine {
     }
     // 一次性恢复被重启打断的创建时澄清（分析链是内存态，重启即蒸发只留悬空事件）
     if (this.deps.clarify) this.clarifyRecovery ??= this.clarifyRecoveryCoordinator.recover().catch(() => {});
+    this.pmLoop.start();
     this.timer = setInterval(() => void this.tick(), this.cfg.tickMs);
+    if (this.cfg.pmLoopEnabled) this.pmTimer = setInterval(() => void this.tickPmLoop(), this.cfg.pmLoopTickMs);
   }
 
   /** M1：停节拍、关闭新 tick 入口并等所有项目 flight 归还，之后调用方才能 close driver/db。 */
@@ -3107,8 +3301,11 @@ export class IssueEngine {
     this.acceptingTicks = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.pmTimer) clearInterval(this.pmTimer);
+    this.pmTimer = null;
+    const pmDrain = this.pmLoop.stop();
     const clarificationDrain = this.closeClarifications();
-    const pending = Promise.allSettled([...this.tickFlights.values()].map((flight) => flight.promise).concat(options.deferClarificationDrain ? [] : [clarificationDrain])).then(
+    const pending = Promise.allSettled([...this.tickFlights.values()].map((flight) => flight.promise).concat([pmDrain], options.deferClarificationDrain ? [] : [clarificationDrain])).then(
       () => {
         if (this.stopPromise === pending) this.stopPromise = null;
       },
@@ -5171,6 +5368,14 @@ export class IssueEngine {
     const a = answer.trim().slice(0, 4000);
     if (!a) return { ok: false, error: '澄清答复为空' };
 
+    if(issue.status==='merging'&&this.deps.moduleWorkspaces?.enabled(issue)) {
+      guard();
+      if(this.deps.moduleWorkspaces.answerMergeClarification(issueId,a)) {
+        this.store.logEvent(issueId,'clarified',{answer:a,source:'exec',via:'merge-agent',...(deliveryKey?{deliveryKey}:{})});
+        return {ok:true,from:'merging',to:'merging'};
+      }
+    }
+
     // 所答问题 = 最近一批未答的创建时问题（有则问答成对写入正文，可读且可追溯）
     const rounds = this.store.clarifyRounds(issueId);
     const lastRound = rounds[rounds.length - 1];
@@ -5402,11 +5607,29 @@ export class IssueEngine {
     const blocked = this.store.lastEnterInfo(issueId, this.store.get(issueId)?.status === 'paused' ? 'paused' : 'blocked');
     const wasPaused = this.store.get(issueId)?.status === 'paused';
     const resumeState = this.resumeStateOf(issueId);
+    if(resumeState==='merging'&&this.deps.moduleWorkspaces?.enabled({id:issueId})) {
+      try {await this.deps.moduleWorkspaces.resumeMergeAgent(issueId);}
+      catch(error) {return {ok:false,error:String(error).slice(0,500)};}
+    }
     return this.applyEvent(issueId, 'unblock', {
       note: guidance,
       actor,
       ...(resumeState ? { resumeState } : {}),
     }, () => {
+      const pmCase = this.deps.db.query<{operation_id:string|null},[IssueId]>('SELECT operation_id FROM issue_pm_loops WHERE issue_id=?').get(issueId);
+      if (pmCase) {
+        this.deps.db.query("UPDATE issue_pm_loops SET phase='watching',decision_json=NULL,operation_id=NULL,no_progress_rounds=0,errors=0,deferrals=0,interventions=0,next_check_ts=?,updated_ts=? WHERE issue_id=?")
+          .run(this.now(),this.now(),issueId);
+        this.store.logEvent(issueId,'pm_loop_reconciled',{operationId:pmCase.operation_id,source:'explicit-resume'});
+      }
+      if(this.deps.moduleWorkspaces?.enabled({id:issueId})) {
+        const job=this.deps.db.query('SELECT 1 FROM issue_timeout_takeovers WHERE issue_id=?').get(issueId);
+        if(job) {
+          const attempt=this.deps.moduleWorkspaces.attempt(issueId);
+          if(attempt&&!attempt.result_sha&&attempt.stop_confirmed)this.deps.db.query('UPDATE workspace_attempts SET stop_confirmed=0 WHERE id=?').run(attempt.id);
+          this.deps.db.query("UPDATE issue_timeout_takeovers SET phase='failed',diagnostic='已由人工继续替代自动接管',updated_ts=? WHERE issue_id=? AND phase IN ('claimed','prepared')").run(this.now(),issueId);
+        }
+      }
       this.store.logEvent(issueId, 'unblock_guidance', {
         guidance,
         resumeState: resumeState ?? 'pending',
@@ -6114,6 +6337,10 @@ export class IssueEngine {
       case 'cancelled': {
         if (workspace.kind === 'module-worktree' && this.deps.moduleWorkspaces) {
           this.deps.moduleWorkspaces.compute(issue.id, false);
+          if ((to==='paused'||to==='blocked') && this.deps.moduleWorkspaces.attempt(issue.id)?.result_sha) {
+            try {await this.deps.moduleWorkspaces.stop(issue,project);}
+            catch(error) {this.store.logEvent(issue.id,'workspace_retained',{reason:String(error)});}
+          }
           if (to === 'done' || to === 'cancelled') {
             try { await this.deps.moduleWorkspaces.release(issue, project); }
             catch (e) { this.store.logEvent(issue.id, 'workspace_retained', { reason: String(e) }); }
@@ -7020,15 +7247,18 @@ export class IssueEngine {
   private async tripStopLoss(
     issue: EngineIssue,
     apply: (id: IssueId, ev: IssueMachineEvent, opts: {
-      note?: string; stopLoss?: boolean;
+      note?: string; stopLoss?: boolean; timeoutReason?:TransitionOptions['timeoutReason'];
     }) => Promise<ApplyResult>,
   ): Promise<boolean> {
     if (!BUSY_STATES.includes(issue.status)) return false;
     const anchor = this.stopLossAnchor(issue.id);
-    if (this.store.countEventsSince(issue.id, 'stop_loss_triggered', anchor) > 0) return false;
+    const alreadyTriggered=this.store.countEventsSince(issue.id, 'stop_loss_triggered', anchor)>0;
     const hit = this.evaluateStopLoss(issue);
     if (!hit) return false;
-    this.store.logEvent(issue.id, 'stop_loss_triggered', {
+    // A crash after the diagnostic but before pause must still reach the durable takeover.
+    if(alreadyTriggered&&!(hit.reason==='runtime'&&this.cfg.timeoutAgentEnabled&&this.deps.moduleWorkspaces?.enabled(issue)))return false;
+    if(hit.reason==='runtime'&&this.store.clarifyPendingOf(issue.id))return false;
+    if(!alreadyTriggered)this.store.logEvent(issue.id, 'stop_loss_triggered', {
       reason: hit.reason,
       blockCount: hit.blockCount,
       stageReentry: hit.stageReentry,
@@ -7042,9 +7272,11 @@ export class IssueEngine {
         ? `已在「${issue.status}」阶段反复重入 ${hit.stageReentry} 次`
         : `已累计运行 ${hours} 小时`;
     await apply(issue.id, 'pause', {
-      note: `止损暂停：${why}，先停下来等你确认。这不是执行失败——现场与恢复上下文都在，` +
-        `确认后从原阶段继续即可。`,
+      note: hit.reason==='runtime'&&this.cfg.timeoutAgentEnabled&&this.deps.moduleWorkspaces?.enabled(issue)
+        ? `执行超时：${why}，已保留现场，将核验停止与归属后由恢复 Agent 接管。`
+        : `止损暂停：${why}，先停下来等你确认。这不是执行失败——现场与恢复上下文都在，确认后从原阶段继续即可。`,
       stopLoss: true,
+      ...(hit.reason==='runtime'&&this.cfg.timeoutAgentEnabled&&this.deps.moduleWorkspaces?.enabled(issue)?{timeoutReason:'runtime' as const}:{}),
     });
     await this.notifySafe({
       kind: 'issue_blocked',
@@ -7131,6 +7363,55 @@ export class IssueEngine {
     }
   }
 
+  private timeoutRequest(issue:EngineIssue, allowPmIncident=false):{pauseEventId:number;reason:NonNullable<TransitionOptions['timeoutReason']>}|null {
+    if(!this.cfg.timeoutAgentEnabled||issue.status!=='paused'||!this.deps.moduleWorkspaces?.enabled(issue)||this.store.clarifyPendingOf(issue.id))return null;
+    if(this.store.activeExecutionSyncBoundary(issue.id)||this.store.hasUnresolvedExecutionSyncEffect(issue.id))return null;
+    const pauseEventId=this.store.lastEnterEventId(issue.id,'paused');
+    const row=this.deps.db.query<{data_json:string|null},[number]>('SELECT data_json FROM issue_events WHERE id=?').get(pauseEventId);
+    if(!row?.data_json)return null;
+    let reason:NonNullable<TransitionOptions['timeoutReason']>;
+    try {const data=JSON.parse(row.data_json);reason=data.timeoutReason??(allowPmIncident&&data.supervisionReason==='merge-agent'?'merge-agent':undefined);} catch {return null;}
+    if(!['runtime','idle','validation','merge-agent','startup'].includes(reason))return null;
+    const job=this.deps.db.query<{phase:string},[number]>('SELECT phase FROM issue_timeout_takeovers WHERE pause_event_id=?').get(pauseEventId);
+    if(job?.phase==='failed'||job?.phase==='resumed')return null;
+    if(this.store.lastEventId(issue.id,'timeout_takeover_failed')>pauseEventId||this.store.lastEventId(issue.id,'timeout_takeover_exhausted')>pauseEventId)return null;
+    return {pauseEventId,reason};
+  }
+
+  private async recoverTimeout(issue:EngineIssue, pmGuidance?:string):Promise<void> {
+    const request=this.timeoutRequest(issue,Boolean(pmGuidance)),service=this.deps.moduleWorkspaces;
+    if(!request||!service)return;
+    const project=this.project(issue.projectId);if(!project||!service.canStart(issue,this.store.listByProject(issue.projectId)))return;
+    if(this.deps.executionUnavailable?.(project))return;
+    const count=this.deps.db.query<{n:number},[string]>('SELECT COUNT(*) n FROM issue_timeout_takeovers WHERE issue_id=?').get(issue.id)!.n;
+    const existing=this.deps.db.query('SELECT 1 FROM issue_timeout_takeovers WHERE pause_event_id=?').get(request.pauseEventId);
+    if(count>=2&&!existing) {this.store.logEvent(issue.id,'timeout_takeover_exhausted',{pauseEventId:request.pauseEventId,limit:2,note:'该 issue 已用尽两次自动超时接管，现场已保留，请核对超时诊断后继续'});return;}
+    const resumeState=request.reason==='validation'&&issue.executionMode==='direct'?'implementing':this.resumeStateOf(issue.id);
+    if(!resumeState||!['planning','implementing','testing','merging'].includes(resumeState)) {
+      this.store.logEvent(issue.id,'timeout_takeover_failed',{pauseEventId:request.pauseEventId,note:'原恢复阶段不支持安全自动接管'});return;
+    }
+    try {
+      const prepared=await service.prepareTimeoutTakeover(issue,project,request.pauseEventId,request.reason,resumeState,pmGuidance ? 'executor' : undefined);
+      if(prepared.oldConversationId)this.watch.delete(prepared.oldConversationId);
+      const relative=prepared.contextPath.slice(service.attempt(issue.id)!.cwd.length+1);
+      const zh=promptLanguage(this.promptLocale(issue,project))==='zh';
+      const guidance=pmGuidance ? `${pmGuidance} ${zh ? `先读取 ${relative}，保留原任务进度和验收要求，修复后继续交付。` : `Read ${relative}; preserve progress and acceptance criteria, repair and continue the original delivery.`}` : zh?`你现在是超时恢复 Agent。先读取 ${relative}，诊断原任务为何超时；保留已有实现、任务进度、原始需求和验收条件，修复原因后继续交付。不要重建任务、丢弃改动、削弱验证或部署；只有缺少业务决策时才澄清。`
+        :`You are the timeout recovery agent. First read ${relative} and diagnose the timeout. Preserve existing changes, progress, requirements and acceptance criteria; fix the cause and continue the original delivery. Do not restart the task, discard work, weaken validation or deploy. Ask only for missing business decisions.`;
+      const result=await this.applyEventLocked(issue.id,'unblock',{note:guidance,resumeState},()=>{
+        if(!service.attempt(issue.id)!.result_sha)this.deps.db.query('UPDATE workspace_attempts SET stop_confirmed=0 WHERE id=?').run(service.attempt(issue.id)!.id);
+        this.deps.db.query("UPDATE issue_timeout_takeovers SET phase='resumed',updated_ts=? WHERE id=?").run(this.now(),prepared.id);
+        this.store.logEvent(issue.id,'timeout_takeover_started',{pauseEventId:request.pauseEventId,reason:request.reason,attempt:service.attempt(issue.id)!.id,conversationId:prepared.conversationId,contextPath:relative});
+        this.store.logEvent(issue.id,'unblock_guidance',{guidance,resumeState,source:'timeout-agent'});
+        this.store.logEvent(issue.id,'stop_loss_resumed',{resumeState,source:'timeout-agent'});
+      });
+      if(!result.ok)throw new Error(result.error);
+    } catch(error) {
+      const note=redactDiagnostic(String(error)).slice(0,1500);
+      this.deps.db.query("UPDATE issue_timeout_takeovers SET phase='failed',diagnostic=?,updated_ts=? WHERE pause_event_id=? AND phase<>'resumed'").run(note,this.now(),request.pauseEventId);
+      this.store.logEvent(issue.id,'timeout_takeover_failed',{pauseEventId:request.pauseEventId,note});
+    }
+  }
+
   /** watcher 主循环：每项目单飞，不同项目并行；每 issue 的错误独立落事件。 */
   async tick(): Promise<void> {
     if (!this.acceptingTicks) return;
@@ -7149,17 +7430,18 @@ export class IssueEngine {
     const started: Promise<void>[] = [];
     const environmental = this.deps.moduleWorkspaces ? this.deps.db.query<{id:IssueId},never[]>(
       "SELECT i.id FROM issues i JOIN projects p ON p.id=i.project_id WHERE i.status='paused' AND i.workspace_mode='module' AND p.status='active'").all()
-      .map(r=>this.store.get(r.id)!).filter(i=>i && this.environmentRecoveryDue(i.id)) : [];
+      .map(r=>this.store.get(r.id)!).filter(i=>i && (this.timeoutRequest(i)||this.environmentRecoveryDue(i.id))) : [];
     for (const issue of environmental.concat(this.store.listDriving()).concat(this.deps.moduleWorkspaces ? this.deps.db.query<{id:IssueId},never[]>(
       "SELECT id FROM issues WHERE status='merging' AND workspace_mode='module'").all().map(r => this.store.get(r.id)!).filter(Boolean) : [])) {
       const flightKey = this.deps.moduleWorkspaces?.enabled(issue) ? `issue:${issue.id}` : `project:${issue.projectId}`;
-      if (!this.acceptingTicks || this.tickFlights.has(flightKey)) continue;
+      if (!this.acceptingTicks || this.tickFlights.has(flightKey) || this.pmActing.has(issue.id)) continue;
 
       let promise!: Promise<void>;
       promise = Promise.resolve()
         .then(async () => {
           if (issue.status === 'paused') {
-            await this.recoverEnvironment(issue);
+            if(this.timeoutRequest(issue)) { if (!this.pmEnabledFor(issue)) await this.transitionCoordinator.run(issue.id,()=>this.recoverTimeout(this.store.get(issue.id)!)); }
+            else await this.recoverEnvironment(issue);
           } else if (issue.status === 'merging' && this.deps.moduleWorkspaces?.enabled(issue)) {
             const project = this.project(issue.projectId);
             if (project) await this.transitionCoordinator.run(issue.id, () => this.completeWorkspaceIntegration(issue, project));
@@ -7325,6 +7607,7 @@ export class IssueEngine {
     // activateConv 重建（jsonl 已落地即 --resume 续上下文），恢复后由既有 kickoff
     // （hasInjectedSince 幂等）+ 催办接续驱动。失败按冷却重试，冷却期不驱动死会话防错误刷屏。
     if (pane === '' && (await this.sessionAlive(issue.projectId, session)) === false) {
+      if (this.pmEnabledFor(issue)) return;
       if (now - w.recoverAt < SESSION_RECOVER_COOLDOWN_MS) return;
       w.recoverAt = now;
       try {
@@ -7361,6 +7644,7 @@ export class IssueEngine {
     // pane_current_command 双双像 shell——生产实测靠这两个信号会误杀，见 agent-liveness 常量注释）
     const liveness = await this.sessionLiveness(issue.projectId, issue.agent, session, pane, now - w.growTs);
     if (liveness === 'shell') {
+      if (this.pmEnabledFor(issue)) return;
       const pm = this.deps.pmFor(project);
       const failure = issue.agent === 'codex' && pm.judgeAgentFailure
         ? await pm.judgeAgentFailure(issue.agent, pane).catch(() => 'unknown' as const)
@@ -7534,6 +7818,7 @@ export class IssueEngine {
     // 让代理重发哨兵/子任务块。要求已 nudge 过（先催后认领：连 nudge 都没让文件动
     // 才有资格判死，排除长思考中来不及落盘的误伤）。
     if (
+      !this.pmEnabledFor(issue) &&
       this.cfg.sessionStaleMs > 0 &&
       path &&
       inputReady &&
@@ -7608,6 +7893,8 @@ export class IssueEngine {
       }
       return; // 未到点：既不 nudge 也不 judge
     }
+
+    if (this.pmEnabledFor(fresh)) return; // PM loop owns strategy; no competing fixed nudge/judge.
 
     const idleMs = now - Math.max(w.fedTs, w.activityTs);
     // quiet 是「静默且没有弹窗挡着」这个基础判据，judge 仍按它 + fallbackSec 走；
@@ -7718,7 +8005,11 @@ export class IssueEngine {
     extra: Record<string, unknown> = {},
   ): Promise<void> {
     const kind = reason === 'nudge' ? 'nudge_exhausted' : 'judge_exhausted';
-    if (this.store.countEventsSince(issue.id, kind, anchor) > 0) return;
+    if (this.store.countEventsSince(issue.id, kind, anchor) > 0) {
+      if(this.cfg.timeoutAgentEnabled&&this.deps.moduleWorkspaces?.enabled(issue)&&!this.store.clarifyPendingOf(issue.id)&&BUSY_STATES.includes(issue.status))
+        await this.applyEvent(issue.id,'pause',{note:'无进展重试已耗尽，保留现场并由恢复 Agent 核验接管',timeoutReason:'idle'});
+      return;
+    }
     this.store.logEvent(issue.id, kind, { count, stage: issue.status, ...extra });
     await this.notifySafe({
       kind: 'status_change',
@@ -7727,7 +8018,7 @@ export class IssueEngine {
       summaryCode: 'auto_retry_exhausted',
       summaryParams: { title: issue.title.slice(0, 60), reason, count },
     });
-    await this.applyEvent(issue.id,'pause',{note:`自动${reason === 'nudge' ? '催办' : '判定'}已达 ${count} 次上限，保留现场，检查执行状态后继续`});
+    await this.applyEvent(issue.id,'pause',{note:`自动${reason === 'nudge' ? '催办' : '判定'}已达 ${count} 次上限，保留现场，检查执行状态后继续`,...(this.cfg.timeoutAgentEnabled&&this.deps.moduleWorkspaces?.enabled(issue)&&!this.store.clarifyPendingOf(issue.id)?{timeoutReason:'idle' as const}:{})});
   }
 
   /** kickoff：进入阶段后的首条 prompt。幂等判据 = 该阶段进入事件之后是否已有 injected 事件 */
@@ -7751,6 +8042,7 @@ export class IssueEngine {
       if (this.now() - w.bootTs > this.cfg.kickoffReadyTimeoutMs) {
         await this.applyEvent(issue.id, 'pause', {
           note: `CC 启动超时：${Math.round(this.cfg.kickoffReadyTimeoutMs / 1000)}s 未出现可输入的代理提示符`,
+          ...(this.cfg.timeoutAgentEnabled&&this.deps.moduleWorkspaces?.enabled(issue)?{timeoutReason:'startup' as const}:{}),
         });
       }
       return;
@@ -8202,6 +8494,7 @@ export class IssueEngine {
       const result = await workspaces.integrate(issue, project, async cwd => {
         const validation = await this.runValidationGate(issue, project, cwd);
         if (validation.outcome === 'error') throw new DependencyPreparationError(validation.note);
+        if(validation.outcome==='skipped'&&workspaces.requiresMergeValidation(issue.id))throw new DependencyPreparationError(`合并 Agent 修复后的候选必须执行系统验证：${validation.note}`);
         return validation.outcome === 'passed' || validation.outcome === 'skipped';
       });
       if (!result.done) {
@@ -8218,7 +8511,7 @@ export class IssueEngine {
       await this.applyEventLocked(issue.id, 'merged');
     } catch(e) {
       const reason=String(e).slice(0,500);
-      await this.applyEventLocked(issue.id, 'pause', { note: reason });
+      await this.applyEventLocked(issue.id, 'pause', { note: reason, ...(e instanceof MergeAgentTimeoutError&&this.cfg.timeoutAgentEnabled?{timeoutReason:'merge-agent' as const}:{}), ...(e instanceof MergeAgentPausedError&&this.pmEnabledFor(issue)?{supervisionReason:'merge-agent' as const}:{}) });
       if (e instanceof DependencyPreparationError || e instanceof WorkspaceOperationUncertain) this.scheduleEnvironmentRecovery(issue.id);
       workspaces.compute(issue.id,false);
       this.deps.db.query('UPDATE workspace_attempts SET diagnostic=? WHERE issue_id=? AND released_ts IS NULL').run(reason,issue.id);
@@ -8300,7 +8593,7 @@ export class IssueEngine {
     issue: EngineIssue,
     project: Project,
     candidateCwd?: string,
-  ): Promise<{ outcome: 'passed' | 'failed' | 'skipped' | 'error'; note: string }> {
+  ): Promise<{ outcome: 'passed' | 'failed' | 'skipped' | 'error'; note: string; timedOut?: boolean }> {
     if (project.validationPolicy === 'none') {
       this.store.logEvent(issue.id, 'validation_skipped', { reason: 'policy-none' });
       return { outcome: 'skipped', note: '项目明确豁免验证' };
@@ -8429,6 +8722,7 @@ export class IssueEngine {
     });
     return {
       outcome: 'failed',
+      timedOut: failed.timedOut,
       note: `门禁「${failed.label}」未通过（退出码 ${failed.code}）：\n${redactDiagnostic(run.tail)}`.slice(0, 1600),
     };
   }
@@ -8519,6 +8813,9 @@ export class IssueEngine {
       if (gate.outcome === 'error' && this.store.lastEventId(issueId,'environment_preparation_failed') > this.store.lastEventId(issueId,'environment_ready')) this.scheduleEnvironmentRecovery(issueId);
       return;
     }
+    if(this.cfg.timeoutAgentEnabled&&this.deps.moduleWorkspaces?.enabled(issue)&&gate.timedOut===true) {
+      await this.applyEvent(issueId,'pause',{note:gateDecision.note,timeoutReason:'validation'});return;
+    }
     // 只数**本轮**的失败（复活后重新开始，口径同哨兵路径）
     const failCount =
       this.store.countEventsSince(issueId, 'tests_failed', Math.max(this.store.lastEventId(issueId, 'reopened'), this.stopLossAnchor(issueId))) + 1;
@@ -8606,7 +8903,7 @@ export class IssueEngine {
     issue: EngineIssue,
     stage: IssueState,
     questions: string[],
-    via: 'sentinel' | 'judge',
+    via: 'sentinel' | 'judge' | 'pm-loop',
     text?: string,
   ): Promise<void> {
     this.deps.moduleWorkspaces?.compute(issue.id, false);
@@ -8636,12 +8933,12 @@ export class IssueEngine {
   /** The tmux lock covers the final delivery guard and journal claim. A rejected guard has
    * performed no external action and must not leave an uncertain input that blocks recovery. */
   private async injectOnce(
-    issue: EngineIssue, session: string, operationKey: string, text: string, beforeSend?: () => void,
+    issue: EngineIssue, session: string, operationKey: string, text: string, beforeSend?: () => void | Promise<void>,
   ): Promise<void> {
     const project = this.project(issue.projectId);
     if (!project) throw new Error(`项目 ${issue.projectId} 不存在`);
     await this.deps.mutex.runExclusive(tmuxLockKey(session), async () => {
-      beforeSend?.();
+      await beforeSend?.();
       const managed = this.deps.db.query<{conversation_id:string},[number]>(`SELECT a.conversation_id FROM workspace_attempts a JOIN module_workspaces w ON w.id=a.workspace_id WHERE w.project_id=?`).all(issue.projectId)
         .find(a => a.conversation_id && this.deps.convs.tmuxName(issue.projectId,a.conversation_id) === session);
       if (managed && !managedConversationOwned(this.deps.db,issue.projectId,managed.conversation_id)) throw new Error('工作区输入归属失效');

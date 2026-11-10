@@ -347,3 +347,22 @@ describe('配置读取（形状见 llm.ts LlmConfig 注释）', () => {
     db.close();
   });
 });
+
+test('caller cancellation aborts an active request without provider retries',async()=>{
+ const controller=new AbortController();let calls=0;
+ const client=new OpenAiCompatibleClient({...CFG,timeoutMs:40,retries:3},async(_url,init)=>{
+  calls++;return new Promise((_resolve,reject)=>init.signal!.addEventListener('abort',()=>reject(init.signal!.reason),{once:true}));
+ });
+ const pending=client.chat(MSGS,{signal:controller.signal});
+ setTimeout(()=>controller.abort(new Error('supervisor stopped')),5);
+ await expect(pending).rejects.toThrow('supervisor stopped');expect(calls).toBe(1);
+});
+
+test('caller cancellation removes a queued model request before it is sent',async()=>{
+ let release!:()=>void,calls=0;
+ const client=new OpenAiCompatibleClient({...CFG,maxConcurrent:1},async()=>{calls++;if(calls===1)await new Promise<void>(r=>{release=r;});return ok('done');});
+ const first=client.chat(MSGS);await Bun.sleep(5);
+ const controller=new AbortController(),second=client.chat(MSGS,{signal:controller.signal});
+ controller.abort(new Error('cancel queued'));release();await first;
+ await expect(second).rejects.toThrow('cancel queued');expect(calls).toBe(1);
+});

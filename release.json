@@ -1,8 +1,7 @@
 {
-  "version": "2.6.5-2026.1106",
+  "version": "2.6.6-2026.1110",
   "notes": [
-    "issue-list-pagination",
-    "sticky-user-question",
-    "agent-conversation-titles"
+    "issue-pm-supervision",
+    "issue-stop-diagnostics"
   ]
 }

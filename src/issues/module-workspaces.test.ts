@@ -77,7 +77,7 @@ async function setup(diagnostics=false) {
  const project=getProject(db,1)!;const store=new IssueStore(db);
  const conversations=new ConversationManager(db,driver,{locate:async()=>null});
  const legacy={resolve:()=>({cwd:repo,kind:'project' as const,branch:null,runId:null}),conversationFor:async()=>{throw new Error('unexpected');}};
- const deps={db,mutex:new KeyedMutex(),driverForProject:()=>driver,legacy,conversations};
+ const deps={db,mutex:new KeyedMutex(),driverForProject:()=>driver,projectForId:(id:number)=>getProject(db,id),legacy,conversations};
  const service=new ModuleWorkspaceService(deps);
  const issue=(moduleId:number)=>store.create(1,{title:'工作区回归',moduleId,agent:'codex',executionMode:'direct'});
  async function captureFailure(fn:()=>Promise<void>):Promise<void> {
@@ -508,3 +508,522 @@ test(`真实引擎候选验收：${failureKind}失败后重启自动恢复到 me
 },30000);
 
 }
+
+test('模块集成冲突交给合并 Agent，保留双方成果并在修复后重新验证', async () => {
+ const s=await setup();const a=s.issue(1),b=s.issue(2);
+ const wa=await s.service.resolve(a,s.project),wb=await s.service.resolve(b,s.project);
+ writeFileSync(wa.cwd+'/same.txt','模块A\n');writeFileSync(wb.cwd+'/same.txt','模块B\n');
+ await s.service.commit(a,s.project);await s.service.commit(b,s.project);
+ await s.git(s.repo,['checkout','--detach']);
+ expect((await s.service.integrate(a,s.project,async()=>true)).done).toBe(true);
+ let repairs=0,validations=0;
+ const mergeAgent={step:async(context:{cwd:string})=>{
+  repairs++;writeFileSync(context.cwd+'/same.txt','模块A\n模块B\n');
+  await s.git(context.cwd,['add','same.txt']);await s.git(context.cwd,['commit','--no-edit']);
+  return {state:'resolved' as const};
+ },cancel:async()=>{},retry:()=>{},answer:()=>false};
+ const service=new ModuleWorkspaceService({...s.deps,...{mergeAgent}});
+ const validate=async(cwd:string)=>{validations++;expect(readFileSync(cwd+'/same.txt','utf8')).toBe('模块A\n模块B\n');return true;};
+ let result=await service.integrate(b,s.project,validate);
+ for(let n=0;n<3&&!result.done;n++) result=await service.integrate(b,s.project,validate);
+ expect(repairs).toBe(1);expect(result.done).toBe(true);expect(validations).toBe(1);
+ const tip=await s.git(s.repo,['rev-parse','main']);
+ expect(await s.git(s.repo,['show',tip+':same.txt'])).toBe('模块A\n模块B');
+ expect(await s.git(s.repo,['merge-base','--is-ancestor',service.attempt(b.id)!.result_sha!,tip])).toBe('');
+});
+
+// The model boundary is simulated; ownership, journal, filesystem and Git are real.
+import { ModuleMergeAgent } from './module-merge-agent';
+import { managedConversationEnvironment, managedConversationOwned } from '../core/workspace-ownership';
+async function mergeAgentFixture() {
+ const s=await setup();const a=s.issue(1),b=s.issue(2);
+ const wa=await s.service.resolve(a,s.project),wb=await s.service.resolve(b,s.project);
+ writeFileSync(wa.cwd+'/same.txt','A\n');writeFileSync(wb.cwd+'/same.txt','B\n');
+ await s.service.commit(a,s.project);await s.service.commit(b,s.project);await s.git(s.repo,['checkout','--detach']);
+ await s.service.integrate(a,s.project,async()=>true);
+ await s.service.integrate(b,s.project,async()=>true);
+ s.db.query("UPDATE issues SET status='merging' WHERE id=?").run(b.id);
+ const job=s.db.query<{id:string;cwd:string;target_sha:string;result_sha:string},[string]>('SELECT * FROM workspace_integrations WHERE attempt_id=?').get(s.service.attempt(b.id)!.id)!;
+ const context={integrationId:job.id,attemptId:s.service.attempt(b.id)!.id,cwd:job.cwd,targetSha:job.target_sha,resultSha:job.result_sha,issue:s.store.get(b.id)!,project:s.project,reason:'集成冲突',files:['same.txt']};
+ let sent=0,stopped=0,ready=true,stopFails=false,sendFails=false;
+ s.driver.capturePane=async()=>ready?'› 修复合并':'OpenAI Codex\nLoading…';
+ s.driver.listSessions=async()=>[{name:'ignored',createdTs:1,attached:false}];
+ s.driver.sendKeys=async()=>{sent++;if(sendFails)throw new Error('lost receipt');};
+ s.driver.stopSessionConfirmed=async()=>{stopped++;if(stopFails)throw new Error('stop unconfirmed');};
+ const deps={db:s.db,mutex:s.deps.mutex,projectForId:s.deps.projectForId,driverForProject:(project:typeof s.project)=>{if(project.ownerUserId!==1)throw new Error('missing project isolation context');return s.driver;},conversations:{createInWorkspaceWithId:s.deps.conversations.createInWorkspaceWithId.bind(s.deps.conversations),activate:async(id:string,cwd?:string)=>{
+  const conv=s.deps.conversations.get(id)!;
+  expect(conv.workspaceCwd).toBe(cwd??null);expect(managedConversationOwned(s.db,1,id)).toBe(true);
+  return conv;
+ }}};
+ const agent=new ModuleMergeAgent(deps);
+ function run(){return s.db.query<any,[]>("SELECT * FROM workspace_merge_agents ORDER BY rowid DESC LIMIT 1").get()!;}
+ function report(status='resolved',details='保留双方功能',extra:Record<string,unknown>={}) {
+  const r=run(),base=job.cwd+'/.panda/tmp/merge-agent/'+r.id;
+  writeFileSync(base+'/result.json',JSON.stringify({runId:r.id,integrationId:job.id,targetSha:job.target_sha,resultSha:job.result_sha,status,details,...extra}));writeFileSync(base+'/done','ok');
+ }
+ return {...s,a,b,job,context,agent,agentDeps:deps,run,report,stats:()=>({sent,stopped}),ready:(v:boolean)=>{ready=v;},stopFails:(v:boolean)=>{stopFails=v;},sendFails:(v:boolean)=>{sendFails=v;}};
+}
+
+test('合并 Agent：等真实输入框，持久启动记录且重建协调器不重复投递',async()=>{
+ const s=await mergeAgentFixture();s.ready(false);
+ await s.agent.step(s.context);expect(s.stats().sent).toBe(0);expect(s.run().state).toBe('dispatching');
+ s.ready(true);await s.agent.step(s.context);expect(s.run().state).toBe('running');
+ const run=s.run();const env=managedConversationEnvironment(s.db,run.conversation_id)!;
+ expect(env.PANDA_WORKSPACE_CWD).toBe(s.job.cwd);expect(env.PANDA_WORKSPACE_ATTEMPT).toBe(run.id);
+ // Simulate control-plane crash after confirmed send, before state write.
+ s.db.query("UPDATE workspace_merge_agents SET state='dispatching' WHERE id=?").run(run.id);
+ await new ModuleMergeAgent(s.agentDeps).step(s.context);
+ expect(s.stats().sent).toBe(1);expect(s.run().state).toBe('running');
+});
+
+test('合并 Agent：项目单活跃，澄清释放名额且答复保存在下一轮上下文',async()=>{
+ const s=await mergeAgentFixture();await s.agent.step(s.context);
+ s.report('needs_clarification','双方负责人规则冲突，采用哪一个？');
+ expect((await s.agent.step(s.context)).state).toBe('clarification');
+ expect(s.run().stop_confirmed).toBe(1);expect(managedConversationOwned(s.db,1,s.run().conversation_id)).toBe(false);
+ expect(s.agent.answer(s.b.id,'保留人工指定的负责人')).toBe(true);
+ await s.agent.step(s.context);
+ const context=JSON.parse(readFileSync(s.job.cwd+'/.panda/tmp/merge-agent/'+s.run().id+'/context.json','utf8'));
+ expect(context.guidance).toBe('保留人工指定的负责人');expect(s.stats().sent).toBe(2);
+});
+
+test('合并 Agent：陈旧报告不被采纳，停止未知时项目占用不会释放',async()=>{
+ const s=await mergeAgentFixture();await s.agent.step(s.context);
+ s.report('resolved','旧结果',{targetSha:'0'.repeat(40)});s.stopFails(true);
+ await expect(s.agent.step(s.context)).rejects.toThrow('stop unconfirmed');
+ expect(s.run().state).toBe('stopping');expect(s.run().stop_confirmed).toBe(0);
+ s.stopFails(false);await s.agent.cancel(s.b.id);s.agent.retry(s.b.id);
+ expect(s.run().state).toBe('retry');expect(s.run().stop_confirmed).toBe(1);
+});
+
+test('合并 Agent：投递回执丢失不盲重发，取消只停止合并轮次',async()=>{
+ const s=await mergeAgentFixture();s.sendFails(true);
+ await expect(s.agent.step(s.context)).rejects.toThrow();
+ expect(s.run().state).toBe('uncertain');
+ await expect(new ModuleMergeAgent(s.agentDeps).step(s.context)).rejects.toThrow();
+ expect(s.stats().sent).toBe(1);
+ await s.agent.cancel(s.b.id);expect(s.run().stop_confirmed).toBe(1);
+ expect(s.service.attempt(s.a.id)!.result_sha).not.toBeNull();
+});
+
+test('合并 Agent：固定成果修复后才重新验证和发布，旧会话不可重新激活',async()=>{
+ const s=await mergeAgentFixture();const service=new ModuleWorkspaceService({...s.deps,mergeAgent:s.agent});
+ expect((await service.integrate(s.context.issue,s.project,async()=>true)).done).toBe(false);
+ const run=s.run();writeFileSync(s.job.cwd+'/same.txt','A\nB\n');
+ await s.git(s.job.cwd,['add','same.txt']);await s.git(s.job.cwd,['commit','--no-edit']);s.report();
+ let validations=0;
+ expect((await service.integrate(s.context.issue,s.project,async()=>{validations++;return true;})).done).toBe(true);
+ expect(validations).toBe(1);expect(s.stats().stopped).toBeGreaterThan(0);
+ expect(managedConversationOwned(s.db,1,run.conversation_id)).toBe(false);
+ expect(()=>managedConversationEnvironment(s.db,run.conversation_id)).toThrow('归属已失效');
+ expect(await s.git(s.repo,['show','main:same.txt'])).toBe('A\nB');
+});
+
+test('合并 Agent：目标前进先停止旧模型再重建，停止失败不生成新候选',async()=>{
+ const s=await mergeAgentFixture();const service=new ModuleWorkspaceService({...s.deps,mergeAgent:s.agent});
+ await service.integrate(s.context.issue,s.project,async()=>true);
+ // Advance canonical target using an unrelated commit, without touching either module.
+ const candidate=s.root+'/advance';await s.git(s.repo,['worktree','add','--detach',candidate,'main']);
+ writeFileSync(candidate+'/later.txt','later');await s.git(candidate,['add','.']);await s.git(candidate,['commit','-m','target advanced']);
+ await s.git(s.repo,['update-ref','refs/heads/main',await s.git(candidate,['rev-parse','HEAD'])]);
+ const count=()=>s.db.query<{n:number},[]>('SELECT COUNT(*) n FROM workspace_integrations').get()!.n;
+ const before=count();s.stopFails(true);
+ await expect(service.integrate(s.context.issue,s.project,async()=>true)).rejects.toThrow('stop unconfirmed');expect(count()).toBe(before);
+ s.stopFails(false);await service.integrate(s.context.issue,s.project,async()=>true);
+ expect(s.run().stop_confirmed).toBe(1);expect(count()).toBe(before);
+ await service.integrate(s.context.issue,s.project,async()=>true);expect(count()).toBe(before+1);
+});
+
+test('合并 Agent：项目唯一活跃修复者，待业务澄清的候选让出名额',async()=>{
+ const s=await mergeAgentFixture();await s.agent.step(s.context);
+ const c=s.issue(3),wc=await s.service.resolve(c,s.project);
+ writeFileSync(wc.cwd+'/third.txt','C');await s.service.commit(c,s.project);
+ s.db.query("UPDATE issues SET status='merging' WHERE id=?").run(c.id);
+ await s.service.integrate(s.store.get(c.id)!,s.project,async()=>false);
+ const job=s.db.query<any,[string]>('SELECT * FROM workspace_integrations WHERE attempt_id=?').get(s.service.attempt(c.id)!.id)!;
+ const context={...s.context,integrationId:job.id,attemptId:job.attempt_id,cwd:job.cwd,targetSha:job.target_sha,resultSha:job.result_sha,issue:s.store.get(c.id)!,reason:'验证失败'};
+ expect((await new ModuleMergeAgent(s.agentDeps).step(context)).state).toBe('waiting');
+ expect(s.db.query<{n:number},[]>('SELECT COUNT(*) n FROM workspace_merge_agents').get()!.n).toBe(1);
+ s.report('needs_clarification','负责人业务规则需要选择');await s.agent.step(s.context);
+ expect((await new ModuleMergeAgent(s.agentDeps).step(context)).state).toBe('running');
+ expect(s.db.query<{n:number},[]>("SELECT COUNT(*) n FROM workspace_merge_agents WHERE state='running'").get()!.n).toBe(1);
+});
+
+test('合并 Agent：反复验证失败最多自动修复三轮，显式恢复才重开预算',async()=>{
+ const s=await mergeAgentFixture();const service=new ModuleWorkspaceService({...s.deps,mergeAgent:s.agent});
+ await service.integrate(s.context.issue,s.project,async()=>false);
+ writeFileSync(s.job.cwd+'/same.txt','A\nB\n');await s.git(s.job.cwd,['add','same.txt']);await s.git(s.job.cwd,['commit','--no-edit']);
+ for(let n=0;n<3;n++) {
+  s.report();expect((await service.integrate(s.context.issue,s.project,async()=>false)).done).toBe(false);
+  if(n<2)await service.integrate(s.context.issue,s.project,async()=>false);
+ }
+ await expect(service.integrate(s.context.issue,s.project,async()=>false)).rejects.toThrow('预算已耗尽');
+ expect(s.db.query<{n:number},[]>('SELECT COUNT(*) n FROM workspace_merge_agents').get()!.n).toBe(3);
+ expect(s.service.attempt(s.b.id)!.integrated_sha).toBeNull();
+ await service.resumeMergeAgent(s.b.id);
+ expect((await service.integrate(s.context.issue,s.project,async()=>true)).done).toBe(false);
+ expect(s.db.query<{n:number},[]>('SELECT COUNT(*) n FROM workspace_merge_agents').get()!.n).toBe(4);
+});
+
+test('真实 tmux：合并会话使用候选目录和独立轮次，完成后验证并停止进程',async()=>{
+ const s=await setup();const a=s.issue(1),b=s.issue(2);
+ const wa=await s.service.resolve(a,s.project),wb=await s.service.resolve(b,s.project);
+ writeFileSync(wa.cwd+'/same.txt','A\n');writeFileSync(wb.cwd+'/same.txt','B\n');
+ await s.service.commit(a,s.project);await s.service.commit(b,s.project);await s.git(s.repo,['checkout','--detach']);
+ await s.service.integrate(a,s.project,async()=>true);
+ s.db.query("UPDATE issues SET status='merging' WHERE id=?").run(b.id);
+ const executable=s.root+'/model-fixture';
+ writeFileSync(executable,`#!/usr/bin/env python3
+import sys,re,json,os,subprocess,time
+from pathlib import Path
+print('OpenAI Codex\\n› Ready',flush=True)
+for line in sys.stdin:
+ m=re.search(r'(\\.panda/tmp/merge-agent/[0-9a-f-]+/context\\.json)',line)
+ if not m: continue
+ print('• Working',flush=True)
+ context=Path(m[1]); data=json.loads(context.read_text()); base=context.parent
+ (base/'observed.json').write_text(json.dumps({'cwd':os.getcwd(),'attempt':os.environ.get('PANDA_WORKSPACE_ATTEMPT')}))
+ Path('same.txt').write_text('A\\nB\\n')
+ subprocess.run(['git','add','-A'],check=True)
+ subprocess.run(['git','commit','--no-edit'],check=True)
+ result={k:data[k] for k in ['runId','integrationId','targetSha','resultSha']}
+ result.update(status='resolved',details='Deterministic model fixture: preserve A and B')
+ (base/'result.json').write_text(json.dumps(result)); (base/'done').write_text('ok')
+ print('Finished\\n› Ready',flush=True)
+`,{mode:0o755});
+ s.driver.findExecutable=async()=>executable;
+ const conversations=s.deps.conversations;
+ const agent=new ModuleMergeAgent({...s.deps,conversations});
+ const service=new ModuleWorkspaceService({...s.deps,mergeAgent:agent});
+ let done=false,checks=0;
+ try {
+  for(let n=0;n<30&&!done;n++) {
+   done=(await service.integrate(s.store.get(b.id)!,s.project,async cwd=>{checks++;return readFileSync(cwd+'/same.txt','utf8')==='A\nB\n';})).done;
+   if(!done)await Bun.sleep(150);
+  }
+  expect(done).toBe(true);expect(checks).toBe(1);
+  const run=s.db.query<any,[]>('SELECT * FROM workspace_merge_agents ORDER BY rowid DESC LIMIT 1').get()!;
+  const job=s.db.query<{cwd:string},[string]>('SELECT cwd FROM workspace_integrations WHERE id=?').get(run.integration_id)!;
+  const observed=JSON.parse(readFileSync(job.cwd+'/.panda/tmp/merge-agent/'+run.id+'/observed.json','utf8'));
+  expect(observed.cwd).toBe(job.cwd);expect(observed.attempt).toBe(run.id);expect(run.stop_confirmed).toBe(1);
+  expect((await s.driver.listSessions()).some(x=>x.name.includes(run.conversation_id))).toBe(false);
+ } finally {await agent.cancel(b.id);}
+},30_000);
+
+test('引擎合并澄清：答复交给修复轮次，不注入已停止的开发会话',async()=>{
+ const s=await mergeAgentFixture();const service=new ModuleWorkspaceService({...s.deps,mergeAgent:s.agent});
+ await s.agent.step(s.context);s.report('needs_clarification','负责人按人工规则还是自动规则？');await s.agent.step(s.context);
+ const engine=new IssueEngine({db:s.db,driver:s.driver,locator:{locate:async()=>null},convs:s.deps.conversations,moduleWorkspaces:service,mutex:s.deps.mutex,
+  pmFor:()=>({judgeDone:async()=> 'not_done',generateClarifyingQuestions:async()=>null}),notify:{dispatch:async()=>{}},config:{resultSummaryTimeoutMs:0}});
+ const sent=s.stats().sent;
+ expect((await engine.clarify(s.b.id,'采用人工指定负责人')).ok).toBe(true);
+ expect(s.run().answer).toBe('采用人工指定负责人');expect(s.stats().sent).toBe(sent);
+ expect(engine.store.execClarifyWait(s.b.id)).toBeNull();
+});
+
+test('引擎合并门禁：Agent修复后缺少系统验证命令不能发布候选',async()=>{
+ const s=await mergeAgentFixture();const service=new ModuleWorkspaceService({...s.deps,mergeAgent:s.agent});
+ await service.integrate(s.context.issue,s.project,async()=>true);
+ writeFileSync(s.job.cwd+'/same.txt','A\nB\n');await s.git(s.job.cwd,['add','same.txt']);await s.git(s.job.cwd,['commit','--no-edit']);s.report();
+ const before=await s.git(s.repo,['rev-parse','main']);s.db.query("UPDATE issues SET status='done' WHERE id=?").run(s.a.id);
+ const engine=new IssueEngine({db:s.db,driver:s.driver,locator:{locate:async()=>null},convs:s.deps.conversations,moduleWorkspaces:service,mutex:s.deps.mutex,
+  pmFor:()=>({judgeDone:async()=> 'not_done',generateClarifyingQuestions:async()=>null}),notify:{dispatch:async()=>{}},config:{resultSummaryTimeoutMs:0,validationTimeoutMs:0}});
+ await engine.tick();
+ expect(engine.store.get(s.b.id)!.status).toBe('paused');
+ expect(await s.git(s.repo,['rev-parse','main'])).toBe(before);
+ expect(service.attempt(s.b.id)!.integrated_sha).toBeNull();
+});
+
+test('引擎合并暂停：停止活跃修复者，保留候选并让出项目Agent名额',async()=>{
+ const s=await mergeAgentFixture();const service=new ModuleWorkspaceService({...s.deps,mergeAgent:s.agent});await s.agent.step(s.context);
+ const engine=new IssueEngine({db:s.db,driver:s.driver,locator:{locate:async()=>null},convs:s.deps.conversations,moduleWorkspaces:service,mutex:s.deps.mutex,
+  pmFor:()=>({judgeDone:async()=> 'not_done',generateClarifyingQuestions:async()=>null}),notify:{dispatch:async()=>{}},config:{resultSummaryTimeoutMs:0}});
+ expect((await engine.applyEvent(s.b.id,'pause',{note:'暂停合并'})).ok).toBe(true);
+ expect(s.run().stop_confirmed).toBe(1);expect(s.run().state).toBe('superseded');
+ expect(s.service.attempt(s.b.id)!.released_ts).toBeNull();
+ expect((await s.driver.git(s.job.cwd,['rev-parse','--verify','MERGE_HEAD'])).code).toBe(0);
+});
+
+test('执行超时：下一轮由新 Agent 接管同一现场，旧会话不可重新启动',async()=>{
+ const s=await setup(),sessions=new Set<string>();
+ s.driver.findExecutable=async()=>'/bin/true';
+ s.driver.listSessions=async()=>[...sessions].map(name=>({name,createdTs:1,attached:false,command:'codex'}));
+ s.driver.createSession=async name=>{sessions.add(name);};s.driver.killSession=async name=>{sessions.delete(name);};
+ s.driver.sendKeys=async()=>{};s.driver.capturePane=async()=> '› Ready';
+ s.driver.stopSessionConfirmed=async name=>{sessions.delete(name);};
+ const engine=new IssueEngine({db:s.db,driver:s.driver,locator:{locate:async()=>null},convs:s.deps.conversations,executionWorkspaces:s.service,moduleWorkspaces:s.service,mutex:s.deps.mutex,
+  pmFor:()=>({judgeDone:async()=> 'not_done',generateClarifyingQuestions:async()=>null}),notify:{dispatch:async()=>{}},
+  config:{resultSummaryTimeoutMs:0,kickoffMinBootMs:0,stopLossRuntimeMs:5000}});
+ const issue=s.issue(1);await engine.scheduleNext(1);
+ const old=engine.store.get(issue.id)!,before=s.service.attempt(issue.id)!;
+ writeFileSync(before.cwd+'/partial.txt','保留已经完成的工作');
+ s.db.query("UPDATE issue_events SET ts=? WHERE issue_id=? AND kind='transition'").run(Date.now()-15000,issue.id);
+ await engine.tick();expect(engine.store.get(issue.id)!.status).toBe('paused');
+ await engine.tick();
+ const fresh=engine.store.get(issue.id)!;
+ expect(fresh.status).toBe('implementing');expect(fresh.convId).not.toBe(old.convId);
+ expect(s.service.attempt(issue.id)!.id).toBe(before.id);expect(s.service.attempt(issue.id)!.cwd).toBe(before.cwd);
+ expect(readFileSync(before.cwd+'/partial.txt','utf8')).toBe('保留已经完成的工作');
+ await expect(s.deps.conversations.activate(old.convId!)).rejects.toThrow('归属');
+});
+
+async function timeoutFixture(config:Record<string,unknown>={}) {
+ const s=await setup(),sessions=new Set<string>(),sent:string[]=[];
+ s.driver.findExecutable=async()=>'/bin/true';
+ s.driver.listSessions=async()=>[...sessions].map(name=>({name,createdTs:1,attached:false,command:'codex'}));
+ s.driver.createSession=async name=>{sessions.add(name);};s.driver.killSession=async name=>{sessions.delete(name);};
+ s.driver.sendKeys=async(_session,text)=>{sent.push(text);};s.driver.capturePane=async()=> '› Ready';
+ s.driver.stopSessionConfirmed=async name=>{sessions.delete(name);};
+ const deps={db:s.db,driver:s.driver,locator:{locate:async()=>null},convs:s.deps.conversations,executionWorkspaces:s.service,moduleWorkspaces:s.service,mutex:s.deps.mutex,
+  pmFor:()=>({judgeDone:async()=> 'not_done' as const,generateClarifyingQuestions:async()=>null}),notify:{dispatch:async()=>{}},
+  config:{resultSummaryTimeoutMs:0,kickoffMinBootMs:0,stopLossRuntimeMs:5000,...config}};
+ const engine=new IssueEngine(deps),issue=s.issue(1);await engine.scheduleNext(1);
+ const expire=async()=>{
+  s.db.query("UPDATE issue_events SET ts=? WHERE issue_id=? AND kind='transition'").run(Date.now()-15000,issue.id);
+  s.db.query("UPDATE issue_events SET ts=? WHERE issue_id=? AND kind IN ('unblock_guidance','stop_loss_resumed')").run(Date.now()-15000,issue.id);
+  await engine.tick();expect(engine.store.get(issue.id)!.status).toBe('paused');
+ };
+ return {...s,engine,issue,engineDeps:deps,expire,sent};
+}
+
+test('超时接管：重建协调器沿用已准备会话，不重复创建或投递',async()=>{
+ const s=await timeoutFixture();await s.expire();
+ const pause=s.store.lastEnterEventId(s.issue.id,'paused');
+ const prepared=await s.service.prepareTimeoutTakeover(s.store.get(s.issue.id)!,s.project,pause,'runtime','implementing');
+ const restartedService=new ModuleWorkspaceService(s.deps);
+ const restarted=new IssueEngine({...s.engineDeps,moduleWorkspaces:restartedService,executionWorkspaces:restartedService});
+ await restarted.tick();
+ expect(s.store.get(s.issue.id)!.convId).toBe(prepared.conversationId);
+ expect(s.db.query<{n:number},[]>('SELECT COUNT(*) n FROM issue_timeout_takeovers').get()!.n).toBe(1);
+ await restarted.tick();await restarted.tick();
+ expect(s.sent.filter(text=>(text.includes('超时恢复 Agent')||text.includes('timeout recovery agent')))).toHaveLength(1);
+ expect(s.sent.find(text=>(text.includes('超时恢复 Agent')||text.includes('timeout recovery agent')))).toContain('ISSUE_READY');
+ const snapshot=JSON.parse(readFileSync(prepared.contextPath,'utf8'));
+ expect(snapshot.reason).toBe('runtime');expect(snapshot.issue.id).toBe(s.issue.id);
+});
+
+test('超时接管：停止确认失败时保留旧绑定，不启动第二个写者',async()=>{
+ const s=await timeoutFixture();await s.expire();const before=s.store.get(s.issue.id)!.convId;
+ s.driver.stopSessionConfirmed=async()=>{throw new Error('old process still alive');};
+ await s.engine.tick();await s.engine.tick();
+ expect(s.store.get(s.issue.id)!.status).toBe('paused');expect(s.store.get(s.issue.id)!.convId).toBe(before);
+ expect(s.db.query<{phase:string},[]>('SELECT phase FROM issue_timeout_takeovers').get()!.phase).toBe('failed');
+ expect(s.store.listEvents(s.issue.id).filter(e=>e.kind==='timeout_takeover_failed')).toHaveLength(1);
+ expect(s.sent.filter(text=>(text.includes('超时恢复 Agent')||text.includes('timeout recovery agent')))).toHaveLength(0);
+});
+
+test('超时接管：手动暂停和等待澄清均不触发恢复',async()=>{
+ const s=await timeoutFixture();const before=s.store.get(s.issue.id)!.convId;
+ await s.engine.applyEvent(s.issue.id,'pause',{note:'用户要求暂停'});await s.engine.tick();
+ expect(s.store.get(s.issue.id)!.status).toBe('paused');
+ expect(s.db.query<{n:number},[]>('SELECT COUNT(*) n FROM issue_timeout_takeovers').get()!.n).toBe(0);
+ await s.engine.unblockIssue(s.issue.id,'继续');
+ s.store.logEvent(s.issue.id,'clarify_questions',{questions:'需要确认业务规则',source:'exec',stage:'implementing'});
+ s.db.query("UPDATE issue_events SET ts=? WHERE issue_id=? AND kind='transition'").run(Date.now()-15000,s.issue.id);
+ await s.engine.tick();
+ expect(s.store.get(s.issue.id)!.status).toBe('implementing');expect(s.store.get(s.issue.id)!.convId).toBe(before);
+ expect(s.db.query<{n:number},[]>('SELECT COUNT(*) n FROM issue_timeout_takeovers').get()!.n).toBe(0);
+});
+
+test('超时接管：最多两次，重启和人工继续均不能清空自动预算',async()=>{
+ const s=await timeoutFixture();
+ for(let n=0;n<2;n++){await s.expire();await s.engine.tick();expect(s.store.get(s.issue.id)!.status).toBe('implementing');}
+ await s.expire();const restarted=new IssueEngine(s.engineDeps);await restarted.tick();await restarted.tick();
+ expect(s.store.get(s.issue.id)!.status).toBe('paused');
+ expect(s.db.query<{n:number},[]>('SELECT COUNT(*) n FROM issue_timeout_takeovers').get()!.n).toBe(2);
+ expect(s.store.listEvents(s.issue.id).filter(e=>e.kind==='timeout_takeover_exhausted')).toHaveLength(1);
+ expect((await restarted.unblockIssue(s.issue.id,'人工检查后继续')).ok).toBe(true);
+ await s.expire();await restarted.tick();
+ expect(s.store.get(s.issue.id)!.status).toBe('paused');
+ expect(s.db.query<{n:number},[]>('SELECT COUNT(*) n FROM issue_timeout_takeovers').get()!.n).toBe(2);
+});
+
+test('超时接管：容量不足不领取预算，恢复后才接管',async()=>{
+ const s=await timeoutFixture();await s.expire();
+ s.db.run('UPDATE projects SET module_concurrency=1 WHERE id=1');
+ const other=s.store.create(1,{title:'占用容量',moduleId:2,agent:'codex',executionMode:'direct'});await s.service.resolve(other,s.project);s.service.compute(other.id,true);
+ await s.engine.tick();
+ expect(s.db.query<{n:number},[]>('SELECT COUNT(*) n FROM issue_timeout_takeovers').get()!.n).toBe(0);
+ s.service.compute(other.id,false);await s.engine.tick();expect(s.store.get(s.issue.id)!.status).toBe('implementing');
+});
+
+test('验证超时：真实命令超时暂停后接管',async()=>{
+ const s=await timeoutFixture();const before=s.store.get(s.issue.id)!.convId;
+ s.db.query('UPDATE projects SET validation_commands_json=? WHERE id=1').run(JSON.stringify([{label:'test',argv:['sh','-c','sleep 10']} ]));
+ s.store.setCompletionReport(s.issue.id,{version:1,outcome:'complete',objective:'完成',implementation:['完成'],advantages:[],disadvantages:[],verification:['修改'],completion:'已完成',unmetGoals:[],remainingWork:[],optionalFollowUps:[]});
+ s.db.query("UPDATE issues SET status='testing' WHERE id=?").run(s.issue.id);
+ // Use the real LocalDriver timeout and the ordinary validation/report path.
+ const engine=new IssueEngine({...s.engineDeps,config:{...s.engineDeps.config,validationTimeoutMs:50}});
+ await (engine as any).completeTesting(s.issue.id,'sentinel',true);
+ expect(s.store.get(s.issue.id)!.status).toBe('paused');
+ expect(s.store.listEvents(s.issue.id).find(e=>e.kind==='validation_failed')?.dataJson).toContain('"timedOut":true');
+ await engine.tick();expect(s.store.get(s.issue.id)!.status).toBe('implementing');expect(s.store.get(s.issue.id)!.convId).not.toBe(before);
+});
+
+test('合并超时：保留冻结成果和候选，由新修复 Agent 继续并继承诊断',async()=>{
+ const s=await mergeAgentFixture();let now=Date.now();
+ const agent=new ModuleMergeAgent({...s.agentDeps,now:()=>now});
+ const service=new ModuleWorkspaceService({...s.deps,mergeAgent:agent});await agent.step(s.context);
+ const old=s.run();now+=31*60_000;
+ const engine=new IssueEngine({db:s.db,driver:s.driver,locator:{locate:async()=>null},convs:s.deps.conversations,moduleWorkspaces:service,executionWorkspaces:service,mutex:s.deps.mutex,
+  pmFor:()=>({judgeDone:async()=> 'not_done',generateClarifyingQuestions:async()=>null}),notify:{dispatch:async()=>{}},config:{resultSummaryTimeoutMs:0}});
+ await engine.tick();expect(s.store.get(s.b.id)!.status).toBe('paused');
+ await engine.tick();expect(s.store.get(s.b.id)!.status).toBe('merging');
+ const next=s.run();expect(next.id).not.toBe(old.id);expect(next.integration_id).toBe(old.integration_id);
+ expect(service.attempt(s.b.id)!.result_sha).toBe(s.context.resultSha);
+ expect(s.store.get(s.b.id)!.convId).toBe(s.context.issue.convId);
+ const context=JSON.parse(readFileSync(s.job.cwd+'/.panda/tmp/merge-agent/'+next.id+'/context.json','utf8'));
+ expect(context.timeoutRecovery.reason).toBe('merge-agent');expect(context.timeoutRecovery.mergeCandidate.cwd).toBe(s.job.cwd);
+});
+
+test('超时接管：人工继续可接续已准备现场，并终结旧接管意图',async()=>{
+ const s=await timeoutFixture();await s.expire();
+ const prepared=await s.service.prepareTimeoutTakeover(s.store.get(s.issue.id)!,s.project,s.store.lastEnterEventId(s.issue.id,'paused'),'runtime','implementing');
+ expect((await s.engine.unblockIssue(s.issue.id,'人工已确认，接着做')).ok).toBe(true);
+ expect(s.store.get(s.issue.id)!.status).toBe('implementing');
+ expect(managedConversationOwned(s.db,1,prepared.conversationId!)).toBe(true);
+ expect(s.db.query<{phase:string},[string]>('SELECT phase FROM issue_timeout_takeovers WHERE id=?').get(prepared.id)!.phase).toBe('failed');
+});
+
+test('启动与无进展超时：使用同一接管入口，禁用开关保持暂停',async()=>{
+ for(const reason of ['startup','idle'] as const) {
+  const s=await timeoutFixture();await s.engine.applyEvent(s.issue.id,'pause',{note:'超时',timeoutReason:reason});
+  await s.engine.tick();expect(s.store.get(s.issue.id)!.status).toBe('implementing');
+ }
+ const disabled=await timeoutFixture({timeoutAgentEnabled:false});await disabled.expire();await disabled.engine.tick();
+ expect(disabled.store.get(disabled.issue.id)!.status).toBe('paused');
+ expect(disabled.db.query<{n:number},[]>('SELECT COUNT(*) n FROM issue_timeout_takeovers').get()!.n).toBe(0);
+});
+
+test('超时接管：诊断脱敏、保留子任务进度，工作流节点不被父会话替换',async()=>{
+ const s=await timeoutFixture();
+ s.db.query('UPDATE issues SET sub_index=2 WHERE id=?').run(s.issue.id);
+ s.driver.capturePane=async()=> '› Ready\nAPI_KEY=should-stay-private';
+ await s.expire();await s.engine.tick();
+ const job=s.db.query<{context_path:string},[]>('SELECT context_path FROM issue_timeout_takeovers').get()!;
+ const text=readFileSync(job.context_path,'utf8');expect(text).not.toContain('should-stay-private');
+ expect(JSON.parse(text).issue.subIndex).toBe(2);expect(s.store.get(s.issue.id)!.subIndex).toBe(2);
+ const graph=await timeoutFixture();await graph.expire();const before=graph.store.get(graph.issue.id)!.convId;
+ graph.db.query("INSERT INTO issue_workflows(issue_id,template_name,template_version,graph_json,graph_hash,context_json,created_ts,updated_ts) VALUES(?,'测试',1,'{}','test','{}',1,1)").run(graph.issue.id);
+ await graph.engine.tick();
+ expect(graph.store.get(graph.issue.id)!.status).toBe('paused');expect(graph.store.get(graph.issue.id)!.convId).toBe(before);
+ expect(graph.store.listEvents(graph.issue.id).find(e=>e.kind==='timeout_takeover_failed')?.dataJson).toContain('节点归属');
+});
+
+test('超时接管：诊断已落盘但暂停未提交时，重启仍补齐暂停和接管',async()=>{
+ const s=await timeoutFixture();
+ s.db.query("UPDATE issue_events SET ts=? WHERE issue_id=? AND kind='transition'").run(Date.now()-15000,s.issue.id);
+ s.store.logEvent(s.issue.id,'stop_loss_triggered',{reason:'runtime',stage:'implementing'});
+ const restarted=new IssueEngine(s.engineDeps);await restarted.tick();expect(s.store.get(s.issue.id)!.status).toBe('paused');
+ await restarted.tick();expect(s.store.get(s.issue.id)!.status).toBe('implementing');
+ const t=await timeoutFixture();t.store.logEvent(t.issue.id,'nudge_exhausted',{count:5,stage:'implementing'});
+ await (t.engine as any).exhaustAutoRetry(t.store.get(t.issue.id)!,'nudge',5,0);
+ expect(t.store.get(t.issue.id)!.status).toBe('paused');await t.engine.tick();expect(t.store.get(t.issue.id)!.status).toBe('implementing');
+ const merge=await mergeAgentFixture();let now=Date.now();const agent=new ModuleMergeAgent({...merge.agentDeps,now:()=>now});await agent.step(merge.context);now+=31*60_000;
+ await expect(agent.step(merge.context)).rejects.toThrow('合并 Agent 超时');
+ const {MergeAgentTimeoutError}=await import('./module-merge-agent');
+ await expect(new ModuleMergeAgent(merge.agentDeps).step(merge.context)).rejects.toBeInstanceOf(MergeAgentTimeoutError);
+});
+
+// PM supervises the existing autonomous executor and the independent merge Agent.
+import type { PmLoopDecision, PmLoopObservation } from './pm-loop';
+function supervisedEngine(s:Awaited<ReturnType<typeof timeoutFixture>>, decide:(o:PmLoopObservation)=>Promise<PmLoopDecision>,config:Record<string,unknown>={}) {
+ return new IssueEngine({...s.engineDeps,pmFor:()=>({judgeDone:async()=> 'not_done' as const,superviseIssue:decide}),
+  config:{...s.engineDeps.config,pmLoopEnabled:true,pmLoopIdleMs:100,pmLoopTickMs:10,...config}});
+}
+
+test('PM Loop：超时后由 PM 决定等待，旧固定接管不抢先执行',async()=>{
+ const s=await timeoutFixture();await s.expire();let calls=0;
+ const engine=supervisedEngine(s,async o=>{calls++;expect(o.facts).toHaveProperty('git');return {action:'wait',reason:'先保留现场核查',waitSeconds:60};});
+ await engine.tick();expect(s.store.get(s.issue.id)!.status).toBe('paused');
+ await engine.tickPmLoop();await engine.tick();await engine.tickPmLoop();
+ expect(calls).toBe(1);expect(s.db.query<{n:number},[]>('SELECT COUNT(*) n FROM issue_timeout_takeovers').get()!.n).toBe(0);
+});
+
+test('PM Loop：恢复普通执行角色并保留原 worktree、改动及单一指令',async()=>{
+ const s=await timeoutFixture(),before=s.service.attempt(s.issue.id)!;writeFileSync(before.cwd+'/partial.txt','keep');await s.expire();
+ const engine=supervisedEngine(s,async()=>({action:'recover',reason:'执行进程已失去响应',instruction:'定位超时原因后继续完成原始目标。'}));
+ await engine.tickPmLoop();await engine.tick();
+ expect(s.store.get(s.issue.id)!.status).toBe('implementing');expect(s.service.attempt(s.issue.id)!.id).toBe(before.id);
+ expect(readFileSync(before.cwd+'/partial.txt','utf8')).toBe('keep');
+ expect(s.sent.at(-1)).toContain('定位超时原因后继续完成原始目标');expect(s.sent.at(-1)).toContain('ISSUE_READY');
+ expect(s.sent.at(-1)).not.toMatch(/你现在是超时恢复 Agent|You are the timeout recovery agent/);
+});
+
+test('PM Loop：自主执行没有旧催办，空闲干预只发一条明确任务',async()=>{
+ const s=await timeoutFixture();let now=Date.now(),calls=0;
+ const engine=supervisedEngine(s,async()=>{calls++;return {action:'continue',reason:'输入已就绪，任务仍未交付',instruction:'继续完成当前 issue，修复定向验证发现的问题。'};},{now:()=>now,nudgeSec:0.001,fallbackSec:0.001,stopLossRuntimeMs:3_600_000});
+ await engine.tick();await engine.tickPmLoop();const initial=s.sent.length;
+ now+=200;await engine.tick();expect(s.sent).toHaveLength(initial);
+ await engine.tickPmLoop();await engine.tickPmLoop();
+ expect(calls).toBe(1);expect(s.sent).toHaveLength(initial+1);expect(s.sent.at(-1)).toContain('继续完成当前 issue');
+ expect(s.sent.at(-1)!.length).toBeLessThanOrEqual(2000);
+ expect(s.store.listEvents(s.issue.id).filter(e=>e.kind==='nudged')).toHaveLength(0);
+});
+
+test('PM Loop：原 issue tick 未返回时仍可独立观察，修改动作等待原入口释放',async()=>{
+ const s=await timeoutFixture();let now=Date.now(),release!:()=>void,first=true,calls=0;
+ s.driver.capturePane=async()=>{if(first){first=false;await new Promise<void>(r=>{release=r;});}return '› Ready';};
+ const engine=supervisedEngine(s,async()=>{calls++;return {action:'wait',reason:'观察到执行入口仍在途',waitSeconds:60};},{now:()=>now,stopLossRuntimeMs:3_600_000});
+ const pending=engine.tick();await Bun.sleep(10);
+ await engine.tickPmLoop();now+=200;await engine.tickPmLoop();expect(calls).toBe(1);
+ release();await pending;await engine.stop();
+});
+
+test('PM Loop：PM 推理期间人工暂停，迟到的续跑决定不注入',async()=>{
+ const s=await timeoutFixture();let now=Date.now(),resolve!:(d:PmLoopDecision)=>void;
+ const engine=supervisedEngine(s,async()=>new Promise(r=>{resolve=r;}),{now:()=>now,stopLossRuntimeMs:3_600_000});
+ await engine.tickPmLoop();now+=200;const pending=engine.tickPmLoop();
+ while(!resolve)await Bun.sleep(5);
+ await engine.applyEvent(s.issue.id,'pause',{note:'用户暂停',actor:1});const sent=s.sent.length;
+ resolve({action:'continue',reason:'旧现场空闲',instruction:'继续执行。'});await pending;
+ expect(s.store.get(s.issue.id)!.status).toBe('paused');expect(s.sent).toHaveLength(sent);
+});
+
+test('PM Loop：合并超时恢复仍由独立合并 Agent 接续同一候选',async()=>{
+ const s=await mergeAgentFixture();let now=Date.now();const agent=new ModuleMergeAgent({...s.agentDeps,now:()=>now});await agent.step(s.context);
+ const service=new ModuleWorkspaceService({...s.deps,mergeAgent:agent}),old=s.run();now+=31*60_000;
+ const engine=new IssueEngine({db:s.db,driver:s.driver,locator:{locate:async()=>null},convs:s.deps.conversations,moduleWorkspaces:service,executionWorkspaces:service,mutex:s.deps.mutex,
+  pmFor:()=>({judgeDone:async()=> 'not_done',superviseIssue:async o=>{expect(o.facts).toHaveProperty('mergeAgent');expect(o.allowedActions).not.toContain('continue');return {action:'recover',reason:'合并 Agent 超时，保留候选恢复'};}}),
+  notify:{dispatch:async()=>{}},config:{resultSummaryTimeoutMs:0,pmLoopEnabled:true}});
+ await engine.tick();expect(s.store.get(s.b.id)!.status).toBe('paused');
+ await engine.tick();expect(s.run().id).toBe(old.id);
+ await engine.tickPmLoop();
+ expect(s.store.get(s.b.id)!.status).toBe('merging');expect(s.run().id).not.toBe(old.id);
+ expect(s.run().integration_id).toBe(old.integration_id);expect(s.store.get(s.b.id)!.convId).toBe(s.context.issue.convId);
+ expect(service.attempt(s.b.id)!.result_sha).toBe(s.context.resultSha);
+});
+
+test('PM Loop：合并 Agent 自动失败暂停也进入监督，人工合并暂停仍保持暂停',async()=>{
+ const s=await mergeAgentFixture();await s.agent.step(s.context);s.report('failed','候选验证失败，需要继续修复');
+ const service=new ModuleWorkspaceService({...s.deps,mergeAgent:s.agent});let decisions=0;
+ const engine=new IssueEngine({db:s.db,driver:s.driver,locator:{locate:async()=>null},convs:s.deps.conversations,moduleWorkspaces:service,executionWorkspaces:service,mutex:s.deps.mutex,
+  pmFor:()=>({judgeDone:async()=> 'not_done',superviseIssue:async()=>{decisions++;return {action:'recover',reason:'继续修复保留的合并候选'};}}),
+  notify:{dispatch:async()=>{}},config:{resultSummaryTimeoutMs:0,pmLoopEnabled:true}});
+ await engine.tick();expect(s.store.get(s.b.id)!.status).toBe('paused');const old=s.run();
+ await engine.tickPmLoop();expect(decisions).toBe(1);expect(s.store.get(s.b.id)!.status).toBe('merging');
+ expect(s.run().id).not.toBe(old.id);expect(s.run().integration_id).toBe(old.integration_id);
+ await engine.applyEvent(s.b.id,'pause',{note:'人工暂停合并',actor:1});await engine.tickPmLoop();
+ expect(s.store.get(s.b.id)!.status).toBe('paused');expect(decisions).toBe(1);
+});
+
+test('PM Loop：等待最终输入锁期间有新进展，旧指令不提交',async()=>{
+ const s=await timeoutFixture();let now=Date.now(),decided=false,captures=0;
+ const engine=supervisedEngine(s,async()=>{decided=true;return {action:'continue',reason:'空闲',instruction:'继续完成当前目标。'};},{now:()=>now,stopLossRuntimeMs:3_600_000});
+ await engine.tick();await engine.tickPmLoop();const initial=s.sent.length;
+ s.driver.capturePane=async()=>{
+  if(decided&&++captures===3)writeFileSync(s.service.attempt(s.issue.id)!.cwd+'/new-progress.txt','progress while PM waits for final input');
+  return '› Ready';
+ };
+ now+=200;await engine.tickPmLoop();expect(captures).toBeGreaterThanOrEqual(3);
+ expect(s.sent).toHaveLength(initial);
+ expect(s.store.listEvents(s.issue.id).some(e=>e.kind==='pm_loop_stale')).toBe(true);
+});
+
+test('PM Loop：未知动作仅在显式人工恢复后解除监督屏障',async()=>{
+ const s=await timeoutFixture();const engine=supervisedEngine(s,async()=>({action:'wait',reason:'核查',waitSeconds:60}));await engine.tickPmLoop();
+ s.db.query("UPDATE issue_pm_loops SET phase='uncertain',operation_id='unknown-old-action' WHERE issue_id=?").run(s.issue.id);
+ await engine.applyEvent(s.issue.id,'pause',{note:'人工核查',actor:1});
+ expect((await engine.unblockIssue(s.issue.id,'已确认旧动作结果，沿用现场继续',1)).ok).toBe(true);
+ expect(s.db.query<{phase:string},[]>('SELECT phase FROM issue_pm_loops').get()!.phase).toBe('watching');
+});

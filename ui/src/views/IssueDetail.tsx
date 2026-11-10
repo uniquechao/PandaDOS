@@ -1873,10 +1873,14 @@ export function IssueStopNotice({ issue, events, pid }: { issue: Issue; events: 
   const closeDiagnostics = () => { setOpen(false); diagnosticButton.current?.focus(); };
   const stop = issueStopState(issue.status, !!issue.awaitingClarify, events);
   if (!stop) return null;
-  const title = stop.kind === 'validation' ? tr('issue.stopValidation') : stop.kind === 'environment' ? tr('issue.stopEnvironment')
+  const branchCause = stop.cause?.kind === 'branch' ? stop.cause : null;
+  const reason = branchCause ? tr('issue.stopBranchReason', { actual: branchCause.actualBranch, expected: branchCause.expectedBranch })
+    : stop.cause ? tr('issue.stopConcreteReason', { reason: stop.cause.raw.split('\n')[0]!.slice(0, 480) }) : '';
+  const technical = [...new Set([stop.cause?.raw, redactDiagnostic(issue.note ?? '')].filter(Boolean))].join('\n\n');
+  const title = branchCause ? tr('issue.stopBranchMismatch') : stop.kind === 'validation' ? tr('issue.stopValidation') : stop.kind === 'environment' ? tr('issue.stopEnvironment')
     : stop.kind === 'budget' ? tr('issue.stopBudget') : stop.kind === 'clarify' ? tr('issue.clarification')
       : stop.kind === 'blocked' ? tr('issue.blockedNeedsYou') : tr('issue.stopPaused');
-  const help = stop.kind === 'validation' ? tr('issue.stopValidationHelp', { label: stop.label })
+  const help = branchCause ? tr('issue.stopBranchAction') : stop.kind === 'validation' ? tr('issue.stopValidationHelp', { label: stop.label })
     : stop.kind === 'environment' ? tr('issue.stopEnvironmentHelp') : stop.kind === 'budget' ? tr('issue.stopBudgetHelp')
       : stop.kind === 'clarify' ? tr('issue.stopClarifyHelp') : stop.kind === 'blocked' ? tr('issue.stopBlockedHelp') : tr('issue.stopPausedHelp');
   const load = async () => {
@@ -1886,6 +1890,7 @@ export function IssueStopNotice({ issue, events, pid }: { issue: Issue; events: 
   };
   return <section class="issue-stop" role="status">
     <strong>{issue.status === 'paused' && stop.kind !== 'paused' ? `${tr('issue.stopPaused')} · ${title}` : title}</strong>
+    {reason && <p class="issue-stop-reason" style={{ overflowWrap: 'anywhere' }}>{reason}</p>}
     <p>{tr('issue.stopStage', { stage: stop.stage ? issueStatusLabel(stop.stage) : tr('issue.stopUnknownStage') })}。{help}</p>
     {stop.stopLoss && stop.kind !== 'budget' && <p>{tr('issue.stopBudgetHelp')}</p>}
     {stop.failures > 0 && <p>{tr('issue.stopFailures', { count: stop.failures })}</p>}
@@ -1894,7 +1899,7 @@ export function IssueStopNotice({ issue, events, pid }: { issue: Issue; events: 
       <details><summary>{tr('issue.stopDetails')}</summary><pre class="stop-raw">{stop.tail}</pre></details>
       {stop.summaryTruncated && <small>{tr('issue.stopTruncated')}</small>}
     </>}
-    <details><summary>{tr('issue.stopDetails')}</summary><pre class="stop-raw">{redactDiagnostic(issue.note ?? '')}</pre></details>
+    <details><summary>{tr('issue.stopDetails')}</summary><pre class="stop-raw">{technical}</pre></details>
     <button ref={diagnosticButton} class="btn sm" onClick={() => void load()}>{tr('issue.stopDiagnostics')}</button>
     {open && <Modal title={tr('issue.stopDiagnostics')} onClose={closeDiagnostics}>
       <div class="stop-diagnostics"><p>{tr('issue.stopDiagnosticsHelp')}</p>

@@ -1,6 +1,7 @@
 import { AgentModelSettings } from '../core/agent-model-settings';
 import { ensurePandaIssuePlanSkill } from '../core/issue-plan-skill';
 import { LocalPlanService } from './local-plans';
+import { ModuleMergeAgent } from '../issues/module-merge-agent';
 import { ModuleWorkspaceService } from '../issues/module-workspaces';
 /**
  * web/server —— V2 控制面完整装配。
@@ -780,7 +781,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
       WHERE link.publication_id = ? AND (issue.status NOT IN ('done', 'cancelled') OR EXISTS (SELECT 1 FROM workspace_attempts a WHERE a.issue_id=issue.id AND a.released_ts IS NULL)) LIMIT 1
     `).get(publicationId)),
   });
-  const executionWorkspaces = new ModuleWorkspaceService({ db, mutex, driverForProject, conversations: convs,
+  const mergeAgent = new ModuleMergeAgent({db,mutex,driverForProject,projectForId:id=>getProject(db,id),conversations:convs,localeForIssue:c=>userPromptLocale(db,c.issue.createdBy??c.project.ownerUserId)});
+  const executionWorkspaces = new ModuleWorkspaceService({ db, mutex, driverForProject, conversations: convs, mergeAgent,
     legacy: createDesignExecutionWorkspaceAdapter({ db, conversations: convs }) });
 
   // 「Agent 认知总结」的历史读取和 runner 均绑定项目执行机；相同 cwd 不等于同一执行位置。

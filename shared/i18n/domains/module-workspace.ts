@@ -4,6 +4,8 @@ export const moduleWorkspaceMessages = {
   "en": {
     "moduleWorkspace.confirmInput": "I verified that the pending input was submitted",
     "moduleWorkspace.title": "Module workspace",
+    "moduleWorkspace.mergeAgent": "Merge agent",
+    "moduleWorkspace.mergeAgentRecord": "View execution record",
     "moduleWorkspace.concurrency": "Concurrent modules",
     "moduleWorkspace.target": "Integration branch",
     "moduleWorkspace.fixedTarget": "Uses the fixed project integration branch.",
@@ -20,6 +22,8 @@ export const moduleWorkspaceMessages = {
   "zh-Hans": {
     "moduleWorkspace.confirmInput": "已核实保留的输入已提交",
     "moduleWorkspace.title": "模块工作区",
+    "moduleWorkspace.mergeAgent": "合并 Agent",
+    "moduleWorkspace.mergeAgentRecord": "查看处理记录",
     "moduleWorkspace.concurrency": "并行模块上限",
     "moduleWorkspace.target": "集成目标分支",
     "moduleWorkspace.fixedTarget": "使用项目固定集成目标分支。",
@@ -36,6 +40,8 @@ export const moduleWorkspaceMessages = {
   "zh-Hant": {
     "moduleWorkspace.confirmInput": "已核實保留的輸入已提交",
     "moduleWorkspace.title": "模組工作區",
+    "moduleWorkspace.mergeAgent": "合併 Agent",
+    "moduleWorkspace.mergeAgentRecord": "查看處理記錄",
     "moduleWorkspace.concurrency": "並行模組上限",
     "moduleWorkspace.target": "整合目標分支",
     "moduleWorkspace.fixedTarget": "使用專案固定的整合目標分支。",
@@ -52,6 +58,8 @@ export const moduleWorkspaceMessages = {
   "ja": {
     "moduleWorkspace.confirmInput": "保留中の入力が送信済みと確認しました",
     "moduleWorkspace.title": "モジュールのワークスペース",
+    "moduleWorkspace.mergeAgent": "マージエージェント",
+    "moduleWorkspace.mergeAgentRecord": "実行記録を表示",
     "moduleWorkspace.concurrency": "同時実行モジュール数",
     "moduleWorkspace.target": "統合先ブランチ",
     "moduleWorkspace.fixedTarget": "プロジェクトに固定された統合先ブランチを使用します。",
@@ -68,6 +76,8 @@ export const moduleWorkspaceMessages = {
   "ko": {
     "moduleWorkspace.confirmInput": "보류된 입력이 전송되었음을 확인했습니다",
     "moduleWorkspace.title": "모듈 작업 공간",
+    "moduleWorkspace.mergeAgent": "병합 에이전트",
+    "moduleWorkspace.mergeAgentRecord": "실행 기록 보기",
     "moduleWorkspace.concurrency": "동시 실행 모듈 수",
     "moduleWorkspace.target": "통합 대상 브랜치",
     "moduleWorkspace.fixedTarget": "프로젝트의 고정된 통합 대상 브랜치를 사용합니다.",
@@ -84,6 +94,8 @@ export const moduleWorkspaceMessages = {
   "es": {
     "moduleWorkspace.confirmInput": "He verificado que se envió la entrada pendiente",
     "moduleWorkspace.title": "Espacio de trabajo del módulo",
+    "moduleWorkspace.mergeAgent": "Agente de integración",
+    "moduleWorkspace.mergeAgentRecord": "Ver registro",
     "moduleWorkspace.concurrency": "Módulos simultáneos",
     "moduleWorkspace.target": "Rama de integración",
     "moduleWorkspace.fixedTarget": "Se usa la rama de integración fija del proyecto.",
@@ -100,6 +112,8 @@ export const moduleWorkspaceMessages = {
   "fr": {
     "moduleWorkspace.confirmInput": "J’ai vérifié que la saisie en attente a été envoyée",
     "moduleWorkspace.title": "Espace de travail du module",
+    "moduleWorkspace.mergeAgent": "Agent de fusion",
+    "moduleWorkspace.mergeAgentRecord": "Voir le journal",
     "moduleWorkspace.concurrency": "Modules simultanés",
     "moduleWorkspace.target": "Branche d’intégration",
     "moduleWorkspace.fixedTarget": "Utilise la branche d’intégration fixe du projet.",
@@ -116,6 +130,8 @@ export const moduleWorkspaceMessages = {
   "de": {
     "moduleWorkspace.confirmInput": "Ich habe die Übermittlung der ausstehenden Eingabe geprüft",
     "moduleWorkspace.title": "Modul-Arbeitsbereich",
+    "moduleWorkspace.mergeAgent": "Merge-Agent",
+    "moduleWorkspace.mergeAgentRecord": "Ausführungsprotokoll ansehen",
     "moduleWorkspace.concurrency": "Gleichzeitige Module",
     "moduleWorkspace.target": "Integrationsbranch",
     "moduleWorkspace.fixedTarget": "Verwendet den festgelegten Integrationsbranch des Projekts.",
@@ -132,6 +148,8 @@ export const moduleWorkspaceMessages = {
   "pt-BR": {
     "moduleWorkspace.confirmInput": "Verifiquei que a entrada pendente foi enviada",
     "moduleWorkspace.title": "Espaço de trabalho do módulo",
+    "moduleWorkspace.mergeAgent": "Agente de integração",
+    "moduleWorkspace.mergeAgentRecord": "Ver registro de execução",
     "moduleWorkspace.concurrency": "Módulos simultâneos",
     "moduleWorkspace.target": "Branch de integração",
     "moduleWorkspace.fixedTarget": "Usa a branch de integração fixa do projeto.",
@@ -148,6 +166,8 @@ export const moduleWorkspaceMessages = {
   "ru": {
     "moduleWorkspace.confirmInput": "Отправка ожидавшего ввода проверена",
     "moduleWorkspace.title": "Рабочая область модуля",
+    "moduleWorkspace.mergeAgent": "Агент слияния",
+    "moduleWorkspace.mergeAgentRecord": "Открыть журнал выполнения",
     "moduleWorkspace.concurrency": "Одновременные модули",
     "moduleWorkspace.target": "Ветка интеграции",
     "moduleWorkspace.fixedTarget": "Используется фиксированная ветка интеграции проекта.",

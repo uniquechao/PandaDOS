@@ -24,6 +24,7 @@ export function IssueWorkspace({ issue, compact = false }: { issue: Issue; compa
   const { t } = useI18n();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [mergeRecordsOpen,setMergeRecordsOpen]=useState(false);
   const w = issue.workspace;
   if (!w) return null;
 
@@ -61,6 +62,14 @@ export function IssueWorkspace({ issue, compact = false }: { issue: Issue; compa
           <div><dt>{t('moduleWorkspace.target')}</dt><dd class="mono">{w.targetBranch ?? '—'}</dd></div>
         </dl>
         {w.integrationCwd && <div class="issue-workspace-candidate"><b>{t('moduleWorkspace.candidate')}</b><div class="mono">{w.integrationCwd}</div></div>}
+        {w.mergeAgent && <div class="issue-workspace-candidate">
+          <b>{t('moduleWorkspace.mergeAgent')}</b>
+          <button class="btn" aria-expanded={mergeRecordsOpen} onClick={()=>setMergeRecordsOpen(!mergeRecordsOpen)}>{t('moduleWorkspace.mergeAgentRecord')}</button>
+          {mergeRecordsOpen && <ol>{w.mergeAgent.records.map((record,index)=><li key={index}>
+            <b>{t(record.state==='resolved'?'status.done':record.state==='clarification'?'board.clarificationPending':record.state==='failed'||record.state==='uncertain'?'status.paused':record.state==='superseded'?'status.cancelled':'ui.executing')}</b>
+            {record.detail && <p class="issue-workspace-diagnostic">{record.detail}</p>}
+          </li>)}</ol>}
+        </div>}
         {w.diagnostic && <p class="issue-workspace-diagnostic" role="status">{w.diagnostic}</p>}
         {(w.retained || w.reason === 'integration') && (
           <div class="issue-workspace-actions">

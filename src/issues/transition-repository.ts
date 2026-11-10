@@ -11,6 +11,9 @@ export interface TransitionOptions {
   actor?: number;
   resumeState?: IssueState;
   stopLoss?: boolean;
+  timeoutReason?: 'runtime'|'idle'|'validation'|'merge-agent'|'startup';
+  /** Typed automatic incident; absence keeps manual pauses untouched. */
+  supervisionReason?: 'merge-agent';
 }
 
 /** Only synchronous persistence operations belong in the SQLite transaction. */
@@ -55,6 +58,8 @@ export class IssueTransitionRepository {
         ...(options.note ? { note: options.note.slice(0, 500) } : {}),
         ...(options.actor !== undefined ? { actor: options.actor } : {}),
         ...(options.stopLoss ? { stopLoss: true } : {}),
+        ...(to==='paused'&&options.timeoutReason?{timeoutReason:options.timeoutReason}:{}),
+        ...(to==='paused'&&options.supervisionReason?{supervisionReason:options.supervisionReason}:{}),
         ...((to === 'blocked' || to === 'paused') ? {
           resumeState: from,
           resumeContext: {

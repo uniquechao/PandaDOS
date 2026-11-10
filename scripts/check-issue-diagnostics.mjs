@@ -1,10 +1,11 @@
 /** 隔离真实浏览器回归：只装载当前组件，模拟 API，不操作服务或 issue。 */
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readlink, rm } from 'node:fs/promises';
+import { readFile, readlink, rm } from 'node:fs/promises';
 import { basename, dirname, resolve } from 'node:path';
 import { createServer } from 'vite';
+import { testTmuxDirectory } from './test-tmux';
 
-const dir = resolve(await mkdtemp('.d-')); // 短路径避免 Chromium Unix socket 超长，独立目录防并发覆盖。
+const dir = testTmuxDirectory(); // 公共仓库短目录，深层 worktree 也不超过 Unix socket 上限。
 const fixture = `
 import { h, render } from 'preact';
 import { IssueStopNotice, BlockedRecoveryModal } from '/src/views/IssueDetail.tsx';
@@ -18,6 +19,10 @@ window.showScenario = (kind = 'validation', locale = 'zh-Hans') => {
     ['validation_failed', { label: 'test', summaryTruncated: true, tail: '(fail) 真实失败名称\\nError: expected 1' }],
     ['tests_failed', { failCount: 4 }],
     ['transition', { from: 'testing', to: 'paused', event: 'tests_failed' }],
+  ] : kind === 'branch' ? [
+    ['environment_preparation_failed', { note: 'Error: 工作区分支发生变化，需恢复原分支' }],
+    ['transition', { from: 'testing', to: 'paused', event: 'pause', note: '执行工作区不可用，恢复后重试验证' }],
+    ['error', { where: 'git-tip', error: '当前分支为 codex/20261106-11d291c-prototype-baseline，issue 工作分支应为 panda/module-2-1' }],
   ] : kind === 'environment' ? [
     ['environment_preparation_failed', { note: 'install failed' }],
     ['transition', { from: 'testing', to: 'paused', event: 'pause' }],
@@ -52,7 +57,7 @@ const delay = ms => new Promise(r => setTimeout(r, ms));
 async function until(fn) { for (let i = 0; i < 100; i++) { const value = await fn(); if (value) return value; await delay(100); } throw Error('等待浏览器验证超时'); }
 try {
   await server.listen();
-  chrome = Bun.spawn([process.env.CHROMIUM_PATH || '/usr/bin/google-chrome', '--headless', '--no-proxy-server', '--disable-extensions', '--disable-background-networking', '--no-sandbox', '--disable-dev-shm-usage', '--remote-debugging-port=0', `--user-data-dir=${dir}`, 'about:blank'], { stdout: 'ignore', stderr: 'pipe', env: { ...process.env, TMPDIR: process.cwd() } });
+  chrome = Bun.spawn([process.env.CHROMIUM_PATH || '/usr/bin/google-chrome', '--headless', '--no-proxy-server', '--disable-extensions', '--disable-background-networking', '--no-sandbox', '--disable-dev-shm-usage', '--remote-debugging-port=0', `--user-data-dir=${dir}`, 'about:blank'], { stdout: 'ignore', stderr: 'pipe', env: { ...process.env, TMPDIR: dir } });
   console.log('启动隔离浏览器');
   const port = await until(async () => { try { return (await readFile(`${dir}/DevToolsActivePort`, 'utf8')).split('\n')[0]; } catch {} });
   const socket = await readlink(`${dir}/SingletonSocket`);
@@ -81,6 +86,13 @@ try {
     assert.match(await evaluate('document.querySelector(".issue-stop").innerText'), /真实失败名称/);
     assert.match(await evaluate('document.querySelector(".issue-stop").innerText'), /摘要已裁剪/);
     assert.equal(await evaluate('document.querySelector(".stop-raw").closest("details").open'), false, '技术详情默认折叠');
+  }
+  for (const locale of ['en', 'zh-Hans', 'zh-Hant', 'ja', 'ko', 'es', 'fr', 'de', 'pt-BR', 'ru']) {
+    await evaluate(`window.showScenario('branch', '${locale}')`);
+    await until(() => evaluate('document.querySelector(".issue-stop-reason")?.textContent.includes("codex/20261106-11d291c-prototype-baseline")'));
+    assert.match(await evaluate('document.querySelector(".issue-stop-reason").textContent'), /panda\/module-2-1/);
+    assert.equal(await evaluate('document.querySelector(".issue-stop-reason").getBoundingClientRect().height > 0'), true, '具体原因默认可见');
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'), true, `${locale} 分支名不溢出`);
   }
   for (const [kind, expected] of [['environment', '环境准备失败'], ['budget', '达到止损上限'], ['paused', '系统暂停'], ['clarify', '必要信息'], ['blocked', '需要外部处理']]) {
     await evaluate(`window.showScenario('${kind}')`);
@@ -115,5 +127,5 @@ try {
 } finally {
   ws?.close(); chrome?.kill(); if (chrome) { await chrome.exited; const err = await new Response(chrome.stderr).text(); if (chrome.exitCode !== 0 && chrome.exitCode !== 143) console.error(err.slice(-1500)); }
   await server.close(); await rm(dir, { recursive: true, force: true });
-  if (socketDir && dirname(socketDir) === process.cwd() && basename(socketDir).startsWith('com.google.Chrome.')) await rm(socketDir, { recursive: true, force: true });
+  if (socketDir && dirname(socketDir) === dir && basename(socketDir).startsWith('com.google.Chrome.')) await rm(socketDir, { recursive: true, force: true });
 }

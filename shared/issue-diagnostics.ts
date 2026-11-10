@@ -27,10 +27,36 @@ export function diagnosticData(event: DiagnosticEvent): Record<string, any> {
   } catch { return {}; }
 }
 
+export type StopCause = { kind: 'branch'; actualBranch: string; expectedBranch: string; raw: string; eventId: number }
+  | { kind: 'technical'; raw: string; eventId: number };
+
+function stopCause(events: DiagnosticEvent[]): StopCause | null {
+  const ready = events.filter(e => e.kind === 'environment_ready' || e.kind === 'validation_passed').at(-1)?.id ?? 0;
+  const failures = events.filter(e => e.id > ready && (e.kind === 'error' || e.kind === 'environment_preparation_failed' || e.kind === 'environment_recovery_failed' || e.kind === 'timeout_takeover_failed' || e.kind === 'timeout_takeover_exhausted'));
+  let fallback: StopCause | null = null;
+  for (const event of failures.reverse()) {
+    const data = diagnosticData(event);
+    const raw = redactDiagnostic(String(data.error ?? data.note ?? '')).slice(0, 2000);
+    if (data.code === 'workspace_branch_mismatch' && typeof data.actualBranch === 'string' && typeof data.expectedBranch === 'string') {
+      return { kind: 'branch', actualBranch: redactDiagnostic(data.actualBranch), expectedBranch: redactDiagnostic(data.expectedBranch), raw, eventId: event.id };
+    }
+    if (!raw) continue;
+    // Historical git-tip events already contain both facts. Do not infer a cause from
+    // arbitrary stderr or keywords: match only this known producer's exact contract.
+    const branches = event.kind === 'error' && data.where === 'git-tip'
+      ? /^当前分支为 (.+)，issue 工作分支应为 (.+)$/.exec(raw) : null;
+    if (branches) return { kind: 'branch', actualBranch: branches[1]!, expectedBranch: branches[2]!, raw, eventId: event.id };
+    const cause: StopCause = { kind: 'technical', raw, eventId: event.id };
+    if (/^(?:Error: )?工作区分支发生变化，需恢复原分支$/.test(raw)) { fallback ??= cause; continue; }
+    return cause;
+  }
+  return fallback;
+}
+
 /** 仅从当前停止轮次的结构化事实派生，不凭权限/账号等日志关键词猜状态。 */
 export function issueStopState(status: string, awaitingClarify: boolean, events: DiagnosticEvent[]) {
   if (['done', 'cancelled'].includes(status)) return null;
-  if (awaitingClarify || status === 'clarifying') return { kind: 'clarify' as const, stage: status === 'clarifying' ? null : status, failures: 0, label: '', tail: '', stopLoss: false, summaryTruncated: false };
+  if (awaitingClarify || status === 'clarifying') return { kind: 'clarify' as const, stage: status === 'clarifying' ? null : status, failures: 0, label: '', tail: '', stopLoss: false, summaryTruncated: false, cause: null as StopCause | null };
   if (['done', 'cancelled', 'pending'].includes(status)) return null;
   const ordered = [...events].sort((a, b) => a.id - b.id);
   const reset = ordered.filter(e => e.kind === 'transition' && ['unblock', 'reopen'].includes(diagnosticData(e).event)).at(-1)?.id ?? 0;
@@ -41,10 +67,10 @@ export function issueStopState(status: string, awaitingClarify: boolean, events:
   const environment = current.filter(e => ['environment_preparation_failed', 'environment_recovery_failed', 'environment_ready'].includes(e.kind)).at(-1);
   const failed = current.filter(e => e.kind === 'tests_failed').at(-1);
   const failures = failed ? Number(diagnosticData(failed).failCount) || 0 : 0;
-  const base = { stage: d.from ?? d.resumeState ?? null, failures, label: '', tail: '', summaryTruncated: false, stopLoss: d.stopLoss === true || d.event === 'tests_failed' && status === 'paused' };
+  const base = { stage: d.from ?? d.resumeState ?? null, failures, label: '', tail: '', summaryTruncated: false, cause: status === 'paused' ? stopCause(current) : null, stopLoss: d.stopLoss === true || d.event === 'tests_failed' && status === 'paused' };
   if (status === 'blocked') return { ...base, kind: 'blocked' as const };
   if (status === 'paused' && environment && environment.kind !== 'environment_ready' && environment.id > (validation?.id ?? 0)) return { ...base, kind: 'environment' as const };
-  if (validation?.kind === 'validation_failed' && (d.event === 'tests_failed' || status === 'paused' && d.stopLoss === true)) {
+  if (validation?.kind === 'validation_failed' && (d.event === 'tests_failed' || status === 'paused' && (d.stopLoss === true || d.timeoutReason === 'validation'))) {
     const v = diagnosticData(validation);
     return { ...base, kind: 'validation' as const, label: String(v.label ?? ''), tail: redactDiagnostic(String(v.tail ?? '')), summaryTruncated: v.summaryTruncated === true || String(v.tail ?? '').length >= 1200 };
   }

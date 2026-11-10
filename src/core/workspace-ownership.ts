@@ -3,7 +3,7 @@ import type { Database } from 'bun:sqlite';
 /** UI focus is not execution authority. Legacy databases remain supported. */
 export function managedConversationOwned(db: Database, projectId: number, conversationId: string): boolean {
   if (!db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_attempts'").get()) return false;
-  return Boolean(db.query(`SELECT 1 FROM workspace_attempts a
+  return Boolean(mergeConversation(db,conversationId,projectId)) || Boolean(db.query(`SELECT 1 FROM workspace_attempts a
     JOIN module_workspaces w ON w.id=a.workspace_id AND w.current_attempt=a.id
     JOIN issues i ON i.id=a.issue_id AND i.conv_id=a.conversation_id
     WHERE w.project_id=? AND a.conversation_id=? AND a.released_ts IS NULL
@@ -24,7 +24,7 @@ function workflowConversationOwned(db:Database,projectId:number,id:string):boole
 
 export function managedExecutionConversationKnown(db:Database,id:string):boolean {
  if(!db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_attempts'").get())return false;
- return managedConversationKnown(db,id) || Boolean(db.query(`SELECT 1 FROM issue_workflow_node_runs n
+ return mergeConversationKnown(db,id) || managedConversationKnown(db,id) || Boolean(db.query(`SELECT 1 FROM issue_workflow_node_runs n
  JOIN issue_workflows f ON f.id=n.issue_workflow_id JOIN issues i ON i.id=f.issue_id
  LEFT JOIN issue_workflow_worktrees t ON t.node_run_id=n.id
  WHERE i.workspace_mode='module' AND (n.conversation_id=? OR t.resolution_conversation_id=?)`).get(id,id));
@@ -32,6 +32,9 @@ export function managedExecutionConversationKnown(db:Database,id:string):boolean
 
 export function managedConversationEnvironment(db: Database, conversationId: string): Record<string,string> | null {
   if (!db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_attempts'").get()) return null;
+  const merge=mergeConversation(db,conversationId);
+  if(merge)return workspaceEnvironment(merge.cwd,merge.id,merge.port,'merge-agent');
+  if(mergeConversationKnown(db,conversationId))throw new Error('合并 Agent 会话归属已失效');
   const row = db.query<{cwd:string;id:string;port:number},[string]>(`SELECT COALESCE(a.execution_cwd,w.cwd) cwd,a.id,r.port
     FROM workspace_attempts a JOIN module_workspaces w ON w.id=a.workspace_id AND w.current_attempt=a.id
     JOIN workspace_runtime_resources r ON r.attempt_id=a.id
@@ -77,13 +80,16 @@ export function issueWorkspaceCwd(db:Database, projectId:number, issueId:string)
 }
 export function managedConversationKnown(db:Database, conversationId:string):boolean {
  if (!db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_attempts'").get()) return false;
- return Boolean(db.query('SELECT 1 FROM workspace_attempts WHERE conversation_id=?').get(conversationId));
+ return Boolean(db.query('SELECT 1 FROM workspace_attempts WHERE conversation_id=?').get(conversationId))
+  || Boolean(db.query("SELECT 1 FROM sqlite_master WHERE name='issue_timeout_takeovers'").get()
+   &&db.query('SELECT 1 FROM issue_timeout_takeovers WHERE source_conversation_id=?').get(conversationId));
 }
 
 export interface IssueWorkspaceView {
  cwd:string|null; branch:string|null; targetBranch:string|null; attempt:string|null;
  phase:string; computeHeld:boolean; retained:boolean; baseSha:string|null;
  resultSha:string|null; integratedSha:string|null; integrationCwd:string|null;
+ mergeAgent?:{conversationId:string;state:string;startedTs:number;detail:string|null;records:Array<{state:string;detail:string|null}>}|null;
  reason:'module-held'|'capacity'|'dependency'|'legacy'|'ready'|'retained'|'integration'; diagnostic:string|null;
 }
 export function issueWorkspaceView(db:Database,issueId:string):IssueWorkspaceView|null {
@@ -92,6 +98,8 @@ export function issueWorkspaceView(db:Database,issueId:string):IssueWorkspaceVie
  if(!i||i.workspace_mode!=='module')return null;
  const p=db.query<{integration_branch:string|null;work_branch:string|null;module_concurrency:number},[number]>('SELECT integration_branch,work_branch,module_concurrency FROM projects WHERE id=?').get(i.project_id)!;
  const a=db.query<{id:string;cwd:string;branch:string;phase:string;compute_held:number;released_ts:number|null;base_sha:string|null;result_sha:string|null;integrated_sha:string|null;diagnostic:string|null},[string]>(`SELECT a.*,COALESCE(a.execution_cwd,w.cwd) cwd,COALESCE(a.execution_branch,w.branch) branch FROM workspace_attempts a JOIN module_workspaces w ON w.id=a.workspace_id WHERE a.issue_id=? ORDER BY a.created_ts DESC,a.rowid DESC LIMIT 1`).get(issueId);
+ const repair=a&&db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_merge_agents'").get()
+  ?db.query<{conversation_id:string;state:string;started_ts:number;diagnostic:string|null},[string]>('SELECT conversation_id,state,started_ts,diagnostic FROM workspace_merge_agents WHERE attempt_id=? ORDER BY rowid DESC LIMIT 1').get(a.id):null;
  const j=a?db.query<{cwd:string;diagnostic:string|null},[string]>('SELECT cwd,diagnostic FROM workspace_integrations WHERE attempt_id=? ORDER BY created_ts DESC,rowid DESC LIMIT 1').get(a.id):null;
  let reason:IssueWorkspaceView['reason']=a?.result_sha&&!a.integrated_sha?'integration':a&&a.released_ts===null&&!a.compute_held?'retained':'ready';
  if(!a && i.status==='pending') {
@@ -102,5 +110,21 @@ export function issueWorkspaceView(db:Database,issueId:string):IssueWorkspaceVie
  }
  return {cwd:a?.cwd??null,branch:a?.branch??null,targetBranch:p.integration_branch??p.work_branch,attempt:a?.id??null,
  phase:a?.phase??'pending',computeHeld:a?.compute_held===1,retained:Boolean(a&&a.released_ts===null&&!a.compute_held),baseSha:a?.base_sha??null,
- resultSha:a?.result_sha??null,integratedSha:a?.integrated_sha??null,integrationCwd:j?.cwd??null,reason,diagnostic:j?.diagnostic??a?.diagnostic??null};
+ resultSha:a?.result_sha??null,integratedSha:a?.integrated_sha??null,integrationCwd:j?.cwd??null,mergeAgent:repair?{conversationId:repair.conversation_id,state:repair.state,startedTs:repair.started_ts,detail:repair.diagnostic,records:db.query<{state:string;detail:string|null},[string]>('SELECT state,diagnostic detail FROM workspace_merge_agents WHERE attempt_id=? ORDER BY rowid DESC LIMIT 10').all(a!.id)}:null,reason,diagnostic:j?.diagnostic??a?.diagnostic??null};
+}
+
+function mergeConversationKnown(db:Database,id:string):boolean {
+ if(!db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_merge_agents'").get())return false;
+ return Boolean(db.query('SELECT 1 FROM workspace_merge_agents WHERE conversation_id=?').get(id));
+}
+function mergeConversation(db:Database,id:string,projectId?:number):{id:string;cwd:string;port:number}|null {
+ if(!mergeConversationKnown(db,id))return null;
+ return db.query<{id:string;cwd:string;port:number},[string,number|null]>(`SELECT r.id,j.cwd,res.port FROM workspace_merge_agents r
+  JOIN workspace_integrations j ON j.id=r.integration_id AND j.attempt_id=r.attempt_id
+  JOIN workspace_attempts a ON a.id=r.attempt_id AND a.released_ts IS NULL AND a.integrated_sha IS NULL
+  JOIN module_workspaces w ON w.current_attempt=a.id AND w.project_id=r.project_id
+  JOIN issues i ON i.id=a.issue_id AND i.project_id=r.project_id AND i.status='merging'
+  JOIN workspace_runtime_resources res ON res.attempt_id=a.id AND res.node_run_id=0
+  WHERE r.conversation_id=? AND r.project_id=COALESCE(?,r.project_id) AND r.stop_confirmed=0
+   AND r.state IN ('starting','dispatching','running','stopping','uncertain')`).get(id,projectId??null);
 }

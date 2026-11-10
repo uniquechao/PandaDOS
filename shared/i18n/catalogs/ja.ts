@@ -1,3 +1,4 @@
+import { issueStopReasonMessages } from '../domains/issue-stop-reasons';
 import { issueListMessages } from '../domains/issue-list';
 import { conversationTitleMessages } from '../domains/conversation-titles';
 import { issueDiagnosticMessages } from '../domains/issue-diagnostics';
@@ -32,6 +33,7 @@ import { workflowMessages } from '../domains/workflows';
 export const jaCatalog = {
   ...issueListMessages["ja"],
   ...issueDiagnosticMessages,
+  ...issueStopReasonMessages["ja"],
   ...localPlanMessages["ja"],
   ...agentModelMessages,
   ...conversationTitleMessages,
