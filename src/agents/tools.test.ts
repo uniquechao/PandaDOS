@@ -11,6 +11,7 @@ import {
   CAPTURE_TAIL_LINES,
   executeTool,
   TOOL_SCHEMAS,
+  pmToolSchemas,
   type PmToolsDeps,
   type ToolConvOps,
 } from './tools';
@@ -152,7 +153,7 @@ function jsonlBytes(): Uint8Array {
 describe('TOOL_SCHEMAS（OpenAI function-calling 形状 + 项目作用域 description）', () => {
   test('四件套齐全，send_command 必填 text', () => {
     const names = TOOL_SCHEMAS.map((t) => t.function.name);
-    expect(names).toEqual(['list_sessions', 'read_progress', 'capture_pane', 'send_command']);
+    expect(names).toEqual(['workspace_resources', 'list_sessions', 'read_progress', 'capture_pane', 'send_command']);
     for (const t of TOOL_SCHEMAS) expect(t.type).toBe('function');
     const send = TOOL_SCHEMAS.find((t) => t.function.name === 'send_command')!;
     expect((send.function.parameters as { required?: string[] }).required).toEqual(['text']);
@@ -350,4 +351,21 @@ describe('未知工具', () => {
     const { deps } = makeDeps();
     expect(await executeTool('nope', {}, deps)).toContain('未知工具 nope');
   });
+});
+
+describe('workspace resource control is scoped and cannot accept a filesystem path',()=>{
+ test('routes only a project job through the controlled service',async()=>{
+  const {deps}=makeDeps();const calls:unknown[][]=[];
+  deps.workspaceResources={list:(id:number)=>({jobs:[],capacity:null}),request:(id:number,job:string)=>{calls.push([id,job]);},pin:async()=>{}};
+  const id='00000000-0000-0000-0000-000000000001';
+  expect(await executeTool('workspace_resources',{action:'recheck',job_id:id},deps)).toContain('queued');
+  expect(calls).toEqual([[deps.projectId,id]]);
+  expect(await executeTool('workspace_resources',{action:'recheck',job_id:id,path:'/arbitrary'},deps)).toContain('invalid_arguments');
+  expect(calls).toHaveLength(1);
+ });
+});
+
+test('generated workspace tool guidance follows the prompt language',()=>{
+ expect(pmToolSchemas(true).find(t=>t.function.name==='workspace_resources')!.function.description).toContain('本项目');
+ expect(pmToolSchemas(false).find(t=>t.function.name==='workspace_resources')!.function.description).toContain('this project');
 });

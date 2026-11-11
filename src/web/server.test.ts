@@ -45,6 +45,34 @@ const LEGACY_SAGA_050_SQL = readFileSync(
 // Bun 默认 5 秒预算容易把正常但受资源竞争影响的用例误判为超时。
 setDefaultTimeout(15_000);
 
+test('fault conversation HTTP lifecycle is independent, scoped and requires manual resolution',async()=>{
+  let analyses=0;
+  const ctx=await boot(undefined,undefined,new FakeDriver(),{incidentRunner:async()=>{analyses++;return 'Verified: the workspace branch differs from the registered branch.';}});
+  const token=(await fsp.readFile(ctx.tokenFile,'utf8')).trim();
+  const project=await api(ctx,'POST','/api/projects',token,{name:'Incident project',executorId:1});
+  expect(project.status).toBe(200);
+  const pid=project.body.project.id;
+  const issue=ctx.server.engine.store.create(pid,{title:'Stopped task',category:'task'});
+  await ctx.server.engine.applyEvent(issue.id,'pause',{note:'branch mismatch',resumeState:'testing'});
+  // Explicit configured model avoids depending on a user's local CLI catalog in tests.
+  ctx.server.db.query("INSERT INTO agent_model_settings(target_kind,target_id,project_id,agent,model,revision,state,updated_ts) VALUES('issue',?,?,?,'fixture',1,'pending',0)").run(issue.id,pid,issue.agent);
+  const root=`/api/projects/${pid}/issues/${issue.id}/incidents`;
+  const opened=await api(ctx,'POST',root+'/open',token,{locale:'zh-Hans'});
+  expect(opened.body.error).toBeUndefined();expect(opened.status).toBe(200);const id=opened.body.incident.id;
+  for(let i=0;i<100 && (await api(ctx,'GET',root+'/'+id,token)).body.incident.runState==='running';i++)await new Promise(r=>setTimeout(r,10));
+  expect((await api(ctx,'POST',root+'/open',token,{locale:'zh-Hans'})).body.incident.id).toBe(id);
+  expect(analyses).toBe(1);
+  expect(ctx.server.engine.store.get(issue.id)?.status).toBe('paused');
+  expect((await api(ctx,'POST',`/api/projects/${pid}/issues/${issue.id}/unblock`,token,{guidance:'bypass'})).status).toBe(409);
+  expect((await api(ctx,'GET',root+'/unrelated-id',token)).status).toBe(404);
+  expect((await api(ctx,'POST',root+'/'+id+'/messages',token,{key:'reply',content:'I have fixed the branch. Please recheck.'})).status).toBe(200);
+  expect(ctx.driver.sent).toHaveLength(0);
+  const resolved=await api(ctx,'POST',root+'/'+id+'/resolve-and-resume',token,{key:'resume',guidance:'Manually checked and corrected.'});
+  expect(resolved.status).toBe(200);expect(resolved.body.queued).toBe(true);
+  expect((await api(ctx,'POST',root+'/'+id+'/resolve-and-resume',token,{key:'resume',guidance:'Manually checked and corrected.'})).status).toBe(200);
+  expect(ctx.server.engine.store.listEvents(issue.id).filter(e=>e.kind==='unblock_requested')).toHaveLength(1);
+});
+
 function u32(value: number): number[] {
   return [(value >>> 24) & 255, (value >>> 16) & 255, (value >>> 8) & 255, value & 255];
 }
@@ -1204,8 +1232,8 @@ describe('server 集成冒烟（完整装配）', () => {
     const h = await api(ctx, 'GET', '/healthz');
     expect(h.status).toBe(200);
     expect(h.body.ok).toBe(true);
-    expect(h.body.db.latest).toBe(94);
-    expect(h.body.db.applied).toBe(88);
+    expect(h.body.db.latest).toBe(96);
+    expect(h.body.db.applied).toBe(90);
     expect(h.body.executors).toEqual([{ id: 1, name: 'local', status: 'online' }]);
     expect(h.body.engine.running).toBe(true);
     expect(h.body.feishu).toBe(false);

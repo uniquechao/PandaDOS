@@ -1,7 +1,8 @@
+import { WorkspaceResourceDeferred } from './workspace-reclamation';
 import { MergeAgentTimeoutError, MergeAgentPausedError } from './module-merge-agent';
 import { IssuePmLoop, type PmLoopObservation, type PmLoopDecision, type PmLoopAction } from './pm-loop';
 import { redactDiagnostic, redactDiagnosticValue } from '../../shared/issue-diagnostics';
-import { prepareDependencies, DependencyPreparationError } from './dependency-preparation';
+import { DependencyPreparationError } from './dependency-preparation';
 import { WorkspaceOperationUncertain, type ModuleWorkspaceService } from './module-workspaces';
 import { managedConversationOwned, issueWorkspaceView, type IssueWorkspaceView } from '../core/workspace-ownership';
 import { effectiveSkillPolicy, skillSessionSettings, saveSkillPolicy, type SkillPolicy } from '../core/skill-policy';
@@ -171,6 +172,7 @@ import { WorkflowWorktreeManager } from './workflow-worktrees';
 import { workflowCompletionReport } from './workflow-completion';
 import type { SupportedLocale } from '../../shared/i18n/locales';
 import { compareIssueIds, parseIssueId, type IssueId } from '../../shared/issue-id';
+import { IssueIncidentStore } from './incidents';
 import { withNewIssueId } from '../core/issue-id';
 
 export type { IssueExecutionSyncEffectOutboxItem } from './execution-sync-effect-repository';
@@ -2127,7 +2129,7 @@ export class IssueStore {
    * 其余按 id（= 创建顺序）FIFO。恢复一条受阻的比开一条新的更值得优先——那条已经花过钱了。
    */
   listPendingUnblockRequests(projectId: number): PendingUnblockRequest[] {
-    const blocked = this.listByProject(projectId).filter((i) => i.status === 'blocked' || i.status === 'paused');
+    const blocked = this.listByProject(projectId).filter((i) => (i.status === 'blocked' || i.status === 'paused') && !new IssueIncidentStore(this.db).held(i.id));
     const out: Array<PendingUnblockRequest & { pinnedTs: number | null }> = [];
     for (const issue of blocked) {
       const request = this.pendingUnblockRequest(issue.id);
@@ -2963,6 +2965,9 @@ class PmSceneChangedError extends Error {}
 
 export class IssueEngine {
   readonly store: IssueStore;
+  readonly incidents: IssueIncidentStore;
+  private readonly incidentOpening = new Set<IssueId>();
+  private readonly workspaceRetryFlights = new Map<IssueId, Promise<{ok:boolean;error?:string}>>();
   private readonly cfg: EngineConfig;
   private readonly effects: IssueEffectJournal;
   private readonly gitDelivery: GitDeliveryService;
@@ -2998,6 +3003,7 @@ export class IssueEngine {
 
   constructor(private readonly deps: EngineDeps) {
     this.store = new IssueStore(deps.db);
+    this.incidents = new IssueIncidentStore(deps.db);
     this.transitionRepository = new IssueTransitionRepository(deps.db, this.store);
     this.schedulingPolicy = new IssueSchedulingPolicy(this.store, (id) => this.transitionCoordinator.isActive(id),
       deps.moduleWorkspaces ? {
@@ -3211,11 +3217,13 @@ export class IssueEngine {
 
   private async applyPmDecision(observation: PmLoopObservation, decision: PmLoopDecision, operationId: string): Promise<'applied' | 'deferred' | 'stale'> {
     const id = observation.issueId;
+    if (this.incidentHeld(id)) return 'deferred';
     if (this.pmContext(id)?.scopeKey !== observation.scopeKey) return 'stale';
     if (this.transitionCoordinator.isActive(id) || this.tickFlights.has(`issue:${id}`) || this.pmActing.has(id)) return 'deferred';
     this.pmActing.add(id);
     try {
       return await this.transitionCoordinator.run(id, async () => {
+        if (this.incidentHeld(id)) return 'deferred';
         const context = this.pmContext(id);
         if (!context || context.scopeKey !== observation.scopeKey) return 'stale';
         const { issue, project, attempt } = context;
@@ -5082,6 +5090,7 @@ export class IssueEngine {
   }
 
   async startIssue(issueId: IssueId): Promise<ApplyResult> {
+    if (this.incidentHeld(issueId)) return {ok:false,error:'incident_manual_hold'};
     if (!this.acceptingTicks) return { ok: false, error: 'Issue scheduling is stopped.' };
     const issue = this.store.get(issueId);
     // 这两条与锁内的同款判定要一起标 deferral（#283）：调度器多半是在这里被挡下的——
@@ -5484,7 +5493,91 @@ export class IssueEngine {
     return this.applyEvent(issue.id, ev, { note, actor: userId });
   }
 
+  incidentHeld(issueId: IssueId): boolean { return this.incidentOpening.has(issueId) || this.incidents.held(issueId); }
+
+  incidentStopId(issueId: IssueId): number {
+    const issue = this.store.get(issueId);
+    return issue && ['paused','blocked'].includes(issue.status) ? this.store.lastEnterEventId(issueId,issue.status as 'paused' | 'blocked') : 0;
+  }
+
+  incidentAttemptId(issueId: IssueId): string | null { return this.deps.moduleWorkspaces?.attempt(issueId)?.id ?? null; }
+  incidentWorkspace(issueId: IssueId) { return this.deps.moduleWorkspaces?.attempt(issueId) ?? null; }
+
+  async incidentRepair(id: string, key: string, kind: 'environment'|'branch'|'verify', expectedSha: string, actor: number) {
+    const incident = this.incidents.get(id); if (!incident) throw new Error('incident_not_found');
+    return this.transitionCoordinator.run(incident.issueId, async () => {
+      const payload = JSON.stringify({kind,expectedSha,actor});
+      const saved = this.incidents.receipt(id,key,'action',payload);
+      if (saved) return JSON.parse(saved) as {ok:boolean;error?:string};
+      const fresh = this.incidents.get(id)!;
+      if (fresh.state !== 'open' || this.incidentStopId(fresh.issueId)!==fresh.stopEventId || this.incidentAttemptId(fresh.issueId)!==fresh.attemptId) throw new Error('incident_stale');
+      if (fresh.runState==='running' || fresh.runState==='queued') throw new Error('incident_busy');
+      if (kind!=='verify' && this.deps.db.query("SELECT 1 FROM issue_incident_receipts WHERE incident_id=? AND kind='action' AND result LIKE '%incident_action_unconfirmed%'").get(id)) throw new Error('incident_action_unconfirmed');
+      if (!/^[a-f0-9]{40,64}$/.test(expectedSha)) throw new Error('incident_recheck_required');
+      const service = this.deps.moduleWorkspaces;
+      if (!service) throw new Error('incident_workspace_unavailable');
+      this.incidents.saveReceipt(id,key,'action',payload,JSON.stringify({ok:false,error:'incident_action_unconfirmed'}));
+      let result: {ok:boolean;error?:string};
+      try {
+        const issue = this.store.get(fresh.issueId)!;
+        await service.incidentRepair(issue,this.project(issue.projectId)!,kind,expectedSha);
+        result={ok:true};
+        if(kind==='verify')this.deps.db.query("UPDATE issue_incident_receipts SET result=? WHERE incident_id=? AND kind='action' AND result LIKE '%incident_action_unconfirmed%'").run(JSON.stringify({ok:false,error:'operation_end_verified_not_replayed'}),id);
+      } catch (error) { result={ok:false,error:(error instanceof WorkspaceOperationUncertain || error instanceof DependencyPreparationError && error.uncertain ? 'incident_action_unconfirmed: ' : '')+redactDiagnostic(String(error)).slice(0,2000)}; }
+      this.deps.db.query("UPDATE issue_incident_receipts SET result=? WHERE incident_id=? AND request_key=?").run(JSON.stringify(result),id,key);
+      this.store.logEvent(fresh.issueId,'incident_repair',{incidentId:id,kind,actor,...result});
+      return result;
+    });
+  }
+
+  async openIncident(issueId: IssueId, actor: number, locale: string) {
+    this.incidentOpening.add(issueId);
+    try {
+      await this.workspaceRetryFlights.get(issueId);
+      const projectId = this.store.get(issueId)?.projectId;
+      await (this.tickFlights.get(`issue:${issueId}`)?.promise ?? this.tickFlights.get(`project:${projectId}`)?.promise);
+      return await this.transitionCoordinator.run(issueId, () => this.deps.db.transaction(() => {
+        const issue = this.store.get(issueId);
+        if (!issue) throw new Error('incident_not_found');
+        return this.incidents.open(issue,this.incidentStopId(issueId),this.incidentAttemptId(issueId),actor,locale);
+      })());
+    } finally { this.incidentOpening.delete(issueId); }
+  }
+
+  async resolveIncident(id: string, key: string, guidance: string, actor: number) {
+    const incident = this.incidents.get(id);
+    if (!incident) throw new Error('incident_not_found');
+    const result = await this.transitionCoordinator.run(incident.issueId, () => this.deps.db.transaction(() => {
+      const payload = JSON.stringify({guidance,actor});
+      const previous = this.incidents.receipt(id,key,'resume',payload);
+      if (previous) return JSON.parse(previous) as {ok:true;queued:true};
+      const current = this.incidents.get(id)!;
+      if (current.state !== 'open' || this.incidentStopId(current.issueId) !== current.stopEventId || this.incidentAttemptId(current.issueId) !== current.attemptId) throw new Error('incident_stale');
+      if (['running','queued'].includes(current.runState)) throw new Error('incident_busy');
+      if (this.deps.db.query("SELECT 1 FROM issue_incident_receipts WHERE incident_id=? AND kind='action' AND result LIKE '%incident_action_unconfirmed%'").get(id)) throw new Error('incident_action_unconfirmed');
+      const workspace=this.incidentWorkspace(current.issueId);
+      if(workspace && this.deps.db.query('SELECT 1 FROM workspace_operations WHERE resource IN (?,?)').get(`workspace:${workspace.workspace_id}`,`workspace-repository:${workspace.executor_id}:${workspace.project_id}`)) throw new Error('incident_action_unconfirmed');
+      if (!guidance.trim() || guidance.length > 4000) throw new Error('incident_invalid_message');
+      this.store.logEvent(current.issueId,'unblock_request_cancelled',{actor,incidentId:id,reason:'superseded-by-incident-resolution'});
+      this.store.logEvent(current.issueId,'unblock_requested',{guidance,resumeState:this.resumeStateOf(current.issueId) ?? 'pending',actor,incidentId:id});
+      this.incidents.state(id,'queued');
+      const result = {ok:true as const,queued:true as const};
+      this.incidents.saveReceipt(id,key,'resume',payload,JSON.stringify(result));
+      return result;
+    })());
+    void this.scheduleNext(incident.projectId,{source:'manual'}).catch(error=>this.store.logEvent(incident.issueId,'error',{where:'incident-resume',error:String(error)}));
+    return result;
+  }
+
   async retryWorkspace(issueId: IssueId, actor?: number, confirmInput = false): Promise<{ok:boolean;error?:string}> {
+    if (this.incidentHeld(issueId)) return {ok:false,error:'incident_manual_hold'};
+    if (this.workspaceRetryFlights.has(issueId)) return this.workspaceRetryFlights.get(issueId)!;
+    const promise = this.retryWorkspaceInner(issueId,actor,confirmInput);
+    this.workspaceRetryFlights.set(issueId,promise);
+    try { return await promise; } finally { this.workspaceRetryFlights.delete(issueId); }
+  }
+
+  private async retryWorkspaceInner(issueId: IssueId, actor?: number, confirmInput = false): Promise<{ok:boolean;error?:string}> {
     const issue=this.store.get(issueId), service=this.deps.moduleWorkspaces;
     if(!issue || !service?.enabled(issue)) return {ok:false,error:'模块工作区不存在'};
     const project=this.project(issue.projectId)!;
@@ -5558,6 +5651,8 @@ export class IssueEngine {
    * 由接力在项目空闲时自动消费；意图可撤销、重复提交以最后一次为准。
    */
   async unblockIssue(issueId: IssueId, guidance: string, actor?: number): Promise<UnblockResult> {
+    if (this.incidentHeld(issueId)) return {ok:false,error:'incident_manual_hold'};
+    if (this.incidents.active(issueId)?.state === 'queued') return {ok:true,queued:true,requestedTs:this.now()};
     const normalized = guidance.trim();
     if (!normalized) return { ok: false, error: '解除阻塞前必须填写补充意见或解除方法' };
     if (normalized.length > 4000) return { ok: false, error: '解除方法不能超过 4000 字' };
@@ -5587,6 +5682,8 @@ export class IssueEngine {
     this.store.logEvent(issueId, 'unblock_request_cancelled', {
       ...(actor !== undefined ? { actor } : {}),
     });
+    const incident = this.incidents.active(issueId);
+    if (incident?.state === 'queued') this.incidents.state(incident.id,'open');
     return { ok: true };
   }
 
@@ -5604,6 +5701,30 @@ export class IssueEngine {
 
   /** 真正执行恢复：手动解除与接力消费意图共用这一条路径，保证留痕与注入完全一致 */
   private async applyUnblock(issueId: IssueId, guidance: string, actor?: number): Promise<ApplyResult> {
+    const issue=this.store.get(issueId);const project=issue && this.project(issue.projectId);
+    const unavailable=project && this.deps.executionUnavailable?.(project);
+    if(unavailable){this.incidentResumeRejected(issueId,unavailable);return {ok:false,error:unavailable};}
+    let result:ApplyResult;
+    try {result=await this.transitionCoordinator.run(issueId,()=>this.applyUnblockLocked(issueId,guidance,actor));}
+    catch(error){result={ok:false,error:redactDiagnostic(String(error))};}
+    if(!result.ok)this.incidentResumeRejected(issueId,result.error);
+    else if(result.to==='pending' && result.from!=='pending' && issue)await this.scheduleNext(issue.projectId,{source:'unblock'});
+    return result;
+  }
+
+  private incidentResumeRejected(issueId:IssueId,error:string):void {
+    const incident=this.incidents.active(issueId);
+    if(incident?.state!=='queued' || this.incidentStopId(issueId)!==incident.stopEventId)return;
+    this.deps.db.transaction(()=>{
+      this.incidents.state(incident.id,'open');
+      this.deps.db.query("UPDATE issue_incidents SET run_state='failed',error=? WHERE id=?").run('incident_recovery_failed: '+redactDiagnostic(error).slice(0,2000),incident.id);
+      this.store.logEvent(issueId,'unblock_request_cancelled',{incidentId:incident.id,reason:'incident-recovery-rejected'});
+      this.store.logEvent(issueId,'incident_recovery_failed',{incidentId:incident.id,error:redactDiagnostic(error).slice(0,2000)});
+    })();
+  }
+
+  private async applyUnblockLocked(issueId: IssueId, guidance: string, actor?: number): Promise<ApplyResult> {
+    if(this.incidentHeld(issueId))return {ok:false,error:'incident_manual_hold'};
     const blocked = this.store.lastEnterInfo(issueId, this.store.get(issueId)?.status === 'paused' ? 'paused' : 'blocked');
     const wasPaused = this.store.get(issueId)?.status === 'paused';
     const resumeState = this.resumeStateOf(issueId);
@@ -5611,7 +5732,7 @@ export class IssueEngine {
       try {await this.deps.moduleWorkspaces.resumeMergeAgent(issueId);}
       catch(error) {return {ok:false,error:String(error).slice(0,500)};}
     }
-    return this.applyEvent(issueId, 'unblock', {
+    return this.applyEventLocked(issueId, 'unblock', {
       note: guidance,
       actor,
       ...(resumeState ? { resumeState } : {}),
@@ -5811,6 +5932,7 @@ export class IssueEngine {
   ): Promise<ApplyResult> {
     let issue = this.store.get(issueId);
     if (!issue) return { ok: false, error: '无此 issue' };
+    if (this.incidentHeld(issueId) && (ev === 'unblock' || ev === 'reopen')) return {ok:false,error:'incident_manual_hold'};
     const from = issue.status;
     const to = transition(from, ev, {
       ...(opts.failCount !== undefined ? { failCount: opts.failCount } : {}),
@@ -5839,6 +5961,8 @@ export class IssueEngine {
         issueId, from, to, event: ev, options: opts, fresh,
         workflowStatus: () => this.workflowSnapshot(issueId)?.status ?? null,
         finalizeDb: () => {
+          if (ev === 'unblock') this.deps.db.query("UPDATE issue_incidents SET state='resumed' WHERE issue_id=? AND state='queued'").run(issueId);
+          if (ev === 'cancel') this.deps.db.query("UPDATE issue_incidents SET state='stale' WHERE issue_id=? AND state IN ('open','queued')").run(issueId);
           if (ev === 'unblock' && this.deps.moduleWorkspaces?.enabled(fresh)) {
             this.deps.moduleWorkspaces.compute(fresh.id, true);
           }
@@ -7341,6 +7465,7 @@ export class IssueEngine {
   }
 
   private environmentRecoveryDue(issueId:IssueId):boolean {
+    if (this.incidentHeld(issueId) || ['open','queued'].includes(this.incidents.active(issueId)?.state ?? '')) return false;
     const events=this.store.listEvents(issueId);
     const scheduled=events.filter(e=>e.kind==='environment_recovery_scheduled').at(-1);
     if(!scheduled || this.store.lastEventId(issueId,'environment_recovery_exhausted')>scheduled.id) return false;
@@ -7364,6 +7489,7 @@ export class IssueEngine {
   }
 
   private timeoutRequest(issue:EngineIssue, allowPmIncident=false):{pauseEventId:number;reason:NonNullable<TransitionOptions['timeoutReason']>}|null {
+    if (this.incidentHeld(issue.id) || ['open','queued'].includes(this.incidents.active(issue.id)?.state ?? '')) return null;
     if(!this.cfg.timeoutAgentEnabled||issue.status!=='paused'||!this.deps.moduleWorkspaces?.enabled(issue)||this.store.clarifyPendingOf(issue.id))return null;
     if(this.store.activeExecutionSyncBoundary(issue.id)||this.store.hasUnresolvedExecutionSyncEffect(issue.id))return null;
     const pauseEventId=this.store.lastEnterEventId(issue.id,'paused');
@@ -7554,7 +7680,8 @@ export class IssueEngine {
       await this.tickWorkflowIssue(issue, project);
       return;
     }
-    if (issue.executionMode === 'direct' && issue.status === 'testing' && issue.completionReport) {
+    if (issue.status === 'testing' && ((issue.executionMode === 'direct' && issue.completionReport)
+      || this.store.lastEventId(issue.id,'validation_deferred')>Math.max(this.store.lastEventId(issue.id,'environment_ready'),this.store.lastEnterEventId(issue.id,'testing')))) {
       await this.completeTesting(issue.id, 'sentinel');
       return;
     }
@@ -8493,6 +8620,7 @@ export class IssueEngine {
     try {
       const result = await workspaces.integrate(issue, project, async cwd => {
         const validation = await this.runValidationGate(issue, project, cwd);
+        if(validation.deferred)throw new WorkspaceResourceDeferred(validation.note);
         if (validation.outcome === 'error') throw new DependencyPreparationError(validation.note);
         if(validation.outcome==='skipped'&&workspaces.requiresMergeValidation(issue.id))throw new DependencyPreparationError(`合并 Agent 修复后的候选必须执行系统验证：${validation.note}`);
         return validation.outcome === 'passed' || validation.outcome === 'skipped';
@@ -8510,6 +8638,11 @@ export class IssueEngine {
       if (!pushed.ok) this.store.logEvent(issue.id, 'auto_push_failed', {detail:pushed.detail});
       await this.applyEventLocked(issue.id, 'merged');
     } catch(e) {
+      if(e instanceof WorkspaceExecutionDeferred) {
+        const previous=this.store.listEvents(issue.id).filter(event=>event.kind==='integration_wait').at(-1);
+        if(previous?.dataJson!==JSON.stringify({reason:e.message}))this.store.logEvent(issue.id,'integration_wait',{reason:e.message});
+        return;
+      }
       const reason=String(e).slice(0,500);
       await this.applyEventLocked(issue.id, 'pause', { note: reason, ...(e instanceof MergeAgentTimeoutError&&this.cfg.timeoutAgentEnabled?{timeoutReason:'merge-agent' as const}:{}), ...(e instanceof MergeAgentPausedError&&this.pmEnabledFor(issue)?{supervisionReason:'merge-agent' as const}:{}) });
       if (e instanceof DependencyPreparationError || e instanceof WorkspaceOperationUncertain) this.scheduleEnvironmentRecovery(issue.id);
@@ -8589,11 +8722,17 @@ export class IssueEngine {
    * 跑一轮门禁。required 项目无命令时返回 error，禁止把缺失证据当成通过；
    * optional 保留原有跳过行为，none 则记录明确豁免。
    */
+  private deferValidation(issueId:IssueId,reason:string):{outcome:'error';note:string;deferred:true} {
+    const last=this.store.listEvents(issueId).filter(e=>e.kind==='validation_deferred').at(-1);
+    if(!last||last.id<=Math.max(this.store.lastEnterEventId(issueId,'testing'),this.store.lastEventId(issueId,'environment_ready'))||last.dataJson!==JSON.stringify({reason}))this.store.logEvent(issueId,'validation_deferred',{reason});
+    return {outcome:'error',note:reason,deferred:true};
+  }
+
   private async runValidationGate(
     issue: EngineIssue,
     project: Project,
     candidateCwd?: string,
-  ): Promise<{ outcome: 'passed' | 'failed' | 'skipped' | 'error'; note: string; timedOut?: boolean }> {
+  ): Promise<{ outcome: 'passed' | 'failed' | 'skipped' | 'error'; note: string; timedOut?: boolean; deferred?:boolean }> {
     if (project.validationPolicy === 'none') {
       this.store.logEvent(issue.id, 'validation_skipped', { reason: 'policy-none' });
       return { outcome: 'skipped', note: '项目明确豁免验证' };
@@ -8610,6 +8749,7 @@ export class IssueEngine {
     try {
       workspace = await this.resolveExecutionWorkspace(issue, project);
     } catch (e) {
+      if(e instanceof WorkspaceExecutionDeferred)return this.deferValidation(issue.id,e.message);
       this.store.logEvent(issue.id, 'error', { where: 'validation-workspace', error: String(e).slice(0, 200) });
       this.store.logEvent(issue.id,'validation_error',{reason:'workspace-unavailable'});
       this.store.logEvent(issue.id,'environment_preparation_failed',{stage:'validation-workspace',note:String(e).slice(-2000)});
@@ -8640,9 +8780,10 @@ export class IssueEngine {
     if (this.deps.moduleWorkspaces?.enabled(issue)) {
       this.store.logEvent(issue.id, 'environment_preparing', { cwd: workspace.cwd, stage: candidateCwd ? 'candidate' : 'testing' });
       try {
-        await prepareDependencies(driver, workspace.cwd, this.deps.moduleWorkspaces.environment(issue.id, workspace.cwd));
+        await this.deps.moduleWorkspaces.prepareValidationEnvironment(issue,project,workspace.cwd);
         this.store.logEvent(issue.id, 'environment_ready', { cwd: workspace.cwd });
       } catch (error) {
+        if(error instanceof WorkspaceExecutionDeferred)return this.deferValidation(issue.id,error.message);
         const note = String(error).slice(-2000);
         this.store.logEvent(issue.id, 'environment_preparation_failed', { cwd: workspace.cwd, note });
         return { outcome: 'error', note };
@@ -8737,6 +8878,7 @@ export class IssueEngine {
     const issue = this.store.get(issueId);
     if (!issue || issue.status !== 'testing' || this.workflowSnapshot(issueId)?.status !== 'completed') return;
     const gate = await this.runValidationGate(issue, project);
+    if(gate.deferred)return;
     const runtime = this.workflowRuntime(issueId);
     const { report, nodeRunIds } = workflowCompletionReport(
       issue.title, runtime?.runs ?? [], gate, this.promptLocale(issue, project),
@@ -8807,6 +8949,7 @@ export class IssueEngine {
       return;
     }
     const gate = await this.runValidationGate(issue, project);
+    if(gate.deferred)return;
     const gateDecision = decideValidationGate(gate, source);
     if (gateDecision.event !== 'tests_failed') {
       await this.applyEvent(issueId, gateDecision.event, gateDecision.note ? { note: gateDecision.note } : {});

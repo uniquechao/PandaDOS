@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test';
+import { afterEach, beforeEach, expect, test, setDefaultTimeout } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, renameSync } from 'node:fs';
 import { openDb } from '../core/db';
 import { migrate } from '../core/migrate';
@@ -12,6 +12,12 @@ import { release as kernelRelease } from 'node:os';
 import { testTmuxDirectory } from '../../scripts/test-tmux';
 import { createProjectDataPersistence } from '../web/project-data-persistence';
 import { moduleIssueRelPath } from './module-docs';
+import { DEPENDENCY_PREPARATION_SCRIPT } from './dependency-preparation';
+import { WorkspaceOperationUncertain } from './module-workspaces';
+
+// Several end-to-end Git/engine flows exceed 5s under full-gate CPU contention.
+// This changes the fixture ceiling, not operation deadlines or behavior assertions.
+setDefaultTimeout(15_000);
 
 class DiagnosticDriver extends LocalDriver {
  readonly commandTrace: Array<Record<string, unknown>> = [];
@@ -97,6 +103,45 @@ async function setup(diagnostics=false) {
  }
  return {root,repo,db,driver,git,project,store,service,issue,deps,captureFailure};
 }
+
+test('explicit incident branch alignment preserves changes and never resumes or rewrites frozen results',async()=>{
+ const s=await setup();const issue=s.issue(1);
+ const workspace=await s.service.resolve(issue,s.project);const a=s.service.attempt(issue.id)!;
+ const sha=await s.git(workspace.cwd,['rev-parse','HEAD']);
+ await s.git(workspace.cwd,['switch','-c','manual-prototype']);
+ // Retained process docs may be untracked; the action must refuse rather than discard them.
+ const dirty=await s.git(workspace.cwd,['status','--porcelain']);
+ if(dirty)await s.git(workspace.cwd,['add','.']);
+ if(dirty)await s.git(workspace.cwd,['commit','-m','preserve process documents']);
+ const head=await s.git(workspace.cwd,['rev-parse','HEAD']);
+ if(head!==sha)await s.git(s.repo,['update-ref',`refs/heads/${a.branch}`,head,sha]);
+ writeFileSync(workspace.cwd+'/human.txt','retained');
+ await expect(s.service.incidentRepair(issue,s.project,'branch',head)).rejects.toThrow('未提交改动');
+ expect(readFileSync(workspace.cwd+'/human.txt','utf8')).toBe('retained');
+ await s.git(workspace.cwd,['add','human.txt']);await s.git(workspace.cwd,['commit','-m','human work']);
+ const newest=await s.git(workspace.cwd,['rev-parse','HEAD']);await s.git(s.repo,['update-ref',`refs/heads/${a.branch}`,newest,head]);
+ await s.service.incidentRepair(issue,s.project,'branch',newest);
+ expect(await s.git(workspace.cwd,['branch','--show-current'])).toBe(a.branch);
+ expect(s.store.get(issue.id)?.status).toBe('pending');
+ s.db.query("UPDATE workspace_attempts SET result_sha=? WHERE id=?").run(newest,a.id);
+ await expect(s.service.incidentRepair(issue,s.project,'branch',newest)).rejects.toThrow('固定成果');
+});
+
+test('disconnected incident dependency preparation retains both ownership receipts until explicit physical verification',async()=>{
+ const s=await setup();const issue=s.issue(1);const workspace=await s.service.resolve(issue,s.project);
+ const head=await s.git(workspace.cwd,['rev-parse','HEAD']);
+ const run=s.driver.runCommand.bind(s.driver);
+ s.driver.runCommand=async(cwd,argv,timeout,env)=>{
+  if(argv[2]===DEPENDENCY_PREPARATION_SCRIPT)throw new Error('SSH connection lost after dispatch');
+  return run(cwd,argv,timeout,env);
+ };
+ await expect(s.service.incidentRepair(issue,s.project,'environment',head)).rejects.toBeInstanceOf(WorkspaceOperationUncertain);
+ expect(s.db.query('SELECT COUNT(*) n FROM workspace_operations').get()).toMatchObject({n:2});
+ s.driver.runCommand=run;
+ await s.service.incidentRepair(issue,s.project,'verify',head);
+ expect(s.db.query('SELECT COUNT(*) n FROM workspace_operations').get()).toMatchObject({n:0});
+ expect(await s.git(workspace.cwd,['rev-parse','HEAD'])).toBe(head);
+});
 
 test('准备期间过程页回写不能污染新 worktree，准备完成后再投影执行目录',async()=>{
  const s=await setup(),a=s.issue(1);
@@ -316,6 +361,7 @@ test('崩溃恢复：验证完成后发布已成功但未写回数据库，不�
  expect((await new ModuleWorkspaceService(s.deps).integrate(a,s.project,async()=>{throw new Error('不得重复验证');})).done).toBe(true);
  expect(s.service.attempt(a.id)?.integrated_sha).toBe(candidate.candidate_sha);
  await s.service.release(a,s.project);
+ expect(s.db.query<{n:number},[string]>('SELECT COUNT(*) n FROM workspace_reclamation_jobs WHERE attempt_id=?').get(attempt.id)?.n).toBe(1);
  const old=attempt.id;const reopened=await s.service.resolve(s.store.get(a.id)!,s.project);
  expect(s.service.attempt(a.id)?.id).not.toBe(old);expect(reopened.cwd).toBe(attempt.cwd);
 });

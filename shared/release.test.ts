@@ -10,11 +10,10 @@ describe('release metadata', () => {
     expect(await file.exists()).toBe(true);
     const release = await file.json();
     expect(release.version).toMatch(/^\d+\.\d+\.\d+-\d{4}\.\d{4}$/);
-    expect(release.version).toBe('2.6.6-2026.1110');
+    expect(release.version).toBe('2.6.7-2026.1111');
     expect(release.version.split('-')[0]).toBe(pkg.version);
     expect(release.notes).toEqual([
-      'issue-pm-supervision',
-      'issue-stop-diagnostics',
+      'issue-incidents-workspace-storage',
     ]);
   });
 

@@ -41,6 +41,17 @@ async function until(fn: () => boolean) { const end = Date.now() + 2_000; while 
 afterEach(() => { for (const path of fixtures.splice(0)) rmSync(path, { recursive: true, force: true }); });
 
 describe('private local CLI member sessions', () => {
+  test('independent fault turns reuse restricted transport with separate durable identity and no host tools',async()=>{
+    const f=fixture();const request={id:'diag-unique-turn',scopeId:'incident-unique',projectId:7,agent:'claude' as const,model:'test-model',effort:'low' as const,deadlineTs:Date.now()+5000,system:'Independent fault analysis only.',input:'Verified failure evidence.'};
+    const text=await f.runtime.runIndependentText(request,new AbortController().signal);
+    expect(text).toContain('Formal delivery');
+    const capture=JSON.parse(readFileSync(f.capture,'utf8'));
+    expect(capture.args[capture.args.indexOf('--tools')+1]).toBe('');
+    expect(capture.args).toContain('--restricted');
+    expect(capture.cwd).toContain(localHash(request.id));
+    expect(capture.cwd).not.toContain('module-workspace');
+    expect(capture.env.PRIVATE_PARENT_SECRET).toBeUndefined();
+  });
   test('verified Claude 2.1.284 supports a formal local session', async () => {
     const f = fixture('success', '2.1.284'); const ctx = context();
     expect(f.runtime.configuredFor([ctx.member])).toBe(true);

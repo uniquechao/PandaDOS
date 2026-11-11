@@ -1,6 +1,28 @@
 import type { ExecutorDriver } from '../executor/driver';
 
-export class DependencyPreparationError extends Error {}
+export class DependencyPreparationError extends Error {
+  constructor(message:string,readonly uncertain=false) { super(message); }
+}
+
+/** A successful probe proves the installer and its inherited lock have ended; it never installs. */
+export async function confirmDependencyPreparationStopped(driver:Pick<ExecutorDriver,'runCommand'>,cwd:string):Promise<void> {
+  const script=String.raw`
+import os,fcntl
+p='.panda/tmp/dependencies/install.lock'
+try:
+    fd=os.open(p,os.O_RDWR|os.O_NOFOLLOW)
+except FileNotFoundError:
+    print('no installer lock')
+else:
+    try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError: raise RuntimeError('依赖准备仍在执行，不能恢复 issue')
+    finally: os.close(fd)
+`;
+  try {
+    const result=await driver.runCommand(cwd,['python3','-c',script],10_000);
+    if(result.code!==0 || result.timedOut)throw new Error(result.err||'依赖准备结束状态未确认');
+  }catch(error){throw new DependencyPreparationError(String(error),true);}
+}
 
 // 在执行机上探测和安装，避免把控制机的文件系统、缓存或 node_modules 带进工作区。
 // 回执和锁属于物理 cwd；重启或连接中断后的重试仍等待同一把执行机锁。
@@ -94,12 +116,14 @@ export async function prepareDependencies(
   cwd: string,
   env?: Record<string, string>,
 ): Promise<void> {
+  let result;
   try {
-    const result = await driver.runCommand(cwd, ['python3', '-c', DEPENDENCY_PREPARATION_SCRIPT], 660_000, env);
-    if (result.code !== 0 || result.timedOut) {
-      throw new Error((result.err || result.out || '执行机未返回准备结果').slice(-1800));
-    }
+    result = await driver.runCommand(cwd, ['python3', '-c', DEPENDENCY_PREPARATION_SCRIPT], 660_000, env);
   } catch (error) {
-    throw new DependencyPreparationError(`依赖环境准备失败，保留工作区并在恢复后重试：${String(error)}`);
+    throw new DependencyPreparationError(`依赖环境准备结果未确认，保留工作区：${String(error)}`,true);
+  }
+  if (result.code !== 0 || result.timedOut) {
+    const reason=(result.err || result.out || '执行机未返回准备结果').slice(-1800);
+    throw new DependencyPreparationError(`依赖环境准备失败，保留工作区并在恢复后重试：${reason}`,result.timedOut || reason.includes('依赖准备仍在执行'));
   }
 }

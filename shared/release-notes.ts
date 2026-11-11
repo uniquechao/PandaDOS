@@ -1,6 +1,7 @@
 import type { MessageKey } from './i18n/messages';
 
 export const RELEASE_NOTE_KEYS = {
+  'issue-incidents-workspace-storage': 'release.note.issueIncidentsWorkspaceStorage',
   'issue-pm-supervision': 'release.note.issuePmSupervision',
   'issue-list-pagination': 'release.note.issueListPagination',
   'sticky-user-question': 'release.note.stickyUserQuestion',

@@ -1,3 +1,4 @@
+import { issueIncidentMessages } from '../domains/issue-incidents';
 import { issueStopReasonMessages } from '../domains/issue-stop-reasons';
 import { issueListMessages } from '../domains/issue-list';
 import { conversationTitleMessages } from '../domains/conversation-titles';
@@ -31,6 +32,7 @@ import { designConfirmationUiMessages } from '../domains/design-confirmation-ui'
 import { workflowMessages } from '../domains/workflows';
 
 export const ptBrCatalog = {
+  ...issueIncidentMessages["pt-BR"],
   ...issueListMessages["pt-BR"],
   ...issueDiagnosticMessages,
   ...issueStopReasonMessages["pt-BR"],

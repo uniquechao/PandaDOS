@@ -1,3 +1,4 @@
+import { WorkspaceReclamationService, workspaceReclamationPolicyFromEnv, type WorkspaceReclamationPolicy } from '../issues/workspace-reclamation';
 import { AgentModelSettings } from '../core/agent-model-settings';
 import { ensurePandaIssuePlanSkill } from '../core/issue-plan-skill';
 import { LocalPlanService } from './local-plans';
@@ -34,6 +35,8 @@ import { migrateRooms } from '../rooms/migrations';
 import { RoomCoordinator } from '../rooms/coordinator';
 import { RoomModelRuntime } from '../rooms/model-runtime';
 import { RoomLocalCliRuntime } from '../rooms/local-cli';
+import { createIssueIncidentService } from './incident-runtime';
+import type { IndependentTextRunner } from '../core/independent-text';
 import { RoomMemberRuntime } from '../rooms/member-runtime';
 import { RoomMemberDesigner } from '../rooms/member-designer';
 import type { RoomRuntime } from '../rooms/runtime';
@@ -131,6 +134,7 @@ export interface ServerOptions {
   defaultDriver?: ExecutorDriver;
   /** 测试/嵌入式装配注入；缺省自动探测本机 workspace 与 Claude/Codex 能力 */
   localExecutorDefaults?: LocalExecutorDefaults;
+  incidentRunner?: IndependentTextRunner;
   /** 飞书配置：undefined = 读 env；null = 明确禁用 */
   feishu?: FeishuConfig | null;
   /**
@@ -143,6 +147,8 @@ export interface ServerOptions {
   publicUrl?: string;
   /** 引擎调参（测试缩短 tick 等） */
   engineConfig?: Partial<EngineConfig>;
+  /** Executor-side storage lifecycle; defaults retain 2 GiB free, 2 GiB cache and 4 GiB archives. */
+  workspaceReclamationPolicy?:Partial<WorkspaceReclamationPolicy>;
   /** driver.status → executors.status 的同步周期；缺省 15s */
   statusIntervalMs?: number;
   /** WS 聊天轮询周期；缺省 1200ms（v1 平移；测试调小） */
@@ -211,6 +217,7 @@ export interface PandaServer {
   migrations: MigrationStatus;
   users: UserStore;
   engine: IssueEngine;
+  workspaceResources:WorkspaceReclamationService;
   notify: NotifyRouter;
   /** executorId → Driver 池（懒创建；退出时统一 close） */
   drivers: Map<number, ExecutorDriver>;
@@ -685,8 +692,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
 
   // ---- 5. LLM + PM 管家池 ----
   const llm = createLlmClient(db);
+  const workspaceResources=new WorkspaceReclamationService({db,mutex,driverForProject,projectForId:id=>getProject(db,id),policy:{...workspaceReclamationPolicyFromEnv(process.env),...opts.workspaceReclamationPolicy}});
   const pmFor = createPmPool({
-    driver: primaryDriver, llm, users, convs, locator, mutex, db,
+    driver: primaryDriver, llm, users, convs, locator, mutex, db, workspaceResources,
     executionForProject: (project) => {
       const context = historyForProject(project);
       return { driver: context.reader, locator: context.locator };
@@ -782,7 +790,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     `).get(publicationId)),
   });
   const mergeAgent = new ModuleMergeAgent({db,mutex,driverForProject,projectForId:id=>getProject(db,id),conversations:convs,localeForIssue:c=>userPromptLocale(db,c.issue.createdBy??c.project.ownerUserId)});
-  const executionWorkspaces = new ModuleWorkspaceService({ db, mutex, driverForProject, conversations: convs, mergeAgent,
+  const executionWorkspaces = new ModuleWorkspaceService({ db, mutex, driverForProject, conversations: convs, mergeAgent, resources:workspaceResources,
     legacy: createDesignExecutionWorkspaceAdapter({ db, conversations: convs }) });
 
   // 「Agent 认知总结」的历史读取和 runner 均绑定项目执行机；相同 cwd 不等于同一执行位置。
@@ -905,6 +913,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   const roomCoordinator = new RoomCoordinator({ service: roomRuntimeAccess(db,roomEngine,attempt => { const scope={projectId:attempt.projectId,roomId:attempt.roomId};roomFeedback.sync(scope);return roomFeedback.list(scope).filter(item=>item.missionId===attempt.missionId); }), runtime: roomRuntime, maxConcurrent: 2 });
   const roomPublication = new RoomPublicationService({ db, rooms: roomEngine, issues: engine });
   const localPlans = new LocalPlanService({ db, engine, driverForProject });
+  const issueIncidents=createIssueIncidentService(db,engine,driverForProject,join(dirname(roomSessionRoot),'incident-sessions'),signal=>llm.acquireSlot(signal),opts.incidentRunner);
   const designEngine = new DesignEngine({
     store: designStore,
     scope: designScope,
@@ -1083,6 +1092,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     overallTimeoutMs: opts.designWorktreeRecoveryTimeoutMs ?? 5_000,
   });
   await designRuns.recoverStartup(25);
+  workspaceResources.start();
   engine.start(); // reporter 挂引擎生命周期：引擎起 tick 才产事件，停机时 progress.stopAll()
   chatApprovals.start();
   let engineRunning = true;
@@ -1219,6 +1229,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
 
   const dispatch = createApiDispatcher({
     db,
+    issueIncidents,
     localPlans,
     preview,
     users,
@@ -1438,6 +1449,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   // ---- 9. 优雅停机（M1：先停引擎并等在途 tick 归还，driver/db 最后关）----
   let stopPromise: Promise<void> | undefined;
   const performStop = async (): Promise<void> => {
+    await issueIncidents.stop();
     if (stopped) return;
     stopped = true;
     server.stop(true);
@@ -1484,6 +1496,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
       if (timer) clearTimeout(timer);
     }
     // Recovery owns Issue/Design DB work; never close the DB underneath it.
+    await workspaceResources.stop(); // No executor deletion or receipt writer may outlive Driver/DB.
     await engine.stop({ deferClarificationDrain: true }); // Tick owners drain here; clarification owners retain the barrier below.
     await chatApprovals.stop(); // 同理：等在途巡检归还，之后不再有它侧的执行机/db 调用
     engineRunning = false;
@@ -1515,6 +1528,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
     migrations,
     users,
     engine,
+    workspaceResources,
     notify,
     drivers,
     approvals,

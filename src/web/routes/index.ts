@@ -63,6 +63,8 @@ import { gitWorkspaceRoutes, type GitWorkspaceDriver } from './git-workspace';
 import type { PreviewService } from '../preview';
 import { greetingRoutes } from './greeting';
 import { issuesRoutes } from './issues';
+import { issueIncidentRoutes } from './issue-incidents';
+import type { IssueIncidentService } from '../issue-incidents';
 import { llmStatusRoutes } from './llm-status';
 import { roomsRoutes, type RoomsRoutesDeps } from './rooms';
 import { meRoutes } from './me';
@@ -75,6 +77,7 @@ import type { IssueId } from '../../../shared/issue-id';
 
 /** 聚合所有路由工厂需要的依赖全集（server.ts 装配后传入） */
 export interface ApiDeps {
+  issueIncidents?: IssueIncidentService;
   localPlans?: LocalPlanService;
   agentModels?: AgentModelSettings;
   db: Database;
@@ -186,6 +189,7 @@ export function allRoutes(deps: ApiDeps): RouteDef[] {
       ...(deps.waitingIssueIds ? { waitingIssueIds: deps.waitingIssueIds } : {}),
     }),
     ...workflowsRoutes({ db: deps.db }),
+    ...(deps.issueIncidents ? issueIncidentRoutes(deps.engine,deps.issueIncidents) : []),
     ...issuesRoutes({
       db: deps.db,
       engine: deps.engine,

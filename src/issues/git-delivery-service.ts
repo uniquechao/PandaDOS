@@ -1,3 +1,4 @@
+import { stageSourceChanges } from './runtime-git-paths';
 import { buildFallbackIdentity, ensureGitIdentity } from '../core/git-identity';
 import type { Project } from '../core/types';
 import type { ExecutorDriver, GitResult } from '../executor/driver';
@@ -129,7 +130,7 @@ export class GitDeliveryService {
       this.ports.store.logEvent(issue.id, 'error', { where, error: detail.slice(0, 300) });
       return { where, detail };
     };
-    const add = await driver.git(cwd, ['add', '-A']);
+    const add = await stageSourceChanges(driver,cwd);
     if (add.code !== 0) {
       return fail('auto_commit', add.err || add.out);
     }

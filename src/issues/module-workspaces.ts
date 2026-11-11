@@ -1,7 +1,9 @@
+import { stageSourceChanges } from './runtime-git-paths';
+import { enqueueReleasedWorkspaceCandidates, type WorkspaceReclamationService, WorkspaceResourceDeferred } from './workspace-reclamation';
 import type { MergeAgentPort } from './module-merge-agent';
 import { MergeAgentPausedError } from './module-merge-agent';
 import { redactDiagnostic, redactDiagnosticValue } from '../../shared/issue-diagnostics';
-import { prepareDependencies } from './dependency-preparation';
+import { prepareDependencies, DependencyPreparationError, confirmDependencyPreparationStopped } from './dependency-preparation';
 import { randomUUID, createHash } from 'node:crypto';
 import { posix } from 'node:path';
 import type { Database } from 'bun:sqlite';
@@ -28,6 +30,7 @@ interface Integration { id:string; attempt_id:string; target_sha:string; result_
  candidate_sha:string|null; phase:string; diagnostic:string|null }
 export interface ModuleWorkspaceDeps {
  mergeAgent?:MergeAgentPort;
+ resources?:Pick<WorkspaceReclamationService,'assertCapacity'>;
  db:Database; mutex:KeyedMutex; driverForProject(project:Project):ExecutorDriver;
  legacy:EngineExecutionWorkspaceOps;
  conversations: {get(id:string):Conversation|undefined; createInWorkspaceWithId(id:string,projectId:number,label:string,agent:'codex'|'claude',cwd:string):Conversation};
@@ -115,8 +118,9 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
  private async operation<T>(resource:string,operation:string,fn:()=>Promise<T>):Promise<T> {
    return this.deps.mutex.runExclusive(resource,async()=>{
      const token=randomUUID();
-     const previous=this.db.query<{token:string;owner_pid:number},[string]>('SELECT token,owner_pid FROM workspace_operations WHERE resource=?').get(resource);
+     const previous=this.db.query<{token:string;owner_pid:number;operation:string},[string]>('SELECT token,owner_pid,operation FROM workspace_operations WHERE resource=?').get(resource);
      if(previous) {
+       if(previous.operation.startsWith('reclaim:'))throw new WorkspaceResourceDeferred('workspace_reclamation_pending');
        let alive=true;
        try {process.kill(previous.owner_pid,0);} catch(e) {if((e as NodeJS.ErrnoException).code==='ESRCH')alive=false;}
        // The former controller cannot issue more commands. Executor-side flock still waits
@@ -147,6 +151,7 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
    let a=this.attempt(issue.id);
    if(!a || (a.released_ts!==null && issue.status==='pending')) {
      if(issue.status!=='pending') throw new Error('执行工作区记录缺失，禁止回落到项目目录');
+     await this.deps.resources?.assertCapacity(project,'start',posix.join(this.root(project),`module-${issue.moduleId??0}`));
      const target=await this.target(project);
      const inherited=await this.deps.legacy.resolve(issue,project);
      const cwd=posix.join(this.root(project),`module-${issue.moduleId??0}`);
@@ -160,8 +165,9 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
        const now=Date.now();
        this.db.query(`INSERT OR IGNORE INTO module_workspaces(project_id,module_key,executor_id,cwd,branch,kind,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?,?)`)
          .run(project.id,issue.moduleId??0,project.executorId,cwd,branch,'module-worktree',now,now);
-       const w=this.db.query<{id:number;cwd:string;executor_id:number;current_attempt:string|null},[number,number]>('SELECT * FROM module_workspaces WHERE project_id=? AND module_key=?').get(project.id,issue.moduleId??0);
+       const w=this.db.query<{id:number;cwd:string;executor_id:number;current_attempt:string|null;environment_state:string},[number,number]>('SELECT * FROM module_workspaces WHERE project_id=? AND module_key=?').get(project.id,issue.moduleId??0);
        if(!w || w.cwd!==cwd || w.executor_id!==project.executorId || w.current_attempt) throw new Error('模块工作区仍被占用或执行位置不一致');
+       if(w.environment_state==='cooling'||this.db.query("SELECT 1 FROM workspace_operations WHERE resource=? AND operation LIKE 'reclaim:%'").get(`workspace:${w.id}`))throw new WorkspaceResourceDeferred('workspace_reclamation_pending');
        const attempt=randomUUID();
        this.db.query(`INSERT INTO workspace_attempts(id,workspace_id,issue_id,agent,execution_executor_id,execution_cwd,execution_branch,execution_kind,execution_run_id,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(attempt,w.id,issue.id,issue.agent,project.executorId,executionCwd,executionBranch,inherited.kind==='design-worktree'?'design-worktree':'module-worktree',inherited.runId,now,now);
        this.db.query('UPDATE module_workspaces SET current_attempt=?,updated_ts=? WHERE id=? AND current_attempt IS NULL').run(attempt,now,w.id);
@@ -229,9 +235,9 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
      await this.repoOperation(project,'exclude-runtime',async()=>{
        const old=await driver.readFileRange(excludePath,0,65536).catch(()=>null);
        const content=old?new TextDecoder().decode(old.data):'';
-       if(content.includes('/.panda/tmp/') && content.includes('/.worktrees/') && content.includes('\nnode_modules/\n'))return;
+       if(content.includes('/.panda/tmp/') && content.includes('/.panda/conversations/') && content.includes('/.build/') && content.includes('/.worktrees/') && content.includes('\nnode_modules/\n'))return;
        if(!driver.replaceFileNoFollowWithin || (old && old.data.length>=65536))throw new Error('无法安全更新运行目录排除规则');
-       const result=await driver.replaceFileNoFollowWithin(posix.dirname(excludePath),posix.basename(excludePath),new TextEncoder().encode(content+'\n/.panda/tmp/\n/.worktrees/\nnode_modules/\n'),old?createHash('sha256').update(old.data).digest('hex'):null);
+       const result=await driver.replaceFileNoFollowWithin(posix.dirname(excludePath),posix.basename(excludePath),new TextEncoder().encode(content+'\n/.panda/tmp/\n/.panda/conversations/\n/.build/\n/.worktrees/\nnode_modules/\n'),old?createHash('sha256').update(old.data).digest('hex'):null);
        if(result==='conflict')throw new Error('Git 排除规则已变化，请保留现场后重试');
      });
      this.db.query("UPDATE workspace_attempts SET phase='prepared',updated_ts=? WHERE id=?").run(Date.now(),a.id);
@@ -243,7 +249,9 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
  }
  private async prepareEnvironment(issue:EngineIssue,project:Project,a:WorkspaceAttempt):Promise<void> {
    try {
+     await this.deps.resources?.assertCapacity(project,'dependencies',a.cwd);
      await prepareDependencies(this.deps.driverForProject(project),a.cwd,this.environment(issue.id,a.cwd));
+     this.db.query("UPDATE module_workspaces SET environment_state='warm' WHERE id=? AND cwd=? AND current_attempt=?").run(a.workspace_id,a.cwd,a.id);
      this.db.query('UPDATE workspace_attempts SET diagnostic=NULL WHERE id=?').run(a.id);
    } catch(error) {
      this.db.query('UPDATE workspace_attempts SET diagnostic=? WHERE id=?').run(String(error).slice(-2000),a.id);
@@ -277,6 +285,10 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
    if(a.kind==='design-worktree' && a.execution_run_id) this.db.query('UPDATE design_run_conversations SET conversation_id=?,updated_ts=? WHERE run_id=? AND module_key=?').run(id,Date.now(),a.execution_run_id,issue.moduleId===null?`unassigned:${issue.agent}`:`module:${issue.moduleId}`);
    return conv;
  }
+ async prepareValidationEnvironment(issue:EngineIssue,project:Project,cwd:string):Promise<void> {
+   const a=this.attempt(issue.id);if(!a)throw new Error('workspace_attempt_missing');
+   this.assertOwned(a);await this.prepareEnvironment(issue,project,{...a,cwd});
+ }
  async recordResult(issue:EngineIssue,workspace:EngineExecutionWorkspace,summary:string):Promise<void> {
    const a=this.attempt(issue.id);
    if(a?.kind==='design-worktree' && a.execution_run_id) await this.deps.legacy.recordResult?.(issue,{cwd:a.cwd,branch:a.branch,kind:'design-worktree',runId:a.execution_run_id},summary);
@@ -288,6 +300,46 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
    const r=this.db.query<{port:number},[string]>('SELECT port FROM workspace_runtime_resources WHERE attempt_id=? AND node_run_id=0').get(a.id);
    if(!r) throw new Error('运行资源记录缺失');
    return workspaceEnvironment(cwd??a.cwd,a.id,r.port);
+ }
+ /** Explicit fault-dialog actions prepare the retained site without resuming its issue. */
+ async incidentRepair(issue:EngineIssue,project:Project,kind:'environment'|'branch'|'verify',expectedSha:string):Promise<void> {
+   const a=this.attempt(issue.id);if(!a)throw new Error('workspace_attempt_missing');
+   this.assertOwned(a);
+   if(a.result_sha && kind!=='verify')throw new Error('固定成果不能在故障会话中改写，请转交独立修复任务');
+   try {await this.stop(issue,project,true);}
+   catch(error){throw new WorkspaceOperationUncertain(`现场进程停止尚未确认：${String(error)}`);}
+   if(kind==='verify') {
+     const repository=`workspace-repository:${project.executorId}:${project.id}`,workspace=`workspace:${a.workspace_id}`;
+     await this.deps.mutex.runExclusive(gitLockKey(project.id),()=>this.deps.mutex.runExclusive(repository,()=>this.deps.mutex.runExclusive(workspace,async()=>{
+       this.assertOwned(a);await this.assertLocation(project,a.cwd);
+       await confirmDependencyPreparationStopped(this.deps.driverForProject(project),a.cwd);
+       // assertLocation uses the executor Git flock. Both physical writers are now quiescent.
+       const prior=this.db.query<{resource:string;token:string;owner_pid:number;operation:string},[string,string]>('SELECT resource,token,owner_pid,operation FROM workspace_operations WHERE resource IN (?,?)').all(repository,workspace);
+       for(const operation of prior) {
+         let alive=true;try{process.kill(operation.owner_pid,0);}catch(error){if((error as NodeJS.ErrnoException).code==='ESRCH')alive=false;}
+         if(operation.operation!=='incident-repair' || alive && operation.owner_pid!==process.pid)throw new WorkspaceOperationUncertain('其它控制器的操作尚未确认结束');
+       }
+       this.db.transaction(()=>{for(const row of prior)this.db.query('DELETE FROM workspace_operations WHERE resource=? AND token=?').run(row.resource,row.token);})();
+     })));
+   }
+   await this.repoOperation(project,'incident-repair',()=>this.operation(`workspace:${a.workspace_id}`,'incident-repair',()=>this.deps.mutex.runExclusive(`workspace-git:${a.workspace_id}`,async()=>{
+     this.assertOwned(a);await this.assertLocation(project,a.cwd);
+     const driver=this.deps.driverForProject(project);
+     const sha=await this.git(driver,a.cwd,['rev-parse','HEAD']);
+     if(sha!==expectedSha)throw new Error('工作区已变化，请重新检查现场后再处理');
+     if(kind==='environment') {
+       await this.assertLocation(project,a.cwd,a.branch);
+       try {await this.prepareEnvironment(issue,project,a);}
+       catch(error){if(error instanceof DependencyPreparationError && error.uncertain)throw new WorkspaceOperationUncertain(error.message);throw error;}
+     } else if(kind==='branch') {
+       if(await this.git(driver,a.cwd,['status','--porcelain']))throw new Error('工作区有未提交改动，请先人工保留和处理，不自动丢弃');
+       const target=await this.git(driver,a.cwd,['rev-parse','--verify',`refs/heads/${a.branch}`]);
+       const ancestor=await driver.git(a.cwd,['merge-base','--is-ancestor',sha,target]);
+       if(ancestor.code!==0)throw new Error('登记分支不包含当前成果，请先人工选择基线，不自动重置');
+       await this.git(driver,a.cwd,['switch',a.branch]);
+       await this.assertLocation(project,a.cwd,a.branch);
+     }
+   })));
  }
  async stop(issue:EngineIssue,project:Project,force=false):Promise<void> {
    await this.deps.mergeAgent?.cancel(issue.id);
@@ -316,7 +368,7 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
    await this.operation(`workspace:${a.workspace_id}`,'commit',async()=>{
      this.assertOwned(a);
      await this.assertLocation(project,a.cwd,a.branch);
-     await this.git(driver,a.cwd,['add','-A']);
+     await stageSourceChanges({git:async(cwd,args)=>({code:0,out:await this.git(driver,cwd,args),err:''})},a.cwd);
      const staged=await driver.git(a.cwd,['diff','--cached','--quiet']);
      if(staged.code===1) await this.git(driver,a.cwd,['commit','-m',`${issue.title.slice(0,120)} (#${issue.id})`]);
      else if(staged.code!==0) throw new Error('无法确认暂存区');
@@ -360,6 +412,7 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
        this.db.query('UPDATE workspace_attempts SET diagnostic=?,updated_ts=? WHERE id=?').run(diagnostic,Date.now(),a.id);
      };
      if(job.phase==='reserved') {
+       await this.deps.resources?.assertCapacity(project,'candidate',job.cwd);
        const entries=await this.git(driver,project.cwd,['worktree','list','--porcelain']);
        if(!entries.split('\n').includes(`worktree ${job.cwd}`)) {
          if(await driver.statPath(job.cwd)) throw new Error('集成候选目录已存在，禁止覆盖');
@@ -469,6 +522,7 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
      this.db.query("UPDATE module_workspaces SET current_attempt=NULL,lifecycle='idle',updated_ts=? WHERE id=? AND current_attempt=?").run(Date.now(),a.workspace_id,a.id);
      // 保留节点与旧轮次的绑定；负数只作归档标记，不继续占用可分配端口。
      this.db.query('UPDATE workspace_runtime_resources SET port=-rowid WHERE attempt_id=?').run(a.id);
+     enqueueReleasedWorkspaceCandidates(this.db,a.id);
      if(!a.integrated_sha)this.db.query('INSERT INTO issue_events(issue_id,kind,data_json,ts) VALUES(?,?,?,?)')
        .run(issue.id,'workspace_released',JSON.stringify({attempt:a.id,reason:'cancelled-clean'}),Date.now());
    })();

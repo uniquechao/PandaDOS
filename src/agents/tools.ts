@@ -1,3 +1,4 @@
+import type { WorkspaceReclamationService } from '../issues/workspace-reclamation';
 /**
  * agents/tools —— PM 问答工具四件套（v1 tools.ts 平移，评审 §2B 改造点全落地）：
  * - 作用域从「本机所有 tmux 会话」收窄到**本项目**（PM 只见自己项目，description 重写）；
@@ -32,6 +33,7 @@ export interface ToolLocator {
 }
 
 export interface PmToolsDeps {
+  workspaceResources?:Pick<WorkspaceReclamationService,'list'|'request'|'pin'>;
   /** 工具作用域锚点：一切寻址锁死在这个项目 */
   projectId: number;
   driver: ExecutorDriver;
@@ -52,6 +54,14 @@ export const CAPTURE_TAIL_LINES = 25;
 // ---------- 工具定义（OpenAI function-calling 兼容；description 已改项目作用域） ----------
 
 export const TOOL_SCHEMAS = [
+  {
+    type:'function',
+    function:{
+      name:'workspace_resources',
+      description:'Inspect this project’s persisted workspace reclamation jobs and executor capacity. Recheck a known job through the controlled collector; pin or unpin a diagnostic archive only when requested. Never accepts paths, shell commands, force removal or another project.',
+      parameters:{type:'object',additionalProperties:false,properties:{action:{type:'string',enum:['list','recheck','pin','unpin']},job_id:{type:'string'}},required:['action']},
+    },
+  },
   {
     type: 'function',
     function: {
@@ -96,6 +106,11 @@ export const TOOL_SCHEMAS = [
   },
 ];
 
+/** Localize only generated tool instructions; IDs, reasons and actions stay machine protocols. */
+export function pmToolSchemas(chinese:boolean) {
+ return chinese?TOOL_SCHEMAS.map(tool=>tool.function.name==='workspace_resources'?{...tool,function:{...tool.function,description:'查看本项目的持久化工作区回收记录、保留原因与执行机容量。按已有记录 ID 请求受控重新检查；仅按用户要求固定或取消固定诊断归档。不接受路径、命令、强制删除或其他项目。'}}:tool):TOOL_SCHEMAS;
+}
+
 // ---------- 执行 ----------
 
 export async function executeTool(
@@ -104,6 +119,20 @@ export async function executeTool(
   deps: PmToolsDeps,
 ): Promise<string> {
   switch (name) {
+    case 'workspace_resources': {
+      const port=deps.workspaceResources;
+      if(!port)return JSON.stringify({code:'workspace_resources_unavailable'});
+      const action=args.action;
+      if(Object.keys(args).some(k=>!['action','job_id'].includes(k))||!['list','recheck','pin','unpin'].includes(String(action)))return JSON.stringify({code:'invalid_arguments'});
+      if(action==='list') {
+        const facts=port.list(deps.projectId);
+        return JSON.stringify({jobs:facts.jobs.slice(0,30).map(j=>({id:j.id,kind:j.kind,workspace_id:j.workspace_id,state:j.state,reason:j.reason,archive_bytes:j.archive_bytes,archive_pinned:j.archive_pinned,archive_prune_state:j.archive_prune_state,archive_prune_reason:j.archive_prune_reason,next_check_ts:j.next_check_ts})),capacity:facts.capacity,policy:facts.policy,more:facts.jobs.length>30});
+      }
+      if(typeof args.job_id!=='string'||!/^[0-9a-f-]{36}$/.test(args.job_id))return JSON.stringify({code:'invalid_arguments'});
+      if(action==='recheck')port.request(deps.projectId,args.job_id);
+      else await port.pin(deps.projectId,args.job_id,action==='pin');
+      return JSON.stringify({state:action==='recheck'?'queued':'updated',job_id:args.job_id});
+    }
     case 'list_sessions': {
       const convs = deps.convs.listByProject(deps.projectId);
       const current = deps.convs.currentConv(deps.projectId);

@@ -1,7 +1,6 @@
 {
-  "version": "2.6.6-2026.1110",
+  "version": "2.6.7-2026.1111",
   "notes": [
-    "issue-pm-supervision",
-    "issue-stop-diagnostics"
+    "issue-incidents-workspace-storage"
   ]
 }

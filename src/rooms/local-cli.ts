@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
+import type { IndependentTextRequest } from '../core/independent-text';
 import { accessSync, closeSync, constants, existsSync, fsyncSync, openSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
@@ -168,6 +169,22 @@ export class RoomLocalCliRuntime implements RoomRuntime {
     // retries are included in one CLI invocation, never reported as one HTTP call.
     const config = [`model_catalog_json=${JSON.stringify(catalogPath)}`, `model_instructions_file=${JSON.stringify(systemPath)}`, `model_reasoning_effort=${JSON.stringify(model.effort)}`, 'project_doc_max_bytes=0', 'web_search="disabled"', 'mcp_servers={}', 'project_root_markers=[".room-root"]', 'approval_policy="never"'];
     return { ...common, formalPath, args: ['exec', '--strict-config', '--ignore-user-config', '--ignore-rules', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only', '--color', 'never', '--json', '--model', model.model, '-C', cwd, '--output-last-message', formalPath, ...CODEX_DISABLED.flatMap(name => ['--disable', name]), '--enable', 'skip_host_skill_discovery', ...config.flatMap(value => ['-c', value]), '-'] };
+  }
+  /** Domain-neutral entry to the isolated text transport. No room/domain rows are created. */
+  async runIndependentText(request: IndependentTextRequest, signal: AbortSignal): Promise<string> {
+    const actorId = `independent:${request.scopeId}`;
+    // Compatibility mapping stays inside the legacy durable process record format.
+    const context: RoomLocalTextContext = {
+      member: {id:actorId,model:{provider:request.agent,model:request.model,effort:request.effort}},
+      attempt: {id:request.id,assignmentId:request.id,roomId:request.scopeId,projectId:request.projectId,
+        missionId:request.scopeId,memberId:actorId,role:'writer',kind:'reply',goalRevision:1,round:1,
+        controlEpoch:1,fence:1,workerId:'independent-text',leaseUntil:request.deadlineTs,deadlineTs:request.deadlineTs,audience:{kind:'room'}},
+    };
+    try {
+      return await this.runText(context,[{role:'system',content:request.system},{role:'user',content:request.input}],signal,()=>!signal.aborted);
+    } finally {
+      if (!await this.confirmStopped(context.attempt,AbortSignal.timeout(10_000))) throw new Error('incident_runtime_stop_unconfirmed');
+    }
   }
   async run(context: RoomExecutionContext, signal: AbortSignal, beforeRequest?: (requestId?: string) => boolean, tools?: RoomToolPort): Promise<RoomFormalResult> {
     const messages = compileRoomMessages(context);

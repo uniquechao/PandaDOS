@@ -779,6 +779,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
         if (!guidance) return json({ ok: false, error: '解除阻塞前必须填写补充意见或解除方法' }, 400);
         if (guidance.length > 4000) return json({ ok: false, error: '解除方法不能超过 4000 字' }, 400);
         const r = await engine.unblockIssue(issue.id, guidance, user!.id);
+        if (!r.ok && r.error==='incident_manual_hold') return json(apiError('incident.manual_hold','Continue in the fault conversation and mark the incident resolved before resuming.',409),409);
         if (!r.ok) return json(r, 409);
         // 项目忙 → 解除意图已排队（#283）：这是成功，不是 409。前端据此显示「等当前任务结束」
         return json({
@@ -829,6 +830,7 @@ export function issuesRoutes(deps: IssuesRoutesDeps): RouteDef[] {
         if(!issue)return json({ok:false,error:'无此 issue'},404);
         const body=await readBody(req);
         const result=await engine.retryWorkspace(issue.id,user!.id,body.confirmInput===true);
+        if(!result.ok && result.error==='incident_manual_hold')return json(apiError('incident.manual_hold','Continue in the fault conversation and mark the incident resolved before resuming.',409),409);
         return result.ok?json({ok:true,issue:engine.store.get(issue.id)}):json(result,409);
       },
     },

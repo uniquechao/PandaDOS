@@ -1,3 +1,4 @@
+import { stageSourceChanges } from './runtime-git-paths';
 import { issueWorkspaceCwd } from '../core/workspace-ownership';
 /**
  * 并行写节点的 Git worktree 生命周期与汇合冲突恢复。
@@ -303,10 +304,7 @@ export class WorkflowWorktreeManager implements WorkflowWorktreeCoordinator {
     if (!worktree || worktree.status === 'cleaned' || worktree.headSha) return { ok: true };
     const lookup = this.workflow(run.issueWorkflowId);
     return this.deps.mutex.runExclusive(this.gitKey(lookup), async () => {
-      await this.driver(lookup.project_id).git(worktree.path, ['reset', '--quiet', '--', '.panda/tmp']);
-      const add = await this.driver(lookup.project_id).git(worktree.path, [
-        'add', '-A', '--', '.', ':(exclude).panda/tmp', ':(exclude).panda/tmp/**',
-      ]);
+      const add = await stageSourceChanges(this.driver(lookup.project_id),worktree.path);
       if (add.code !== 0) return { ok: false, reason: `workflow.worktree_stage_failed:${diagnostic(add.err || add.out)}` };
       const staged = await this.driver(lookup.project_id).git(worktree.path, ['diff', '--cached', '--quiet']);
       if (staged.code === 1) {

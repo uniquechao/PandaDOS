@@ -44,6 +44,63 @@ import { IssueEffectJournal } from './effect-journal';
 import { validateWorkflowGraph, WorkflowTemplateStore } from './workflows';
 import { compareIssueIds, type IssueId } from '../../shared/issue-id';
 
+test('fault dialog hold blocks direct, queued and workspace recovery; manual request is durable and idempotent', async () => {
+  const { engine, projectId, admin, db } = await setup();
+  const issue = engine.store.create(projectId,{title:'Diagnose',category:'task'});
+  await engine.applyEvent(issue.id,'pause',{note:'known failure',resumeState:'testing'});
+  const incident = await engine.openIncident(issue.id,admin.id,'zh-Hans');
+  expect(engine.incidents.held(issue.id)).toBe(true);
+  expect((await engine.unblockIssue(issue.id,'bypass',admin.id)).ok).toBe(false);
+  expect((await engine.applyEvent(issue.id,'unblock',{resumeState:'testing'})).ok).toBe(false);
+  expect((await engine.retryWorkspace(issue.id,admin.id)).ok).toBe(false);
+  await engine.tick();
+  expect(engine.store.get(issue.id)?.status).toBe('paused');
+  const first = await engine.resolveIncident(incident.id,'resume-1','verified externally',admin.id);
+  const again = await engine.resolveIncident(incident.id,'resume-1','verified externally',admin.id);
+  expect(again).toEqual(first);
+  expect(engine.store.listEvents(issue.id).filter(e=>e.kind==='unblock_requested')).toHaveLength(1);
+  expect(db.query('SELECT COUNT(*) n FROM issue_incident_receipts').get()).toMatchObject({n:1});
+});
+
+test('old fault window cannot release a new stop round', async () => {
+  const { engine, projectId, admin } = await setup();
+  const issue = engine.store.create(projectId,{title:'Old fault',category:'task'});
+  await engine.applyEvent(issue.id,'pause',{note:'first'});
+  const incident = await engine.openIncident(issue.id,admin.id,'en');
+  engine.store.logEvent(issue.id,'transition',{from:'testing',to:'paused',event:'pause',note:'second'});
+  await expect(engine.resolveIncident(incident.id,'resume-2','fixed',admin.id)).rejects.toThrow('incident_stale');
+  expect(engine.store.get(issue.id)?.status).toBe('paused');
+});
+
+test('rejected incident recovery returns to an actionable held conversation with the actual error',async()=>{
+ const {engine,projectId,admin}=await setup();
+ const issue=engine.store.create(projectId,{title:'Recovery failure',category:'task'});
+ await engine.applyEvent(issue.id,'pause',{note:'failure',resumeState:'testing'});
+ const incident=await engine.openIncident(issue.id,admin.id,'en');
+ (engine as any).deps.moduleWorkspaces={enabled:()=>true,attempt:()=>null,canStart:()=>true,compute:()=>{throw new Error('workspace process stop not confirmed');}};
+ await engine.resolveIncident(incident.id,'try-resume','fixed externally',admin.id);
+ await flushMicrotasks(100);
+ await engine.scheduleNext(projectId,{source:'manual'});
+ expect(engine.incidents.get(incident.id)).toMatchObject({state:'open',runState:'failed'});
+ expect(engine.incidents.get(incident.id)?.error).toContain('workspace process stop not confirmed');
+ expect(engine.incidents.held(issue.id)).toBe(true);
+ expect(engine.store.pendingUnblockRequest(issue.id)).toBeNull();
+});
+
+test('opening fault handling waits for merge-resume preparation and then prevents the old recovery from proceeding',async()=>{
+ const {engine,projectId,admin,db}=await setup();const issue=engine.store.create(projectId,{title:'Merge recovery',category:'task'});
+ db.query("UPDATE issues SET status='merging' WHERE id=?").run(issue.id);
+ await engine.applyEvent(issue.id,'pause',{note:'merge stopped',resumeState:'merging'});
+ let release!:()=>void;let entered!:()=>void;const barrier=new Promise<void>(r=>release=r);const ready=new Promise<void>(r=>entered=r);
+ (engine as any).deps.moduleWorkspaces={enabled:()=>true,attempt:()=>({id:'attempt',result_sha:'fixed'}),canStart:()=>true,resumeMergeAgent:async()=>{entered();await barrier;}};
+ expect((engine as any).resumeStateOf(issue.id)).toBe('merging');
+ const old=engine.unblockIssue(issue.id,'retry',admin.id);await ready;
+ let opened=false;const open=engine.openIncident(issue.id,admin.id,'en').then(v=>{opened=true;return v;});
+ await flushMicrotasks();expect(opened).toBe(false);
+ release();expect((await old).ok).toBe(false);const incident=await open;
+ expect(engine.incidents.held(issue.id)).toBe(true);expect(incident.attemptId).toBe('attempt');
+});
+
 // ---------- 假 Driver：文件/git 走真 fs（LocalDriver），tmux 进内存录制 ----------
 
 class FakeDriver extends LocalDriver {
@@ -8869,4 +8926,22 @@ test('显式恢复测试失败暂停后，旧失败与重入预算不再立即�
  await s.engine.tick();
  expect(s.engine.store.get(issue.id)!.status).toBe('implementing');
  expect(s.engine.store.countEvents(issue.id,'tests_failed')).toBe(MAX_TEST_FAILURES+2);
+});
+
+test('low disk during validation defers the gate without environment recovery or a failed test',async()=>{
+ const s=await setup({config:{validationTimeoutMs:100}});
+ const issue=s.engine.store.create(s.projectId,{title:'capacity gate',agent:'codex'});
+ s.engine.store.setValidationCommands(s.projectId,[{label:'test',argv:['bun','test']}]);
+ const {WorkspaceResourceDeferred}=await import('./workspace-reclamation');
+ const gate=s.engine as unknown as {deps:EngineDeps;runValidationGate(i:EngineIssue,p:Project):Promise<{outcome:string;deferred?:boolean}>};
+ gate.deps.moduleWorkspaces={enabled:()=>true,attempt:()=>null,environment:()=>({}),prepareValidationEnvironment:async()=>{throw new WorkspaceResourceDeferred('executor_disk_low');}} as unknown as NonNullable<EngineDeps['moduleWorkspaces']>;
+ s.driver.onRunCommand=()=>({code:0,out:'ok',err:'',timedOut:false,durationMs:1});
+ const result=await gate.runValidationGate(issue,getProject(s.db,s.projectId)!);
+ expect(result.deferred).toBe(true);
+ expect(s.engine.store.countEvents(issue.id,'environment_preparation_failed')).toBe(0);
+ expect(s.engine.store.countEvents(issue.id,'tests_failed')).toBe(0);
+ expect(s.engine.store.countEvents(issue.id,'validation_deferred')).toBe(1);
+ s.engine.store.logEvent(issue.id,'transition',{from:'implementing',to:'testing'});
+ await gate.runValidationGate(issue,getProject(s.db,s.projectId)!);
+ expect(s.engine.store.countEvents(issue.id,'validation_deferred')).toBe(2);
 });

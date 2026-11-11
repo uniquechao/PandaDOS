@@ -36,6 +36,8 @@ function setup() {
     git: async (_cwd: string, args: string[]) => {
       calls.push(args);
       const [command] = args;
+      if (command === 'ls-files') return ok(args.includes('--cached')?'source.ts\0':'');
+      if (command === 'reset') return ok();
       if (command === 'add') return ok();
       if (command === 'diff') return staged ? { code: 1, out: '', err: '' } : ok();
       if (command === 'write-tree') return ok(`${tree}\n`);

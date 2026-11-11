@@ -1,7 +1,28 @@
 import { test, expect } from 'bun:test';
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { LocalDriver } from '../executor/local';
-import { prepareDependencies } from './dependency-preparation';
+import { prepareDependencies, DependencyPreparationError, confirmDependencyPreparationStopped } from './dependency-preparation';
+
+test('dependency disconnect and timeout remain uncertain, while a confirmed failed command does not',async()=>{
+ for(const mode of ['disconnect','timeout','failed'] as const){
+  let error:unknown;
+  try{await prepareDependencies({runCommand:async()=>{if(mode==='disconnect')throw new Error('SSH lost');return {code:1,out:'',err:'failed',timedOut:mode==='timeout',durationMs:1};}},'/unused');}catch(e){error=e;}
+  expect(error).toBeInstanceOf(DependencyPreparationError);
+  expect((error as DependencyPreparationError).uncertain).toBe(mode!=='failed');
+ }
+});
+
+test('dependency verification refuses a live installer lock and accepts only after it is released',async()=>{
+ mkdirSync('.private',{recursive:true});const root=mkdtempSync(process.cwd()+'/.private/deps-barrier-');
+ mkdirSync(root+'/.panda/tmp/dependencies',{recursive:true});
+ const child=Bun.spawn(['python3','-u','-c',"import fcntl,time; f=open('.panda/tmp/dependencies/install.lock','a+'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); time.sleep(20)"],{cwd:root,stdout:'pipe',stderr:'ignore'});
+ try{
+  const reader=child.stdout.getReader();await reader.read();reader.releaseLock();
+  await expect(confirmDependencyPreparationStopped(new LocalDriver(),root)).rejects.toThrow('仍在执行');
+  child.kill();await child.exited;
+  await confirmDependencyPreparationStopped(new LocalDriver(),root);
+ }finally{child.kill();await child.exited;rmSync(root,{recursive:true,force:true});}
+});
 
 for(const [manager,lock,version,expected] of [
  ['bun','bun.lock','1.3.14',['install','--frozen-lockfile']],

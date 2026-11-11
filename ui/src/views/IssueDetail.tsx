@@ -2,6 +2,7 @@ import { issueStatusLabel } from '../lib/labels';
 import { issueStopState, redactDiagnostic } from '../../../shared/issue-diagnostics';
 import { AgentModelSettings } from '../components/AgentModelSettings';
 import { IssueWorkspace } from '../components/IssueWorkspace';
+import { IssueIncidentDialog } from '../components/IssueIncidentDialog';
 import { SkillPolicyEditor } from '../components/SkillPolicyEditor';
 /**
  * Issue 工作台（2026-07-15 重构：看板→主从工作台的右栏）。
@@ -128,6 +129,7 @@ export function IssueWorkbench({
   const [editing, setEditing] = useState(false);
   const [returnToRecovery, setReturnToRecovery] = useState(false);
   const [recoveryOpen, setRecoveryOpen] = useState(false);
+  const [faultDialogIssue,setFaultDialogIssue]=useState<IssueId|null>(null);
   const [recoveryGuidance, setRecoveryGuidance] = useState('');
   const [recoveryError, setRecoveryError] = useState('');
   const [doneReopenOpen, setDoneReopenOpen] = useState(false);
@@ -177,6 +179,7 @@ export function IssueWorkbench({
     setEditing(false);
     setReturnToRecovery(false);
     setRecoveryOpen(false);
+    setFaultDialogIssue(null);
     setRecoveryGuidance('');
     setRecoveryError('');
     setDoneReopenOpen(false);
@@ -304,7 +307,7 @@ export function IssueWorkbench({
   const openRecovery = (): void => {
     if (!['blocked', 'paused'].includes(issue?.status ?? '')) return;
     setRecoveryError('');
-    setRecoveryOpen(true);
+    setFaultDialogIssue(iid);
   };
 
   const submitRecovery = async (): Promise<void> => {
@@ -580,7 +583,7 @@ export function IssueWorkbench({
 
       {/* 顶部常驻澄清提示条（tab 栏之上，任何 tab 都看得到；点击弹窗回答，答完自动收起） */}
       {clarifyPanel}
-      {issue && <IssueStopNotice key={issue.id} issue={issue} events={events} pid={pid} />}
+      {issue && <IssueStopNotice key={issue.id} issue={issue} events={events} pid={pid} requested={faultDialogIssue===issue.id} onIncidentClosed={()=>setFaultDialogIssue(null)} />}
 
       {/* 「已完成但未推送」警示条（#272）：与澄清条同层常驻，直到有一次 auto_push 成功 */}
       {pushFailure && <PushFailedBar branch={pushFailure.branch} detail={pushFailure.detail} />}
@@ -1865,7 +1868,9 @@ function DiagnosticOutput({ event }: { event: IssueEvent }) {
     {typeof err === 'string' && err && <pre class="stop-raw">{err}</pre>}</>;
 }
 
-export function IssueStopNotice({ issue, events, pid }: { issue: Issue; events: IssueEvent[]; pid: number }) {
+export function IssueStopNotice({ issue, events, pid, requested=false, onIncidentClosed }: { issue: Issue; events: IssueEvent[]; pid: number; requested?:boolean; onIncidentClosed?:()=>void }) {
+  const [incidentOpen,setIncidentOpen]=useState(false);
+  const incidentButton=useRef<HTMLButtonElement>(null);
   const [diagnostics, setDiagnostics] = useState<{ retainedOutput: boolean; events: IssueEvent[] } | null>(null);
   const [open, setOpen] = useState(false);
   const [error, setError] = useState('');
@@ -1901,6 +1906,8 @@ export function IssueStopNotice({ issue, events, pid }: { issue: Issue; events: 
     </>}
     <details><summary>{tr('issue.stopDetails')}</summary><pre class="stop-raw">{technical}</pre></details>
     <button ref={diagnosticButton} class="btn sm" onClick={() => void load()}>{tr('issue.stopDiagnostics')}</button>
+    {['paused','blocked'].includes(issue.status) && <button ref={incidentButton} class="btn sm primary" onClick={()=>setIncidentOpen(true)}>{tr('incident.open')}</button>}
+    {(incidentOpen || requested) && <IssueIncidentDialog pid={pid} issueId={issue.id} onClose={()=>{setIncidentOpen(false);onIncidentClosed?.();incidentButton.current?.focus();}} />}
     {open && <Modal title={tr('issue.stopDiagnostics')} onClose={closeDiagnostics}>
       <div class="stop-diagnostics"><p>{tr('issue.stopDiagnosticsHelp')}</p>
         {error && <p role="alert">{error}</p>}

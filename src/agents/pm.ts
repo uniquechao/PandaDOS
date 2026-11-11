@@ -56,7 +56,7 @@ import {
   type ProgressAnalysis,
   type SummaryStore,
 } from './progress';
-import { executeTool, TOOL_SCHEMAS, type PmToolsDeps, type ToolConvOps, type ToolLocator } from './tools';
+import { executeTool, pmToolSchemas, type PmToolsDeps, type ToolConvOps, type ToolLocator } from './tools';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../../shared/i18n/locales';
 import { outputLanguageInstruction, promptLanguage } from './prompts/language';
 import { parseIssueId, type IssueId } from '../../shared/issue-id';
@@ -285,6 +285,7 @@ export interface PmUserStore {
 }
 
 export interface PmAgentDeps {
+  workspaceResources?:PmToolsDeps['workspaceResources'];
   driver: ExecutorDriver;
   /** Resolve the paired Driver and JSONL locator when a project lives on another executor. */
   executionForProject?(project: Project): { driver: ExecutorDriver; locator: ToolLocator };
@@ -729,22 +730,22 @@ Return exactly one JSON decision using an action from allowedActions. Fields: ac
     const asker = this.deps.users.byId(userId)?.username ?? (zh ? `用户${userId}` : `User ${userId}`);
     // v1 能力段措辞沿用，作用域从「本机所有会话」改写为本项目（评审 §2B）
     const capability = zh
-      ? `# 你的能力（重要）\n你是项目「${this.project.name}」的 PM 管家，只负责本项目${this.project.goal ? `（项目目标：${this.project.goal}）` : ''}。有工具：list_sessions / read_progress / capture_pane / send_command。需要时主动调用再回答，绝不要说你没有监控能力。send_command 会改变项目会话状态，确认用户意图后再调。\n\n# 排版（飞书 lark_md）\n简洁：关键 **加粗**，多项换行+emoji；不要长段落或 markdown 标题。\n\n## 本项目对话快照\n${snapshot}\n\n（当前提问者：${asker}）`
-      : `# Capabilities\nYou are the PM assistant for project "${this.project.name}" and only this project${this.project.goal ? ` (goal: ${this.project.goal})` : ''}. You can use list_sessions, read_progress, capture_pane, and send_command. Use tools when evidence is needed; never claim you cannot monitor the project. send_command changes session state, so confirm the user's intent first.\n\n# Feishu lark_md format\nBe concise, use **bold** and short emoji-separated lines where useful, and avoid headings or long paragraphs.\n\n## Project conversation snapshot\n${snapshot}\n\nCurrent requester: ${asker}`;
+      ? `# 你的能力（重要）\n你是项目「${this.project.name}」的 PM 管家，只负责本项目${this.project.goal ? `（项目目标：${this.project.goal}）` : ''}。有工具：list_sessions / read_progress / capture_pane / send_command / workspace_resources。磁盘或工作区回收问题先用 workspace_resources 查看容量与保留原因，重新检查只能提交已有记录 ID，不能绕过保护或编造删除命令。需要时主动调用再回答，绝不要说你没有监控能力。send_command 会改变项目会话状态，确认用户意图后再调。\n\n# 排版（飞书 lark_md）\n简洁：关键 **加粗**，多项换行+emoji；不要长段落或 markdown 标题。\n\n## 本项目对话快照\n${snapshot}\n\n（当前提问者：${asker}）`
+      : `# Capabilities\nYou are the PM assistant for project "${this.project.name}" and only this project${this.project.goal ? ` (goal: ${this.project.goal})` : ''}. You can use list_sessions, read_progress, capture_pane, send_command, and workspace_resources. For disk or reclamation questions, inspect capacity and retention reasons through workspace_resources; recheck an existing job ID without bypassing preservation guards or inventing deletion commands. Use tools when evidence is needed; never claim you cannot monitor the project. send_command changes session state, so confirm the user's intent first.\n\n# Feishu lark_md format\nBe concise, use **bold** and short emoji-separated lines where useful, and avoid headings or long paragraphs.\n\n## Project conversation snapshot\n${snapshot}\n\nCurrent requester: ${asker}`;
     const system = `${this.systemPrompt(locale)}\n\n${capability}\n\n${outputLanguageInstruction(locale)}`;
-    return this.chatWithTools(system, question);
+    return this.chatWithTools(system, question, locale);
   }
 
   // ---- 内部 ----
 
   /** 带工具的问答循环（v1 chatWithTools 平移：5 轮上限、工具异常转字符串继续） */
-  private async chatWithTools(system: string, userText: string): Promise<string> {
+  private async chatWithTools(system: string, userText: string,locale:SupportedLocale): Promise<string> {
     const messages: LlmMessage[] = [
       { role: 'system', content: system },
       { role: 'user', content: userText },
     ];
     for (let round = 0; round < CHAT_TOOL_ROUNDS; round++) {
-      const msg = await this.deps.llm.chat(messages, { tools: TOOL_SCHEMAS });
+      const msg = await this.deps.llm.chat(messages, { tools: pmToolSchemas(promptLanguage(locale)==='zh') });
       messages.push(msg.raw);
       if (msg.toolCalls.length) {
         for (const tc of msg.toolCalls) {
@@ -770,6 +771,7 @@ Return exactly one JSON decision using an action from allowedActions. Fields: ac
   private toolDeps(): PmToolsDeps {
     return {
       projectId: this.project.id,
+      workspaceResources:this.deps.workspaceResources,
       driver: this.deps.driver,
       convs: this.deps.convs,
       locator: this.deps.locator,

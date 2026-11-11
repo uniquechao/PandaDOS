@@ -27,6 +27,9 @@ export interface ApiErrorDescriptor {
 }
 
 const ERROR_MESSAGE_KEYS: Readonly<Record<string, MessageKey>> = {
+  'incident.operation_failed': 'incident.error',
+  'incident.busy': 'incident.pending',
+  'incident.manual_hold': 'incident.intro',
   'issues.list_invalid': 'errors.issues.list_invalid',
   'local_plans.invalid': 'errors.local_plans.invalid',
   'local_plans.changed': 'errors.local_plans.changed',
