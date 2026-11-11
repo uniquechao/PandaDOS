@@ -143,7 +143,10 @@ export class WorkspaceReclamationService {
   let snapshot:Capacity;
   try {snapshot=await this.capacity(project,phase==='start',cwd);}catch {throw new WorkspaceResourceDeferred('executor_capacity_unknown');}
   if(snapshot.available_bytes===null||snapshot.available_bytes<this.policy.minFreeBytes)throw new WorkspaceResourceDeferred('executor_disk_low');
-  if(phase==='start'&&snapshot.cache_bytes>this.policy.cacheMaxBytes)throw new WorkspaceResourceDeferred('executor_cache_pressure');
+  // Cache size is an eviction watermark, not a global admission veto. Held/dirty
+  // workspaces may be intentionally unreclaimable; their cache must not stop unrelated
+  // modules while the executor still satisfies the real free-space requirement.
+  if(phase==='start'&&snapshot.cache_bytes>this.policy.cacheMaxBytes)this.reconcile(new Set([project.executorId]));
  }
  tick():Promise<void> {
   if(this.stopped)return Promise.resolve();

@@ -205,3 +205,58 @@ test('quota pressure makes room for an archive larger than half the budget',asyn
  await gc.tick();expect(gc.list(1).jobs.find(j=>j.integration_id===integration)?.reason).toBe('archive_quota');
  await gc.tick();expect(gc.list(1).jobs.find(j=>j.integration_id===integration)?.state).toBe('reclaimed');expect(existsSync(old.archive_path!)).toBe(false);
 },30_000);
+
+test('protected cache pressure does not veto independent starts when disk space is sufficient',async()=>{
+ const s=await scene();
+ s.db.query('UPDATE module_workspaces SET current_attempt=?').run(s.attempt);
+ s.db.query('UPDATE workspace_attempts SET released_ts=NULL,stop_confirmed=1,compute_held=0').run();
+ s.db.query("UPDATE issues SET status='cancelled'").run();
+ s.put(s.moduleCwd,'uncommitted-requirement.md','preserve this requirement');
+ s.put(s.moduleCwd,`.panda/tmp/runtime/${s.attempt}/cache/protected`,'preserve this cache');
+ const original=s.driver.runCommand.bind(s.driver);
+ s.driver.runCommand=async(cwd,argv,ms,env)=>argv.at(-1)?.includes('"action":"capacity"')
+  ?{code:0,out:JSON.stringify({state:'ready',availableBytes:1000,totalBytes:2000,cacheBytes:200,archiveBytes:0}),err:'',timedOut:false,durationMs:0}
+  :original(cwd,argv,ms,env);
+ const gc=await s.service({minFreeBytes:10,cacheMaxBytes:100});
+ await expect(gc.assertCapacity(s.project,'start')).resolves.toBeUndefined();
+ s.db.run("INSERT INTO project_modules(id,project_id,slug,display_name,agent,source,created_ts) VALUES(1,1,'independent','independent','codex','manual',1)");
+ const next=s.store.create(1,{title:'independent issue',moduleId:1,agent:'codex',executionMode:'direct'});
+ const modules=new ModuleWorkspaceService({...s.deps,resources:gc,
+  legacy:{resolve:()=>({cwd:s.repo,kind:'project',branch:null,runId:null}),conversationFor:async()=>{throw new Error('unused');}},
+  conversations:{get:()=>undefined,createInWorkspaceWithId:()=>{throw new Error('unused');}}});
+ const prepared=await modules.resolve(next,s.project);
+ expect(prepared.cwd).not.toBe(s.moduleCwd);
+ expect(modules.attempt(next.id)?.released_ts).toBeNull();
+ await gc.tick();
+ expect(readFileSync(s.moduleCwd+'/uncommitted-requirement.md','utf8')).toBe('preserve this requirement');
+ expect(readFileSync(s.moduleCwd+`/.panda/tmp/runtime/${s.attempt}/cache/protected`,'utf8')).toBe('preserve this cache');
+ expect(s.db.query<{current_attempt:string},[]>('SELECT current_attempt FROM module_workspaces WHERE id=1').get()?.current_attempt).toBe(s.attempt);
+ expect(gc.list(1).capacity?.cache_bytes).toBe(200);
+ expect(gc.list(1).jobs.some(j=>j.kind==='environment'&&j.workspace_id===1)).toBe(false);
+},30_000);
+
+test('cache pressure enqueues idle environments before their normal age threshold without delaying starts',async()=>{
+ const s=await scene();s.db.query('DELETE FROM workspace_integrations').run();
+ s.db.query('UPDATE module_workspaces SET updated_ts=?').run(Date.now());
+ s.put(s.moduleCwd,`.panda/tmp/runtime/${s.attempt}/cache/old`,'reclaimable');
+ const gc=await s.service({idleMs:24*60*60_000,cacheMaxBytes:0});
+ gc.reconcile();expect(gc.list(1).jobs).toHaveLength(0);
+ await expect(gc.assertCapacity(s.project,'start')).resolves.toBeUndefined();
+ expect(gc.list(1).jobs.some(j=>j.kind==='environment'&&j.state==='pending')).toBe(true);
+ await gc.tick();
+ expect(existsSync(s.moduleCwd+`/.panda/tmp/runtime/${s.attempt}/cache/old`)).toBe(false);
+},30_000);
+
+test('an old healthy capacity receipt cannot admit starts after the executor probe fails',async()=>{
+ const s=await scene(),gc=await s.service();
+ await gc.assertCapacity(s.project,'start');
+ const original=s.driver.runCommand.bind(s.driver);
+ s.driver.runCommand=async(cwd,argv,ms,env)=>{
+  if(argv.at(-1)?.includes('"action":"capacity"'))throw new Error('executor unavailable');
+  return original(cwd,argv,ms,env);
+ };
+ for(const phase of ['start','candidate','dependencies'] as const) {
+  await expect(gc.assertCapacity(s.project,phase)).rejects.toThrow('executor_capacity_unknown');
+ }
+ expect(gc.list(1).capacity?.reason).toContain('executor unavailable');
+},30_000);

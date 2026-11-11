@@ -1,6 +1,6 @@
 {
-  "version": "2.6.7-2026.1111",
+  "version": "2.6.8-2026.1112",
   "notes": [
-    "issue-incidents-workspace-storage"
+    "executor-cache-admission"
   ]
 }
