@@ -10,7 +10,7 @@ architecture decisions; PandaDOS keeps the queue moving, preserves context, hand
 approvals, watches progress, records results, and brings you back only when a real decision is
 needed.
 
-[简体中文](README.zh-CN.md)
+[简体中文](README.zh-CN.md) · [日本語](README.ja.md)
 
 [Why PandaDOS](#why-pandados) · [Quick start](#quick-start) ·
 [Your first 10 minutes](#your-first-10-minutes) · [How it works](#how-it-works) ·
