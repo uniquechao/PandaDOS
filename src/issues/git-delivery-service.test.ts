@@ -37,6 +37,7 @@ function setup() {
       calls.push(args);
       const [command] = args;
       if (command === 'ls-files') return ok(args.includes('--cached')?'source.ts\0':'');
+      if (command === 'rm') return ok();
       if (command === 'reset') return ok();
       if (command === 'add') return ok();
       if (command === 'diff') return staged ? { code: 1, out: '', err: '' } : ok();

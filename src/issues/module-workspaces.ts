@@ -107,12 +107,20 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
      const common=await driver.git(cwd,['rev-parse','--path-format=absolute','--git-common-dir']);
      if(common.code!==0) throw new Error(common.err);
      try {
-       r=await driver.runCommand(cwd,['flock','-x',posix.join(common.out.trim(),'panda-workspace.lock'),'git',...args],120_000);
-       if(r.timedOut) throw new WorkspaceOperationUncertain('执行机 Git 操作结果未知，保留操作记录');
+       const lock=posix.join(common.out.trim(),'panda-workspace.lock');
+       if(args[0]==='ls-files') {
+         // Git data must use the raw Git transport: runCommand truncates logs at 64 KiB.
+         // A command-local alias retains the same executor flock; Git quotes each operand.
+         const quotedLock="'"+lock.replaceAll("'", "'\\''")+"'";
+         r=await driver.git(cwd,['-c',`alias.panda-locked-read=!flock -x ${quotedLock} git`,'panda-locked-read',...args]);
+       } else {
+         r=await driver.runCommand(cwd,['flock','-x',lock,'git',...args],120_000);
+         if(r.timedOut) throw new WorkspaceOperationUncertain('执行机 Git 操作结果未知，保留操作记录');
+       }
      } catch(e) { throw e instanceof WorkspaceOperationUncertain ? e : new WorkspaceOperationUncertain(String(e)); }
    } else r=await driver.git(cwd,args);
    if(r.code!==0) throw new Error(`${args[0]}：${(r.err||r.out).slice(0,500)}`);
-   return r.out.trim();
+   return args.includes('-z')?r.out:r.out.trim();
  }
  /** Persistent short operation lock. Unknown owner is retained; never stolen by a timeout. */
  private async operation<T>(resource:string,operation:string,fn:()=>Promise<T>):Promise<T> {

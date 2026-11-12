@@ -1,19 +1,16 @@
 import type { ExecutorDriver, GitResult } from '../executor/driver';
 
-// Untracking preserves disk contents and history. Enumerating source paths also avoids Git's
-// ignored-directory/exclusion-pathspec incompatibility, without force-adding ignored data.
+// Untracking preserves disk contents and history. Stage tracked changes as a group so Git
+// can update previously tracked files beneath ignored directories without force-adding data.
 export const RUNTIME_GIT_ROOTS=['.panda/tmp','.panda/conversations','node_modules'];
 export async function stageSourceChanges(driver:Pick<ExecutorDriver,'git'>,cwd:string):Promise<GitResult> {
- const tracked=await driver.git(cwd,['ls-files','-z','--',...RUNTIME_GIT_ROOTS]);
+ const runtime=await driver.git(cwd,['rm','--cached','-r','-f','--quiet','--ignore-unmatch','--',...RUNTIME_GIT_ROOTS.map(p=>`:(literal)${p}`)]);
+ if(runtime.code!==0)return runtime;
+ const tracked=await driver.git(cwd,['add','-u','--','.']);
  if(tracked.code!==0)return tracked;
- const names=tracked.out.split('\0').filter(Boolean);
- for(let n=0;n<names.length;n+=100) {
-  const r=await driver.git(cwd,['rm','--cached','-f','--ignore-unmatch','--',...names.slice(n,n+100).map(p=>`:(literal)${p}`)]);
-  if(r.code!==0)return r;
- }
  const reset=await driver.git(cwd,['reset','--quiet','--','.build']);
  if(reset.code!==0)return reset;
- const files=await driver.git(cwd,['ls-files','--cached','--others','--exclude-standard','-z']);
+ const files=await driver.git(cwd,['ls-files','--others','--exclude-standard','-z']);
  if(files.code!==0)return files;
  const roots=[...RUNTIME_GIT_ROOTS,'.build'];
  const source=[...new Set(files.out.split('\0').filter(p=>p&&!roots.some(root=>p===root||p.startsWith(root+'/'))))];

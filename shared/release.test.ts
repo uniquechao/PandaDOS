@@ -10,10 +10,10 @@ describe('release metadata', () => {
     expect(await file.exists()).toBe(true);
     const release = await file.json();
     expect(release.version).toMatch(/^\d+\.\d+\.\d+-\d{4}\.\d{4}$/);
-    expect(release.version).toBe('2.6.8-2026.1112');
+    expect(release.version).toBe('2.6.9-2026.1112');
     expect(release.version.split('-')[0]).toBe(pkg.version);
     expect(release.notes).toEqual([
-      'executor-cache-admission',
+      'native-merge-recovery',
     ]);
   });
 

@@ -1,6 +1,7 @@
 import type { MessageKey } from './i18n/messages';
 
 export const RELEASE_NOTE_KEYS = {
+  'native-merge-recovery': 'release.note.nativeMergeRecovery',
   'executor-cache-admission': 'release.note.executorCacheAdmission',
   'issue-incidents-workspace-storage': 'release.note.issueIncidentsWorkspaceStorage',
   'issue-pm-supervision': 'release.note.issuePmSupervision',

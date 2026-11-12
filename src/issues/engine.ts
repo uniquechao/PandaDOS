@@ -5744,10 +5744,13 @@ export class IssueEngine {
         this.store.logEvent(issueId,'pm_loop_reconciled',{operationId:pmCase.operation_id,source:'explicit-resume'});
       }
       if(this.deps.moduleWorkspaces?.enabled({id:issueId})) {
+        const attempt=this.deps.moduleWorkspaces.attempt(issueId);
+        if(attempt&&!attempt.result_sha&&attempt.stop_confirmed) {
+          this.deps.moduleWorkspaces.assertOwned(attempt);
+          this.deps.db.query('UPDATE workspace_attempts SET stop_confirmed=0 WHERE id=? AND released_ts IS NULL').run(attempt.id);
+        }
         const job=this.deps.db.query('SELECT 1 FROM issue_timeout_takeovers WHERE issue_id=?').get(issueId);
         if(job) {
-          const attempt=this.deps.moduleWorkspaces.attempt(issueId);
-          if(attempt&&!attempt.result_sha&&attempt.stop_confirmed)this.deps.db.query('UPDATE workspace_attempts SET stop_confirmed=0 WHERE id=?').run(attempt.id);
           this.deps.db.query("UPDATE issue_timeout_takeovers SET phase='failed',diagnostic='已由人工继续替代自动接管',updated_ts=? WHERE issue_id=? AND phase IN ('claimed','prepared')").run(this.now(),issueId);
         }
       }
@@ -7093,7 +7096,7 @@ export class IssueEngine {
    */
   private async ensureActiveConv(issue: EngineIssue, resuming = false): Promise<boolean> {
     const current = this.issueConversationActive(issue) ? issue.convId ?? undefined : this.deps.convs.currentConv(issue.projectId);
-    if (this.issueConversationActive(issue)) return true;
+    if (this.issueConversationActive(issue) && !resuming) return true;
     if (!this.deps.moduleWorkspaces?.enabled(issue) && current !== undefined && (!resuming || current === issue.convId)) return true;
     try {
       await this.activateConv(issue);

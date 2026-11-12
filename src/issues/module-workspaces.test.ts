@@ -1073,3 +1073,29 @@ test('PM Loop：未知动作仅在显式人工恢复后解除监督屏障',async
  expect((await engine.unblockIssue(s.issue.id,'已确认旧动作结果，沿用现场继续',1)).ok).toBe(true);
  expect(s.db.query<{phase:string},[]>('SELECT phase FROM issue_pm_loops').get()!.phase).toBe('watching');
 });
+
+
+test('native result freezing preserves an inventory larger than the executor log limit',async()=>{
+ const s=await setup();const issue=s.issue(1);const workspace=await s.service.resolve(issue,s.project);
+ const paths:string[]=[];
+ for(let n=0;n<900;n++){const path=`source-${String(n).padStart(4,'0')}-${'x'.repeat(85)}.ts`;paths.push(path);writeFileSync(workspace.cwd+'/'+path,'source '+n);}
+ writeFileSync(workspace.cwd+'/ leading source.ts','literal leading space');
+ const listed=await s.driver.git(workspace.cwd,['ls-files','--others','--exclude-standard','-z']);expect(listed.out.length).toBeGreaterThan(65536);
+ await s.service.commit(issue,s.project);const a=s.service.attempt(issue.id)!;expect(a.result_sha).toBeTruthy();
+ for(const path of [paths[0]!,paths[paths.length-1]!, ' leading source.ts'])expect(await s.git(workspace.cwd,['show',`${a.result_sha}:${path}`])).toBe(path.startsWith(' ')?'literal leading space':'source '+(path===paths[0]?0:899));
+ expect(await s.git(workspace.cwd,['status','--porcelain'])).toBe('');
+},30_000);
+
+test('explicit recovery reauthorizes a stopped retained conversation without a timeout takeover',async()=>{
+ const s=await setup();const issue=s.issue(1);const workspace=await s.service.resolve(issue,s.project);
+ const conv=await s.service.conversationFor(issue,workspace);
+ s.db.query("UPDATE issues SET status='paused',conv_id=? WHERE id=?").run(conv.id,issue.id);
+ s.store.logEvent(issue.id,'transition',{event:'pause',from:'testing',to:'paused',resumeState:'testing'});
+ s.db.query('UPDATE workspace_attempts SET stop_confirmed=1,compute_held=0 WHERE issue_id=?').run(issue.id);
+ let activated=false;
+ s.deps.conversations.activate=async(id:string)=>{const {managedConversationOwned}=await import('../core/workspace-ownership');activated=managedConversationOwned(s.db,1,id);if(!activated)throw new Error('工作区会话归属已失效');return conv;};
+ const engine=new IssueEngine({db:s.db,driver:s.driver,convs:s.deps.conversations,locator:{locate:async()=>null},moduleWorkspaces:s.service,executionWorkspaces:s.service,mutex:s.deps.mutex,pmFor:()=>({judgeDone:async()=> 'not_done'}),notify:{dispatch:async()=>{}},config:{resultSummaryTimeoutMs:0}});
+ expect((await engine.unblockIssue(issue.id,'旧进程已确认停止，保留原成果继续')).ok).toBe(true);
+ expect(activated).toBe(true);expect(s.service.attempt(issue.id)!.stop_confirmed).toBe(0);expect(s.store.get(issue.id)!.status).toBe('testing');
+ expect(s.service.attempt(issue.id)!.conversation_id).toBe(conv.id);
+},30_000);

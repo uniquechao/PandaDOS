@@ -23,3 +23,18 @@ test('automatic staging removes runtime index entries while preserving disk data
   expect(readFileSync(cwd+'/node_modules/.vitest/results.json','utf8')).toBe('old runtime');
  }finally {rmSync(cwd,{recursive:true,force:true});}
 },30_000);
+
+
+test('staging updates ignored tracked files without force-adding new archives',async()=>{
+ const cwd=mkdtempSync(process.cwd()+'/.private/ignored-stage-');const driver=new LocalDriver();
+ const git=async(args:string[])=>{const r=await driver.git(cwd,args);if(r.code)throw new Error(r.err);return r.out;};
+ try {
+  mkdirSync(cwd+'/backup',{recursive:true});writeFileSync(cwd+'/backup/existing.txt','before');
+  await git(['init','-b','main']);await git(['config','user.name','test']);await git(['config','user.email','test@example.invalid']);
+  await git(['add','-A']);await git(['commit','-qm','tracked archive']);
+  writeFileSync(cwd+'/.gitignore','/backup/\n');writeFileSync(cwd+'/backup/existing.txt','after');writeFileSync(cwd+'/backup/new.txt','keep ignored');
+  const {stageSourceChanges}=await import('./runtime-git-paths');const r=await stageSourceChanges(driver,cwd);expect(r.code).toBe(0);
+  expect(await git(['show',':backup/existing.txt'])).toBe('after');expect(await git(['ls-files','--','backup/new.txt'])).toBe('');
+  expect(readFileSync(cwd+'/backup/new.txt','utf8')).toBe('keep ignored');
+ }finally {rmSync(cwd,{recursive:true,force:true});}
+},30_000);

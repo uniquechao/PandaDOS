@@ -1,6 +1,6 @@
 {
-  "version": "2.6.8-2026.1112",
+  "version": "2.6.9-2026.1112",
   "notes": [
-    "executor-cache-admission"
+    "native-merge-recovery"
   ]
 }
