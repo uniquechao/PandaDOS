@@ -130,11 +130,11 @@ operations, follow [DEPLOY.md](DEPLOY.md).
      working directory and available conversation history.
    - Choose tmux to register a session that is already running.
    - Select **New project** to clone a Git repository or create a blank workspace.
-5. **Choose how to work.**
-   - Use an **issue project** for queued, traceable delivery. Create an issue with the outcome,
-     relevant context, and acceptance criteria; PandaDOS handles the execution stages.
-   - Use a **chat project** for exploratory work or one-off changes. Create a conversation and work
-     directly with Claude Code or Codex without an issue queue.
+5. **Choose how to work.** All projects use the issue board.
+   - For queued, traceable work, create an issue with the desired outcome, relevant context, and
+     acceptance criteria. PandaDOS handles the execution stages.
+   - For exploratory work or one-off changes, start a standalone conversation in the same project
+     and work directly with Claude Code or Codex outside the issue queue.
 6. **Set the approval level.** Start with balanced mode, review what PandaDOS approves automatically,
    and increase automation only when the repository and executor are properly isolated.
 7. **Leave the queue running.** Watch from the browser or phone, answer genuine clarification
@@ -166,10 +166,11 @@ You define outcomes and priorities
 
 ![PandaDOS issue workflow](docs/images/panda-issue-workflow-en.png)
 
-Each issue is a traceable unit of work. Independent projects can run separately; work sharing one
-repository is serialized to reduce conflicting edits. A module can keep one assigned agent.
-Issue conversations normally rotate; module knowledge in `MODULE.md`
-provides continuity across issues, while an unfinished conversation can be resumed.
+Each issue is a traceable unit of work. Independent projects can run separately. With module
+workspaces, issues in the same module run sequentially, while issues in different modules can run
+concurrently up to the configured limit for the project. A module can keep one assigned agent.
+Issue conversations normally rotate; module knowledge in `MODULE.md` provides continuity across
+issues, while an unfinished conversation can be resumed.
 
 ### Approval and safety model
 
