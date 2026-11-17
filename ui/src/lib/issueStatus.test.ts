@@ -112,6 +112,19 @@ describe('pushFailureState（#272 / B-02）', () => {
     expect(pushFailureState([failed(), ev('auto_push', { branch: 'panda/up' })])).toBeNull();
   });
 
+  test('仅匹配同一分支且晚于失败的远端核验回执', () => {
+    const oldReceipt = ev('workspace_push_verified', { target: 'panda/up' });
+    const failure = failed();
+    const otherBranch = ev('workspace_push_verified', { target: 'develop' });
+    const matching = ev('workspace_push_verified', { target: 'panda/up' });
+    expect(pushFailureState([oldReceipt, failure, otherBranch])?.branch).toBe('panda/up');
+    expect(pushFailureState([oldReceipt, failure, otherBranch, matching])).toBeNull();
+  });
+
+  test('不同分支的成功推送不清除当前分支的失败提示', () => {
+    expect(pushFailureState([failed(), ev('auto_push', { branch: 'develop' })])?.branch).toBe('panda/up');
+  });
+
   test('只看最后一次失败：先失败→推成功→又失败，仍要显示最新那条', () => {
     const events = [
       failed('第一次'),

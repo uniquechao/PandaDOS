@@ -33,6 +33,7 @@ export type IssueMachineEvent =
   | 'plan_rejected'     // plan_review → planning（带意见重排）
   | 'impl_done'         // implementing → testing（全部子任务 STAGE_DONE）
   | 'tests_passed'      // testing → merge_review（进卡点②）
+  | 'candidate_ready'   // testing → merge_review（候选尚未验证）
   | 'work_remaining'
   | 'tests_failed'      // testing → implementing；失败次数 > 上限 → blocked
   | 'review_approved'   // merge_review → merging
@@ -76,7 +77,7 @@ const TABLE: Readonly<Record<IssueState, Partial<Record<IssueMachineEvent, Issue
   planning: { plan_ready: 'plan_review' },
   plan_review: { plan_approved: 'implementing', plan_rejected: 'planning' },
   implementing: { impl_done: 'testing', request_plan: 'planning' },
-  testing: { tests_passed: 'merge_review', work_remaining: 'implementing' },
+  testing: { tests_passed: 'merge_review', candidate_ready: 'merge_review', work_remaining: 'implementing' },
   merge_review: { review_approved: 'merging', review_rejected: 'implementing' },
   merging: { merged: 'done', merge_conflict: 'blocked' },
   blocked: {},

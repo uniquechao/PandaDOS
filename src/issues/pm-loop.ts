@@ -5,6 +5,7 @@ import type { IssueId } from '../../shared/issue-id';
 import { redactDiagnostic, redactDiagnosticValue } from '../../shared/issue-diagnostics';
 
 export type PmLoopAction = 'wait' | 'continue' | 'verify' | 'recover' | 'clarify' | 'pause';
+export type PmApplyResult = 'applied'|'deferred'|'stale'|'exhausted';
 export interface PmLoopDecision {
  action: PmLoopAction;
  reason: string;
@@ -44,7 +45,7 @@ export interface PmLoopDeps {
  list(): IssueId[];
  observe(id: IssueId, signal: AbortSignal): Promise<PmLoopObservation | null>;
  decide(observation: PmLoopObservation, signal: AbortSignal): Promise<PmLoopDecision>;
- apply(observation: PmLoopObservation, decision: PmLoopDecision, operationId: string): Promise<'applied' | 'deferred' | 'stale'>;
+ apply(observation: PmLoopObservation, decision: PmLoopDecision, operationId: string): Promise<PmApplyResult>;
  config?: Partial<PmLoopConfig>;
 }
 interface CaseRow {
@@ -216,6 +217,11 @@ export class IssuePmLoop {
    .run(this.now(), observation.issueId, operationId);
   try {
    const result = await this.deps.apply(observation, decision, operationId);
+   if(result==='exhausted') {
+    this.deps.db.query("UPDATE issue_pm_loops SET phase='stopped',updated_ts=? WHERE issue_id=?").run(this.now(),observation.issueId);
+    this.event(observation.issueId,'pm_loop_exhausted',{operationId,action:decision.action});
+    return;
+   }
    if (result === 'deferred') {
     this.deps.db.query("UPDATE issue_pm_loops SET phase='ready',deferrals=deferrals+1,next_check_ts=?,updated_ts=? WHERE issue_id=?")
      .run(this.now() + this.cfg.minWaitMs, this.now(), observation.issueId);

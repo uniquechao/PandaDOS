@@ -7,15 +7,19 @@ export interface ReclamationRequest {
  workspaceRoot:string; projectCwd:string; cwd:string; branch:string|null;
  expectedHead?:string|null; resultSha?:string|null; targetRef:string;
  attemptIds:string[]; startedTs?:number; generation:number; minFreeBytes:number; archiveMaxBytes:number;
- probePaths?:string[]; cachePaths?:string[];
+ probePaths?:string[]; cachePaths?:string[]; probeGitMetadata?:boolean;
  archives?:Array<{jobId:string;path:string;sha256:string;bytes:number}>;
 }
 export interface ReclamationResult {
  state:'ready'|'reclaimed'|'retained'|'uncertain'; reason?:string; details?:string;
  archive?:{path:string;sha256:string;bytes:number}; archivePurged?:boolean;
  availableBytes?:number; totalBytes?:number; cacheBytes?:number; archiveBytes?:number;
+ filesystems?:WorkspaceFilesystemCapacity[];
  sourceHead?:string; resources?:Array<{rel:string;kind:string}>;
  purged?:string[];
+}
+export interface WorkspaceFilesystemCapacity {
+ id:string; availableBytes:number; totalBytes:number; availableInodes:number|null;
 }
 export class ReclamationUncertain extends Error {}
 
@@ -127,13 +131,28 @@ def tree_bytes(path):
    except FileNotFoundError:pass
  return total
 def free_space():
- probes=[workspace,project,root.parent,archive_root]
- probes+=list(map(Path,q.get('probePaths',[])));values=[]
- for p in probes:
+ # The archive writer only needs a small reserve on the archive filesystem.
+ volume=filesystems([archive_root])[0]
+ return volume['availableBytes'],volume['totalBytes']
+def filesystems(paths):
+ volumes={}
+ for p in dict.fromkeys(paths):
   real(p,True)
   while not p.exists():p=p.parent
-  s=os.statvfs(p);values.append((s.f_bavail*s.f_frsize,s.f_blocks*s.f_frsize))
- return min(values)
+  fd=os.open(p,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+  try:
+   # Read capacity and device from the same descriptor.
+   s=os.fstatvfs(fd);key=str(os.fstat(fd).st_dev)
+  finally:os.close(fd)
+  inodes=s.f_favail if s.f_files and 0<=s.f_favail<=s.f_files else None
+  value={'id':key,'availableBytes':s.f_bavail*s.f_frsize,'totalBytes':s.f_blocks*s.f_frsize,'availableInodes':inodes}
+  prior=volumes.get(key)
+  if prior:
+   value['availableBytes']=min(value['availableBytes'],prior['availableBytes'])
+   value['totalBytes']=min(value['totalBytes'],prior['totalBytes'])
+   value['availableInodes']=None if inodes is None or prior['availableInodes'] is None else min(inodes,prior['availableInodes'])
+  volumes[key]=value
+ return list(volumes.values())
 def archive_bytes():
  if not archive_base.is_dir():return 0
  total=0
@@ -536,7 +555,10 @@ try:
  archive_base=workspace/'.panda-archives';archive_root=archive_base/('project-'+str(q['projectId']))
  real(archive_root,True)
  if q['action']=='capacity':
-  available,total=free_space();cache=0
+  probes=list(map(Path,q.get('probePaths',[]))) or [workspace,project,root.parent,archive_root]
+  if q.get('probeGitMetadata'):
+   probes.append(Path(out(project,['rev-parse','--path-format=absolute','--git-common-dir'])))
+  volumes=filesystems(probes);lowest=min(volumes,key=lambda v:v['availableBytes']);cache=0
   for p in q.get('cachePaths',[]):
    p=Path(p);real(p,True)
    if not p.is_relative_to(workspace/'.panda-worktrees'):reject('path_outside_workspace')
@@ -548,7 +570,7 @@ try:
       if name=='cache':cache+=tree_bytes(child)
       elif re.fullmatch(r'node--?[0-9]+|merge-agent',name) and not child.is_symlink():keep.append(name)
      dirs[:]=keep
-  result={'state':'ready','availableBytes':available,'totalBytes':total,'cacheBytes':cache,'archiveBytes':archive_bytes()}
+  result={'state':'ready','availableBytes':lowest['availableBytes'],'totalBytes':lowest['totalBytes'],'cacheBytes':cache,'archiveBytes':archive_bytes(),'filesystems':volumes}
  elif q['action']=='prune':result=prune()
  elif q['action'] in ('inspect','reclaim'):result=reclaim()
  else:reject('action_invalid')

@@ -1,0 +1,236 @@
+.issue-worktree-tab {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  container-type: inline-size;
+}
+
+.issue-worktree-layout {
+  min-height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(210px, 26%);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--card);
+  overflow: hidden;
+}
+
+.issue-worktree-chat {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.issue-worktree-chat-head,
+.issue-worktree-chat-title,
+.issue-worktree-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.issue-worktree-chat-head {
+  min-height: 53px;
+  justify-content: space-between;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.issue-worktree-chat-title h3,
+.issue-worktree-scene h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.issue-worktree-chat-title .badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.issue-worktree-chat-title .agent-logo {
+  width: 14px;
+  height: 14px;
+}
+
+.issue-worktree-transcript.chat-msgs {
+  min-height: 160px;
+  max-height: min(52dvh, 600px);
+  padding: 14px;
+  gap: 12px;
+}
+
+.issue-worktree-message {
+  align-self: flex-start;
+  min-width: 0;
+  max-width: min(88%, 680px);
+}
+
+.issue-worktree-message.user {
+  align-self: flex-end;
+}
+
+.issue-worktree-message.user .mut {
+  text-align: end;
+}
+
+.issue-worktree-bubble {
+  margin-top: 4px;
+  border-radius: var(--r-md);
+  padding: 8px 12px;
+  color: var(--fg);
+  background: var(--fill);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.issue-worktree-message.user .issue-worktree-bubble {
+  background: var(--accent-weak);
+}
+
+.issue-worktree-question,
+.issue-worktree-diagnostic {
+  margin: 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--accent);
+  border-radius: var(--r-sm);
+  background: var(--fill);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.issue-worktree-composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding: 10px 12px;
+}
+
+.issue-worktree-composer textarea {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  max-height: 180px;
+  resize: vertical;
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 9px 10px;
+}
+
+.issue-worktree-composer .btn {
+  min-height: 44px;
+}
+
+.issue-worktree-readonly,
+.issue-worktree-error,
+.issue-worktree-empty {
+  margin: 0;
+  padding: 10px 12px;
+}
+
+.issue-worktree-scene {
+  min-width: 0;
+  border-left: 1px solid var(--line);
+  padding: 14px;
+}
+
+.issue-worktree-facts {
+  margin: 10px 0;
+  font-size: 13px;
+}
+
+.issue-worktree-facts > div {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+  gap: 8px;
+  padding: 7px 0;
+  border-top: 1px solid var(--line);
+}
+
+.issue-worktree-facts dt {
+  color: var(--mut);
+}
+
+.issue-worktree-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.issue-worktree-evidence {
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+.issue-worktree-evidence summary {
+  cursor: pointer;
+  color: var(--accent-2);
+  padding-block: 6px;
+}
+
+.issue-worktree-evidence code {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.issue-worktree-evidence ol {
+  padding-inline-start: 16px;
+}
+
+.issue-worktree-evidence li {
+  margin: 8px 0;
+}
+
+.issue-worktree-evidence time {
+  display: block;
+  color: var(--mut);
+}
+
+.issue-worktree-evidence pre {
+  font-family: var(--mono);
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.issue-worktree-confirm {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.issue-worktree-tab :is(button, textarea, summary):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@container (max-width: 620px) {
+  .issue-worktree-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .issue-worktree-scene {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .issue-worktree-controls .btn {
+    min-height: 44px;
+  }
+}
+
+@media (max-width: 520px) {
+  .wb-tabseg .seg-btn {
+    min-width: 0;
+    padding-inline: 3px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}

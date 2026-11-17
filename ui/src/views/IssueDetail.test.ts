@@ -134,7 +134,7 @@ describe('Issue 工作台信息架构', () => {
   });
 
   test('改动 tab 统一展示本 issue 的改动文件，不再呈现 commit 视图', () => {
-    expect(source).toContain("type WbTab = 'detail' | 'workflow' | 'exec' | 'changes'");
+    expect(source).toContain("type WbTab = 'detail' | 'workflow' | 'exec' | 'worktree' | 'changes'");
     expect(source).not.toContain('IssueCommitsTab');
     expect(source).toContain('const byPath = new Map<string, IssueChangeLeaf>()');
     expect(source).toContain('dedupWorktree');
@@ -144,6 +144,16 @@ describe('Issue 工作台信息架构', () => {
     expect(source).toContain("source: 'wt'");
     expect(source).not.toContain('<CommitPanel');
     expect(source).not.toContain("tr('issue.commitHistory'");
+  });
+
+  test('Worktree follows execution and opens an issue-scoped panel', () => {
+    const exec = source.indexOf("onClick={() => setTab('exec')}");
+    const worktree = source.indexOf("onClick={() => setTab('worktree')}");
+    const changes = source.indexOf("onClick={() => setTab('changes')}");
+    expect(exec).toBeGreaterThan(0);
+    expect(worktree).toBeGreaterThan(exec);
+    expect(changes).toBeGreaterThan(worktree);
+    expect(source).toContain('<IssueWorktree key={`${pid}:${iid}`} pid={pid} iid={iid} onChanged={load} />');
   });
 
   test('宽屏左树右 diff，窄屏维持文件 diff 全屏钻入', () => {

@@ -172,6 +172,18 @@ test('large executor inventories use a verified request file instead of exceedin
  const {readdirSync}=await import('node:fs');expect(readdirSync(f.workspaceRoot+'/.panda-archives/requests').filter(n=>n.endsWith('.json'))).toHaveLength(0);
 },30_000);
 
+test('capacity reports the device and inode availability for the nearest existing write directory',async()=>{
+ const f=await fixture();
+ const {statSync,statfsSync}=await import('node:fs');
+ const {runWorkspaceReclamation}=await import('./workspace-reclamation');
+ const r=await runWorkspaceReclamation(f.driver,f.projectCwd,{...f.request,action:'capacity',
+  probePaths:[f.cwd,f.cwd+'/future/path']});
+ const stat=statfsSync(f.cwd);
+ expect(r.state).toBe('ready');
+ expect(r.filesystems).toEqual([expect.objectContaining({id:String(statSync(f.cwd).dev),
+  availableInodes:stat.files?expect.any(Number):null})]);
+},30_000);
+
 test('streamed archive quota failure discards partial bytes and keeps the scene',async()=>{
  const f=await fixture(),{randomBytes}=await import('node:crypto');put(f.cwd,'.panda/tmp/report.bin','');writeFileSync(f.cwd+'/.panda/tmp/report.bin',randomBytes(128*1024));
  const r=await f.run({archiveMaxBytes:1024});expect(r.state).toBe('retained');expect(r.reason).toBe('archive_quota');expect(existsSync(f.cwd)).toBe(true);

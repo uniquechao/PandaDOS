@@ -44,6 +44,8 @@ describe('项目设置控制台', () => {
     expect(projectSettingsDirty(saved, { ...saved, name: ' PandaDOS ' })).toBeFalse();
     expect(projectSettingsDirty(saved, { ...saved, goal: 'New goal' })).toBeTrue();
     expect(projectSettingsDirty(saved, { ...saved, validationPolicy: 'required' })).toBeTrue();
+    expect(projectSettingsDirty(saved, { ...saved, mergeAgent: null })).toBeFalse();
+    expect(projectSettingsDirty(saved, { ...saved, mergeAgent: 'claude' })).toBeTrue();
   });
 
   test('设置控制台移除自动化，并将执行机归入仓库章节，issue 订阅、成员和模块保持独立', () => {

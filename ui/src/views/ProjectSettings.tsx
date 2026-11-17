@@ -51,6 +51,7 @@ export interface ProjectSettingsFields {
   validationCommands: string;
   moduleConcurrency?: number;
   workBranch?: string;
+  mergeAgent?: AgentKind | null;
   validationPolicy?: 'required' | 'optional' | 'none';
 }
 
@@ -91,6 +92,7 @@ function normalizedProjectSettings(fields: ProjectSettingsFields): ProjectSettin
     validationCommands: formatValidationCommandLines(parseValidationCommandLines(fields.validationCommands)),
     moduleConcurrency: fields.moduleConcurrency ?? 2,
     workBranch: fields.workBranch ?? '',
+    mergeAgent: fields.mergeAgent ?? null,
     validationPolicy: fields.validationPolicy ?? 'optional',
   };
 }
@@ -98,7 +100,8 @@ function normalizedProjectSettings(fields: ProjectSettingsFields): ProjectSettin
 export function projectSettingsDirty(saved: ProjectSettingsFields, current: ProjectSettingsFields): boolean {
   const a = normalizedProjectSettings(saved);
   const b = normalizedProjectSettings(current);
-  return a.moduleConcurrency !== b.moduleConcurrency || a.workBranch !== b.workBranch || a.name !== b.name || a.goal !== b.goal || a.validationCommands !== b.validationCommands || a.validationPolicy !== b.validationPolicy;
+  return a.moduleConcurrency !== b.moduleConcurrency || a.workBranch !== b.workBranch || a.mergeAgent !== b.mergeAgent
+    || a.name !== b.name || a.goal !== b.goal || a.validationCommands !== b.validationCommands || a.validationPolicy !== b.validationPolicy;
 }
 
 /** 空 token 不进入请求，避免界面把脱敏摘要或空值误当成新凭据覆盖后端。 */
@@ -251,6 +254,7 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
   const [name, setName] = useState('');
   const [goal, setGoal] = useState('');
   const [moduleConcurrency, setModuleConcurrency] = useState(2);
+  const [mergeAgent, setMergeAgent] = useState<AgentKind | null>(null);
   const [workBranch, setWorkBranch] = useState('');
   const [validationCommands, setValidationCommands] = useState('');
   const [validationPolicy, setValidationPolicy] = useState<'required' | 'optional' | 'none'>('optional');
@@ -277,6 +281,7 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
   const applyProject = (next: Project): void => {
     const fields = {
       moduleConcurrency: next.moduleConcurrency ?? 2,
+      mergeAgent: next.mergeAgent ?? null,
       workBranch: next.integrationBranch ?? next.workBranch ?? '',
       name: next.name,
       goal: next.goal ?? '',
@@ -285,6 +290,7 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
     };
     setProject(next);
     setModuleConcurrency(fields.moduleConcurrency);
+    setMergeAgent(fields.mergeAgent);
     setWorkBranch(fields.workBranch);
     setName(fields.name);
     setGoal(fields.goal);
@@ -329,7 +335,7 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
   };
   useEffect(load, [pid]);
 
-  const currentFields = { name, goal, validationCommands, validationPolicy, moduleConcurrency, workBranch };
+  const currentFields = { name, goal, validationCommands, validationPolicy, moduleConcurrency, mergeAgent, workBranch };
   const dirty = Boolean(savedFields && projectSettingsDirty(savedFields, currentFields));
 
   useEffect(() => {
@@ -359,6 +365,7 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
         validationCommands: parseValidationCommandLines(currentFields.validationCommands),
         validationPolicy: currentFields.validationPolicy,
         moduleConcurrency: currentFields.moduleConcurrency,
+        ...(mergeAgent !== (savedFields?.mergeAgent ?? null) ? { mergeAgent } : {}),
         ...(!project?.integrationBranch ? {workBranch:currentFields.workBranch || null} : {}),
       });
       applyProject(result.project);
@@ -463,6 +470,19 @@ export function ProjectSettingsView({ pid, me }: { pid: number; me: Me }) {
               <label class="field">{t('project.goal')}<textarea rows={3} value={goal} disabled={!canManage} onInput={(e) => setGoal(e.currentTarget.value)} /><span class="small mut">{t('projectSettings.descriptionHelp')}</span></label>
               <label class="field">{t('moduleWorkspace.concurrency')}
                 <input type="number" min="1" max="32" value={moduleConcurrency} disabled={!canManage} onInput={e => setModuleConcurrency(Number(e.currentTarget.value))} />
+              </label>
+              <label class="field">{t('moduleWorkspace.mergeAgent')}
+                <select value={mergeAgent ?? ''} disabled={!canManage} onChange={(e) => {
+                  const value = e.currentTarget.value;
+                  setMergeAgent(value === 'claude' || value === 'codex' ? value : null);
+                }}>
+                  <option value="">{t('worktree.inheritAgent')}</option>
+                  {(['claude', 'codex'] as const).map((agent) => (
+                    <option key={agent} value={agent} disabled={Boolean(executor) && !supportedAgents.includes(agent)}>
+                      {agent === 'claude' ? 'Claude' : 'Codex'}
+                    </option>
+                  ))}
+                </select>
               </label>
               <label class="field">{t('moduleWorkspace.target')}
                 <input value={workBranch} disabled={!canManage || Boolean(project?.integrationBranch)} onInput={e => setWorkBranch(e.currentTarget.value)} />

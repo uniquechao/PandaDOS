@@ -376,3 +376,16 @@ export class OpenAiCompatibleClient implements LlmClient {
 export function createLlmClient(db?: Database, fetchFn?: FetchLike): OpenAiCompatibleClient {
   return new OpenAiCompatibleClient(() => loadLlmConfig(db), fetchFn);
 }
+
+export function loadPmLlmConfig(shared: LlmConfig, env = process.env): LlmConfig {
+  const { PANDA_PM_LLM_BASE_URL: baseUrl, PANDA_PM_LLM_MODEL: model, PANDA_PM_LLM_API_KEY: apiKey } = env;
+  if (baseUrl === undefined && model === undefined && apiKey === undefined) return shared;
+  // An incomplete PM override must never send the shared provider's token to a different host.
+  return { ...shared, baseUrl: baseUrl?.trim() ?? '', model: model?.trim() ?? '', apiKey: apiKey?.trim() ?? '' };
+}
+
+export function createPmLlmClient(db: Database, shared: OpenAiCompatibleClient): OpenAiCompatibleClient {
+  const sharedConfig = loadLlmConfig(db);
+  if (loadPmLlmConfig(sharedConfig) === sharedConfig) return shared;
+  return new OpenAiCompatibleClient(() => loadPmLlmConfig(loadLlmConfig(db)));
+}

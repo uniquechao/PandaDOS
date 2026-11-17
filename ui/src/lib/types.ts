@@ -132,6 +132,7 @@ export interface Project {
   workBranch: string | null;
   moduleConcurrency?: number;
   integrationBranch?: string | null;
+  mergeAgent?: AgentKind | null;
   /** Agent（claude/codex）读历史+代码库产出的项目认知长文（null = 尚未生成） */
   understanding: string | null;
   /** 生成该认知的 CLI 代理（null = 尚未生成） */

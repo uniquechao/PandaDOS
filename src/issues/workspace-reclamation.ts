@@ -1,24 +1,30 @@
 import { randomUUID } from 'node:crypto';
 import { posix } from 'node:path';
 import type { Database } from 'bun:sqlite';
+import { workspaceInputWritePaths } from './workspace-inputs';
+import { DependencyPreparationError } from './dependency-preparation';
 import type { Project } from '../core/types';
 import type { ExecutorDriver } from '../executor/driver';
-import { runWorkspaceReclamation, type ReclamationRequest, type ReclamationResult } from '../executor/workspace-reclamation';
+import { runWorkspaceReclamation, type ReclamationRequest, type ReclamationResult, type WorkspaceFilesystemCapacity } from '../executor/workspace-reclamation';
 import { redactDiagnostic } from '../../shared/issue-diagnostics';
 import { KeyedMutex } from './mutex';
 import { WorkspaceExecutionDeferred } from './workspace-deferral';
 
 export interface WorkspaceReclamationPolicy {
- idleMs:number; minFreeBytes:number; cacheMaxBytes:number; archiveMaxBytes:number;
+ idleMs:number; minFreeBytes:number; minFreeInodes:number; writeReserveBytes:number; writeReserveInodes:number;
+ cacheMaxBytes:number; archiveMaxBytes:number;
  archiveRetentionMs:number; retryMs:number; tickMs:number; batchSize:number;
 }
 export const DEFAULT_WORKSPACE_RECLAMATION_POLICY:Readonly<WorkspaceReclamationPolicy>={
- idleMs:6*60*60_000,minFreeBytes:2*1024**3,cacheMaxBytes:2*1024**3,archiveMaxBytes:4*1024**3,
+ idleMs:6*60*60_000,minFreeBytes:2*1024**3,minFreeInodes:16_384,writeReserveBytes:512*1024**2,writeReserveInodes:16_384,
+ cacheMaxBytes:2*1024**3,archiveMaxBytes:4*1024**3,
  archiveRetentionMs:7*24*60*60_000,retryMs:60_000,tickMs:30_000,batchSize:8,
 };
 export function workspaceReclamationPolicyFromEnv(env:Record<string,string|undefined>):Partial<WorkspaceReclamationPolicy> {
  const result:Partial<WorkspaceReclamationPolicy>={};
- const names={PANDA_WORKSPACE_MIN_FREE_BYTES:'minFreeBytes',PANDA_WORKSPACE_CACHE_MAX_BYTES:'cacheMaxBytes',PANDA_WORKSPACE_ARCHIVE_MAX_BYTES:'archiveMaxBytes',PANDA_WORKSPACE_IDLE_MS:'idleMs',PANDA_WORKSPACE_ARCHIVE_RETENTION_MS:'archiveRetentionMs'} as const;
+ const names={PANDA_WORKSPACE_MIN_FREE_BYTES:'minFreeBytes',PANDA_WORKSPACE_MIN_FREE_INODES:'minFreeInodes',
+  PANDA_WORKSPACE_WRITE_RESERVE_BYTES:'writeReserveBytes',PANDA_WORKSPACE_WRITE_RESERVE_INODES:'writeReserveInodes',
+  PANDA_WORKSPACE_CACHE_MAX_BYTES:'cacheMaxBytes',PANDA_WORKSPACE_ARCHIVE_MAX_BYTES:'archiveMaxBytes',PANDA_WORKSPACE_IDLE_MS:'idleMs',PANDA_WORKSPACE_ARCHIVE_RETENTION_MS:'archiveRetentionMs'} as const;
  for(const [name,key] of Object.entries(names)) {
   const raw=env[name];if(raw===undefined)continue;const n=Number(raw);
   if(!raw.trim()||!Number.isSafeInteger(n)||n<0)throw new Error(`reclamation_policy_invalid:${name}`);
@@ -33,7 +39,14 @@ export interface ReclamationJob {
  archive_path:string|null;archive_sha256:string|null;archive_bytes:number;archive_pinned:number;
  archive_purged_ts:number|null;archive_prune_state:string;archive_prune_reason:string|null;receipt_json:string|null;retry_count:number;next_check_ts:number;created_ts:number;updated_ts:number;
 }
-interface Capacity {executor_id:number;available_bytes:number|null;total_bytes:number|null;cache_bytes:number;archive_bytes:number;checked_ts:number;reason:string|null}
+interface Capacity {executor_id:number;available_bytes:number|null;total_bytes:number|null;available_inodes:number|null;cache_bytes:number;archive_bytes:number;checked_ts:number;reason:string|null}
+export type WorkspaceWritePhase='start'|'candidate'|'dependencies'|'validation';
+interface CapacityLeaseOwner {token:string;owner_pid:number;uncertain:number}
+function leaseNeedsConfirmation(owner:CapacityLeaseOwner):boolean {
+ if(owner.uncertain)return true;
+ try {process.kill(owner.owner_pid,0);}catch(error){return (error as NodeJS.ErrnoException).code==='ESRCH';}
+ return false;
+}
 interface Binding {
  current_attempt:string|null;environment_generation:number;environment_state:string;module_cwd:string;module_branch:string;
  project_id:number;executor_id:number;module_key:number;workspace_root:string;project_cwd:string;project_executor:number;
@@ -60,6 +73,7 @@ export class WorkspaceReclamationService {
  readonly policy:WorkspaceReclamationPolicy;
  private stopped=false;
  private flight:Promise<void>|null=null;
+ private readonly admissions=new Set<Promise<unknown>>();
  private timer:ReturnType<typeof setInterval>|undefined;
  constructor(private readonly deps:WorkspaceReclamationDeps) {
   this.policy={...DEFAULT_WORKSPACE_RECLAMATION_POLICY,...deps.policy};
@@ -68,7 +82,7 @@ export class WorkspaceReclamationService {
  }
  private get db(){return this.deps.db;}
  start():void {if(this.stopped||this.timer)return;void this.tick();this.timer=setInterval(()=>void this.tick(),this.policy.tickMs);}
- async stop():Promise<void>{this.stopped=true;if(this.timer)clearInterval(this.timer);await this.flight;}
+ async stop():Promise<void>{this.stopped=true;if(this.timer)clearInterval(this.timer);await Promise.allSettled([this.flight,...this.admissions]);}
  list(projectId:number):{jobs:ReclamationJob[];capacity:Capacity|null;policy?:Readonly<WorkspaceReclamationPolicy>} {
   const project=this.deps.projectForId(projectId);
   return {jobs:this.db.query<ReclamationJob,[number]>("SELECT * FROM workspace_reclamation_jobs WHERE project_id=? ORDER BY CASE WHEN state='reclaimed' THEN 1 ELSE 0 END,updated_ts DESC,id LIMIT 100").all(projectId),
@@ -114,8 +128,16 @@ export class WorkspaceReclamationService {
    workspaceRoot:e.workspace_root,projectCwd:project.cwd,cwd:project.cwd,branch:null,targetRef:`refs/heads/${project.workBranch??'main'}`,
    attemptIds:[],generation:0,minFreeBytes:this.policy.minFreeBytes,archiveMaxBytes:this.policy.archiveMaxBytes};
  }
- private async capacity(project:Project,measureCache=false,cwd?:string):Promise<Capacity> {
-  const request=this.baseRequest(project);request.probePaths=cwd?[cwd]:[];
+ private async capacity(project:Project,measureCache=false,cwd?:string,phase?:WorkspaceWritePhase):Promise<{snapshot:Capacity;volumes:WorkspaceFilesystemCapacity[]}> {
+  const request=this.baseRequest(project);
+  if(cwd) {
+   request.probePaths=[cwd];
+   if(phase) {
+    request.probePaths.push(posix.join(cwd,'.panda/tmp'),posix.join(cwd,'.panda/tmp/runtime'));
+    if(phase==='dependencies'||phase==='validation')request.probePaths.push(posix.join(cwd,'node_modules'),posix.join(cwd,'.venv'));
+    request.probeGitMetadata=phase==='start'||phase==='candidate';
+   }
+  }
   if(measureCache) {
    const rows=this.db.query<{cwd:string;id:string},[number]>(`SELECT w.cwd,a.id FROM module_workspaces w JOIN workspace_attempts a ON a.workspace_id=w.id WHERE w.executor_id=?
     UNION SELECT COALESCE(a.execution_cwd,w.cwd),a.id FROM module_workspaces w JOIN workspace_attempts a ON a.workspace_id=w.id WHERE w.executor_id=?1
@@ -126,27 +148,129 @@ export class WorkspaceReclamationService {
    request.cachePaths=[...new Set(rows.filter(r=>r.cwd.startsWith(ownedRoot)).map(r=>posix.join(r.cwd,'.panda/tmp/runtime',r.id)))];
   }
   let result:ReclamationResult;
+  let volumes:WorkspaceFilesystemCapacity[];
   try {
-   result=await runWorkspaceReclamation(this.deps.driverForProject(project),project.cwd,request);
+   const driver=this.deps.driverForProject(project);
+   if(cwd && (phase==='dependencies'||phase==='validation')) {
+    request.probePaths!.push(...await workspaceInputWritePaths(driver,cwd,project.validationCommands));
+   }
+   result=await runWorkspaceReclamation(driver,project.cwd,request);
    if(result.state!=='ready'||!Number.isSafeInteger(result.availableBytes)||!Number.isSafeInteger(result.totalBytes))throw new Error(result.reason??'capacity_unknown');
+   volumes=result.filesystems??[];
+   const valid=(n:number)=>Number.isSafeInteger(n)&&n>=0;
+   if(!Array.isArray(volumes)||!volumes.length||new Set(volumes.map(v=>v.id)).size!==volumes.length||
+      volumes.some(v=>typeof v.id!=='string'||!v.id||!valid(v.availableBytes)||!valid(v.totalBytes)||v.availableBytes>v.totalBytes||
+       (v.availableInodes!==null&&!valid(v.availableInodes))))throw new Error('capacity_filesystems_unknown');
   } catch(error) {
    this.db.query(`INSERT INTO workspace_capacity(executor_id,checked_ts,reason) VALUES(?,?,?) ON CONFLICT(executor_id) DO UPDATE SET checked_ts=excluded.checked_ts,reason=excluded.reason`).run(project.executorId,Date.now(),redactDiagnostic(String(error)).slice(-1000));
    throw error;
   }
-  this.db.query(`INSERT INTO workspace_capacity(executor_id,available_bytes,total_bytes,cache_bytes,archive_bytes,checked_ts,reason) VALUES(?,?,?,?,?,?,NULL)
+  const freeInodes=volumes.some(v=>v.availableInodes===null)?null:Math.min(...volumes.map(v=>v.availableInodes!));
+  this.db.query(`INSERT INTO workspace_capacity(executor_id,available_bytes,total_bytes,available_inodes,cache_bytes,archive_bytes,checked_ts,reason) VALUES(?,?,?,?,?,?,?,NULL)
    ON CONFLICT(executor_id) DO UPDATE SET available_bytes=excluded.available_bytes,total_bytes=excluded.total_bytes,
-   cache_bytes=CASE WHEN ? THEN excluded.cache_bytes ELSE workspace_capacity.cache_bytes END,archive_bytes=excluded.archive_bytes,checked_ts=excluded.checked_ts,reason=NULL`)
-   .run(project.executorId,result.availableBytes!,result.totalBytes!,result.cacheBytes??0,result.archiveBytes??0,Date.now(),measureCache?1:0);
-  return this.db.query<Capacity,[number]>('SELECT * FROM workspace_capacity WHERE executor_id=?').get(project.executorId)!;
+   available_inodes=excluded.available_inodes,cache_bytes=CASE WHEN ? THEN excluded.cache_bytes ELSE workspace_capacity.cache_bytes END,
+   archive_bytes=excluded.archive_bytes,checked_ts=excluded.checked_ts,reason=NULL`)
+   .run(project.executorId,result.availableBytes!,result.totalBytes!,freeInodes,result.cacheBytes??0,result.archiveBytes??0,Date.now(),measureCache?1:0);
+  return {snapshot:this.db.query<Capacity,[number]>('SELECT * FROM workspace_capacity WHERE executor_id=?').get(project.executorId)!,volumes};
  }
- async assertCapacity(project:Project,phase:'start'|'candidate'|'dependencies',cwd?:string):Promise<void> {
-  let snapshot:Capacity;
-  try {snapshot=await this.capacity(project,phase==='start',cwd);}catch {throw new WorkspaceResourceDeferred('executor_capacity_unknown');}
-  if(snapshot.available_bytes===null||snapshot.available_bytes<this.policy.minFreeBytes)throw new WorkspaceResourceDeferred('executor_disk_low');
+ private async probeAdmission(project:Project,phase:WorkspaceWritePhase,cwd?:string) {
+  if(this.stopped)throw new WorkspaceResourceDeferred('executor_capacity_unknown');
+  let capacity:Awaited<ReturnType<WorkspaceReclamationService['capacity']>>;
+  try {capacity=await this.capacity(project,phase==='start',cwd,phase);}
+  catch(error) {
+   if(error instanceof DependencyPreparationError)throw error;
+   throw new WorkspaceResourceDeferred('executor_capacity_unknown');
+  }
+  const {snapshot}=capacity;
   // Cache size is an eviction watermark, not a global admission veto. Held/dirty
   // workspaces may be intentionally unreclaimable; their cache must not stop unrelated
   // modules while the executor still satisfies the real free-space requirement.
   if(phase==='start'&&snapshot.cache_bytes>this.policy.cacheMaxBytes)this.reconcile(new Set([project.executorId]));
+  return capacity.volumes;
+ }
+ private checkCapacity(executorId:number,volumes:WorkspaceFilesystemCapacity[],bytes=0,inodes=0):void {
+  for(const v of volumes) {
+   const held=this.db.query<{bytes:number;inodes:number},[number,string]>(`SELECT COALESCE(SUM(reserved_bytes),0) bytes,
+    COALESCE(SUM(reserved_inodes),0) inodes FROM workspace_capacity_leases WHERE executor_id=? AND filesystem_id=?`).get(executorId,v.id)!;
+   if(v.availableBytes-held.bytes-bytes<this.policy.minFreeBytes)throw new WorkspaceResourceDeferred('executor_disk_low');
+   if(v.availableInodes===null&&(held.inodes>0||inodes>0||this.policy.minFreeInodes>0))
+    throw new WorkspaceResourceDeferred('executor_capacity_unknown');
+   if((v.availableInodes??0)-held.inodes-inodes<this.policy.minFreeInodes)throw new WorkspaceResourceDeferred('executor_inode_low');
+  }
+ }
+ assertCapacity(project:Project,phase:WorkspaceWritePhase,cwd?:string):Promise<void> {
+  return this.trackAdmission(this.probeAdmission(project,phase,cwd).then(volumes=>this.checkCapacity(project.executorId,volumes)));
+ }
+ withCapacityLease<T>(project:Project,phase:WorkspaceWritePhase,cwd:string,fn:(markUncertain:()=>void)=>Promise<T>):Promise<T> {
+  return this.trackAdmission(this.runCapacityLease(project,phase,cwd,fn));
+ }
+ private trackAdmission<T>(admission:Promise<T>):Promise<T> {
+  const flight=admission.finally(()=>this.admissions.delete(flight));
+  this.admissions.add(flight);
+  return flight;
+ }
+ private admissionGeneration(executorId:number):number {
+  return this.db.query<{admission_generation:number},[number]>('SELECT admission_generation FROM workspace_capacity WHERE executor_id=?').get(executorId)?.admission_generation??0;
+ }
+ private async runCapacityLease<T>(project:Project,phase:WorkspaceWritePhase,cwd:string,fn:(markUncertain:()=>void)=>Promise<T>):Promise<T> {
+  // The installer and build may hold both inputs and outputs during a write.
+  const multiplier=phase==='dependencies'||phase==='validation'?2:1;
+  const bytes=Math.min(Number.MAX_SAFE_INTEGER,this.policy.writeReserveBytes*multiplier);
+  const inodes=Math.min(Number.MAX_SAFE_INTEGER,this.policy.writeReserveInodes*multiplier);
+  const token=randomUUID();
+  for(let retry=0;retry<3;retry++) {
+   const generation=this.admissionGeneration(project.executorId);
+   const volumes=await this.probeAdmission(project,phase,cwd);
+   if(this.stopped)throw new WorkspaceResourceDeferred('executor_capacity_unknown');
+   const claimed=this.db.transaction(()=>{
+    // A completed writer can use bytes between the probe and this transaction.
+    // Re-probe if any lease was released during that interval.
+    if(this.admissionGeneration(project.executorId)!==generation)return false;
+    if(this.db.query('SELECT 1 FROM workspace_capacity_leases WHERE executor_id=? AND cwd=?').get(project.executorId,cwd))
+     throw new WorkspaceResourceDeferred('executor_write_unconfirmed');
+    this.checkCapacity(project.executorId,volumes,bytes,inodes);
+    const insert=this.db.query(`INSERT INTO workspace_capacity_leases
+     (token,executor_id,filesystem_id,project_id,cwd,phase,reserved_bytes,reserved_inodes,owner_pid,created_ts)
+     VALUES(?,?,?,?,?,?,?,?,?,?)`);
+    for(const v of volumes)insert.run(token,project.executorId,v.id,project.id,cwd,phase,bytes,inodes,process.pid,Date.now());
+    return true;
+   }).immediate();
+   if(!claimed)continue;
+   let uncertain=false;
+   try {
+    const result=await fn(()=>{uncertain=true;});
+    if(uncertain)throw new WorkspaceResourceDeferred('executor_write_unconfirmed');
+    return result;
+   }
+   finally {
+    if(uncertain)this.db.query('UPDATE workspace_capacity_leases SET uncertain=1 WHERE token=?').run(token);
+    else this.db.transaction(()=>this.releaseCapacityLease(project.executorId,token)).immediate();
+   }
+  }
+  throw new WorkspaceResourceDeferred('executor_capacity_unknown');
+ }
+ private releaseCapacityLease(executorId:number,token:string):void {
+  if(this.db.query('DELETE FROM workspace_capacity_leases WHERE executor_id=? AND token=?').run(executorId,token).changes)
+   this.db.query('UPDATE workspace_capacity SET admission_generation=admission_generation+1 WHERE executor_id=?').run(executorId);
+ }
+ private capacityLeaseOwner(project:Project,phase:WorkspaceWritePhase,cwd:string):CapacityLeaseOwner|null {
+  return this.db.query<CapacityLeaseOwner,[number,number,string,WorkspaceWritePhase]>(
+   'SELECT token,owner_pid,uncertain FROM workspace_capacity_leases WHERE executor_id=? AND project_id=? AND cwd=? AND phase=? LIMIT 1'
+  ).get(project.executorId,project.id,cwd,phase);
+ }
+ uncertainCapacityLeaseToken(project:Project,phase:WorkspaceWritePhase,cwd:string):string|null {
+  const owner=this.capacityLeaseOwner(project,phase,cwd);
+  return owner&&leaseNeedsConfirmation(owner)?owner.token:null;
+ }
+ hasUncertainCapacityLease(project:Project,phase:WorkspaceWritePhase,cwd:string):boolean {
+  return this.uncertainCapacityLeaseToken(project,phase,cwd)!==null;
+ }
+ /** The caller must first confirm the old physical writer has stopped. */
+ confirmCapacityLeaseStopped(project:Project,phase:WorkspaceWritePhase,cwd:string,token:string):void {
+  this.db.transaction(()=>{
+   const owner=this.capacityLeaseOwner(project,phase,cwd);
+   if(owner?.token===token&&leaseNeedsConfirmation(owner))this.releaseCapacityLease(project.executorId,token);
+  }).immediate();
  }
  tick():Promise<void> {
   if(this.stopped)return Promise.resolve();
@@ -160,8 +284,9 @@ export class WorkspaceReclamationService {
    if(this.stopped)return;if(measured.has(p.executor_id))continue;
    const project=this.deps.projectForId(p.id);if(!project)continue;measured.add(p.executor_id);
    try {
-    const c=await this.capacity(project,true);
-    if((c.available_bytes??0)<this.policy.minFreeBytes||c.cache_bytes>this.policy.cacheMaxBytes)pressure.add(project.executorId);
+    const {snapshot:c}=await this.capacity(project,true);
+    if((c.available_bytes??0)<this.policy.minFreeBytes||
+      (c.available_inodes!==null&&c.available_inodes<this.policy.minFreeInodes)||c.cache_bytes>this.policy.cacheMaxBytes)pressure.add(project.executorId);
     await this.pruneArchives(project,c.archive_bytes);
    }catch {/* An unreachable executor is visible in the capacity ledger; never fall back locally. */}
   }
@@ -186,6 +311,7 @@ export class WorkspaceReclamationService {
   const expected=posix.join(b.workspace_root,'.panda-worktrees',`project-${job.project_id}`,job.kind==='candidate'?`integration/${job.integration_id}`:`module-${b.module_key}`);
   if(job.cwd!==expected||(job.kind==='candidate'?b.integration_cwd:b.module_cwd)!==job.cwd)return 'workspace_binding_changed';
   if(b.released_ts===null||!b.stop_confirmed)return 'execution_not_released';
+  if(this.db.query('SELECT 1 FROM workspace_capacity_leases WHERE executor_id=? AND cwd=?').get(job.executor_id,job.cwd))return 'executor_write_unconfirmed';
   if(job.kind==='candidate'&&(!b.integrated_sha||b.issue_status!=='done'||!['published','validated'].includes(b.integration_phase??'')||!b.candidate_sha))return 'candidate_not_published';
   if(this.db.query(`SELECT 1 FROM workspace_merge_agents WHERE attempt_id=? AND (stop_confirmed=0 OR state IN ('starting','dispatching','running','stopping','uncertain'))`).get(job.attempt_id))return 'merge_writer_active';
   if(job.kind==='environment') {

@@ -27,6 +27,12 @@ export interface ApiErrorDescriptor {
 }
 
 const ERROR_MESSAGE_KEYS: Readonly<Record<string, MessageKey>> = {
+  'worktree.not_found': 'issue.notFound',
+  'worktree.forbidden': 'errors.auth.forbidden',
+  'worktree.stale': 'worktree.stale',
+  'worktree.agent_not_ready': 'worktree.agentNotReady',
+  'worktree.operation_unconfirmed': 'worktree.operationUnconfirmed',
+  'worktree.invalid_request': 'worktree.invalidRequest',
   'incident.operation_failed': 'incident.error',
   'incident.busy': 'incident.pending',
   'incident.manual_hold': 'incident.intro',

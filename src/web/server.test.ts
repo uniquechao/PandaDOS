@@ -1232,8 +1232,8 @@ describe('server 集成冒烟（完整装配）', () => {
     const h = await api(ctx, 'GET', '/healthz');
     expect(h.status).toBe(200);
     expect(h.body.ok).toBe(true);
-    expect(h.body.db.latest).toBe(96);
-    expect(h.body.db.applied).toBe(90);
+    expect(h.body.db.latest).toBe(98);
+    expect(h.body.db.applied).toBe(92);
     expect(h.body.executors).toEqual([{ id: 1, name: 'local', status: 'online' }]);
     expect(h.body.engine.running).toBe(true);
     expect(h.body.feishu).toBe(false);
@@ -1778,7 +1778,7 @@ test('模块工作区完整装配：非主执行器启动及文件归属不回�
  const ctx=await boot(undefined,db=>{
   db.run(`INSERT INTO executors(name,host,ssh_user,key_ref,workspace_root,claude_dir)
     SELECT 'secondary','127.0.0.2','test','test',workspace_root || '/second',claude_dir FROM executors WHERE id=1`);
- },primary,{driverFactory:ex=>ex.id===1?primary:secondary});
+ },primary,{driverFactory:ex=>ex.id===1?primary:secondary,workspaceReclamationPolicy:{minFreeInodes:0,writeReserveInodes:0}});
  const token=(await fsp.readFile(ctx.tokenFile,'utf8')).trim();
  const created=await api(ctx,'POST','/api/projects',token,{name:'执行器隔离',executorId:2});
  expect(created.status).toBe(200);const p=created.body.project;

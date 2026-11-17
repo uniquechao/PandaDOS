@@ -2,13 +2,15 @@ import { issueStatusLabel } from '../lib/labels';
 import { issueStopState, redactDiagnostic } from '../../../shared/issue-diagnostics';
 import { AgentModelSettings } from '../components/AgentModelSettings';
 import { IssueWorkspace } from '../components/IssueWorkspace';
+import { IssueWorktree } from '../components/IssueWorktree';
 import { IssueIncidentDialog } from '../components/IssueIncidentDialog';
 import { SkillPolicyEditor } from '../components/SkillPolicyEditor';
 /**
  * Issue 工作台（2026-07-15 重构：看板→主从工作台的右栏）。
- * 一个 issue 的三视图（tab，2026-07-24 issue #80 提交併入改动）：
+ * 一个 issue 的工作台页签：
  *  - 详情：body / 截图 / 计划(子任务)；
  *  - 执行：执行现场——「对话」(ChatPane 钉住 issue conv，含菜单/输入) 与「原生」(真实代理 tmux) 二选一；
+ *  - Worktree：合并 Agent 对话、集成现场、验证证据和人工干预；
  *  - 改动：合并本 issue 已提交与执行中未提交的文件，按路径去重后显示一棵 ChangeTree；
  *         点文件 → 对应范围内/工作区单文件 diff。
  *         范围：固定/共享分支取 impl_base 起点 start..tip，否则 base..branch。
@@ -18,7 +20,7 @@ import { SkillPolicyEditor } from '../components/SkillPolicyEditor';
  * embedded=true：作为看板右栏嵌入（无返回键，左栏列表即导航）；
  * embedded=false：窄屏整页（顶部返回键回项目看板）。
  */
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useEffect, useId, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { api, ApiError, getProjectExecutorAgents, setIssueAutoApprove } from '../lib/api';
 import { nav } from '../lib/router';
@@ -104,7 +106,7 @@ export function completionReportState(
   };
 }
 
-type WbTab = 'detail' | 'workflow' | 'exec' | 'changes';
+type WbTab = 'detail' | 'workflow' | 'exec' | 'worktree' | 'changes';
 
 /**
  * 一个 issue 的工作台。embedded=true 作看板右栏（无返回键）；
@@ -126,6 +128,7 @@ export function IssueWorkbench({
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
   const [tab, setTab] = useState<WbTab>('detail');
+  const tabsId = useId();
   const [editing, setEditing] = useState(false);
   const [returnToRecovery, setReturnToRecovery] = useState(false);
   const [recoveryOpen, setRecoveryOpen] = useState(false);
@@ -194,6 +197,14 @@ export function IssueWorkbench({
   }, [pid, iid]);
 
   const issue = detail?.issue ?? null;
+  const tabProps = (name: WbTab) => ({
+    id: `${tabsId}-${name}`,
+    role: 'tab' as const,
+    'aria-controls': `${tabsId}-panel`,
+    'aria-selected': tab === name,
+    tabIndex: tab === name ? 0 : -1,
+    class: `seg-btn${tab === name ? ' on' : ''}`,
+  });
 
   useEffect(() => {
     if (detail && tab === 'workflow' && !detail.workflowRuntime) setTab('detail');
@@ -596,27 +607,45 @@ export function IssueWorkbench({
         <UnblockQueuedBar request={detail.unblockRequest} onCancel={cancelUnblockQueue} />
       )}
 
-      {/* iOS 分段控件（#113）：外层类名保留（测试/布局锚点），三枚 tab 收进 .seg 轨道 */}
+      {/* iOS 分段控件（#113）：外层类名保留（测试/布局锚点）。 */}
       <div class="id-tabs wb-tabs">
-        <div class="seg wb-tabseg">
-          <button class={`seg-btn${tab === 'detail' ? ' on' : ''}`} onClick={() => setTab('detail')}>
+        <div class="seg wb-tabseg" role="tablist" onKeyDown={(event) => {
+          const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
+          const index = buttons.findIndex((button) => button === event.target);
+          if (index < 0) return;
+          let next: number;
+          switch (event.key) {
+            case 'ArrowLeft': next = (index + buttons.length - 1) % buttons.length; break;
+            case 'ArrowRight': next = (index + 1) % buttons.length; break;
+            case 'Home': next = 0; break;
+            case 'End': next = buttons.length - 1; break;
+            default: return;
+          }
+          event.preventDefault();
+          buttons[next]?.focus();
+          buttons[next]?.click();
+        }}>
+          <button {...tabProps('detail')} onClick={() => setTab('detail')}>
             {tr('issue.detailsTab')}
           </button>
           {detail?.workflowRuntime && (
-            <button class={`seg-btn${tab === 'workflow' ? ' on' : ''}`} onClick={() => setTab('workflow')}>
+            <button {...tabProps('workflow')} onClick={() => setTab('workflow')}>
               {tr('workflow.issueTab')}
             </button>
           )}
-          <button class={`seg-btn${tab === 'exec' ? ' on' : ''}`} onClick={() => setTab('exec')}>
+          <button {...tabProps('exec')} onClick={() => setTab('exec')}>
             {tr('issue.executionTab')}
           </button>
-          <button class={`seg-btn${tab === 'changes' ? ' on' : ''}`} onClick={() => setTab('changes')}>
+          <button {...tabProps('worktree')} onClick={() => setTab('worktree')}>
+            {tr('worktree.tab')}
+          </button>
+          <button {...tabProps('changes')} onClick={() => setTab('changes')}>
             {tr('issue.changesTab')}{changesN > 0 ? `·${changesN}` : ''}
           </button>
         </div>
       </div>
 
-      <div class="wb-body">
+      <div class="wb-body" id={`${tabsId}-panel`} role="tabpanel" aria-labelledby={`${tabsId}-${tab}`} tabIndex={0}>
         {!issue && !err && <Loading />}
         {issue && tab === 'detail' && (
           <DetailTab
@@ -660,6 +689,9 @@ export function IssueWorkbench({
         )}
         {issue && tab === 'workflow' && detail?.workflowRuntime && (
           <WorkflowRuntimePanel runtime={detail.workflowRuntime} />
+        )}
+        {issue && tab === 'worktree' && (
+          <IssueWorktree key={`${pid}:${iid}`} pid={pid} iid={iid} onChanged={load} />
         )}
         {issue && tab === 'changes' && (
           <IssueChangesTab key={iid} pid={pid} iid={iid} info={git.info} err={git.err} onRefresh={git.refresh} />

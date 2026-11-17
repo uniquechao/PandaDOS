@@ -1,7 +1,9 @@
 import type { SupportedLocale } from '../locales';
+import { issueWorktreeMessages } from './issue-worktree';
 
 export const moduleWorkspaceMessages = {
   "en": {
+    ...issueWorktreeMessages["en"],
     "moduleWorkspace.confirmInput": "I verified that the pending input was submitted",
     "moduleWorkspace.title": "Module workspace",
     "moduleWorkspace.mergeAgent": "Merge agent",
@@ -20,6 +22,7 @@ export const moduleWorkspaceMessages = {
     "moduleWorkspace.retry": "Check and retry"
   },
   "zh-Hans": {
+    ...issueWorktreeMessages["zh-Hans"],
     "moduleWorkspace.confirmInput": "已核实保留的输入已提交",
     "moduleWorkspace.title": "模块工作区",
     "moduleWorkspace.mergeAgent": "合并 Agent",
@@ -38,6 +41,7 @@ export const moduleWorkspaceMessages = {
     "moduleWorkspace.retry": "检查并重试"
   },
   "zh-Hant": {
+    ...issueWorktreeMessages["zh-Hant"],
     "moduleWorkspace.confirmInput": "已核實保留的輸入已提交",
     "moduleWorkspace.title": "模組工作區",
     "moduleWorkspace.mergeAgent": "合併 Agent",
@@ -56,6 +60,7 @@ export const moduleWorkspaceMessages = {
     "moduleWorkspace.retry": "檢查並重試"
   },
   "ja": {
+    ...issueWorktreeMessages["ja"],
     "moduleWorkspace.confirmInput": "保留中の入力が送信済みと確認しました",
     "moduleWorkspace.title": "モジュールのワークスペース",
     "moduleWorkspace.mergeAgent": "マージエージェント",
@@ -74,6 +79,7 @@ export const moduleWorkspaceMessages = {
     "moduleWorkspace.retry": "確認して再試行"
   },
   "ko": {
+    ...issueWorktreeMessages["ko"],
     "moduleWorkspace.confirmInput": "보류된 입력이 전송되었음을 확인했습니다",
     "moduleWorkspace.title": "모듈 작업 공간",
     "moduleWorkspace.mergeAgent": "병합 에이전트",
@@ -92,6 +98,7 @@ export const moduleWorkspaceMessages = {
     "moduleWorkspace.retry": "확인 후 재시도"
   },
   "es": {
+    ...issueWorktreeMessages["es"],
     "moduleWorkspace.confirmInput": "He verificado que se envió la entrada pendiente",
     "moduleWorkspace.title": "Espacio de trabajo del módulo",
     "moduleWorkspace.mergeAgent": "Agente de integración",
@@ -110,6 +117,7 @@ export const moduleWorkspaceMessages = {
     "moduleWorkspace.retry": "Comprobar y reintentar"
   },
   "fr": {
+    ...issueWorktreeMessages["fr"],
     "moduleWorkspace.confirmInput": "J’ai vérifié que la saisie en attente a été envoyée",
     "moduleWorkspace.title": "Espace de travail du module",
     "moduleWorkspace.mergeAgent": "Agent de fusion",
@@ -128,6 +136,7 @@ export const moduleWorkspaceMessages = {
     "moduleWorkspace.retry": "Vérifier et réessayer"
   },
   "de": {
+    ...issueWorktreeMessages["de"],
     "moduleWorkspace.confirmInput": "Ich habe die Übermittlung der ausstehenden Eingabe geprüft",
     "moduleWorkspace.title": "Modul-Arbeitsbereich",
     "moduleWorkspace.mergeAgent": "Merge-Agent",
@@ -146,6 +155,7 @@ export const moduleWorkspaceMessages = {
     "moduleWorkspace.retry": "Prüfen und erneut versuchen"
   },
   "pt-BR": {
+    ...issueWorktreeMessages["pt-BR"],
     "moduleWorkspace.confirmInput": "Verifiquei que a entrada pendente foi enviada",
     "moduleWorkspace.title": "Espaço de trabalho do módulo",
     "moduleWorkspace.mergeAgent": "Agente de integração",
@@ -164,6 +174,7 @@ export const moduleWorkspaceMessages = {
     "moduleWorkspace.retry": "Verificar e tentar novamente"
   },
   "ru": {
+    ...issueWorktreeMessages["ru"],
     "moduleWorkspace.confirmInput": "Отправка ожидавшего ввода проверена",
     "moduleWorkspace.title": "Рабочая область модуля",
     "moduleWorkspace.mergeAgent": "Агент слияния",

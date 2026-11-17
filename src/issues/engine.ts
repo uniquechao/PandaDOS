@@ -1,16 +1,19 @@
 import { WorkspaceResourceDeferred } from './workspace-reclamation';
 import { MergeAgentTimeoutError, MergeAgentPausedError } from './module-merge-agent';
-import { IssuePmLoop, type PmLoopObservation, type PmLoopDecision, type PmLoopAction } from './pm-loop';
+import { IssuePmLoop, type PmLoopObservation, type PmLoopDecision, type PmLoopAction, type PmApplyResult } from './pm-loop';
 import { redactDiagnostic, redactDiagnosticValue } from '../../shared/issue-diagnostics';
 import { DependencyPreparationError } from './dependency-preparation';
-import { WorkspaceOperationUncertain, type ModuleWorkspaceService } from './module-workspaces';
+import { CandidateValidationTimeoutError, CandidateValidationInputsChangedError, WorkspaceOperationUncertain, type CandidateValidationContext, type ModuleWorkspaceService } from './module-workspaces';
 import { managedConversationOwned, issueWorkspaceView, type IssueWorkspaceView } from '../core/workspace-ownership';
 import { effectiveSkillPolicy, skillSessionSettings, saveSkillPolicy, type SkillPolicy } from '../core/skill-policy';
 import { ClarificationDelivery, ClarificationNotDeliveredError, type ClarificationDeliveryInput } from './clarification-delivery';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { agentHomesFromClaudeDir, listGlobalSkills, listProjectSkills } from '../core/skills';
 import { WorkspaceExecutionDeferred } from './workspace-deferral';
-import { validationIdentity, validationCheckKey } from './validation-identity';
+import { candidateInputSnapshot, validationIdentity, validationCheckKey } from './validation-identity';
+import { configuredWorkspaceValidation, projectedAttachmentPath } from './workspace-inputs';
+import { splitValidationCommands } from './validation-preparation';
+import { validationFailureEvidence } from './validation-evidence';
 /**
  * issues/engine —— issue 生命周期状态机引擎（v2 的心脏，spec §5）。
  *
@@ -906,6 +909,7 @@ interface ProjectRow {
   work_branch?: string | null;
   module_concurrency?: number;
   integration_branch?: string | null;
+  merge_agent?: string | null;
   /** 007 迁移；同上，旧库兜底 null / 'idle' */
   understanding?: string | null;
   understanding_agent?: string | null;
@@ -939,6 +943,7 @@ export function mapProject(r: ProjectRow): Project {
     workBranch: r.work_branch ?? null,
     moduleConcurrency:r.module_concurrency ?? 2,
     integrationBranch:r.integration_branch ?? null,
+    mergeAgent:r.merge_agent === 'codex' || r.merge_agent === 'claude' ? r.merge_agent : null,
     understanding: r.understanding ?? null,
     understandingAgent:
       r.understanding_agent === 'codex' || r.understanding_agent === 'claude'
@@ -3190,7 +3195,7 @@ export class IssueEngine {
     if (!attempt.result_sha && issue.status !== 'paused' && inputReady && sessionInfo) allowedActions.push('continue', 'verify', 'clarify');
     const recentEvents = this.deps.db.query<{id:number;kind:string;data_json:string|null;ts:number}, [IssueId]>(
       `SELECT id,kind,substr(data_json,1,2500) data_json,ts FROM issue_events WHERE issue_id=?
-       AND kind IN ('error','validation_failed','validation_diagnostic','integration_wait','stop_loss_triggered','timeout_takeover_failed','merge_agent_failed','pm_loop_applied','pm_loop_model_failed','pm_loop_decision')
+       AND kind IN ('error','validation_failed','validation_error','validation_invalidated','environment_preparation_failed','validation_diagnostic','integration_wait','stop_loss_triggered','timeout_takeover_failed','merge_agent_failed','pm_loop_applied','pm_loop_model_failed','pm_loop_decision')
        ORDER BY id DESC LIMIT 8`).all(id);
     const facts = redactDiagnosticValue({
       title: issue.title, goal: issue.body, projectGoal: project.goal, stage: issue.status,
@@ -3201,7 +3206,7 @@ export class IssueEngine {
       git: { known: gitKnown, head: head.status === 'fulfilled' ? head.value.out.trim() : 'unknown',
         status: status.status === 'fulfilled' ? status.value.out.slice(-8000) : 'unknown' },
       recentOutput: output.status === 'fulfilled' ? output.value : 'unavailable',
-      timeout, mergeAgent: merge, recentEvents,
+      timeout, mergeAgent: merge, recentEvents,validationFailure:validationFailureEvidence(this.deps.db,id,merge?.integration_id),
       readErrors: [sessions, pane, head, status, output].flatMap((r, index) => r.status === 'rejected' ? [{ index, error: String(r.reason).slice(0,500) }] : []),
     }) as Record<string, unknown>;
     const progressKey = createHash('sha256').update(JSON.stringify({
@@ -3215,7 +3220,7 @@ export class IssueEngine {
       ...(timeout ? { trigger: `timeout:${timeout.reason}` } : exited ? { trigger: 'executor-exited' } : {}) };
   }
 
-  private async applyPmDecision(observation: PmLoopObservation, decision: PmLoopDecision, operationId: string): Promise<'applied' | 'deferred' | 'stale'> {
+  private async applyPmDecision(observation: PmLoopObservation, decision: PmLoopDecision, operationId: string): Promise<PmApplyResult> {
     const id = observation.issueId;
     if (this.incidentHeld(id)) return 'deferred';
     if (this.pmContext(id)?.scopeKey !== observation.scopeKey) return 'stale';
@@ -3244,8 +3249,7 @@ export class IssueEngine {
             if (!result.ok) throw new Error(result.error);
           }
           const guidance = `${decision.instruction ?? decision.reason}`;
-          await this.recoverTimeout(this.store.get(id)!, guidance);
-          return 'applied';
+          return this.recoverTimeout(this.store.get(id)!, guidance);
         }
         if (attempt.result_sha || issue.status === 'paused') return 'stale';
         if (decision.action === 'clarify') {
@@ -5530,17 +5534,22 @@ export class IssueEngine {
     });
   }
 
-  async openIncident(issueId: IssueId, actor: number, locale: string) {
+  async openIncident(issueId: IssueId, actor: number, locale: string, expectedAttemptId?: string, onOpened?: (id: string) => void) {
     this.incidentOpening.add(issueId);
     try {
       await this.workspaceRetryFlights.get(issueId);
       const projectId = this.store.get(issueId)?.projectId;
       await (this.tickFlights.get(`issue:${issueId}`)?.promise ?? this.tickFlights.get(`project:${projectId}`)?.promise);
-      return await this.transitionCoordinator.run(issueId, () => this.deps.db.transaction(() => {
-        const issue = this.store.get(issueId);
-        if (!issue) throw new Error('incident_not_found');
-        return this.incidents.open(issue,this.incidentStopId(issueId),this.incidentAttemptId(issueId),actor,locale);
-      })());
+      return await this.transitionCoordinator.run(issueId, async () => {
+        if (expectedAttemptId) await this.confirmWorktreeInterventionStop(issueId,expectedAttemptId);
+        return this.deps.db.transaction(() => {
+          const issue = this.store.get(issueId);
+          if (!issue) throw new Error('incident_not_found');
+          const incident = this.incidents.open(issue,this.incidentStopId(issueId),this.incidentAttemptId(issueId),actor,locale);
+          onOpened?.(incident.id);
+          return incident;
+        })();
+      });
     } finally { this.incidentOpening.delete(issueId); }
   }
 
@@ -5575,6 +5584,56 @@ export class IssueEngine {
     const promise = this.retryWorkspaceInner(issueId,actor,confirmInput);
     this.workspaceRetryFlights.set(issueId,promise);
     try { return await promise; } finally { this.workspaceRetryFlights.delete(issueId); }
+  }
+
+  async recheckWorktreeIntegration(issueId: IssueId, expectedAttemptId: string): Promise<{ok:boolean;error?:string}> {
+    return this.transitionCoordinator.run(issueId, async () => {
+      const issue = this.store.get(issueId);
+      const attempt = this.deps.moduleWorkspaces?.attempt(issueId);
+      const project = issue ? this.project(issue.projectId) : undefined;
+      if (this.incidentHeld(issueId)) return {ok:false,error:'incident_manual_hold'};
+      if (!project || issue?.status !== 'merging' || !attempt || attempt.id !== expectedAttemptId || attempt.released_ts !== null) {
+        return {ok:false,error:'worktree_snapshot_changed'};
+      }
+      await this.completeWorkspaceIntegration(issue, project);
+      return {ok:true};
+    });
+  }
+
+  async pauseWorktreeIntegration(issueId: IssueId, expectedAttemptId: string, actor: number): Promise<{ok:boolean;error?:string}> {
+    return this.transitionCoordinator.run(issueId, async () => {
+      const issue = this.store.get(issueId);
+      const workspace = this.deps.moduleWorkspaces;
+      const attempt = workspace?.attempt(issueId);
+      if (this.incidentHeld(issueId) || issue?.status !== 'merging' || !workspace || !attempt ||
+        attempt.id !== expectedAttemptId || attempt.released_ts !== null || !attempt.result_sha || attempt.integrated_sha) {
+        return {ok:false,error:'worktree_snapshot_changed'};
+      }
+      workspace.assertOwned(attempt);
+      const result = await this.applyEventLocked(issueId, 'pause', {actor,note:'worktree_manual_pause'});
+      return result.ok && result.to === 'paused' ? {ok:true} : {ok:false,error:'worktree_snapshot_changed'};
+    });
+  }
+
+  async confirmWorktreeStopped(issueId: IssueId, expectedAttemptId: string): Promise<void> {
+    await this.transitionCoordinator.run(issueId, () => this.confirmWorktreeInterventionStop(issueId,expectedAttemptId));
+  }
+
+  private async confirmWorktreeInterventionStop(issueId: IssueId, expectedAttemptId: string): Promise<void> {
+    const issue = this.store.get(issueId);
+    const workspace = this.deps.moduleWorkspaces;
+    const attempt = workspace?.attempt(issueId);
+    const project = issue ? this.project(issue.projectId) : undefined;
+    if (issue?.status !== 'paused' || !workspace || !project || !attempt || attempt.id !== expectedAttemptId ||
+      attempt.released_ts !== null || !attempt.result_sha || attempt.integrated_sha || this.incidents.held(issueId)) throw new Error('worktree_stale');
+    workspace.assertOwned(attempt);
+    if (this.deps.db.query(`SELECT 1 FROM workspace_operations WHERE resource IN (?,?) OR resource IN (
+      SELECT 'integration:' || id FROM workspace_integrations WHERE attempt_id=?
+    )`).get(`workspace:${attempt.workspace_id}`,`workspace-repository:${project.executorId}:${project.id}`,attempt.id)) {
+      throw new Error('worktree_operation_unconfirmed');
+    }
+    await workspace.stop(issue,project,true);
+    if (!workspace.attempt(issueId)?.stop_confirmed) throw new Error('worktree_operation_unconfirmed');
   }
 
   private async retryWorkspaceInner(issueId: IssueId, actor?: number, confirmInput = false): Promise<{ok:boolean;error?:string}> {
@@ -6139,7 +6198,7 @@ export class IssueEngine {
     if (from === 'planning' && ev === 'plan_ready') return 'plan_ready';
     if (from === 'plan_review' && (ev === 'plan_approved' || ev === 'plan_rejected')) return ev;
     if (from === 'implementing' && ev === 'impl_done') return 'impl_done';
-    if (from === 'testing' && (ev === 'tests_passed' || ev === 'tests_failed')) return ev;
+    if (from === 'testing' && (ev === 'tests_passed' || ev === 'tests_failed' || ev === 'candidate_ready')) return ev;
     if (from === 'merge_review' && (ev === 'review_approved' || ev === 'review_rejected')) return ev;
     return null;
   }
@@ -6363,7 +6422,12 @@ export class IssueEngine {
             .runExclusive(this.workspaceGitKey(project.id, issue.id), async () => {
               const branch = await this.inspectIssueBranchLocked(project, issue, workspace);
               if (!branch.ok) return branch;
-              const autoFailure = await this.gitDelivery.deliverLocked(project, issue, workspace);
+              let autoFailure = null;
+              if (this.validatesOnlyCandidate(issue, project)) {
+                await this.deps.moduleWorkspaces!.commit(issue, project, true);
+              } else {
+                autoFailure = await this.gitDelivery.deliverLocked(project, issue, workspace);
+              }
               await this.stampImplTip(project, issue, workspace);
               const status = await this.driverForProject(project).git(workspace.cwd, ['status', '--porcelain']);
               const snapshot = this.implCommits(issue.id);
@@ -6375,9 +6439,15 @@ export class IssueEngine {
                 dirtyEmptyImplRange: status.code === 0 && status.out.trim().length > 0 && emptyImplRange,
               };
             })
-            .catch((e: unknown) => ({ ok: false as const, err: String(e).slice(0, 300) }));
+            .catch((e: unknown) => ({ ok: false as const, err: String(e).slice(0, 300), uncertain:e instanceof WorkspaceOperationUncertain }));
           if (!finished.ok) {
             this.store.logEvent(issueId, 'error', { where: 'git-branch', error: finished.err });
+            if ('uncertain' in finished && finished.uncertain) {
+              this.logIntegrationWait(issueId,'operation_uncertain',finished.err);
+              await this.applyEventLocked(issueId,'pause',{note:finished.err});
+              this.scheduleEnvironmentRecovery(issueId);
+              return;
+            }
             await this.applyEventLocked(issueId, 'block', {
               note: `自动收尾已停止：${finished.err}`,
             });
@@ -6411,7 +6481,7 @@ export class IssueEngine {
           }
           this.store.logEvent(issueId, 'auto_approved', { kind: 'merge_review' });
           await this.applyEventLocked(issueId, 'review_approved', {
-            note: '测试通过，自动收尾（commit/push）',
+            note: this.validatesOnlyCandidate(issue, project) ? '成果已固定，进入候选验证' : '测试通过，自动收尾（commit/push）',
           });
           break;
         }
@@ -7507,17 +7577,18 @@ export class IssueEngine {
     return {pauseEventId,reason};
   }
 
-  private async recoverTimeout(issue:EngineIssue, pmGuidance?:string):Promise<void> {
+  private async recoverTimeout(issue:EngineIssue, pmGuidance?:string):Promise<'applied'|'deferred'|'exhausted'> {
     const request=this.timeoutRequest(issue,Boolean(pmGuidance)),service=this.deps.moduleWorkspaces;
-    if(!request||!service)return;
-    const project=this.project(issue.projectId);if(!project||!service.canStart(issue,this.store.listByProject(issue.projectId)))return;
-    if(this.deps.executionUnavailable?.(project))return;
+    if(!request||!service)return 'deferred';
+    const project=this.project(issue.projectId);if(!project||!service.canStart(issue,this.store.listByProject(issue.projectId)))return 'deferred';
+    if(this.deps.executionUnavailable?.(project))return 'deferred';
     const count=this.deps.db.query<{n:number},[string]>('SELECT COUNT(*) n FROM issue_timeout_takeovers WHERE issue_id=?').get(issue.id)!.n;
     const existing=this.deps.db.query('SELECT 1 FROM issue_timeout_takeovers WHERE pause_event_id=?').get(request.pauseEventId);
-    if(count>=2&&!existing) {this.store.logEvent(issue.id,'timeout_takeover_exhausted',{pauseEventId:request.pauseEventId,limit:2,note:'该 issue 已用尽两次自动超时接管，现场已保留，请核对超时诊断后继续'});return;}
-    const resumeState=request.reason==='validation'&&issue.executionMode==='direct'?'implementing':this.resumeStateOf(issue.id);
+    if(count>=2&&!existing) {this.store.logEvent(issue.id,'timeout_takeover_exhausted',{pauseEventId:request.pauseEventId,limit:2,note:'该 issue 已用尽两次自动超时接管，现场已保留，请核对超时诊断后继续'});return 'exhausted';}
+    const resumeState=service.attempt(issue.id)?.result_sha ? 'merging'
+      : request.reason==='validation'&&issue.executionMode==='direct' ? 'implementing' : this.resumeStateOf(issue.id);
     if(!resumeState||!['planning','implementing','testing','merging'].includes(resumeState)) {
-      this.store.logEvent(issue.id,'timeout_takeover_failed',{pauseEventId:request.pauseEventId,note:'原恢复阶段不支持安全自动接管'});return;
+      this.store.logEvent(issue.id,'timeout_takeover_failed',{pauseEventId:request.pauseEventId,note:'原恢复阶段不支持安全自动接管'});return 'exhausted';
     }
     try {
       const prepared=await service.prepareTimeoutTakeover(issue,project,request.pauseEventId,request.reason,resumeState,pmGuidance ? 'executor' : undefined);
@@ -7534,10 +7605,13 @@ export class IssueEngine {
         this.store.logEvent(issue.id,'stop_loss_resumed',{resumeState,source:'timeout-agent'});
       });
       if(!result.ok)throw new Error(result.error);
+      return 'applied';
     } catch(error) {
+      if(error instanceof WorkspaceResourceDeferred || error instanceof WorkspaceExecutionDeferred)return 'deferred';
       const note=redactDiagnostic(String(error)).slice(0,1500);
       this.deps.db.query("UPDATE issue_timeout_takeovers SET phase='failed',diagnostic=?,updated_ts=? WHERE pause_event_id=? AND phase<>'resumed'").run(note,this.now(),request.pauseEventId);
       this.store.logEvent(issue.id,'timeout_takeover_failed',{pauseEventId:request.pauseEventId,note});
+      return 'exhausted';
     }
   }
 
@@ -8259,7 +8333,7 @@ export class IssueEngine {
       if (!Array.isArray(arr)) return [];
       return arr
         .filter((p) => typeof p === 'string' && p)
-        .map((p) => (p.startsWith('/') ? p : `${workspace.cwd.replace(/\/+$/, '')}/${p}`));
+        .map((p) => p.startsWith('/') ? p : `${workspace.cwd.replace(/\/+$/, '')}/${this.deps.moduleWorkspaces?.enabled(issue) && workspace.kind === 'module-worktree' ? projectedAttachmentPath(p) ?? p : p}`);
     } catch {
       return [];
     }
@@ -8621,39 +8695,47 @@ export class IssueEngine {
     const workspaces = this.deps.moduleWorkspaces!;
     if (this.store.get(issue.id)?.status !== 'merging') return;
     try {
-      const result = await workspaces.integrate(issue, project, async cwd => {
-        const validation = await this.runValidationGate(issue, project, cwd);
+      const result = await workspaces.integrate(issue, project, async (cwd, candidate) => {
+        const validation = await this.runValidationGate(issue, this.project(issue.projectId) ?? project, cwd, candidate);
         if(validation.deferred)throw new WorkspaceResourceDeferred(validation.note);
+        if(validation.inputsChanged)return {inputsChanged:validation.note,recoverable:validation.recoverableInputs};
+        if(validation.timedOut && this.cfg.timeoutAgentEnabled)return {timeout:validation.note};
         if (validation.outcome === 'error') throw new DependencyPreparationError(validation.note);
         if(validation.outcome==='skipped'&&workspaces.requiresMergeValidation(issue.id))throw new DependencyPreparationError(`合并 Agent 修复后的候选必须执行系统验证：${validation.note}`);
         return validation.outcome === 'passed' || validation.outcome === 'skipped';
-      });
+      }, (cwd, candidate) => this.verifyCandidateReceipt(issue, this.project(issue.projectId) ?? project, cwd, candidate));
       if (!result.done) {
-        const last = this.store.listEvents(issue.id).filter(e => e.kind === 'integration_wait').at(-1);
-        if (last?.dataJson !== JSON.stringify({reason:result.reason})) this.store.logEvent(issue.id, 'integration_wait', {reason:result.reason});
+        this.logIntegrationWait(issue.id, result.code, result.reason);
         return;
       }
       const workspace = await this.resolveExecutionWorkspace(issue, project);
       const summary = await this.collectResultSummary(project, issue, 'done', workspace);
       if (summary.kind === 'incomplete') { await this.applyEventLocked(issue.id, 'block', {note:summary.reason}); return; }
       this.store.logEvent(issue.id, 'workspace_integrated', {sha:workspaces.attempt(issue.id)?.integrated_sha});
+      const target = await workspaces.target(project);
       const pushed = await workspaces.push(issue, project);
-      if (!pushed.ok) this.store.logEvent(issue.id, 'auto_push_failed', {detail:pushed.detail});
+      if (!pushed.ok) this.store.logEvent(issue.id, 'auto_push_failed', {branch:target,detail:pushed.detail});
+      else if (!pushed.skipped) this.store.logEvent(issue.id, 'auto_push', {branch:target});
       await this.applyEventLocked(issue.id, 'merged');
     } catch(e) {
       if(e instanceof WorkspaceExecutionDeferred) {
-        const previous=this.store.listEvents(issue.id).filter(event=>event.kind==='integration_wait').at(-1);
-        if(previous?.dataJson!==JSON.stringify({reason:e.message}))this.store.logEvent(issue.id,'integration_wait',{reason:e.message});
+        this.logIntegrationWait(issue.id, 'resource_wait', e.message);
         return;
       }
       const reason=String(e).slice(0,500);
-      await this.applyEventLocked(issue.id, 'pause', { note: reason, ...(e instanceof MergeAgentTimeoutError&&this.cfg.timeoutAgentEnabled?{timeoutReason:'merge-agent' as const}:{}), ...(e instanceof MergeAgentPausedError&&this.pmEnabledFor(issue)?{supervisionReason:'merge-agent' as const}:{}) });
-      if (e instanceof DependencyPreparationError || e instanceof WorkspaceOperationUncertain) this.scheduleEnvironmentRecovery(issue.id);
+      const timeoutReason = e instanceof CandidateValidationTimeoutError ? 'validation' : e instanceof MergeAgentTimeoutError && this.cfg.timeoutAgentEnabled ? 'merge-agent' : undefined;
+      await this.applyEventLocked(issue.id, 'pause', { note: reason, timeoutReason, ...(e instanceof MergeAgentPausedError&&this.pmEnabledFor(issue)?{supervisionReason:'merge-agent' as const}:{}) });
+      if (e instanceof DependencyPreparationError || e instanceof WorkspaceOperationUncertain || e instanceof CandidateValidationInputsChangedError && e.recoverable) this.scheduleEnvironmentRecovery(issue.id);
       workspaces.compute(issue.id,false);
       this.deps.db.query('UPDATE workspace_attempts SET diagnostic=? WHERE issue_id=? AND released_ts IS NULL').run(reason,issue.id);
-      const last=this.store.listEvents(issue.id).filter(event=>event.kind==='integration_wait').at(-1);
-      if(last?.dataJson!==JSON.stringify({reason}))this.store.logEvent(issue.id,'integration_wait',{reason});
+      this.logIntegrationWait(issue.id, e instanceof CandidateValidationInputsChangedError ? 'validation_inputs_changed' : e instanceof CandidateValidationTimeoutError ? 'validation_timeout' : e instanceof WorkspaceOperationUncertain ? 'operation_uncertain' : 'environment_error', reason);
     }
+  }
+
+  private logIntegrationWait(issueId: IssueId, code: string, reason: string): void {
+    const data = { reason:redactDiagnostic(reason).slice(0, 800), code };
+    const previous = this.store.listEvents(issueId).filter(event => event.kind === 'integration_wait').at(-1);
+    if (previous?.dataJson !== JSON.stringify(data)) this.store.logEvent(issueId, 'integration_wait', data);
   }
 
   // ---- 门禁执行（#279 / I-03）：在会话外跑，代理这几分钟是空闲的、不烧 token ----
@@ -8667,7 +8749,7 @@ export class IssueEngine {
    */
   private async computeValidationScope(
     issue: EngineIssue,
-    workspace: EngineExecutionWorkspace,
+    workspace: Pick<EngineExecutionWorkspace,'cwd'>,
   ): Promise<ValidationScope> {
     const cwd = workspace.cwd;
     const driver = this.executionForIssue(issue).driver;
@@ -8731,11 +8813,40 @@ export class IssueEngine {
     return {outcome:'error',note:reason,deferred:true};
   }
 
+  private async resolveIssueValidation(project: Project, cwd: string, moduleWorkspace: boolean) {
+    const configured = project.validationCommands ?? (moduleWorkspace ? await configuredWorkspaceValidation(this.driverForProject(project), cwd) : null);
+    const commands = resolveValidationCommands(configured, configured === null ? await this.readPackageJson(project,cwd) : null);
+    return {commands:moduleWorkspace?splitValidationCommands(commands).checks:commands,recipeCommands:commands, explicit:configured !== null};
+  }
+
+  private candidateRecipe(project: Project, candidate: CandidateValidationContext, commands: readonly ValidationCommand[]): string {
+    return JSON.stringify(['candidate-gate-v2', project.executorId, project.validationPolicy, this.cfg.validationTimeoutMs,
+      candidate.integrationId, candidate.candidateSha, candidate.targetSha, candidate.resultSha, commands]);
+  }
+
+  private hasCandidateReceipt(issueId: IssueId, key: string): boolean {
+    return this.store.listEvents(issueId).some(event => {
+      if (event.kind !== 'validation_passed' || !event.dataJson) return false;
+      try { return JSON.parse(event.dataJson).candidateReceipt === key; } catch { return false; }
+    });
+  }
+
+  private async verifyCandidateReceipt(issue: EngineIssue, project: Project, cwd: string, candidate: CandidateValidationContext): Promise<boolean> {
+    const requiresValidation = project.validationPolicy === 'required' || this.deps.moduleWorkspaces!.requiresMergeValidation(issue.id);
+    if (project.validationPolicy === 'none' || this.cfg.validationTimeoutMs <= 0) return !requiresValidation;
+    const {commands,recipeCommands} = await this.resolveIssueValidation(project,cwd,true);
+    if (commands.length === 0) return !requiresValidation;
+    const env = this.deps.moduleWorkspaces!.environment(issue.id, cwd);
+    const snapshot = await candidateInputSnapshot(this.driverForProject(project), cwd, recipeCommands, env, 'current');
+    return !!snapshot && this.hasCandidateReceipt(issue.id, validationCheckKey(snapshot.digest,[this.candidateRecipe(project,candidate,recipeCommands)]));
+  }
+
   private async runValidationGate(
     issue: EngineIssue,
     project: Project,
     candidateCwd?: string,
-  ): Promise<{ outcome: 'passed' | 'failed' | 'skipped' | 'error'; note: string; timedOut?: boolean; deferred?:boolean }> {
+    candidate?: CandidateValidationContext,
+  ): Promise<{ outcome: 'passed' | 'failed' | 'skipped' | 'error'; note: string; timedOut?: boolean; deferred?:boolean; inputsChanged?:boolean;recoverableInputs?:boolean }> {
     if (project.validationPolicy === 'none') {
       this.store.logEvent(issue.id, 'validation_skipped', { reason: 'policy-none' });
       return { outcome: 'skipped', note: '项目明确豁免验证' };
@@ -8748,9 +8859,10 @@ export class IssueEngine {
       this.store.logEvent(issue.id, 'validation_skipped', { reason: 'gate-disabled' });
       return { outcome: 'skipped', note: '门禁执行已关闭' };
     }
-    let workspace: EngineExecutionWorkspace;
+    let workspace: Pick<EngineExecutionWorkspace,'cwd'>;
     try {
-      workspace = await this.resolveExecutionWorkspace(issue, project);
+      // The integration service has already verified candidate ownership and location.
+      workspace = candidateCwd ? {cwd:candidateCwd} : await this.resolveExecutionWorkspace(issue, project);
     } catch (e) {
       if(e instanceof WorkspaceExecutionDeferred)return this.deferValidation(issue.id,e.message);
       this.store.logEvent(issue.id, 'error', { where: 'validation-workspace', error: String(e).slice(0, 200) });
@@ -8758,14 +8870,16 @@ export class IssueEngine {
       this.store.logEvent(issue.id,'environment_preparation_failed',{stage:'validation-workspace',note:String(e).slice(-2000)});
       return { outcome: 'error', note: '执行工作区不可用，恢复后重试验证' };
     }
-    if (candidateCwd) workspace = { ...workspace, cwd: candidateCwd };
     const scope: ValidationScope = candidateCwd ? {kind:'full',files:[],reason:'集成候选'} : await this.computeValidationScope(issue, workspace);
     this.store.setValidationScope(issue.id, scope);
 
-    const commands = resolveValidationCommands(
-      project.validationCommands,
-      await this.readPackageJson(project, workspace.cwd),
-    );
+    let resolved;
+    try { resolved = await this.resolveIssueValidation(project,workspace.cwd,this.deps.moduleWorkspaces?.enabled(issue) ?? false); }
+    catch (e) {
+      this.store.logEvent(issue.id, 'validation_error', { reason:'recipe-unavailable', detail:redactDiagnostic(String(e)).slice(0,400) });
+      return { outcome:'error', note:'无法读取验证配置，请修复后重新运行门禁' };
+    }
+    const {commands,recipeCommands,explicit} = resolved;
     if (commands.length === 0) {
       if (project.validationPolicy === 'required') {
         this.store.logEvent(issue.id, 'validation_error', { reason: 'required-no-commands' });
@@ -8774,14 +8888,9 @@ export class IssueEngine {
       this.store.logEvent(issue.id, 'validation_skipped', { reason: 'no-commands' });
       return { outcome: 'skipped', note: '没有可执行的门禁命令' };
     }
-    this.store.logEvent(issue.id, 'validation_started', {
-      scope: scope.kind,
-      files: scope.files.length,
-      commands: commands.map((c) => c.label),
-    });
     const driver = this.driverForProject(project);
-    if (this.deps.moduleWorkspaces?.enabled(issue)) {
-      this.store.logEvent(issue.id, 'environment_preparing', { cwd: workspace.cwd, stage: candidateCwd ? 'candidate' : 'testing' });
+    if (!candidateCwd && this.deps.moduleWorkspaces?.enabled(issue)) {
+      this.store.logEvent(issue.id, 'environment_preparing', { cwd: workspace.cwd, stage: 'testing' });
       try {
         await this.deps.moduleWorkspaces.prepareValidationEnvironment(issue,project,workspace.cwd);
         this.store.logEvent(issue.id, 'environment_ready', { cwd: workspace.cwd });
@@ -8792,8 +8901,27 @@ export class IssueEngine {
         return { outcome: 'error', note };
       }
     }
-    const cacheable = project.validationCommands === null && commands.every(c => c.argv[0] === 'bun');
-    const workspaceIdentity = await validationIdentity(driver, workspace.cwd);
+    const runEnv = this.deps.moduleWorkspaces?.enabled(issue) ? this.deps.moduleWorkspaces.environment(issue.id, workspace.cwd) : undefined;
+    const snapshotId = candidate ? randomUUID() : undefined;
+    const before = snapshotId ? await candidateInputSnapshot(driver,workspace.cwd,recipeCommands,runEnv ?? {},'start',snapshotId) : null;
+    if (candidate && !before) {
+      this.store.logEvent(issue.id, 'validation_error', { reason:'candidate-identity-unavailable', ...candidate });
+      return { outcome:'error', note:'无法确认候选验证输入，已保留现场' };
+    }
+    const candidateReceipt = candidate && before ? validationCheckKey(before.digest,[this.candidateRecipe(project,candidate,recipeCommands)]) : undefined;
+    if (candidateReceipt && this.hasCandidateReceipt(issue.id,candidateReceipt)) {
+      const snapshot = await candidateInputSnapshot(driver,workspace.cwd,recipeCommands,runEnv ?? {},'finish',snapshotId);
+      if (!snapshot || snapshot.digest !== before!.digest) {
+        return {outcome:'error', inputsChanged:!!snapshot, note:'候选验证输入发生变化或无法复核'};
+      }
+      this.store.logEvent(issue.id, 'validation_reused', { key:candidateReceipt, ...candidate });
+      return { outcome:'passed', note:'' };
+    }
+    this.store.logEvent(issue.id, 'validation_started', {
+      scope:scope.kind, files:scope.files.length, commands:commands.map(command=>command.label), ...candidate,
+    });
+    const cacheable = !candidate && !explicit && commands.every(c => c.argv[0] === 'bun');
+    const workspaceIdentity = candidate ? before!.digest : await validationIdentity(driver, workspace.cwd);
     const identity = cacheable ? workspaceIdentity : null;
     const passed = new Set(this.store.listEvents(issue.id).filter(e => e.kind === 'validation_check_passed')
       .flatMap(e => { try { return [JSON.parse(e.dataJson ?? '{}').key as string]; } catch { return []; } }));
@@ -8805,16 +8933,16 @@ export class IssueEngine {
           this.store.logEvent(issue.id, 'validation_reused', { key, argv });
           return { code: 0, out: '', err: '', durationMs: 0, timedOut: false };
         }
-        const result = await driver.runCommand(cwd, argv, timeoutMs, this.deps.moduleWorkspaces?.enabled(issue) ? this.deps.moduleWorkspaces.environment(issue.id, cwd) : undefined);
+        const result = await driver.runCommand(cwd, argv, timeoutMs, runEnv);
         capturedOutputChars = result.out.trim().length + result.err.trim().length;
         this.store.logEvent(issue.id, 'validation_diagnostic', redactDiagnosticValue({
-          argv, code: result.code, timedOut: result.timedOut, durationMs: result.durationMs,
+          argv, ...(cwd===workspace.cwd?{}:{cwd:cwd.slice(workspace.cwd.length+1)}), code: result.code, timedOut: result.timedOut, durationMs: result.durationMs,
           out: redactDiagnostic(result.out), err: redactDiagnostic(result.err),
           sourceTruncated: /…\[前 \d+ 字省略\]…/.test(result.out + result.err),
         }) as Record<string, unknown>);
         if (key && result.code === 0 && !result.timedOut) {
           // Commands that change inputs must never certify the old identity.
-          if (await validationIdentity(driver, cwd) === identity) {
+          if (await validationIdentity(driver, workspace.cwd) === identity) {
             this.store.logEvent(issue.id, 'validation_check_passed', { key, argv, durationMs: result.durationMs });
           } else this.store.logEvent(issue.id, 'validation_invalidated', { reason: 'inputs-changed-during-check' });
         }
@@ -8822,8 +8950,9 @@ export class IssueEngine {
       },
     };
     let run;
+    let after;
     try {
-      run = await runValidation(executor, workspace.cwd, commands, project.validationCommands !== null ? { kind: 'full', files: [], reason: '项目明确配置' } : scope, {
+      run = await runValidation(executor, workspace.cwd, commands, explicit ? { kind: 'full', files: [], reason: '项目明确配置' } : scope, {
         timeoutMs: this.cfg.validationTimeoutMs,
       });
     } catch (e) {
@@ -8832,13 +8961,27 @@ export class IssueEngine {
       this.store.logEvent(issue.id, 'error', { where: 'validation', error: String(e).slice(0, 300) });
       this.store.logEvent(issue.id,'validation_error',{reason:'executor-error'});
       return { outcome: 'error', note: '门禁执行失败（执行机异常），恢复后重试验证' };
+    } finally {
+      if (snapshotId) after = await candidateInputSnapshot(driver,workspace.cwd,recipeCommands,runEnv ?? {},'finish',snapshotId);
+    }
+    if (candidate && !after) {
+      this.store.logEvent(issue.id, 'validation_error', {reason:'candidate-identity-unavailable', ...candidate});
+      return { outcome:'error', note:'无法复核候选验证输入，已保留现场' };
+    }
+    if (before && after && after.digest !== before.digest) {
+      this.store.logEvent(issue.id,'validation_invalidated',redactDiagnosticValue({reason:'inputs-changed-during-gate', ...candidate,
+        before:before.digest, after:after.digest, changedPaths:after.changedPaths, changedCount:after.changedCount,
+        environmentChanged:after.environmentChanged}) as Record<string,unknown>);
+      const recoverableInputs=!after.environmentChanged && after.changedCount>0 && after.changedCount===after.changedPaths.length &&
+        after.changedPaths.every(path=>['node_modules','.venv','venv'].includes(path.split('/').at(-1)!));
+      return { outcome:'error', inputsChanged:true,recoverableInputs, note:'验证期间候选输入发生变化' };
     }
     if (run.skipped) {
       this.store.logEvent(issue.id, 'validation_skipped', { reason: 'no-commands' });
       return { outcome: 'skipped', note: '没有可执行的门禁命令' };
     }
     if (run.ok) {
-      if (workspaceIdentity) {
+      if (!candidate && workspaceIdentity) {
         const currentIdentity = await validationIdentity(driver, workspace.cwd);
         if (!currentIdentity || currentIdentity !== workspaceIdentity) {
           this.store.logEvent(issue.id, 'validation_invalidated', { reason: 'inputs-changed-during-gate' });
@@ -8849,6 +8992,7 @@ export class IssueEngine {
       this.store.logEvent(issue.id, 'validation_passed', {
         scope: scope.kind,
         workspaceIdentity,
+        ...(candidateReceipt ? {...candidate, candidateReceipt} : {}),
         durationMs: run.durationMs,
         steps: run.steps.map((x) => ({ label: x.label, durationMs: x.durationMs })),
       });
@@ -8951,6 +9095,10 @@ export class IssueEngine {
       await this.applyEvent(issueId, reportDecision.kind, { note: reportDecision.note });
       return;
     }
+    if (this.validatesOnlyCandidate(issue, project)) {
+      await this.applyEvent(issueId, 'candidate_ready', { note: '实施已就绪，系统将在独立候选验证' });
+      return;
+    }
     const gate = await this.runValidationGate(issue, project);
     if(gate.deferred)return;
     const gateDecision = decideValidationGate(gate, source);
@@ -8967,6 +9115,11 @@ export class IssueEngine {
       this.store.countEventsSince(issueId, 'tests_failed', Math.max(this.store.lastEventId(issueId, 'reopened'), this.stopLossAnchor(issueId))) + 1;
     this.store.logEvent(issueId, 'tests_failed', { note: gateDecision.note, failCount, source: 'validation' });
     await this.applyEvent(issueId, 'tests_failed', { failCount, note: gateDecision.note });
+  }
+
+  private validatesOnlyCandidate(issue: EngineIssue, project: Project): boolean {
+    return !project.manualReview && (issue.category === 'task' || issue.category === 'debug') &&
+      this.deps.moduleWorkspaces?.attempt(issue.id)?.kind === 'module-worktree' && !this.workflowSnapshot(issue.id);
   }
 
   /** 三级判定第 3 级：PM 保守判（读-判-重读-CAS，applyEvent 的 CAS 即重读端） */

@@ -122,6 +122,7 @@ export interface Project {
   workBranch: string | null;
   moduleConcurrency?: number;
   integrationBranch?: string | null;
+  mergeAgent?: AgentKind | null;
   /** Agent（claude/codex）读历史会话+代码库产出的项目认知长文（007 迁移；null = 尚未生成） */
   understanding: string | null;
   /** 生成上面认知的 CLI 代理（007 迁移；null = 尚未生成） */
@@ -298,6 +299,8 @@ export function parseReasoningEffort(value: unknown): ReasoningEffort | null {
 export interface ValidationCommand {
   label: string;
   argv: string[];
+  /** Validated repository-relative working directory from an execution manifest. */
+  cwd?: string;
 }
 
 /**

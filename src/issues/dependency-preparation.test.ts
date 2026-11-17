@@ -41,6 +41,10 @@ for(const [manager,lock,version,expected] of [
    const env={PATH:root+'/bin:'+process.env.PATH};const driver=new LocalDriver();
    await prepareDependencies(driver,root,env);
    expect(readFileSync(root+'/install-args','utf8').trim().split('\n')).toEqual([...expected]);
+   mkdirSync(root+'/node_modules/.vite/vitest',{recursive:true});
+   mkdirSync(root+'/node_modules/.tmp',{recursive:true});
+   writeFileSync(root+'/node_modules/.vite/vitest/results.json','test output');
+   writeFileSync(root+'/node_modules/.tmp/tsconfig.app.tsbuildinfo','build output');
    await prepareDependencies(driver,root,env);
    expect(readFileSync(root+'/calls','utf8').trim().split('\n')).toHaveLength(1);
    writeFileSync(root+'/node_modules/unexpected','依赖输入变化');

@@ -12,6 +12,7 @@
  */
 import type { CommandResult } from '../executor/driver';
 import type { ValidationCommand, ValidationScope } from '../core/types';
+import { posix } from 'node:path';
 
 // ---------- 常量 ----------
 
@@ -177,8 +178,8 @@ export function buildValidationCommands(
   if (scope.kind === 'docs') return [{ label: 'diff-check', argv: ['git', 'diff', '--check'] }];
   if (scope.kind === 'full' || scope.files.length === 0) return base.map((c) => ({ ...c, argv: [...c.argv] }));
   return base.map((c) =>
-    isTestCommand(c)
-      ? { label: `${c.label}（定向 ${scope.files.length} 个文件）`, argv: [...c.argv, ...scope.files] }
+    isTestCommand(c) && !c.cwd
+      ? { ...c, label: `${c.label}（定向 ${scope.files.length} 个文件）`, argv: [...c.argv, ...scope.files] }
       : { ...c, argv: [...c.argv] },
   );
 }
@@ -268,7 +269,7 @@ export async function runValidation(
   }
 
   for (const command of planned) {
-    const r = await exec.runCommand(cwd, command.argv, timeoutMs);
+    const r = await exec.runCommand(command.cwd ? posix.join(cwd, command.cwd) : cwd, command.argv, timeoutMs);
     const step: ValidationStepResult = {
       label: command.label,
       argv: command.argv,

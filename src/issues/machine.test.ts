@@ -22,6 +22,7 @@ describe('issue 状态机：合法转换', () => {
     expect(transition('plan_review', 'plan_approved')).toBe('implementing');
     expect(transition('implementing', 'impl_done')).toBe('testing');
     expect(transition('testing', 'tests_passed')).toBe('merge_review');
+    expect(transition('testing', 'candidate_ready')).toBe('merge_review');
     expect(transition('merge_review', 'review_approved')).toBe('merging');
     expect(transition('merging', 'merged')).toBe('done');
   });

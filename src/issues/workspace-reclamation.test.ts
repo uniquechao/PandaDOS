@@ -44,7 +44,8 @@ async function scene() {
  db.query("INSERT INTO module_workspaces(id,project_id,module_key,executor_id,cwd,branch,kind,lifecycle,created_ts,updated_ts) VALUES(1,1,0,1,?,'panda/module-1-0','module-worktree','idle',1,1)").run(moduleCwd);
  db.query("INSERT INTO workspace_attempts(id,workspace_id,issue_id,agent,phase,executor_start_ts,result_sha,integrated_sha,stop_confirmed,compute_held,released_ts,created_ts,updated_ts) VALUES(?,1,?,'codex','released',?,?,?,1,0,1,1,1)").run(attempt,issue.id,Date.now()-1000,head,head);
  db.query("INSERT INTO workspace_integrations(id,attempt_id,target_sha,result_sha,cwd,candidate_sha,phase,created_ts,updated_ts) VALUES(?,?,?,?,?,?,'published',1,1)").run(integration,attempt,head,head,candidateCwd,head);
- const deps={db,mutex,driverForProject:()=>driver,projectForId:(id:number)=>getProject(db,id),policy:{idleMs:0,minFreeBytes:0,retryMs:0,archiveMaxBytes:64*1024*1024,cacheMaxBytes:64*1024*1024}};
+ const deps={db,mutex,driverForProject:()=>driver,projectForId:(id:number)=>getProject(db,id),
+  policy:{idleMs:0,minFreeBytes:0,minFreeInodes:0,writeReserveInodes:0,retryMs:0,archiveMaxBytes:64*1024*1024,cacheMaxBytes:64*1024*1024}};
  const service=async(extra:Record<string,number>={})=>{
   const {WorkspaceReclamationService}=await import('./workspace-reclamation');
   const value=new WorkspaceReclamationService({...deps,policy:{...deps.policy,...extra}});cleanups.push(()=>value.stop());return value;
@@ -111,7 +112,8 @@ test('environment reclamation and a new module reservation are mutually exclusiv
 test('executor disk pressure defers startup and does not consume an environment recovery attempt',async()=>{
  const s=await scene();const original=s.driver.runCommand.bind(s.driver);
  s.driver.runCommand=async(cwd,argv,timeoutMs,env)=>argv.at(-1)?.includes('"action":"capacity"')
-  ?{code:0,out:JSON.stringify({state:'ready',availableBytes:1,totalBytes:100,cacheBytes:0,archiveBytes:0}),err:'',timedOut:false,durationMs:0}
+  ?{code:0,out:JSON.stringify({state:'ready',availableBytes:1,totalBytes:100,cacheBytes:0,archiveBytes:0,
+   filesystems:[{id:'test',availableBytes:1,totalBytes:100,availableInodes:1_000_000}]}),err:'',timedOut:false,durationMs:0}
   :original(cwd,argv,timeoutMs,env);
  const gc=await s.service({minFreeBytes:10});await expect(gc.assertCapacity(s.project,'start')).rejects.toBeInstanceOf(WorkspaceExecutionDeferred);
  expect(s.db.query<{n:number},[]>("SELECT COUNT(*) n FROM issue_events WHERE kind='environment_recovery_attempt'").get()?.n).toBe(0);
@@ -215,9 +217,10 @@ test('protected cache pressure does not veto independent starts when disk space 
  s.put(s.moduleCwd,`.panda/tmp/runtime/${s.attempt}/cache/protected`,'preserve this cache');
  const original=s.driver.runCommand.bind(s.driver);
  s.driver.runCommand=async(cwd,argv,ms,env)=>argv.at(-1)?.includes('"action":"capacity"')
-  ?{code:0,out:JSON.stringify({state:'ready',availableBytes:1000,totalBytes:2000,cacheBytes:200,archiveBytes:0}),err:'',timedOut:false,durationMs:0}
+  ?{code:0,out:JSON.stringify({state:'ready',availableBytes:1000,totalBytes:2000,cacheBytes:200,archiveBytes:0,
+   filesystems:[{id:'test',availableBytes:1000,totalBytes:2000,availableInodes:1_000_000}]}),err:'',timedOut:false,durationMs:0}
   :original(cwd,argv,ms,env);
- const gc=await s.service({minFreeBytes:10,cacheMaxBytes:100});
+ const gc=await s.service({minFreeBytes:10,cacheMaxBytes:100,writeReserveBytes:0});
  await expect(gc.assertCapacity(s.project,'start')).resolves.toBeUndefined();
  s.db.run("INSERT INTO project_modules(id,project_id,slug,display_name,agent,source,created_ts) VALUES(1,1,'independent','independent','codex','manual',1)");
  const next=s.store.create(1,{title:'independent issue',moduleId:1,agent:'codex',executionMode:'direct'});
@@ -259,4 +262,84 @@ test('an old healthy capacity receipt cannot admit starts after the executor pro
   await expect(gc.assertCapacity(s.project,phase)).rejects.toThrow('executor_capacity_unknown');
  }
  expect(gc.list(1).capacity?.reason).toContain('executor unavailable');
+},30_000);
+
+test('write admission reserves peak bytes per filesystem while an operation is in flight',async()=>{
+ const s=await scene(),gc=await s.service({minFreeBytes:100,writeReserveBytes:100,writeReserveInodes:0});
+ const other=await s.service({minFreeBytes:100,writeReserveBytes:100,writeReserveInodes:0});
+ const original=s.driver.runCommand.bind(s.driver);
+ s.driver.runCommand=async(cwd,argv,ms,env)=>{
+  if(!argv.at(-1)?.includes('"action":"capacity"'))return original(cwd,argv,ms,env);
+  const request=JSON.parse(argv.at(-1)!);
+  const key=request.probePaths?.includes(s.candidateCwd)?'volume-b':'volume-a';
+  return {code:0,out:JSON.stringify({state:'ready',availableBytes:250,totalBytes:1000,
+   filesystems:[{id:key,availableBytes:250,totalBytes:1000,availableInodes:1_000_000}]}),err:'',timedOut:false,durationMs:0};
+ };
+ let enter!:()=>void,release!:()=>void;
+ const entered=new Promise<void>(r=>enter=r),barrier=new Promise<void>(r=>release=r);
+ const flight=gc.withCapacityLease(s.project,'candidate',s.moduleCwd,async()=>{enter();await barrier;});
+ await entered;
+ try {
+  await expect(other.withCapacityLease(s.project,'candidate',s.moduleCwd+'-other',async()=>{})).rejects.toThrow('executor_disk_low');
+  await expect(other.withCapacityLease(s.project,'candidate',s.candidateCwd,async()=>42)).resolves.toBe(42);
+ }finally{release();await flight;}
+ await expect(gc.withCapacityLease(s.project,'candidate',s.moduleCwd+'-other',async()=>42)).resolves.toBe(42);
+},30_000);
+
+test('a probe sampled before another writer released must be refreshed before admission',async()=>{
+ const s=await scene(),gc=await s.service({minFreeBytes:100,writeReserveBytes:100,writeReserveInodes:0});
+ let enter!:()=>void,release!:()=>void,sample!:()=>void,report!:()=>void;
+ const entered=new Promise<void>(r=>enter=r),barrier=new Promise<void>(r=>release=r);
+ const sampled=new Promise<void>(r=>sample=r),reported=new Promise<void>(r=>report=r);
+ let probes=0,availableBytes=300;
+ s.driver.runCommand=async()=>{
+  const snapshot={id:'volume',availableBytes,totalBytes:1000,availableInodes:1_000_000};
+  if(++probes===2){sample();await reported;}
+  return {code:0,out:JSON.stringify({state:'ready',...snapshot,filesystems:[snapshot]}),err:'',timedOut:false,durationMs:0};
+ };
+ const writer=gc.withCapacityLease(s.project,'candidate',s.moduleCwd,async()=>{enter();await barrier;});
+ await entered;
+ const next=gc.withCapacityLease(s.project,'candidate',s.candidateCwd,async()=>{throw new Error('must not write');});
+ await sampled;
+ availableBytes=150;release();await writer;report();
+ await expect(next).rejects.toThrow('executor_disk_low');
+ expect(probes).toBe(3);
+},30_000);
+
+test('low inode headroom defers writing even when free bytes are sufficient',async()=>{
+ const s=await scene(),gc=await s.service({minFreeBytes:100,minFreeInodes:10,writeReserveBytes:100,writeReserveInodes:10});
+ s.driver.runCommand=async()=>({code:0,out:JSON.stringify({state:'ready',availableBytes:1000,totalBytes:1000,
+  filesystems:[{id:'volume-a',availableBytes:1000,totalBytes:1000,availableInodes:19}]}),err:'',timedOut:false,durationMs:0});
+ await expect(gc.withCapacityLease(s.project,'candidate',s.candidateCwd,async()=>{throw new Error('must not write');})).rejects.toThrow('executor_inode_low');
+ expect(gc.list(1).capacity?.available_inodes).toBe(19);
+},30_000);
+
+test('unknown inode headroom blocks admission while periodic byte and cache observations stay available',async()=>{
+ const s=await scene(),gc=await s.service({minFreeInodes:1,writeReserveBytes:0});
+ const original=s.driver.runCommand.bind(s.driver);
+ s.driver.runCommand=async(cwd,argv,ms,env)=>argv.at(-1)?.includes('"action":"capacity"')
+  ?{code:0,out:JSON.stringify({state:'ready',availableBytes:1000,totalBytes:1000,cacheBytes:25,
+    filesystems:[{id:'volume',availableBytes:1000,totalBytes:1000,availableInodes:null}]}),err:'',timedOut:false,durationMs:0}
+  :original(cwd,argv,ms,env);
+ await gc.tick();
+ expect(gc.list(1).capacity).toMatchObject({available_bytes:1000,available_inodes:null,cache_bytes:25});
+ await expect(gc.assertCapacity(s.project,'start')).rejects.toThrow('executor_capacity_unknown');
+},30_000);
+
+test('an unconfirmed write remains reserved across service restart until its stop is confirmed',async()=>{
+ const s=await scene(),gc=await s.service({writeReserveBytes:1,writeReserveInodes:0});
+ await expect(gc.withCapacityLease(s.project,'dependencies',s.moduleCwd,async markUncertain=>{
+  markUncertain();
+  throw new Error('executor disconnected');
+ })).rejects.toThrow('executor disconnected');
+ await gc.stop();
+ const next=await s.service({writeReserveBytes:1,writeReserveInodes:0});
+ await expect(next.withCapacityLease(s.project,'validation',s.moduleCwd,async()=>42)).rejects.toThrow('executor_write_unconfirmed');
+ await next.tick();
+ expect(next.list(1).jobs.find(job=>job.kind==='environment')?.reason).toBe('executor_write_unconfirmed');
+ const token=next.uncertainCapacityLeaseToken(s.project,'dependencies',s.moduleCwd)!;
+ next.confirmCapacityLeaseStopped(s.project,'dependencies',s.moduleCwd,'old-token');
+ expect(next.uncertainCapacityLeaseToken(s.project,'dependencies',s.moduleCwd)).toBe(token);
+ next.confirmCapacityLeaseStopped(s.project,'dependencies',s.moduleCwd,token);
+ await expect(next.withCapacityLease(s.project,'validation',s.moduleCwd,async()=>42)).resolves.toBe(42);
 },30_000);

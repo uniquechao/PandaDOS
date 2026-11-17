@@ -64,7 +64,9 @@ import type { PreviewService } from '../preview';
 import { greetingRoutes } from './greeting';
 import { issuesRoutes } from './issues';
 import { issueIncidentRoutes } from './issue-incidents';
+import { issueWorktreeRoutes } from './issue-worktree';
 import type { IssueIncidentService } from '../issue-incidents';
+import type { IssueWorktreeService } from '../issue-worktree';
 import { llmStatusRoutes } from './llm-status';
 import { roomsRoutes, type RoomsRoutesDeps } from './rooms';
 import { meRoutes } from './me';
@@ -78,6 +80,7 @@ import type { IssueId } from '../../../shared/issue-id';
 /** 聚合所有路由工厂需要的依赖全集（server.ts 装配后传入） */
 export interface ApiDeps {
   issueIncidents?: IssueIncidentService;
+  issueWorktree?: IssueWorktreeService;
   localPlans?: LocalPlanService;
   agentModels?: AgentModelSettings;
   db: Database;
@@ -190,6 +193,7 @@ export function allRoutes(deps: ApiDeps): RouteDef[] {
     }),
     ...workflowsRoutes({ db: deps.db }),
     ...(deps.issueIncidents ? issueIncidentRoutes(deps.engine,deps.issueIncidents) : []),
+    ...(deps.issueWorktree ? issueWorktreeRoutes(deps.issueWorktree) : []),
     ...issuesRoutes({
       db: deps.db,
       engine: deps.engine,

@@ -47,8 +47,15 @@ export class IssueEffectJournal {
   }
 
   hasUncertainInput(issueId: IssueId): boolean {
+    const mergeRuns = this.db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_merge_agents'").get();
+    const retiredRunGuard = mergeRuns ? `AND NOT EXISTS (
+      SELECT 1 FROM workspace_merge_agents r JOIN workspace_attempts a ON a.id=r.attempt_id
+      WHERE a.issue_id=j.issue_id AND r.stop_confirmed=1
+        AND (j.operation_key='merge-agent:' || r.id OR instr(j.operation_key,'merge-chat:' || r.id || ':')=1)
+    )` : '';
     return this.db.query<{ found: number }, [IssueId]>(
-      "SELECT 1 AS found FROM issue_effect_journal WHERE issue_id = ? AND status = 'uncertain' AND target NOT LIKE 'notify:%' AND target NOT LIKE 'git:%' LIMIT 1",
+      `SELECT 1 AS found FROM issue_effect_journal j WHERE issue_id = ? AND status = 'uncertain'
+        AND target NOT LIKE 'notify:%' AND target NOT LIKE 'git:%' ${retiredRunGuard} LIMIT 1`,
     ).get(issueId) !== null;
   }
 

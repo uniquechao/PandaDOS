@@ -28,7 +28,7 @@ import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { explainMenuForHuman } from '../agents/approval';
-import { createLlmClient, loadLlmConfig } from '../agents/llm';
+import { createLlmClient, createPmLlmClient, loadLlmConfig } from '../agents/llm';
 import { RoomEngine } from '../rooms/engine';
 import { RoomStore } from '../rooms/store';
 import { migrateRooms } from '../rooms/migrations';
@@ -105,6 +105,7 @@ import { FeishuMessaging } from './feishu-messaging';
 import { PrivateChat } from '../notify/private-chat';
 import { authDepsFromDb, createDispatcher } from './middleware';
 import { createApiDispatcher } from './routes';
+import { IssueWorktreeService } from './issue-worktree';
 import { actRoutes } from './routes/act';
 import { createProjectDataPersistence } from './project-data-persistence';
 import { decidePoll, ProjectDataSyncCoordinator } from './project-data-sync';
@@ -694,7 +695,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   const llm = createLlmClient(db);
   const workspaceResources=new WorkspaceReclamationService({db,mutex,driverForProject,projectForId:id=>getProject(db,id),policy:{...workspaceReclamationPolicyFromEnv(process.env),...opts.workspaceReclamationPolicy}});
   const pmFor = createPmPool({
-    driver: primaryDriver, llm, users, convs, locator, mutex, db, workspaceResources,
+    driver: primaryDriver, llm: createPmLlmClient(db, llm), users, convs, locator, mutex, db, workspaceResources,
     executionForProject: (project) => {
       const context = historyForProject(project);
       return { driver: context.reader, locator: context.locator };
@@ -914,6 +915,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   const roomPublication = new RoomPublicationService({ db, rooms: roomEngine, issues: engine });
   const localPlans = new LocalPlanService({ db, engine, driverForProject });
   const issueIncidents=createIssueIncidentService(db,engine,driverForProject,join(dirname(roomSessionRoot),'incident-sessions'),signal=>llm.acquireSlot(signal),opts.incidentRunner);
+  const issueWorktree = new IssueWorktreeService({ db, engine, mergeAgent, incidents: issueIncidents, mutex, driverForProject, historyForProject });
   const designEngine = new DesignEngine({
     store: designStore,
     scope: designScope,
@@ -1230,6 +1232,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<PandaServer
   const dispatch = createApiDispatcher({
     db,
     issueIncidents,
+    issueWorktree,
     localPlans,
     preview,
     users,

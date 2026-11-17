@@ -168,9 +168,8 @@ export interface PushFailure {
  * 反而让人以为活没干完），但也绝不能静默 done——于是留下 `auto_push_failed` 事件，
  * 由这里翻成详情页顶部一直挂着的警示条。
  *
- * 只认「最后一条 `auto_push_failed` 之后有没有成功的 `auto_push`」：重跑、人工在 Git 页
- * 补推、后续 issue 在同一分支推成功，都会落 `auto_push`，标记随之自动消失，不需要谁去清。
- * `push_skipped`（项目根本没有 origin）刻意**不**算解除——那说明它至今仍没被推走。
+ * 同分支后续的 `auto_push` 或 Worktree 远端核验回执会清除提示。
+ * 旧失败事件没有分支时，沿用 `auto_push` 解除提示的行为。
  */
 export function pushFailureState(events: IssueEvent[]): PushFailure | null {
   let failed: IssueEvent | null = null;
@@ -181,7 +180,20 @@ export function pushFailureState(events: IssueEvent[]): PushFailure | null {
     }
   }
   if (!failed) return null;
-  if (events.some((e) => e.kind === 'auto_push' && e.id > failed!.id)) return null;
-  const d = tryJson<{ branch?: string; detail?: string }>(failed.dataJson);
-  return { branch: (d?.branch ?? '').trim(), detail: (d?.detail ?? '').trim() };
+  const failedId = failed.id;
+  const data = tryJson<{ branch?: string; detail?: string }>(failed.dataJson);
+  const branch = typeof data?.branch === 'string' ? data.branch.trim() : '';
+  if (events.some((event) => {
+    if (event.id <= failedId) return false;
+    if (event.kind === 'auto_push') {
+      const receipt = tryJson<{ branch?: string }>(event.dataJson);
+      return !branch || receipt?.branch === branch;
+    }
+    if (event.kind === 'workspace_push_verified') {
+      const receipt = tryJson<{ target?: string }>(event.dataJson);
+      return Boolean(branch && receipt?.target === branch);
+    }
+    return false;
+  })) return null;
+  return { branch, detail: typeof data?.detail === 'string' ? data.detail.trim() : '' };
 }

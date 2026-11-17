@@ -3,7 +3,9 @@ import { enqueueReleasedWorkspaceCandidates, type WorkspaceReclamationService, W
 import type { MergeAgentPort } from './module-merge-agent';
 import { MergeAgentPausedError } from './module-merge-agent';
 import { redactDiagnostic, redactDiagnosticValue } from '../../shared/issue-diagnostics';
-import { prepareDependencies, DependencyPreparationError, confirmDependencyPreparationStopped } from './dependency-preparation';
+import { DependencyPreparationError, confirmDependencyPreparationStopped } from './dependency-preparation';
+import { prepareWorkspaceInputs, projectWorkspaceAttachments } from './workspace-inputs';
+import { observeRemoteCandidate } from './git-target-evidence';
 import { randomUUID, createHash } from 'node:crypto';
 import { posix } from 'node:path';
 import type { Database } from 'bun:sqlite';
@@ -19,6 +21,10 @@ import { issueMetaProjection, moduleMetaProjection } from './project-data-sync';
 import type { IssueId } from '../../shared/issue-id';
 
 export class WorkspaceOperationUncertain extends Error {}
+export class CandidateValidationTimeoutError extends Error {}
+export class CandidateValidationInputsChangedError extends Error {
+ constructor(note:string,readonly recoverable=false) {super(note);}
+}
 
 export interface WorkspaceAttempt {
  id:string; workspace_id:number; issue_id:IssueId; conversation_id:string|null; agent:string;
@@ -28,9 +34,28 @@ export interface WorkspaceAttempt {
 }
 interface Integration { id:string; attempt_id:string; target_sha:string; result_sha:string; cwd:string;
  candidate_sha:string|null; phase:string; diagnostic:string|null }
+export type IntegrationWaitCode = 'target_busy' | 'target_advanced' | 'target_checked_out' |
+  'merge_conflict' | 'merge_repair' | 'merge_clarification' | 'validation_failed' | 'validation_inputs_changed';
+type IntegrationResult = { done:true } | { done:false; code:IntegrationWaitCode; reason:string };
+export interface CandidateValidationContext {
+  integrationId:string;
+  candidateSha:string;
+  targetSha:string;
+  resultSha:string;
+}
+type CandidateCheck = (cwd:string, context:CandidateValidationContext)=>Promise<boolean>;
+type CandidateValidation = (cwd:string, context:CandidateValidationContext)=>Promise<boolean|{inputsChanged:string;recoverable?:boolean}|{timeout:string}>;
+type TargetQueue = { active:string|null; waiting:Set<string> };
+const targetQueuesByMutex = new WeakMap<KeyedMutex, Map<string,TargetQueue>>();
+type HeavyPhase = 'start'|'candidate'|'dependencies'|'validation';
 export interface ModuleWorkspaceDeps {
  mergeAgent?:MergeAgentPort;
- resources?:Pick<WorkspaceReclamationService,'assertCapacity'>;
+ resources?:Pick<WorkspaceReclamationService,'assertCapacity'> & {
+   withCapacityLease?<T>(project:Project,phase:HeavyPhase,cwd:string,fn:(markUncertain:()=>void)=>Promise<T>):Promise<T>;
+   hasUncertainCapacityLease?(project:Project,phase:HeavyPhase,cwd:string):boolean;
+   uncertainCapacityLeaseToken?(project:Project,phase:HeavyPhase,cwd:string):string|null;
+   confirmCapacityLeaseStopped?(project:Project,phase:HeavyPhase,cwd:string,token:string):void|Promise<void>;
+ };
  db:Database; mutex:KeyedMutex; driverForProject(project:Project):ExecutorDriver;
  legacy:EngineExecutionWorkspaceOps;
  conversations: {get(id:string):Conversation|undefined; createInWorkspaceWithId(id:string,projectId:number,label:string,agent:'codex'|'claude',cwd:string):Conversation};
@@ -38,7 +63,12 @@ export interface ModuleWorkspaceDeps {
 
 /** Durable reservations are not leases: an expired clock never authorizes a second writer. */
 export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
- constructor(private readonly deps:ModuleWorkspaceDeps) {}
+ private readonly targetQueues: Map<string,TargetQueue>;
+ constructor(private readonly deps:ModuleWorkspaceDeps) {
+   const queues=targetQueuesByMutex.get(deps.mutex)??new Map<string,TargetQueue>();
+   targetQueuesByMutex.set(deps.mutex,queues);
+   this.targetQueues=queues;
+ }
  private get db() { return this.deps.db; }
  enabled(issue:Pick<EngineIssue,'id'>):boolean {
    return this.db.query<{workspace_mode:string},[IssueId]>('SELECT workspace_mode FROM issues WHERE id=?').get(issue.id)?.workspace_mode === 'module';
@@ -136,13 +166,31 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
        if(!alive) this.db.query('DELETE FROM workspace_operations WHERE resource=? AND token=?').run(resource,previous.token);
      }
      const claim=this.db.query('INSERT OR IGNORE INTO workspace_operations(resource,token,operation,owner_pid,created_ts) VALUES(?,?,?,?,?)').run(resource,token,operation,process.pid,Date.now());
-     if(!claim.changes) throw new Error('工作区存在未确认的执行机操作，需核对现场后恢复');
+     if(!claim.changes) throw new WorkspaceOperationUncertain('工作区存在未确认的执行机操作，需核对现场后恢复');
      let uncertain=false;
      try {return await fn();} catch(e) {uncertain=e instanceof WorkspaceOperationUncertain;throw e;} finally {if(!uncertain)this.db.query('DELETE FROM workspace_operations WHERE resource=? AND token=?').run(resource,token);}
    });
  }
  private repoOperation<T>(project:Project,operation:string,fn:()=>Promise<T>):Promise<T> {
    return this.deps.mutex.runExclusive(gitLockKey(project.id),()=>this.operation(`workspace-repository:${project.executorId}:${project.id}`,operation,fn));
+ }
+
+ private async withCapacity<T>(project:Project,phase:HeavyPhase,cwd:string,fn:()=>Promise<T>):Promise<T> {
+   const resources=this.deps.resources;
+   if(!resources?.withCapacityLease) {
+     await resources?.assertCapacity(project,phase==='validation'?'dependencies':phase,cwd);
+     return fn();
+   }
+   if(resources.hasUncertainCapacityLease?.(project,phase,cwd)) {
+     throw new WorkspaceOperationUncertain('执行机写入的容量预留尚未确认结束，保留现场');
+   }
+   return resources.withCapacityLease(project,phase,cwd,async markUncertain=>{
+     try {return await fn();}
+     catch(e) {
+       if(e instanceof WorkspaceOperationUncertain || e instanceof DependencyPreparationError && e.uncertain)markUncertain();
+       throw e;
+     }
+   });
  }
  private async assertLocation(project:Project,cwd:string,branch?:string):Promise<void> {
    const driver=this.deps.driverForProject(project);
@@ -226,13 +274,16 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
        const exists=await driver.git(project.cwd,['show-ref','--verify','--quiet',`refs/heads/${a.branch}`]);
        if(exists.code!==1) throw new Error('模块分支已存在但工作区遗失，需核对保留成果');
        await driver.mkdirp(posix.dirname(a.cwd));
-       await this.repoOperation(project,'create-worktree',()=>this.git(driver,project.cwd,['worktree','add','-b',a.branch,a.cwd,base]));
+       await this.withCapacity(project,'start',a.cwd,()=>
+         this.repoOperation(project,'create-worktree',()=>this.git(driver,project.cwd,['worktree','add','-b',a.branch,a.cwd,base])));
      }
      await this.assertLocation(project,a.cwd,a.branch);
      const dirty=await this.git(driver,a.cwd,['status','--porcelain']);
      if(dirty) throw new Error('工作区有未保存改动，保留现场等待恢复：\n'+dirty.split('\n').slice(0,8).join('\n').slice(0,1200));
      // Fast-forward only. A failed prior publication cannot be silently folded into another issue.
-     await this.git(driver,a.cwd,['merge','--ff-only',base]);
+     if(await this.git(driver,a.cwd,['rev-parse','HEAD'])!==base) {
+       await this.withCapacity(project,'start',a.cwd,()=>this.git(driver,a.cwd,['merge','--ff-only',base]));
+     }
      const head=await this.git(driver,a.cwd,['rev-parse','HEAD']);
      if(a.kind!=='design-worktree' && head!==base) throw new Error('模块分支含未集成成果，禁止开启下一条');
      const resource=this.db.query<{port:number},[string]>('SELECT port FROM workspace_runtime_resources WHERE attempt_id=? AND node_run_id=0').get(a.id);
@@ -243,9 +294,9 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
      await this.repoOperation(project,'exclude-runtime',async()=>{
        const old=await driver.readFileRange(excludePath,0,65536).catch(()=>null);
        const content=old?new TextDecoder().decode(old.data):'';
-       if(content.includes('/.panda/tmp/') && content.includes('/.panda/conversations/') && content.includes('/.build/') && content.includes('/.worktrees/') && content.includes('\nnode_modules/\n'))return;
+       if(content.includes('/.panda/tmp/') && content.includes('/.panda/conversations/') && content.includes('/.build/') && content.includes('/.worktrees/') && content.includes('\nnode_modules/\n') && content.includes('\n.venv/\n'))return;
        if(!driver.replaceFileNoFollowWithin || (old && old.data.length>=65536))throw new Error('无法安全更新运行目录排除规则');
-       const result=await driver.replaceFileNoFollowWithin(posix.dirname(excludePath),posix.basename(excludePath),new TextEncoder().encode(content+'\n/.panda/tmp/\n/.panda/conversations/\n/.build/\n/.worktrees/\nnode_modules/\n'),old?createHash('sha256').update(old.data).digest('hex'):null);
+       const result=await driver.replaceFileNoFollowWithin(posix.dirname(excludePath),posix.basename(excludePath),new TextEncoder().encode(content+'\n/.panda/tmp/\n/.panda/conversations/\n/.build/\n/.worktrees/\nnode_modules/\n.venv/\n'),old?createHash('sha256').update(old.data).digest('hex'):null);
        if(result==='conflict')throw new Error('Git 排除规则已变化，请保留现场后重试');
      });
      this.db.query("UPDATE workspace_attempts SET phase='prepared',updated_ts=? WHERE id=?").run(Date.now(),a.id);
@@ -257,8 +308,11 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
  }
  private async prepareEnvironment(issue:EngineIssue,project:Project,a:WorkspaceAttempt):Promise<void> {
    try {
-     await this.deps.resources?.assertCapacity(project,'dependencies',a.cwd);
-     await prepareDependencies(this.deps.driverForProject(project),a.cwd,this.environment(issue.id,a.cwd));
+     await this.withCapacity(project,'dependencies',a.cwd,async()=>{
+       const driver=this.deps.driverForProject(project);
+       await projectWorkspaceAttachments(driver,project.cwd,a.cwd,issue.imagesJson);
+       await prepareWorkspaceInputs(driver,a.cwd,this.environment(issue.id,a.cwd),project.validationCommands);
+     });
      this.db.query("UPDATE module_workspaces SET environment_state='warm' WHERE id=? AND cwd=? AND current_attempt=?").run(a.workspace_id,a.cwd,a.id);
      this.db.query('UPDATE workspace_attempts SET diagnostic=NULL WHERE id=?').run(a.id);
    } catch(error) {
@@ -371,7 +425,8 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
    const a=this.attempt(issue.id)!;
    if(!locked)return this.deps.mutex.runExclusive(`workspace-git:${a.workspace_id}`,()=>this.commit(issue,project,true));this.assertOwned(a);
    if(a.result_sha) return;
-   await this.stop(issue,project);
+   try {await this.stop(issue,project);}
+   catch(e) {throw new WorkspaceOperationUncertain(`未能确认实施进程已停止：${String(e)}`);}
    const driver=this.deps.driverForProject(project);
    await this.operation(`workspace:${a.workspace_id}`,'commit',async()=>{
      this.assertOwned(a);
@@ -385,16 +440,45 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
      this.db.query("UPDATE workspace_attempts SET result_sha=?,phase='integrating',compute_held=0,updated_ts=? WHERE id=? AND result_sha IS NULL").run(sha,Date.now(),a.id);
    });
  }
- async integrate(issue:EngineIssue,project:Project,validate:(cwd:string)=>Promise<boolean>):Promise<{done:boolean;reason?:string}> {
-   const a=this.attempt(issue.id)!;this.assertOwned(a);
-   if(a.integrated_sha) return {done:true};
-   if(this.deps.mergeAgent&&this.db.query(`SELECT 1 FROM workspace_merge_agents r JOIN workspace_attempts other ON other.id=r.attempt_id
-     WHERE r.project_id=? AND other.issue_id<>? AND r.state IN ('starting','dispatching','running','stopping','uncertain')`).get(project.id,issue.id))
-     return {done:false,reason:'等待本项目合并 Agent 完成；其它模块可继续开发'};
-   if(!a.result_sha) await this.commit(issue,project);
-   const fresh=this.attempt(issue.id)!;
-   const driver=this.deps.driverForProject(project), target=await this.target(project);
-   const targetRef=`refs/heads/${target}`;
+ async integrate(issue:EngineIssue,project:Project,validate:CandidateValidation,verify?:CandidateCheck):Promise<IntegrationResult> {
+   const attempt=this.attempt(issue.id)!;
+   this.assertOwned(attempt);
+   if(attempt.integrated_sha) return {done:true};
+   if(!attempt.result_sha) await this.commit(issue,project);
+   const driver=this.deps.driverForProject(project);
+   const targetRef=`refs/heads/${await this.target(project)}`;
+   const gitDir=await this.git(driver,project.cwd,['rev-parse','--path-format=absolute','--git-common-dir']);
+   const key=JSON.stringify([project.executorId,gitDir,targetRef]);
+   let queue=this.targetQueues.get(key);
+   if(!queue) {
+     queue={active:null,waiting:new Set()};
+     this.targetQueues.set(key,queue);
+   }
+   if(queue.active!==attempt.id)queue.waiting.add(attempt.id);
+   if(queue.active===null) {
+     for(const id of queue.waiting) {
+       if(this.db.query(`SELECT 1 FROM workspace_attempts a JOIN issues i ON i.id=a.issue_id
+         WHERE a.id=? AND a.released_ts IS NULL AND a.integrated_sha IS NULL
+         AND i.status NOT IN ('paused','blocked','cancelled','done')`).get(id))break;
+       queue.waiting.delete(id);
+     }
+   }
+   if(queue.active!==null || queue.waiting.values().next().value!==attempt.id) {
+     return {done:false,code:'target_busy',reason:'等待同一目标分支的候选完成验证'};
+   }
+   queue.waiting.delete(attempt.id);
+   queue.active=attempt.id;
+   try {return await this.integrateAgainstTarget(issue,project,this.attempt(issue.id)!,driver,targetRef,validate,verify);}
+   finally {
+     queue.active=null;
+     if(!queue.waiting.size)this.targetQueues.delete(key);
+   }
+ }
+
+ private async integrateAgainstTarget(issue:EngineIssue,project:Project,a:WorkspaceAttempt,driver:ExecutorDriver,
+   targetRef:string,validate:CandidateValidation,verify?:CandidateCheck):Promise<IntegrationResult> {
+   const resultSha=a.result_sha;
+   if(!resultSha)throw new Error('候选缺少固定成果');
    const tip=await this.git(driver,project.cwd,['rev-parse',targetRef]);
    // 只有已验证候选的发布记录可以用于崩溃恢复；成果的祖先关系本身不是验证证据。
    const published=this.db.query<{candidate_sha:string},[string]>("SELECT candidate_sha FROM workspace_integrations WHERE attempt_id=? AND candidate_sha IS NOT NULL AND phase IN ('validated','published') ORDER BY created_ts DESC").all(a.id);
@@ -405,14 +489,14 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
      return {done:true};
    }
    const question=this.db.query<{question:string},[string]>("SELECT question FROM workspace_merge_agents WHERE attempt_id=? AND state='clarification' AND answer IS NULL ORDER BY rowid DESC LIMIT 1").get(a.id);
-   if(question)return {done:false,reason:question.question};
+   if(question)return {done:false,code:'merge_clarification',reason:question.question};
    // Never abandon a live model writer when the target moves.
    const stale=this.db.query<{id:string},[string,string]>(`SELECT j.id FROM workspace_integrations j JOIN workspace_merge_agents r ON r.integration_id=j.id WHERE j.attempt_id=? AND j.target_sha<>? AND r.state IN ('starting','dispatching','running','stopping','uncertain') LIMIT 1`).get(a.id,tip);
-   if(stale) {await this.deps.mergeAgent?.cancel(issue.id);return {done:false,reason:'目标已前进，旧合并 Agent 停止后重建候选'};}
+   if(stale) {await this.deps.mergeAgent?.cancel(issue.id);return {done:false,code:'target_advanced',reason:'目标已前进，旧合并 Agent 停止后重建候选'};}
    const id=randomUUID();
    this.db.query(`INSERT OR IGNORE INTO workspace_integrations(id,attempt_id,target_sha,result_sha,cwd,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?)`)
-     .run(id,a.id,tip,fresh.result_sha!,posix.join(this.root(project),'integration',id),Date.now(),Date.now());
-   let job=this.db.query<Integration,[string,string,string]>('SELECT * FROM workspace_integrations WHERE attempt_id=? AND target_sha=? AND result_sha=?').get(a.id,tip,fresh.result_sha!)!;
+     .run(id,a.id,tip,resultSha,posix.join(this.root(project),'integration',id),Date.now(),Date.now());
+   let job=this.db.query<Integration,[string,string,string]>('SELECT * FROM workspace_integrations WHERE attempt_id=? AND target_sha=? AND result_sha=?').get(a.id,tip,resultSha)!;
    return this.operation(`integration:${job.id}`,'integrate',async()=>{
      this.assertOwned(a);
      const status=(phase:string,diagnostic:string|null=null)=>{
@@ -420,78 +504,133 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
        this.db.query('UPDATE workspace_attempts SET diagnostic=?,updated_ts=? WHERE id=?').run(diagnostic,Date.now(),a.id);
      };
      if(job.phase==='reserved') {
-       await this.deps.resources?.assertCapacity(project,'candidate',job.cwd);
        const entries=await this.git(driver,project.cwd,['worktree','list','--porcelain']);
        if(!entries.split('\n').includes(`worktree ${job.cwd}`)) {
          if(await driver.statPath(job.cwd)) throw new Error('集成候选目录已存在，禁止覆盖');
          await driver.mkdirp(posix.dirname(job.cwd));
-         await this.repoOperation(project,'create-candidate',()=>this.git(driver,project.cwd,['worktree','add','--detach',job.cwd,tip]));
+         await this.withCapacity(project,'candidate',job.cwd,()=>
+           this.repoOperation(project,'create-candidate',()=>this.git(driver,project.cwd,['worktree','add','--detach',job.cwd,tip])));
        }
        status('merging');job={...job,phase:'merging'};
      }
      await this.assertLocation(project,job.cwd);
+     if(['validating','validation_failed','validated'].includes(job.phase) && !this.attempt(issue.id)?.stop_confirmed) {
+       try {await this.stop(issue,project,true);}
+       catch(e) {throw new WorkspaceOperationUncertain(`未能确认上次候选验证已停止：${String(e)}`);}
+     }
      const repair=async(files:string[],reason:string)=>{
-       if(!this.deps.mergeAgent)return false;
-       const r=await this.deps.mergeAgent.step({integrationId:job.id,attemptId:a.id,cwd:job.cwd,targetSha:tip,resultSha:fresh.result_sha!,issue,project,reason,files});
-       if(r.state!=='resolved') {status(job.phase,r.reason??'合并 Agent 正在处理');return false;}
+       if(!this.deps.mergeAgent)return {done:false,code:'merge_conflict',reason} as const;
+       const r=await this.deps.mergeAgent.step({integrationId:job.id,attemptId:a.id,cwd:job.cwd,targetSha:tip,resultSha,issue,project,reason,files});
+       if(r.state!=='resolved') {
+         const waiting=r.reason??'合并 Agent 正在处理';
+         status(job.phase,waiting);
+         return {done:false,code:r.state==='clarification'?'merge_clarification':'merge_repair',reason:waiting} as const;
+       }
        const remaining=await this.git(driver,job.cwd,['diff','--name-only','--diff-filter=U']);
        const head=await this.git(driver,job.cwd,['rev-parse','HEAD']);
        const dirty=await this.git(driver,job.cwd,['status','--porcelain','--untracked-files=no']);
        const merging=await driver.git(job.cwd,['rev-parse','--verify','MERGE_HEAD']);
-       if(remaining||dirty||merging.code===0||(await driver.git(job.cwd,['merge-base','--is-ancestor',tip,head])).code!==0||(await driver.git(job.cwd,['merge-base','--is-ancestor',fresh.result_sha!,head])).code!==0)
+       if(remaining||dirty||merging.code===0||(await driver.git(job.cwd,['merge-base','--is-ancestor',tip,head])).code!==0||(await driver.git(job.cwd,['merge-base','--is-ancestor',resultSha,head])).code!==0)
          throw new MergeAgentPausedError('合并 Agent 报告已完成，但候选不干净或缺少双方成果');
        this.db.query("UPDATE workspace_integrations SET candidate_sha=?,phase='validating',diagnostic=NULL WHERE id=?").run(head,job.id);
        job={...job,candidate_sha:head,phase:'validating'};
-       return true;
+       return null;
      };
      if(job.phase==='conflict'&&this.deps.mergeAgent&&this.db.query('SELECT 1 FROM workspace_merge_agents WHERE integration_id=?').get(job.id)) {
-       if(!await repair([],job.diagnostic??'集成冲突'))return {done:false,reason:this.attempt(issue.id)?.diagnostic??'合并 Agent 正在处理冲突'};
+       const wait=await repair([],job.diagnostic??'集成冲突');if(wait)return wait;
      }
      if(job.phase==='validation_failed'&&this.deps.mergeAgent) {
-       if(!await repair([],job.diagnostic??'集成候选验证未通过'))return {done:false,reason:this.attempt(issue.id)?.diagnostic??'合并 Agent 正在修复验证失败'};
+       const wait=await repair([],job.diagnostic??'集成候选验证未通过');if(wait)return wait;
      }
      if(job.phase==='merging'||job.phase==='conflict') {
        const unmerged=await this.git(driver,job.cwd,['diff','--name-only','--diff-filter=U']);
        if(unmerged) {
          status('conflict','集成冲突，现场已保留');job={...job,phase:'conflict'};
-         if(!await repair(unmerged.split('\n'),'集成冲突'))return {done:false,reason:this.attempt(issue.id)?.diagnostic??'集成冲突，现场已保留'};
+         const wait=await repair(unmerged.split('\n'),'集成冲突，现场已保留');if(wait)return wait;
        }
        if(job.phase!=='validating') {
        const mergeHead=await driver.git(job.cwd,['rev-parse','--verify','MERGE_HEAD']);
        if(mergeHead.code===0) {
-         await this.git(driver,job.cwd,['commit','--no-edit']);
+         await this.withCapacity(project,'candidate',job.cwd,()=>this.git(driver,job.cwd,['commit','--no-edit']));
        } else {
-         try {await this.git(driver,job.cwd,['merge','--no-ff','--no-edit',fresh.result_sha!]);}
-         catch(e) {if(e instanceof WorkspaceOperationUncertain)throw e;status('conflict',String(e).slice(0,500));return {done:false,reason:'集成冲突或合并失败，现场已保留'};}
+         try {await this.withCapacity(project,'candidate',job.cwd,()=>this.git(driver,job.cwd,['merge','--no-ff','--no-edit',resultSha]));}
+         catch(e) {
+           if(e instanceof WorkspaceOperationUncertain || e instanceof WorkspaceResourceDeferred)throw e;
+           if(!await this.git(driver,job.cwd,['diff','--name-only','--diff-filter=U']))throw e;
+           status('conflict',String(e).slice(0,500));return {done:false,code:'merge_conflict',reason:'集成冲突，现场已保留'};
+         }
        }
        const candidate=await this.git(driver,job.cwd,['rev-parse','HEAD']);
-       if((await driver.git(job.cwd,['merge-base','--is-ancestor',fresh.result_sha!,candidate])).code!==0) throw new Error('候选未包含固定成果');
+       if((await driver.git(job.cwd,['merge-base','--is-ancestor',resultSha,candidate])).code!==0) throw new Error('候选未包含固定成果');
        this.db.query("UPDATE workspace_integrations SET candidate_sha=?,phase='validating' WHERE id=?").run(candidate,job.id);
        job={...job,candidate_sha:candidate,phase:'validating'};
        }
      }
+     const validationContext=()=>({integrationId:job.id,candidateSha:job.candidate_sha!,targetSha:tip,resultSha});
+     const matchesCandidate=async()=>Boolean(job.candidate_sha) &&
+       await this.git(driver,job.cwd,['rev-parse','HEAD'])===job.candidate_sha &&
+       !await this.git(driver,job.cwd,['status','--porcelain','--untracked-files=no']);
+     if(job.phase==='validated'&&verify) {
+       const trees=await this.git(driver,project.cwd,['worktree','list','--porcelain']);
+       if(trees.split('\n').includes(`branch ${targetRef}`))return {done:false,code:'target_checked_out',reason:'目标分支正在其它工作区检出，等待释放'};
+     }
+     if((job.phase==='validating'||job.phase==='validated') && (!await matchesCandidate() ||
+       (await driver.git(job.cwd,['merge-base','--is-ancestor',tip,job.candidate_sha!])).code!==0 ||
+       (await driver.git(job.cwd,['merge-base','--is-ancestor',resultSha,job.candidate_sha!])).code!==0)) {
+       const reason='当前候选与登记的提交不一致，已保留现场';
+       status('validating',reason);
+       throw new CandidateValidationInputsChangedError(reason);
+     }
+     if(job.phase==='validated'&&verify) {
+       if(!await verify(job.cwd,validationContext())) {status('validating');job={...job,phase:'validating'};}
+     }
      if(job.phase==='validating'||job.phase==='validation_failed') {
        for(const path of Object.values(this.environment(issue.id,job.cwd)).filter(v=>v.startsWith(job.cwd)&&!v.endsWith('.db')&&!v.endsWith('/admin-token'))) await driver.mkdirp(path);
-       this.db.query('UPDATE workspace_attempts SET stop_confirmed=0 WHERE id=?').run(a.id);
-       let valid=false;
-       try {
-         await this.prepareEnvironment(issue,project,{...a,cwd:job.cwd});
-         valid=await validate(job.cwd);
-       } finally {await this.stop(issue,project,true);}
-       if(!valid) {this.db.query("UPDATE workspace_merge_agents SET state='retry' WHERE integration_id=? AND state='resolved'").run(job.id);status('validation_failed','集成候选验证未通过');return {done:false,reason:'集成候选验证未通过'};}
-       if(await this.git(driver,job.cwd,['rev-parse','HEAD'])!==job.candidate_sha || await this.git(driver,job.cwd,['status','--porcelain','--untracked-files=no'])) {
-         status('validation_failed','验证期间候选内容发生变化');return {done:false,reason:'验证期间候选内容发生变化'};
+       await this.prepareEnvironment(issue,project,{...a,cwd:job.cwd});
+       const validation=await this.withCapacity(project,'validation',job.cwd,async()=>{
+         this.db.query('UPDATE workspace_attempts SET stop_confirmed=0 WHERE id=?').run(a.id);
+         try {return await validate(job.cwd,validationContext());}
+         finally {
+           try {await this.stop(issue,project,true);}
+           catch(e) {throw new WorkspaceOperationUncertain(`未能确认候选验证进程已停止：${String(e)}`);}
+         }
+       });
+       if(validation!==true) {
+         if(typeof validation==='object' && 'inputsChanged' in validation) {
+           status('validating',validation.inputsChanged);
+           throw new CandidateValidationInputsChangedError(validation.inputsChanged,validation.recoverable);
+         }
+         this.db.query("UPDATE workspace_merge_agents SET state='retry' WHERE integration_id=? AND state='resolved'").run(job.id);
+         if(typeof validation==='object' && 'timeout' in validation) {
+           status('validation_failed',validation.timeout);
+           throw new CandidateValidationTimeoutError(validation.timeout);
+         }
+         const reason='集成候选验证未通过';
+         status('validation_failed',reason);
+         return {done:false,code:'validation_failed',reason};
+       }
+       if(!await matchesCandidate() || (verify && !await verify(job.cwd,validationContext()))) {
+         status('validating','验证期间候选内容发生变化');throw new CandidateValidationInputsChangedError('验证期间候选内容发生变化');
        }
        status('validated');job={...job,phase:'validated'};
      }
      return this.repoOperation(project,'publish-candidate',async()=>{
        this.assertOwned(a);
        const now=await this.git(driver,project.cwd,['rev-parse',targetRef]);
-       if(now!==tip) {status('superseded','目标分支已前进，重新构建并验证');return {done:false,reason:'目标分支已前进，重新构建并验证'};}
+       if(now!==tip) {status('superseded','目标分支已前进，重新构建并验证');return {done:false,code:'target_advanced',reason:'目标分支已前进，重新构建并验证'};}
        const trees=await this.git(driver,project.cwd,['worktree','list','--porcelain']);
-       if(trees.split('\n').includes(`branch ${targetRef}`)) {status('validated','目标分支正在其它工作区检出，等待释放');return {done:false,reason:'目标分支正在其它工作区检出，等待释放'};}
-       if(job.phase!=='validated'||!job.candidate_sha) return {done:false,reason:'候选尚未验证'};
-       await this.git(driver,project.cwd,['update-ref',targetRef,job.candidate_sha,tip]);
+       if(trees.split('\n').includes(`branch ${targetRef}`)) {status('validated','目标分支正在其它工作区检出，等待释放');return {done:false,code:'target_checked_out',reason:'目标分支正在其它工作区检出，等待释放'};}
+       if(job.phase!=='validated'||!job.candidate_sha) throw new Error('候选尚未验证');
+       try {await this.git(driver,project.cwd,['update-ref',targetRef,job.candidate_sha,tip]);}
+       catch(e) {
+         if(e instanceof WorkspaceOperationUncertain)throw e;
+         const updated=await this.git(driver,project.cwd,['rev-parse',targetRef]);
+         if(updated===tip)throw e;
+         if((await driver.git(project.cwd,['merge-base','--is-ancestor',job.candidate_sha,updated])).code!==0) {
+           status('superseded','目标分支已前进，重新构建并验证');
+           return {done:false,code:'target_advanced',reason:'目标分支已前进，重新构建并验证'};
+         }
+       }
        status('published');
        this.db.query("UPDATE workspace_attempts SET integrated_sha=?,phase='integrated',diagnostic=NULL,updated_ts=? WHERE id=?").run(job.candidate_sha,Date.now(),a.id);
        return {done:true};
@@ -540,6 +679,7 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
    const a=this.attempt(issue.id);if(!a)return;
    this.assertOwned(a);
    const driver=this.deps.driverForProject(project);
+   const resources=this.deps.resources;
    const locks=this.db.query<{resource:string;token:string;owner_pid:number},never[]>('SELECT resource,token,owner_pid FROM workspace_operations').all()
      .filter(r=>r.resource===`workspace:${a.workspace_id}`||r.resource===`workspace-repository:${project.executorId}:${project.id}`||r.resource.startsWith('integration:')&&Boolean(this.db.query('SELECT 1 FROM workspace_integrations WHERE id=? AND attempt_id=?').get(r.resource.slice(12),a.id)));
    for(const lock of locks) {
@@ -551,6 +691,19 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
      // A surviving Git process owns this executor-side lock until it actually exits.
      await this.git(driver,project.cwd,['rev-parse','HEAD']);
      this.db.query('DELETE FROM workspace_operations WHERE resource=? AND token=?').run(lock.resource,lock.token);
+   }
+   if(resources?.uncertainCapacityLeaseToken && resources.confirmCapacityLeaseStopped) {
+     const candidates=this.db.query<{cwd:string},[string]>('SELECT cwd FROM workspace_integrations WHERE attempt_id=?').all(a.id);
+     const checks:Array<[HeavyPhase,string]>=[['start',a.cwd],['dependencies',a.cwd]];
+     for(const {cwd} of candidates) checks.push(['candidate',cwd],['dependencies',cwd],['validation',cwd]);
+     for(const [phase,cwd] of checks) {
+       const token=resources.uncertainCapacityLeaseToken(project,phase,cwd);
+       if(!token)continue;
+       if(phase==='dependencies')await confirmDependencyPreparationStopped(driver,cwd);
+       else if(phase==='validation')await this.stop(issue,project,true);
+       else await this.git(driver,project.cwd,['rev-parse','HEAD']);
+       await resources.confirmCapacityLeaseStopped(project,phase,cwd,token);
+     }
    }
    await this.deps.mergeAgent?.cancel(issue.id);
    this.deps.mergeAgent?.retry(issue.id);
@@ -624,11 +777,33 @@ export class ModuleWorkspaceService implements EngineExecutionWorkspaceOps {
    return Boolean(this.db.query(`SELECT 1 FROM workspace_merge_agents r JOIN workspace_attempts a ON a.id=r.attempt_id WHERE a.issue_id=? AND a.released_ts IS NULL AND r.state='resolved'`).get(issueId));
  }
  answerMergeClarification(issueId:string,answer:string):boolean {return this.deps.mergeAgent?.answer(issueId,answer)??false;}
- async push(issue:EngineIssue,project:Project):Promise<{ok:boolean;detail?:string}> {
+ async push(issue:EngineIssue,project:Project):Promise<{ok:boolean;detail?:string;skipped?:boolean}> {
    const a=this.attempt(issue.id);if(!a?.integrated_sha) return {ok:false,detail:'尚未集成'};
    const driver=this.deps.driverForProject(project);
-   if((await driver.git(project.cwd,['remote','get-url','origin'])).code!==0) return {ok:true};
-   try {const r=await driver.git(project.cwd,['push','origin',`${a.integrated_sha}:refs/heads/${await this.target(project)}`]);return r.code===0?{ok:true}:{ok:false,detail:(r.err||r.out).slice(0,500)};}
+   try {
+     const branch=await this.target(project);
+     const candidate=a.integrated_sha;
+     const operation=`workspace-push:${a.id}:${branch}:${candidate}`;
+     const prior=this.db.query<{kind:string},[string,string]>(`SELECT kind FROM issue_events WHERE issue_id=?
+       AND kind IN ('workspace_push_requested','workspace_push_receipt') AND json_extract(data_json,'$.operation')=?
+       ORDER BY id DESC LIMIT 1`).get(issue.id,operation);
+     if(prior?.kind==='workspace_push_receipt')return {ok:true};
+     const record=(kind:string,tip?:string)=>this.db.query('INSERT INTO issue_events(issue_id,kind,data_json,ts) VALUES(?,?,?,?)')
+       .run(issue.id,kind,JSON.stringify({operation,attemptId:a.id,branch,candidate,...(tip?{tip}:{})}),Date.now());
+     if(prior) {
+       const observed=await observeRemoteCandidate(driver,project.cwd,branch,candidate);
+       if(!observed?.included)return {ok:false,detail:'workspace_push_unconfirmed'};
+       record('workspace_push_receipt',observed.tip);
+       return {ok:true};
+     }
+     const remote=await driver.git(project.cwd,['remote','get-url','origin']);
+     if(remote.code!==0) return remote.code===2?{ok:true,skipped:true}:{ok:false,detail:(remote.err||remote.out).slice(0,500)};
+     record('workspace_push_requested');
+     const r=await driver.git(project.cwd,['push','origin',`${candidate}:refs/heads/${branch}`]);
+     if(r.code!==0)return {ok:false,detail:(r.err||r.out).slice(0,500)};
+     record('workspace_push_receipt',candidate);
+     return {ok:true};
+   }
    catch(e) {return {ok:false,detail:String(e).slice(0,500)};}
  }
 }

@@ -17,14 +17,19 @@ The controller records job ownership, reasons and outcomes in SQLite. Release an
 | Setting | Default |
 | --- | --- |
 | `PANDA_WORKSPACE_MIN_FREE_BYTES` | 2147483648 (2 GiB) |
+| `PANDA_WORKSPACE_MIN_FREE_INODES` | 16384 |
+| `PANDA_WORKSPACE_WRITE_RESERVE_BYTES` | 536870912 (512 MiB) |
+| `PANDA_WORKSPACE_WRITE_RESERVE_INODES` | 16384 |
 | `PANDA_WORKSPACE_CACHE_MAX_BYTES` | 2147483648 (2 GiB) |
 | `PANDA_WORKSPACE_ARCHIVE_MAX_BYTES` | 4294967296 (4 GiB) |
 | `PANDA_WORKSPACE_IDLE_MS` | 21600000 (6 hours) |
 | `PANDA_WORKSPACE_ARCHIVE_RETENTION_MS` | 604800000 (7 days) |
 
-Settings are nonnegative integers in bytes or milliseconds. Embedders may override the same policy through `ServerOptions.workspaceReclamationPolicy`.
+Settings are nonnegative integers in bytes, inodes or milliseconds. Embedders may override the same policy through `ServerOptions.workspaceReclamationPolicy`.
 
-The cache budget is a soft eviction watermark: exceeding it immediately queues eligible idle environments for the background collector, even before the normal idle age. It does not block unrelated new Issues when the executor has sufficient real free space. Caches belonging to held, dirty or uninspectable executions are retained; their protected state cannot veto all starts on the executor. Disk checks inspect the executor's actual workspace, candidate/install and archive filesystems. Low space delays new tasks, candidate creation and dependency installation without consuming environment repair attempts. Reclamation has a separate small write reserve so it can still free stopped caches below the task-start threshold.
+The cache budget is a soft eviction watermark. Exceeding it immediately queues eligible idle environments for the background collector, even before the normal idle age. Caches belonging to held, dirty or uninspectable executions are retained. Independent Issues can start while protected caches exceed the watermark if the executor has enough free disk space.
+
+Admission measures free bytes and inodes on the executor filesystems used by the operation. Starts and candidate creation reserve the configured amount on each affected filesystem. Dependency preparation and validation reserve twice that amount to account for simultaneous inputs and outputs. An operation defers when the floor cannot be maintained after subtracting its own reserve and the reserves already held on those filesystems. A failed probe or resource deferral leaves environment repair and test failure budgets unchanged. Reservations survive controller restarts and remain charged until the old writer is confirmed stopped. Archive creation uses its own small write allowance so the collector can reclaim stopped caches below the start threshold.
 
 Expired completed archives rotate automatically; quota pressure can rotate older completed archives sooner. `workspace_resources` actions `pin` and `unpin` control retention of a project's archive. Pinned, incomplete or unknown archives are not purged. Pins cannot be acknowledged during an unconfirmed deletion. An oversized archive retains its original scene. Archive limits count storage on the executor, including other projects using that executor; unknown archive payloads are counted but never deleted by the collector.
 

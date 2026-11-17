@@ -14,6 +14,7 @@ import { createProjectDataPersistence } from '../web/project-data-persistence';
 import { moduleIssueRelPath } from './module-docs';
 import { DEPENDENCY_PREPARATION_SCRIPT } from './dependency-preparation';
 import { WorkspaceOperationUncertain } from './module-workspaces';
+import { WorkspaceResourceDeferred } from './workspace-reclamation';
 
 // Several end-to-end Git/engine flows exceed 5s under full-gate CPU contention.
 // This changes the fixture ceiling, not operation deadlines or behavior assertions.
@@ -199,7 +200,7 @@ test('真实 Git：同模块复用、跨模块并发及主目录脏文件保持�
  expect(wa.cwd).not.toBe(wb.cwd);expect(s.service.canStart(a2,[a,b])).toBe(false);expect(s.service.canStart(c,[a,b])).toBe(false);
  writeFileSync(wa.cwd+'/a.txt','A1');writeFileSync(wb.cwd+'/b.txt','B');
  await s.service.commit(a,s.project);
- expect((await s.service.integrate(a,s.project,async()=>true)).reason).toContain('检出');
+ expect(await s.service.integrate(a,s.project,async()=>true)).toMatchObject({done:false,code:'target_checked_out'});
  expect(readFileSync(s.repo+'/user.txt','utf8')).toBe('保留用户修改');
  await s.git(s.repo,['checkout','--detach']);
  expect((await s.service.integrate(a,s.project,async()=>true)).done).toBe(true);
@@ -213,22 +214,166 @@ test('真实 Git：同模块复用、跨模块并发及主目录脏文件保持�
 
 test('真实 Git：目标前进使旧验证失效，冲突现场不阻塞其它模块集成',async()=>{
  const s=await setup(true);const a=s.issue(1),b=s.issue(2),c=s.issue(3);
+ s.driver.stopSessionConfirmed=async()=>{}; // This fixture only runs synchronous Git commands.
  await s.captureFailure(async()=>{
  const wa=await s.service.resolve(a,s.project),wb=await s.service.resolve(b,s.project);
  writeFileSync(wa.cwd+'/same.txt','A\n');writeFileSync(wb.cwd+'/same.txt','B\n');
  await s.service.commit(a,s.project);await s.service.commit(b,s.project);await s.git(s.repo,['checkout','--detach']);
  let validations=0;
- const first=await s.service.integrate(b,s.project,async()=>{validations++;await s.service.integrate(a,s.project,async()=>true);return true;});
- expect(first.done).toBe(false);expect(first.reason).toContain('前进');
+ const first=await s.service.integrate(b,s.project,async()=>{
+   validations++;
+   await s.git(s.repo,['update-ref','refs/heads/main',s.service.attempt(a.id)!.result_sha!]);
+   return true;
+ });
+ expect(first).toMatchObject({done:false,code:'target_advanced'});
  expect((await s.service.integrate(b,s.project,async()=>{validations++;return true;})).done).toBe(false);
  expect(validations).toBe(1);
  const conflict=s.db.query<{cwd:string},[string]>("SELECT cwd FROM workspace_integrations WHERE attempt_id=? AND phase='conflict'").get(s.service.attempt(b.id)!.id)!;
  expect((await s.git(conflict.cwd,['diff','--name-only','--diff-filter=U']))).toBe('same.txt');
+ expect((await s.service.integrate(a,s.project,async()=>true)).done).toBe(true);
  await s.service.release(a,s.project);
  const wc=await s.service.resolve(c,s.project);writeFileSync(wc.cwd+'/c.txt','C');await s.service.commit(c,s.project);
  expect((await s.service.integrate(c,s.project,async()=>true)).done).toBe(true);
  expect(await s.git(conflict.cwd,['diff','--name-only','--diff-filter=U'])).toBe('same.txt');
  });
+});
+
+test('同一目标的候选顺序验收，第二条只在第一条合入后的基线上验证一次', async () => {
+ const s = await setup();
+ s.driver.stopSessionConfirmed = async () => {}; // Neither fixture starts a model or subprocess tree.
+ const a = s.issue(1), b = s.issue(2);
+ const wa = await s.service.resolve(a, s.project), wb = await s.service.resolve(b, s.project);
+ writeFileSync(wa.cwd + '/a.txt', 'A');
+ writeFileSync(wb.cwd + '/b.txt', 'B');
+ await s.service.commit(a, s.project);
+ await s.service.commit(b, s.project);
+ await s.git(s.repo, ['checkout', '--detach']);
+ let entered!: () => void, release!: () => void;
+ const validating = new Promise<void>(resolve => { entered = resolve; });
+ const blocked = new Promise<void>(resolve => { release = resolve; });
+ const first = s.service.integrate(a, s.project, async () => { entered(); await blocked; return true; });
+ await Promise.race([validating, first.then(result => { throw Error(`first candidate ended before gate: ${JSON.stringify(result)}`); })]);
+ const secondChecks: string[] = [];
+ const validateSecond = async (cwd: string) => { secondChecks.push(await s.git(cwd, ['rev-parse', 'HEAD^1'])); return true; };
+ const waiting = await s.service.integrate(b, s.project, validateSecond).finally(release);
+ expect((await first).done).toBe(true);
+ expect(waiting.done).toBe(false);
+ expect(secondChecks).toEqual([]);
+ expect((await s.service.integrate(b, s.project, validateSecond)).done).toBe(true);
+ expect(secondChecks).toEqual([s.service.attempt(a.id)!.integrated_sha!]);
+ expect(await s.git(s.repo, ['show', 'main:b.txt'])).toBe('B');
+});
+
+test('已有合并 Agent 修复冲突时，同目标无冲突候选仍能验证并发布', async () => {
+ const s=await setup();
+ s.driver.stopSessionConfirmed=async()=>{}; // The durable merge state below models the external writer.
+ const a=s.issue(1), b=s.issue(2), c=s.issue(3);
+ s.db.query('UPDATE projects SET module_concurrency=3 WHERE id=1').run();
+ const wa=await s.service.resolve(a,s.project), wb=await s.service.resolve(b,s.project), wc=await s.service.resolve(c,s.project);
+ writeFileSync(wa.cwd+'/same.txt','A\n');
+ writeFileSync(wb.cwd+'/same.txt','B\n');
+ writeFileSync(wc.cwd+'/third.txt','C\n');
+ for(const issue of [a,b,c])await s.service.commit(issue,s.project);
+ await s.git(s.repo,['checkout','--detach']);
+ expect((await s.service.integrate(a,s.project,async()=>true)).done).toBe(true);
+ expect(await s.service.integrate(b,s.project,async()=>true)).toMatchObject({done:false,code:'merge_conflict'});
+ const attempt=s.service.attempt(b.id)!;
+ const integration=s.db.query<{id:string},[string]>('SELECT id FROM workspace_integrations WHERE attempt_id=?').get(attempt.id)!;
+ s.db.query(`INSERT INTO workspace_merge_agents(id,integration_id,attempt_id,project_id,conversation_id,state,reason,remaining,started_ts,updated_ts)
+  VALUES('repair-run',?,?,1,'repair-conversation','running','conflict',3,1,1)`).run(integration.id,attempt.id);
+ const service=new ModuleWorkspaceService({...s.deps,mergeAgent:{step:async()=>{throw new Error('no repair needed');},cancel:async()=>{},retry:()=>{},answer:()=>false}});
+ expect((await service.integrate(c,s.project,async()=>true)).done).toBe(true);
+ expect(await s.git(s.repo,['show','main:third.txt'])).toBe('C');
+ expect(s.db.query("SELECT state FROM workspace_merge_agents WHERE id='repair-run'").get()).toEqual({state:'running'});
+});
+
+test('候选等待验证容量时归还同目标名额，且没有调用验收命令', async () => {
+ const s=await setup();
+ s.driver.stopSessionConfirmed=async()=>{};
+ const a=s.issue(1), b=s.issue(2);
+ const wa=await s.service.resolve(a,s.project), wb=await s.service.resolve(b,s.project);
+ writeFileSync(wa.cwd+'/a.txt','A');
+ writeFileSync(wb.cwd+'/b.txt','B');
+ await s.service.commit(a,s.project);await s.service.commit(b,s.project);
+ await s.git(s.repo,['checkout','--detach']);
+ let defer=true;
+ const service=new ModuleWorkspaceService({...s.deps,resources:{assertCapacity:async()=>{},async withCapacityLease(_project,phase,_cwd,run){
+   if(phase==='validation' && defer)throw new WorkspaceResourceDeferred('executor_disk_low');
+   return run(()=>{});
+ }}});
+ let calls=0;
+ const validate=async()=>{calls++;return true;};
+ await expect(service.integrate(a,s.project,validate)).rejects.toThrow('executor_disk_low');
+ expect(calls).toBe(0);
+ defer=false;
+ expect((await service.integrate(b,s.project,validate)).done).toBe(true);
+ expect(calls).toBe(1);
+ expect(service.attempt(a.id)?.integrated_sha).toBeNull();
+});
+
+test('普通模块自动交付只在候选跑配置门禁，远端只收到已合入目标', async () => {
+ const s = await setup();
+ const origin = s.root + '/origin.git';
+ mkdirSync(origin);
+ await s.git(origin, ['init', '--bare']);
+ await s.git(s.repo, ['remote', 'add', 'origin', origin]);
+ const check = ['bun', '-e', "if (!require('node:fs').existsSync('result.txt')) process.exit(1)"];
+ s.db.query("UPDATE projects SET validation_policy='required',validation_commands_json=? WHERE id=1")
+  .run(JSON.stringify([{ label: '验收成果', argv: check }]));
+ const issue = s.issue(1);
+ const sessions = new Set<string>();
+ s.driver.findExecutable = async () => '/bin/true';
+ s.driver.listSessions = async () => [...sessions].map(name => ({ name, createdTs: 1, attached: false, command: 'codex' }));
+ s.driver.createSession = async name => { sessions.add(name); };
+ s.driver.killSession = async name => { sessions.delete(name); };
+ s.driver.stopSessionConfirmed = async name => { sessions.delete(name); };
+ s.driver.sendKeys = async () => {};
+ s.driver.capturePane = async () => '›';
+ await s.service.target(s.project);
+ await s.git(s.repo, ['checkout', '--detach']);
+ const gateCwds: string[] = [];
+ const run = s.driver.runCommand.bind(s.driver);
+ s.driver.runCommand = async (cwd, argv, timeout, env) => {
+  if (JSON.stringify(argv) === JSON.stringify(check)) gateCwds.push(cwd);
+  return run(cwd, argv, timeout, env);
+ };
+ const engine = new IssueEngine({ db: s.db, driver: s.driver, convs: s.deps.conversations, locator: { locate: async () => null },
+  executionWorkspaces: s.service, moduleWorkspaces: s.service, mutex: s.deps.mutex,
+  pmFor: () => ({ judgeDone: async () => 'not_done' }), notify: { dispatch: async () => {} },
+  config: { resultSummaryTimeoutMs: 0, autoMerge: false, kickoffMinBootMs: 0 } });
+ await engine.scheduleNext(1);
+ const source = s.service.attempt(issue.id)!;
+ writeFileSync(source.cwd + '/result.txt', '固定成果');
+ await engine.applyEvent(issue.id, 'impl_done');
+ await engine['completeTesting'](issue.id, 'sentinel');
+ expect(engine.store.get(issue.id)?.status, JSON.stringify(engine.store.listEvents(issue.id))).toBe('done');
+ expect(gateCwds).toHaveLength(1);
+ expect(gateCwds[0]).toContain('/integration/');
+ expect(await s.git(origin, ['for-each-ref', '--format=%(refname)', 'refs/heads'])).toBe('refs/heads/main');
+ expect(await s.git(origin, ['show', 'main:result.txt'])).toBe('固定成果');
+});
+
+test('验证通过后等待目标释放，配置变动须重新验证候选再允许发布', async () => {
+ const s = await setup();
+ s.driver.stopSessionConfirmed = async () => {};
+ const issue = s.issue(1), source = await s.service.resolve(issue, s.project);
+ writeFileSync(source.cwd + '/result.txt', '固定成果');
+ await s.service.commit(issue, s.project);
+ s.db.query("UPDATE issues SET status='merging' WHERE id=?").run(issue.id);
+ const configure = (argv: string[]) => s.db.query("UPDATE projects SET validation_policy='required',validation_commands_json=? WHERE id=1")
+  .run(JSON.stringify([{ label: '验收成果', argv }]));
+ configure(['bun', '-e', 'process.exit(0)']);
+ const engine = new IssueEngine({ db: s.db, driver: s.driver, convs: s.deps.conversations, locator: { locate: async () => null },
+  executionWorkspaces: s.service, moduleWorkspaces: s.service, mutex: s.deps.mutex,
+  pmFor: () => ({ judgeDone: async () => 'not_done' }), notify: { dispatch: async () => {} }, config: { resultSummaryTimeoutMs: 0 } });
+ await engine.tick();
+ expect(engine.store.countEvents(issue.id, 'validation_passed')).toBe(1);
+ expect(s.service.attempt(issue.id)?.integrated_sha).toBeNull();
+ configure(['bun', '-e', 'process.exit(7)']);
+ await s.git(s.repo, ['checkout', '--detach']);
+ await engine.tick();
+ expect(engine.store.countEvents(issue.id, 'validation_failed')).toBe(1);
+ expect(s.service.attempt(issue.id)?.integrated_sha).toBeNull();
 });
 
 test('持久占用：暂停释放名额但不释放模块；重建服务沿用轮次并拒绝陈旧占用',async()=>{
@@ -422,7 +567,7 @@ test('真实锁文件：干净模块与深层 UUID 候选自动安装，准备�
    const run=s.driver.runCommand.bind(s.driver);
    let failed=false;
    s.driver.runCommand=async(cwd,argv,timeout,env)=>{
-     if(!failed && argv[0]==='python3' && argv[2]?.includes('receipt.json')) {
+     if(!failed && argv[0]==='python3' && argv[2]===DEPENDENCY_PREPARATION_SCRIPT) {
        failed=true;
        return {code:1,out:'',err:'环境准备失败：模拟包源暂不可用',timedOut:false,durationMs:1};
      }
@@ -446,10 +591,10 @@ test('真实锁文件：干净模块与深层 UUID 候选自动安装，准备�
    await s.git(s.repo,['checkout','--detach']);
    let candidate='';let candidateFailure=true;
    s.driver.runCommand=async(cwd,argv,timeout,env)=>{
-     if(cwd.includes('/integration/') && argv[0]==='python3' && argv[2]?.includes('receipt.json')) {
+     if(cwd.includes('/integration/') && argv[0]==='python3' && argv[2]===DEPENDENCY_PREPARATION_SCRIPT) {
        expect(env?.PANDA_DB).toStartWith(cwd);expect(env?.TMPDIR).toStartWith(cwd);
      }
-     if(candidateFailure && cwd.includes('/integration/') && argv[0]==='python3' && argv[2]?.includes('receipt.json')) {
+     if(candidateFailure && cwd.includes('/integration/') && argv[0]==='python3' && argv[2]===DEPENDENCY_PREPARATION_SCRIPT) {
        candidateFailure=false;
        return {code:1,out:'',err:'环境准备失败：模拟候选执行机暂不可用',timedOut:false,durationMs:1};
      }
@@ -480,7 +625,7 @@ test('引擎环境恢复：启动失败暂停、重启保留退避、三次上�
  writeFileSync(s.repo+'/bun.lock','锁文件夹具');
  await s.git(s.repo,['add','.']);await s.git(s.repo,['commit','-m','准备失败夹具']);
  const run=s.driver.runCommand.bind(s.driver);
- s.driver.runCommand=async(cwd,argv,timeout,env)=>argv[0]==='python3'&&argv[2]?.includes('receipt.json')
+ s.driver.runCommand=async(cwd,argv,timeout,env)=>argv[0]==='python3'&&argv[2]===DEPENDENCY_PREPARATION_SCRIPT
   ? {code:1,out:'',err:'包源暂不可用',timedOut:false,durationMs:1}:run(cwd,argv,timeout,env);
  let now=Date.now();
  const makeEngine=()=>new IssueEngine({db:s.db,driver:s.driver,convs:s.deps.conversations,locator:{locate:async()=>null},
@@ -529,7 +674,7 @@ test(`真实引擎候选验收：${failureKind}失败后重启自动恢复到 me
   const run=s.driver.runCommand.bind(s.driver);let fail=true;
   s.driver.runCommand=async(cwd,argv,timeout,env)=>{
    if(fail && cwd.includes('/integration/') && (failureKind==='依赖准备'
-      ? argv[0]==='python3' && argv[2]?.includes('receipt.json') : argv[0]==='flock')) {
+      ? argv[0]==='python3' && argv[2]===DEPENDENCY_PREPARATION_SCRIPT : argv[0]==='flock')) {
     fail=false;return {code:1,out:'',err:'候选执行环境暂不可用',timedOut:failureKind==='执行机 Git',durationMs:1};
    }
    return run(cwd,argv,timeout,env);
@@ -622,6 +767,16 @@ test('合并 Agent：等真实输入框，持久启动记录且重建协调器�
  expect(s.stats().sent).toBe(1);expect(s.run().state).toBe('running');
 });
 
+test('merge repair context keeps the invalidated input evidence instead of a successful command output',async()=>{
+ const s=await mergeAgentFixture();
+ s.store.logEvent(s.b.id,'validation_invalidated',{integrationId:s.job.id,reason:'inputs-changed-during-gate',changedPaths:['apps/web/node_modules'],changedCount:1});
+ s.store.logEvent(s.b.id,'validation_diagnostic',{code:0,out:'tests passed'});
+ await s.agent.step(s.context);
+ const context=JSON.parse(readFileSync(s.job.cwd+'/.panda/tmp/merge-agent/'+s.run().id+'/context.json','utf8'));
+ expect(context.validationFailure.kind).toBe('validation_invalidated');
+ expect(context.validationFailure.data.changedPaths).toEqual(['apps/web/node_modules']);
+});
+
 test('合并 Agent：项目单活跃，澄清释放名额且答复保存在下一轮上下文',async()=>{
  const s=await mergeAgentFixture();await s.agent.step(s.context);
  s.report('needs_clarification','双方负责人规则冲突，采用哪一个？');
@@ -663,6 +818,17 @@ test('合并 Agent：固定成果修复后才重新验证和发布，旧会话�
  expect(managedConversationOwned(s.db,1,run.conversation_id)).toBe(false);
  expect(()=>managedConversationEnvironment(s.db,run.conversation_id)).toThrow('归属已失效');
  expect(await s.git(s.repo,['show','main:same.txt'])).toBe('A\nB');
+});
+
+test('candidate input drift preserves the resolved merge and never spends another business repair round',async()=>{
+ const s=await mergeAgentFixture();const service=new ModuleWorkspaceService({...s.deps,mergeAgent:s.agent});
+ await service.integrate(s.context.issue,s.project,async()=>true);
+ writeFileSync(s.job.cwd+'/same.txt','A\nB\n');await s.git(s.job.cwd,['add','same.txt']);await s.git(s.job.cwd,['commit','--no-edit']);s.report();
+ await expect(service.integrate(s.context.issue,s.project,async()=>({inputsChanged:'fixture input drift'}))).rejects.toThrow('fixture input drift');
+ expect(s.run().state).toBe('resolved');expect(s.stats().sent).toBe(1);
+ expect(s.db.query<{phase:string},[string]>('SELECT phase FROM workspace_integrations WHERE id=?').get(s.job.id)!.phase).toBe('validating');
+ expect((await service.integrate(s.context.issue,s.project,async()=>true)).done).toBe(true);
+ expect(s.stats().sent).toBe(1);
 });
 
 test('合并 Agent：目标前进先停止旧模型再重建，停止失败不生成新候选',async()=>{
@@ -893,8 +1059,9 @@ test('超时接管：容量不足不领取预算，恢复后才接管',async()=>
  s.service.compute(other.id,false);await s.engine.tick();expect(s.store.get(s.issue.id)!.status).toBe('implementing');
 });
 
-test('验证超时：真实命令超时暂停后接管',async()=>{
+test('候选验证超时：保留冻结成果，恢复合入且不重启源会话',async()=>{
  const s=await timeoutFixture();const before=s.store.get(s.issue.id)!.convId;
+ await s.git(s.repo,['checkout','--detach']);
  s.db.query('UPDATE projects SET validation_commands_json=? WHERE id=1').run(JSON.stringify([{label:'test',argv:['sh','-c','sleep 10']} ]));
  s.store.setCompletionReport(s.issue.id,{version:1,outcome:'complete',objective:'完成',implementation:['完成'],advantages:[],disadvantages:[],verification:['修改'],completion:'已完成',unmetGoals:[],remainingWork:[],optionalFollowUps:[]});
  s.db.query("UPDATE issues SET status='testing' WHERE id=?").run(s.issue.id);
@@ -903,7 +1070,13 @@ test('验证超时：真实命令超时暂停后接管',async()=>{
  await (engine as any).completeTesting(s.issue.id,'sentinel',true);
  expect(s.store.get(s.issue.id)!.status).toBe('paused');
  expect(s.store.listEvents(s.issue.id).find(e=>e.kind==='validation_failed')?.dataJson).toContain('"timedOut":true');
- await engine.tick();expect(s.store.get(s.issue.id)!.status).toBe('implementing');expect(s.store.get(s.issue.id)!.convId).not.toBe(before);
+ const frozen=s.service.attempt(s.issue.id)!.result_sha;
+ expect(frozen).not.toBeNull();
+ s.db.query('UPDATE projects SET validation_commands_json=? WHERE id=1').run(JSON.stringify([{label:'test',argv:['true']}]));
+ await engine.tick();
+ expect(s.store.get(s.issue.id)!.status).toBe('done');
+ expect(s.store.get(s.issue.id)!.convId).toBe(before);
+ expect(s.service.attempt(s.issue.id)!.result_sha).toBe(frozen);
 });
 
 test('合并超时：保留冻结成果和候选，由新修复 Agent 继续并继承诊断',async()=>{
@@ -984,6 +1157,30 @@ test('PM Loop：超时后由 PM 决定等待，旧固定接管不抢先执行',a
  await engine.tick();expect(s.store.get(s.issue.id)!.status).toBe('paused');
  await engine.tickPmLoop();await engine.tick();await engine.tickPmLoop();
  expect(calls).toBe(1);expect(s.db.query<{n:number},[]>('SELECT COUNT(*) n FROM issue_timeout_takeovers').get()!.n).toBe(0);
+});
+
+test('PM observation includes the gate failure even when the latest command exited zero',async()=>{
+ const s=await timeoutFixture();await s.expire();
+ s.store.logEvent(s.issue.id,'validation_invalidated',{reason:'inputs-changed-during-gate',changedPaths:['apps/web/node_modules']});
+ s.store.logEvent(s.issue.id,'validation_diagnostic',{code:0,out:'tests passed'});
+ let calls=0;
+ const engine=supervisedEngine(s,async o=>{
+  calls++;expect(o.facts.validationFailure).toMatchObject({kind:'validation_invalidated',data:{changedPaths:['apps/web/node_modules']}});
+  return {action:'wait',reason:'retain input evidence',waitSeconds:60};
+ });
+ await engine.tickPmLoop();expect(calls).toBe(1);
+});
+
+test('PM recovery budget exhaustion never reports an applied recovery or repeats an exhausted action',async()=>{
+ const s=await timeoutFixture();
+ for(let n=0;n<2;n++){await s.expire();await s.engine.tick();}
+ await s.expire();
+ const engine=supervisedEngine(s,async()=>({action:'recover',reason:'recover retained execution'}));
+ await engine.tickPmLoop();
+ expect(s.store.get(s.issue.id)!.status).toBe('paused');
+ expect(s.store.listEvents(s.issue.id).filter(e=>e.kind==='pm_loop_applied')).toHaveLength(0);
+ expect(s.store.listEvents(s.issue.id).filter(e=>e.kind==='pm_loop_exhausted')).toHaveLength(1);
+ expect(s.db.query<{phase:string},[string]>('SELECT phase FROM issue_pm_loops WHERE issue_id=?').get(s.issue.id)!.phase).toBe('stopped');
 });
 
 test('PM Loop：恢复普通执行角色并保留原 worktree、改动及单一指令',async()=>{

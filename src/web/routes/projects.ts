@@ -1444,6 +1444,14 @@ export function projectsRoutes(deps: ProjectsRoutesDeps): RouteDef[] {
           if (!Number.isInteger(b.moduleConcurrency) || Number(b.moduleConcurrency)<1 || Number(b.moduleConcurrency)>32) return json({ok:false,error:'模块并发上限须为 1 到 32 的整数'},400);
           sets.push('module_concurrency = ?'); vals.push(Number(b.moduleConcurrency));
         }
+        if ('mergeAgent' in b) {
+          const agent = b.mergeAgent;
+          if (agent !== null && agent !== 'claude' && agent !== 'codex')
+            return json(apiError('worktree.invalid_request', 'Choose Claude, Codex or the execution agent.', 400), 400);
+          if (agent && !projectAgentSupport(db, id, agent).ok)
+            return json(apiError('worktree.agent_not_ready', 'The selected merge CLI is unavailable on the executor.', 409), 409);
+          sets.push('merge_agent = ?'); vals.push(agent);
+        }
         // 门禁命令（047 / #279）：数组 = 显式配置；null = 清回「未配置」（按 package.json 探测）。
         // 空数组是「显式不跑门禁」，与 null 不同，必须原样落库。
         if ('validationCommands' in b) {
